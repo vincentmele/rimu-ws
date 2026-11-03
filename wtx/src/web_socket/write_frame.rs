@@ -132,7 +132,7 @@ where
 /// Queues `frame` without awaiting anything if it can be: a small, uncompressed frame that is not
 /// a close frame and leaves the queue under [`WRITE_QUEUE_FLUSH_LEN`]. Returns `false`, with the
 /// frame untouched, for everything else, which is left to [`write_frame_buffered`].
-#[inline]
+#[inline(always)]
 pub(crate) fn try_queue_frame<C, P, R, const IS_CLIENT: bool>(
   frame: &mut Frame<P>,
   no_masking: bool,
@@ -159,7 +159,9 @@ where
   let payload = payload.lease();
   let header_len = header.len();
   let added = header_len.wrapping_add(payload.len());
-  write_queue.reserve(added)?;
+  if write_queue.capacity().wrapping_sub(write_queue.len()) < added {
+    write_queue.reserve(added)?;
+  }
   let (_, spare) = write_queue.split_at_spare_mut();
   if spare.len() < added {
     cold_path();
