@@ -382,7 +382,9 @@ impl BufStreamReader {
     }
     if following_len == 0 && !self.forbid_clear {
       self.clear();
-      self.buffer.reserve(additional)?;
+      if self.buffer.capacity() < additional {
+        self.buffer.reserve(additional)?;
+      }
       return Ok(());
     }
     let required_capacity = current_end_idx.wrapping_add(additional);

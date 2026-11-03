@@ -440,6 +440,11 @@ impl StreamWriter for UringTcpStream {
   async fn write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<()> {
     write_all_vectored(self.idx, self.generation, bytes).await
   }
+
+  #[inline]
+  fn try_write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<bool> {
+    try_write_all_vectored(self.idx, self.generation, bytes)
+  }
 }
 
 impl TcpStream for UringTcpStream {
@@ -520,6 +525,11 @@ impl StreamWriter for UringWriteHalf {
   async fn write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<()> {
     write_all_vectored(self.idx, self.generation, bytes).await
   }
+
+  #[inline]
+  fn try_write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<bool> {
+    try_write_all_vectored(self.idx, self.generation, bytes)
+  }
 }
 
 async fn read(
@@ -533,6 +543,10 @@ async fn read(
 async fn write_all_vectored(idx: u32, generation: u32, bytes: &[&[u8]]) -> crate::Result<()> {
   with_reactor(|reactor| reactor.queue_send(idx, generation, bytes))?;
   poll_fn(|cx| poll_reactor(|reactor| reactor.poll_send_room(idx, generation, cx))).await
+}
+
+fn try_write_all_vectored(idx: u32, generation: u32, bytes: &[&[u8]]) -> crate::Result<bool> {
+  with_reactor(|reactor| reactor.try_queue_send(idx, generation, bytes))
 }
 
 fn drop_conn_ref(idx: u32, generation: u32) {
@@ -884,9 +898,23 @@ impl Reactor {
 
   // ---- ring
 
+  // Inlined, so the entry can be stored straight into its slot; a full queue, which needs a
+  // submit and a retry, is handled out of line.
+  #[inline(always)]
   fn push_sqe(&self, sqe: &squeue::Entry) {
     let mut ring = self.ring.borrow_mut();
     // SAFETY: every buffer an entry points to lives in a `Conn` or `BufRing` until its completion
+    if unsafe { ring.submission().push(sqe) }.is_err() {
+      drop(ring);
+      self.push_sqe_full(sqe);
+    }
+  }
+
+  #[cold]
+  #[inline(never)]
+  fn push_sqe_full(&self, sqe: &squeue::Entry) {
+    let mut ring = self.ring.borrow_mut();
+    // SAFETY: as in `push_sqe`
     while unsafe { ring.submission().push(sqe) }.is_err() {
       let _rslt = ring.submit();
     }
@@ -1226,6 +1254,25 @@ impl Reactor {
       self.start_send(idx, generation);
     }
     Ok(())
+  }
+
+  /// [`Self::queue_send`] only while the connection is under its high-water mark, so that a
+  /// write that needn't wait for room skips the future: `false` queues nothing.
+  fn try_queue_send(&self, idx: u32, generation: u32, bytes: &[&[u8]]) -> crate::Result<bool> {
+    {
+      let conns = self.conns.borrow();
+      let Some(conn) = conns.get(idx as usize).filter(|el| el.generation == generation) else {
+        return Err(io_err(libc::EBADF));
+      };
+      if conn.tx_err != 0 {
+        return Err(io_err(conn.tx_err));
+      }
+      if conn.tx_pending.len() >= self.params.tx_high_water {
+        return Ok(false);
+      }
+    }
+    self.queue_send(idx, generation, bytes)?;
+    Ok(true)
   }
 
   fn start_send(&self, idx: u32, generation: u32) {
@@ -1808,6 +1855,9 @@ mod tests {
               {
                 return;
               }
+            }
+            if writer.try_flush(&mut common).is_err() {
+              return;
             }
             match reader.fill(&mut common).await {
               Ok(Fill::Buffered) => continue,

@@ -36,7 +36,9 @@ where
 {
   #[inline]
   async fn read(&mut self, bytes: MaybeUninitSlice<'_, u8>) -> crate::Result<Option<NonZeroUsize>> {
-    flush_write_queue(self.stream, self.write_queue).await?;
+    if !self.write_queue.is_empty() {
+      flush_write_queue(self.stream, self.write_queue).await?;
+    }
     self.stream.read(bytes).await
   }
 }

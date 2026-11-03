@@ -455,6 +455,8 @@ fn run(input: &[u8], chunks: &[usize], origin: WebSocketPayloadOrigin, mode: Loo
         // The queueing loop waits with `fill`, so every data frame is parsed by
         // `read_buffered_frame`, and only what that declines reaches `read_frame`.
         if mode == Loop::Queue {
+          // `Mem` can't write synchronously, so this declines and `fill` sends the queue.
+          let _ = writer.try_flush(&mut common).unwrap();
           match reader.fill(&mut common).await {
             Ok(Fill::Buffered) => continue,
             Ok(Fill::Closed) => break End::Eof,

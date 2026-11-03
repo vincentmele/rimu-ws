@@ -11,6 +11,14 @@ pub trait StreamWriter: StreamCommon {
   ///
   /// If the length of the outermost slice is greater than 8.
   fn write_all_vectored(&mut self, bytes: &[&[u8]]) -> impl Future<Output = crate::Result<()>>;
+
+  /// [`Self::write_all_vectored`] without awaiting, for streams that can take the bytes at once.
+  /// Returns `false`, having written nothing, when the bytes would have to wait, and then
+  /// [`Self::write_all_vectored`] should be awaited. The default never writes.
+  #[inline]
+  fn try_write_all_vectored(&mut self, _bytes: &[&[u8]]) -> crate::Result<bool> {
+    Ok(false)
+  }
 }
 
 impl<T> StreamWriter for &mut T
@@ -25,6 +33,11 @@ where
   #[inline]
   async fn write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<()> {
     (**self).write_all_vectored(bytes).await
+  }
+
+  #[inline]
+  fn try_write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<bool> {
+    (**self).try_write_all_vectored(bytes)
   }
 }
 

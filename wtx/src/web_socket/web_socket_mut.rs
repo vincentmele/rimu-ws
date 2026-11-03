@@ -1,7 +1,7 @@
 use crate::{
   collections::VectorUsize,
   misc::LeaseMut,
-  net::{BufStreamReader, ConnectionState, Stream},
+  net::{BufStreamReader, ConnectionState, Stream, StreamWriter},
   rng::Xorshift64,
   tls::{TlsCtx, TlsStream},
   web_socket::{
@@ -97,9 +97,15 @@ where
       BufferedFrame::Incomplete(elem) => elem,
       BufferedFrame::Data(_) | BufferedFrame::Other => return Ok(Fill::ReadFrame),
     };
-    let stream =
-      &mut QueuedStream { stream: &mut *common.stream, write_queue: &mut *common.write_queue };
-    match self.network_buffer.read_following(frame_len, stream).await {
+    // With nothing queued (`WebSocketWriterMut::try_flush` sent it), read the stream directly.
+    let rslt = if common.write_queue.is_empty() {
+      self.network_buffer.read_following(frame_len, &mut *common.stream).await
+    } else {
+      let stream =
+        &mut QueuedStream { stream: &mut *common.stream, write_queue: &mut *common.write_queue };
+      self.network_buffer.read_following(frame_len, stream).await
+    };
+    match rslt {
       Ok(true) => Ok(Fill::Buffered),
       Ok(false) => Ok(Fill::Closed),
       Err(err) => {
@@ -274,6 +280,27 @@ where
     common: &mut WebSocketCommonMut<'instance, NC, S, TCX, IS_CLIENT>,
   ) -> crate::Result<()> {
     flush_write_queue(common.stream, common.write_queue).await
+  }
+
+  /// [`Self::flush`] without awaiting, for a stream that can take the queued frames at once.
+  /// Returns `false`, sending nothing, when they would have to wait; they then go out before the
+  /// next read waits, or with [`Self::flush`].
+  ///
+  /// After a synchronous loop over the buffered frames, this hands what it queued to the stream
+  /// without going through an awaited write.
+  #[inline]
+  pub fn try_flush(
+    &mut self,
+    common: &mut WebSocketCommonMut<'instance, NC, S, TCX, IS_CLIENT>,
+  ) -> crate::Result<bool> {
+    if common.write_queue.is_empty() {
+      return Ok(true);
+    }
+    if common.stream.try_write_all_vectored(&[common.write_queue.as_slice()])? {
+      common.write_queue.clear();
+      return Ok(true);
+    }
+    Ok(false)
   }
 
   /// Writes a frame to the stream, after any frames queued by [`Self::write_frame_buffered`].

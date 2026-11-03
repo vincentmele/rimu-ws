@@ -347,6 +347,15 @@ where
     self.can_reply_key_update = true;
     Ok(())
   }
+
+  /// Plaintext forwards to the stream; records always go through [`Self::write_all_vectored`].
+  #[inline]
+  fn try_write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<bool> {
+    if TCX::TY.is_plain_text() {
+      return self.stream.try_write_all_vectored(bytes);
+    }
+    Ok(false)
+  }
 }
 
 /// What a pending read becomes given the state of the connection when the read started.

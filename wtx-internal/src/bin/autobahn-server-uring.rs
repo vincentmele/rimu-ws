@@ -47,6 +47,7 @@ async fn echo(
         writer.write_frame_buffered(&mut common, &mut frame).await?;
       }
     }
+    let _ = writer.try_flush(&mut common)?;
     match reader.fill(&mut common).await? {
       Fill::Buffered => continue,
       Fill::Closed => break,
