@@ -35,12 +35,16 @@ name = "web_socket"
 path = "web_socket.rs"
 
 [[bin]]
+name = "web_socket_differential"
+path = "web_socket_differential.rs"
+
+[[bin]]
 name = "x509"
 path = "x509.rs"
 
 [dependencies]
 libfuzzer-sys = { version = "0.4" }
-wtx = { default-features = false, features = ["arbitrary", "asn1", "crypto-ring", "http-cookie", "std", "web-socket", "x509"], path = "../wtx" }
+wtx = { default-features = false, features = ["_fuzz", "arbitrary", "asn1", "crypto-ring", "http-cookie", "std", "web-socket", "x509"], path = "../wtx" }
 
 [package]
 edition = "2024"

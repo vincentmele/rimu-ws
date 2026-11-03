@@ -2,6 +2,9 @@
 //! TCP connection.
 
 mod close_code;
+#[cfg(any(test, feature = "_fuzz"))]
+#[doc(hidden)]
+pub mod differential;
 mod frame;
 mod handshake;
 mod is_in_continuation_frame;
@@ -149,56 +152,69 @@ where
       wsb,
     } = self;
     let WebSocketBuffer { network_buffer, reader_buffer, writer_buffer: _, write_queue } = wsb;
-    if is_in_continuation_frame.is_none() {
-      buffer.clear();
-      loop {
-        match read_frame::buffered_data_frame::<NC, IS_CLIENT>(
-          *max_payload_len,
-          *nc_rsv1,
-          network_buffer.following(),
-          *no_masking,
-        ) {
-          read_frame::BufferedFrame::Data(rslt) => {
-            let (rfi, header_len) = rslt?;
-            return read_frame::take_buffered_data_frame::<IS_CLIENT>(
-              header_len,
-              network_buffer,
-              *nc_rsv1,
-              *no_masking,
-              payload_origin,
-              &rfi,
-              buffer,
-            );
-          }
-          read_frame::BufferedFrame::Incomplete(frame_len) => {
-            let local_stream =
-              &mut QueuedStream { stream: &mut *stream, write_queue: &mut *write_queue };
-            if !network_buffer.read_following(frame_len, local_stream).await? {
-              return Err(WebSocketError::ClosedConnection.into());
+    let rslt: crate::Result<FrameMut<'frame>> = 'read: {
+      if is_in_continuation_frame.is_none() {
+        buffer.clear();
+        loop {
+          match read_frame::buffered_data_frame::<NC, IS_CLIENT>(
+            *max_payload_len,
+            *nc_rsv1,
+            network_buffer.following(),
+            *no_masking,
+          ) {
+            read_frame::BufferedFrame::Data(rslt) => {
+              let (rfi, header_len) = match rslt {
+                Ok(elem) => elem,
+                Err(err) => break 'read Err(err),
+              };
+              break 'read read_frame::take_buffered_data_frame::<IS_CLIENT>(
+                header_len,
+                network_buffer,
+                *nc_rsv1,
+                *no_masking,
+                payload_origin,
+                &rfi,
+                buffer,
+              );
             }
+            read_frame::BufferedFrame::Incomplete(frame_len) => {
+              let local_stream =
+                &mut QueuedStream { stream: &mut *stream, write_queue: &mut *write_queue };
+              match network_buffer.read_following(frame_len, local_stream).await {
+                Ok(true) => {}
+                Ok(false) => break 'read Err(WebSocketError::ClosedConnection.into()),
+                Err(err) => break 'read Err(err),
+              }
+            }
+            read_frame::BufferedFrame::Other => break,
           }
-          read_frame::BufferedFrame::Other => break,
         }
       }
+      read_frame::read_frame::<_, _, _, _, _, true, IS_CLIENT>(
+        is_in_continuation_frame,
+        *max_payload_len,
+        nc,
+        *nc_rsv1,
+        network_buffer,
+        *no_masking,
+        payload_origin,
+        reader_buffer,
+        rng,
+        &mut QueuedStream { stream: &mut *stream, write_queue: &mut *write_queue },
+        None,
+        buffer,
+        |el| el.stream.connection_state = ConnectionState::ClosedGracefully,
+        |local_stream| local_stream,
+        |local_stream| local_stream,
+      )
+      .await
+    };
+    if rslt.is_err() {
+      // Frames queued before the error still go out, in front of whatever the caller sends next.
+      core::hint::cold_path();
+      let _rslt = write_frame::flush_write_queue(stream, write_queue).await;
     }
-    read_frame::read_frame::<_, _, _, _, _, true, IS_CLIENT>(
-      is_in_continuation_frame,
-      *max_payload_len,
-      nc,
-      *nc_rsv1,
-      network_buffer,
-      *no_masking,
-      payload_origin,
-      reader_buffer,
-      rng,
-      &mut QueuedStream { stream, write_queue },
-      None,
-      buffer,
-      |el| el.stream.connection_state = ConnectionState::ClosedGracefully,
-      |local_stream| local_stream,
-      |local_stream| local_stream,
-    )
-    .await
+    rslt
   }
 
   /// Different mutable parts that allow sending received frames using common elements.

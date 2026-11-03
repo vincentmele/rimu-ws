@@ -119,6 +119,14 @@ impl BufStreamReader {
     unsafe { self.buffer.get(self.current_end_idx..).unwrap_unchecked() }
   }
 
+  /// Mutable version of [`Self::following`].
+  #[cfg(feature = "web-socket")]
+  #[inline]
+  pub(crate) fn following_mut(&mut self) -> &mut [u8] {
+    let current_end_idx = self.current_end_idx;
+    self.buffer.get_mut(current_end_idx..).unwrap_or_default()
+  }
+
   /// Whether buffer clearing is currently forbidden.
   ///
   /// Should be used temporally to avoid capacity overflow.

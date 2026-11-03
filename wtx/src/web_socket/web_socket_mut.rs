@@ -7,14 +7,17 @@ use crate::{
   web_socket::{
     Frame, FrameMut, WebSocketError, WebSocketPayloadOrigin,
     is_in_continuation_frame::IsInContinuationFrame,
-    read_frame::{BufferedFrame, buffered_data_frame, read_frame, take_buffered_data_frame},
+    read_frame::{
+      BufferedFrame, buffered_data_frame, check_buffered_data_frame, read_frame,
+      take_buffered_data_frame, take_checked_data_frame,
+    },
     web_socket_compression::NegotiatedWsCompression,
     write_frame::{
       QueuedStream, flush_write_queue, try_queue_frame, write_frame, write_frame_buffered,
     },
   },
 };
-use core::marker::PhantomData;
+use core::{hint::cold_path, marker::PhantomData};
 
 /// Auxiliary common structure used by [`WebSocketReaderMut`] and [`WebSocketWriterMut`]
 #[derive(Debug)]
@@ -72,7 +75,7 @@ where
     if self.is_in_continuation_frame.is_some() {
       return Ok(None);
     }
-    let BufferedFrame::Data(rslt) = buffered_data_frame::<NC, IS_CLIENT>(
+    let BufferedFrame::Data(Ok((rfi, header_len))) = buffered_data_frame::<NC, IS_CLIENT>(
       self.max_payload_len,
       common.nc_rsv1,
       self.network_buffer.following(),
@@ -80,13 +83,21 @@ where
     ) else {
       return Ok(None);
     };
-    let (rfi, header_len) = rslt?;
+    // A frame that breaks the protocol stays in the buffer for `read_frame`, which reports the
+    // error after sending the frames queued in front of it.
+    if !check_buffered_data_frame::<IS_CLIENT>(
+      header_len,
+      self.network_buffer,
+      self.no_masking,
+      &rfi,
+    ) {
+      return Ok(None);
+    }
     buffer.clear();
-    take_buffered_data_frame::<IS_CLIENT>(
+    take_checked_data_frame(
       header_len,
       self.network_buffer,
       common.nc_rsv1,
-      self.no_masking,
       payload_origin,
       &rfi,
       buffer,
@@ -109,58 +120,71 @@ where
     'buffer: 'frame,
     'this: 'frame,
   {
-    if self.is_in_continuation_frame.is_none() {
-      buffer.clear();
-      loop {
-        match buffered_data_frame::<NC, IS_CLIENT>(
-          self.max_payload_len,
-          common.nc_rsv1,
-          self.network_buffer.following(),
-          self.no_masking,
-        ) {
-          BufferedFrame::Data(rslt) => {
-            let (rfi, header_len) = rslt?;
-            return take_buffered_data_frame::<IS_CLIENT>(
-              header_len,
-              self.network_buffer,
-              common.nc_rsv1,
-              self.no_masking,
-              payload_origin,
-              &rfi,
-              buffer,
-            );
-          }
-          BufferedFrame::Incomplete(frame_len) => {
-            let stream = &mut QueuedStream {
-              stream: &mut *common.stream,
-              write_queue: &mut *common.write_queue,
-            };
-            if !self.network_buffer.read_following(frame_len, stream).await? {
-              return Err(WebSocketError::ClosedConnection.into());
+    let rslt: crate::Result<FrameMut<'frame>> = 'read: {
+      if self.is_in_continuation_frame.is_none() {
+        buffer.clear();
+        loop {
+          match buffered_data_frame::<NC, IS_CLIENT>(
+            self.max_payload_len,
+            common.nc_rsv1,
+            self.network_buffer.following(),
+            self.no_masking,
+          ) {
+            BufferedFrame::Data(rslt) => {
+              let (rfi, header_len) = match rslt {
+                Ok(elem) => elem,
+                Err(err) => break 'read Err(err),
+              };
+              break 'read take_buffered_data_frame::<IS_CLIENT>(
+                header_len,
+                self.network_buffer,
+                common.nc_rsv1,
+                self.no_masking,
+                payload_origin,
+                &rfi,
+                buffer,
+              );
             }
+            BufferedFrame::Incomplete(frame_len) => {
+              let stream = &mut QueuedStream {
+                stream: &mut *common.stream,
+                write_queue: &mut *common.write_queue,
+              };
+              match self.network_buffer.read_following(frame_len, stream).await {
+                Ok(true) => {}
+                Ok(false) => break 'read Err(WebSocketError::ClosedConnection.into()),
+                Err(err) => break 'read Err(err),
+              }
+            }
+            BufferedFrame::Other => break,
           }
-          BufferedFrame::Other => break,
         }
       }
+      read_frame::<_, _, _, _, _, true, IS_CLIENT>(
+        self.is_in_continuation_frame,
+        self.max_payload_len,
+        common.nc,
+        common.nc_rsv1,
+        self.network_buffer.lease_mut(),
+        self.no_masking,
+        payload_origin,
+        self.reader_buffer.lease_mut(),
+        common.rng,
+        &mut QueuedStream { stream: &mut *common.stream, write_queue: &mut *common.write_queue },
+        None,
+        buffer,
+        |el| el.stream.connection_state = ConnectionState::ClosedGracefully,
+        |local_stream| local_stream,
+        |local_stream| local_stream,
+      )
+      .await
+    };
+    if rslt.is_err() {
+      // Frames queued before the error still go out, in front of whatever the caller sends next.
+      cold_path();
+      let _rslt = flush_write_queue(common.stream, common.write_queue).await;
     }
-    read_frame::<_, _, _, _, _, true, IS_CLIENT>(
-      self.is_in_continuation_frame,
-      self.max_payload_len,
-      common.nc,
-      common.nc_rsv1,
-      self.network_buffer.lease_mut(),
-      self.no_masking,
-      payload_origin,
-      self.reader_buffer.lease_mut(),
-      common.rng,
-      &mut QueuedStream { stream: common.stream, write_queue: common.write_queue },
-      None,
-      buffer,
-      |el| el.stream.connection_state = ConnectionState::ClosedGracefully,
-      |local_stream| local_stream,
-      |local_stream| local_stream,
-    )
-    .await
+    rslt
   }
 }
 

@@ -316,7 +316,11 @@ where
       cold_path();
       closed_conn_cb(stream);
     }
-    (op_code, payload_origin.manage_payload(network_buffer.current_mut(), user_buffer)?)
+    // The provided buffer holds the fragments received so far, so a control frame that arrives
+    // between them is returned from the network buffer whatever the origin. Copying it into the
+    // provided buffer would hand the fragments out as its payload and add its bytes to the message.
+    let _ = payload_origin;
+    (op_code, network_buffer.current_mut())
   } else {
     reader_buffer.clear();
     let op_code = is_in_continuation_frame.op_code;
@@ -360,6 +364,53 @@ where
       BufferedFrame::Other => return Ok(None),
     }
   }
+}
+
+/// Unmasks and checks the payload of the buffered frame found by [`buffered_data_frame`] without
+/// consuming anything, for [`take_checked_data_frame`]. A frame that would fail is masked again,
+/// which leaves the buffer as it was, and `false` is returned.
+#[inline]
+pub(crate) fn check_buffered_data_frame<const IS_CLIENT: bool>(
+  header_len: usize,
+  network_buffer: &mut BufStreamReader,
+  no_masking: bool,
+  rfi: &ReadFrameInfo,
+) -> bool {
+  if !matches!(rfi.op_code, OpCode::Binary | OpCode::Text) {
+    return false;
+  }
+  let Some(payload) =
+    network_buffer.following_mut().get_mut(header_len..header_len.wrapping_add(rfi.payload_len))
+  else {
+    return false;
+  };
+  if unmask_nb::<IS_CLIENT>(rfi.mask, payload, no_masking).is_err() {
+    return false;
+  }
+  if manage_op_code_of_first_final_frame(rfi.op_code, payload).is_err() {
+    let _rslt = unmask_nb::<IS_CLIENT>(rfi.mask, payload, no_masking);
+    return false;
+  }
+  true
+}
+
+/// Consumes a frame that [`check_buffered_data_frame`] accepted and returns it.
+#[inline]
+pub(crate) fn take_checked_data_frame<'frame, 'nb, 'ub>(
+  header_len: usize,
+  network_buffer: &'nb mut BufStreamReader,
+  nc_rsv1: u8,
+  payload_origin: WebSocketPayloadOrigin,
+  rfi: &ReadFrameInfo,
+  user_buffer: &'ub mut VectorUsize<u8>,
+) -> crate::Result<FrameMut<'frame>>
+where
+  'nb: 'frame,
+  'ub: 'frame,
+{
+  let payload = network_buffer.consume_frame(header_len, rfi.payload_len);
+  let payload = payload_origin.manage_payload(payload, user_buffer)?;
+  Ok(Frame::new(true, rfi.op_code, payload, nc_rsv1))
 }
 
 /// Consumes the frame found by [`fetch_buffered_data_frame`] and returns it, unmasked and checked.

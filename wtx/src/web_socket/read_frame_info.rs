@@ -202,9 +202,7 @@ impl ReadFrameInfo {
     if rsv2 != 0 || rsv3 != 0 {
       return Err(WebSocketError::InvalidCompressionHeaderParameter.into());
     }
-    let should_decompress = if D::IS_NOOP {
-      false
-    } else if nc_rsv1 == 0 {
+    let should_decompress = if D::IS_NOOP || nc_rsv1 == 0 {
       if rsv1 != 0 {
         return Err(WebSocketError::InvalidCompressionHeaderParameter.into());
       }

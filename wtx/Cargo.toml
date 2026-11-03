@@ -175,6 +175,7 @@ x509 = ["asn1", "crypto", "hashbrown"]
 zlib-rs = ["dep:zlib-rs", "zlib-rs?/rust-allocator"]
 
 _bench = []
+_fuzz = ["web-socket"]
 _hack = ["aws-lc-rs?/aws-lc-sys", "embassy-net?/medium-ip", "embassy-net?/proto-ipv4", "embassy-time?/generic-queue-64", "embassy-time?/std"] # Does not decide for downstream users
 _integration-tests = ["ccadb", "serde_json?/raw_value"]
 _tracing-tree = ["tracing", "tracing-subscriber", "tracing-tree"]
