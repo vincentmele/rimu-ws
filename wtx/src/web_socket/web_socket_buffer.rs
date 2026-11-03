@@ -7,6 +7,8 @@ pub struct WebSocketBuffer {
   // Used for decompression
   pub(crate) reader_buffer: VectorUsize<u8>,
   pub(crate) writer_buffer: VectorUsize<u8>,
+  // Frames written with `write_frame_buffered` that haven't been sent yet
+  pub(crate) write_queue: VectorUsize<u8>,
 }
 
 impl WebSocketBuffer {
@@ -17,14 +19,16 @@ impl WebSocketBuffer {
       network_buffer: BufStreamReader::new(),
       reader_buffer: VectorUsize::new(),
       writer_buffer: VectorUsize::new(),
+      write_queue: VectorUsize::new(),
     }
   }
 
   pub(crate) fn clear(&mut self) {
-    let Self { network_buffer, reader_buffer, writer_buffer } = self;
+    let Self { network_buffer, reader_buffer, writer_buffer, write_queue } = self;
     network_buffer.clear();
     reader_buffer.clear();
     writer_buffer.clear();
+    write_queue.clear();
   }
 }
 

@@ -2,16 +2,153 @@
 
 use crate::{
   codec::CompressionFlush,
-  collections::VectorUsize,
+  collections::{MaybeUninitSlice, VectorUsize},
   misc::{Lease, LeaseMut},
-  net::StreamWriter,
+  net::{StreamCommon, StreamReader, StreamWriter},
   rng::Rng,
   web_socket::{
     Frame, FrameMut, mask_op::mask_op, misc::has_masked_frame,
     web_socket_compression::WebSocketCompression,
   },
 };
-use core::hint::cold_path;
+use core::{hint::cold_path, num::NonZeroUsize};
+
+/// Queued frames are sent once the queue reaches this many bytes, even if nothing would block.
+/// Payloads of at least this size bypass the queue (no copy) and are sent with whatever is
+/// queued in front of them.
+pub(crate) const WRITE_QUEUE_FLUSH_LEN: usize = 16 * 1024;
+
+/// A stream whose reads and writes first send the frames queued by `write_frame_buffered`.
+///
+/// Reading flushes before the socket is touched, so queued replies always go out before the
+/// connection can block waiting for its peer. Writing puts the queue and the new bytes in one
+/// syscall, which keeps frames in the order they were written.
+pub(crate) struct QueuedStream<'any, S> {
+  pub(crate) stream: &'any mut S,
+  pub(crate) write_queue: &'any mut VectorUsize<u8>,
+}
+
+impl<S> StreamCommon for QueuedStream<'_, S> {}
+
+impl<S> StreamReader for QueuedStream<'_, S>
+where
+  S: StreamReader + StreamWriter,
+{
+  #[inline]
+  async fn read(&mut self, bytes: MaybeUninitSlice<'_, u8>) -> crate::Result<Option<NonZeroUsize>> {
+    flush_write_queue(self.stream, self.write_queue).await?;
+    self.stream.read(bytes).await
+  }
+}
+
+impl<S> StreamWriter for QueuedStream<'_, S>
+where
+  S: StreamWriter,
+{
+  #[inline]
+  async fn write_all(&mut self, bytes: &[u8]) -> crate::Result<()> {
+    if self.write_queue.is_empty() {
+      return self.stream.write_all(bytes).await;
+    }
+    self.stream.write_all_vectored(&[self.write_queue.as_slice(), bytes]).await?;
+    self.write_queue.clear();
+    Ok(())
+  }
+
+  #[inline]
+  async fn write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<()> {
+    if self.write_queue.is_empty() {
+      return self.stream.write_all_vectored(bytes).await;
+    }
+    let mut slices: [&[u8]; 8] = [&[]; 8];
+    if let (Some(first), Some(rest)) = (self.write_queue.get(..), slices.get_mut(1..=bytes.len())) {
+      rest.copy_from_slice(bytes);
+      slices[0] = first;
+      self.stream.write_all_vectored(slices.get(..=bytes.len()).unwrap_or_default()).await?;
+      self.write_queue.clear();
+      return Ok(());
+    }
+    cold_path();
+    flush_write_queue(self.stream, self.write_queue).await?;
+    self.stream.write_all_vectored(bytes).await
+  }
+}
+
+pub(crate) async fn flush_write_queue<SW>(
+  stream_writer: &mut SW,
+  write_queue: &mut VectorUsize<u8>,
+) -> crate::Result<()>
+where
+  SW: StreamWriter,
+{
+  if !write_queue.is_empty() {
+    stream_writer.write_all(write_queue).await?;
+    write_queue.clear();
+  }
+  Ok(())
+}
+
+/// Appends `frame` to `write_queue` instead of writing it. See [`QueuedStream`].
+pub(crate) async fn write_frame_buffered<C, P, R, SW, const IS_CLIENT: bool>(
+  frame: &mut Frame<P>,
+  no_masking: bool,
+  nc: &mut C,
+  nc_rsv1: u8,
+  rng: &mut R,
+  stream_writer: &mut SW,
+  writer_buffer: &mut VectorUsize<u8>,
+  write_queue: &mut VectorUsize<u8>,
+  closed_conn_cb: impl FnOnce(&mut SW),
+) -> crate::Result<()>
+where
+  C: WebSocketCompression,
+  P: LeaseMut<[u8]>,
+  R: Rng,
+  SW: StreamWriter,
+{
+  if manage_compression::<C, _>(frame, nc_rsv1) {
+    let fr = manage_frame_compression::<_, _, _, IS_CLIENT>(
+      nc,
+      nc_rsv1,
+      frame,
+      no_masking,
+      rng,
+      writer_buffer,
+    )?;
+    enqueue(fr.header(), fr.payload(), stream_writer, write_queue).await?;
+  } else {
+    mask_frame::<_, _, IS_CLIENT>(frame, no_masking, rng);
+    let (header, payload) = frame.header_and_payload_mut();
+    enqueue(header, payload.lease(), stream_writer, write_queue).await?;
+  }
+  if frame.op_code().is_close() {
+    cold_path();
+    flush_write_queue(stream_writer, write_queue).await?;
+    closed_conn_cb(stream_writer);
+  }
+  Ok(())
+}
+
+async fn enqueue<SW>(
+  header: &[u8],
+  payload: &[u8],
+  stream_writer: &mut SW,
+  write_queue: &mut VectorUsize<u8>,
+) -> crate::Result<()>
+where
+  SW: StreamWriter,
+{
+  if payload.len() >= WRITE_QUEUE_FLUSH_LEN {
+    stream_writer.write_all_vectored(&[write_queue.as_slice(), header, payload]).await?;
+    write_queue.clear();
+    return Ok(());
+  }
+  let _ = write_queue.extend_from_copyable_slices([header, payload])?;
+  if write_queue.len() >= WRITE_QUEUE_FLUSH_LEN {
+    flush_write_queue(stream_writer, write_queue).await?;
+  }
+  Ok(())
+}
 
 pub(crate) fn mask_frame<P, R, const IS_CLIENT: bool>(
   frame: &mut Frame<P>,

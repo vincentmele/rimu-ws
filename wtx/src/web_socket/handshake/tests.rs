@@ -100,6 +100,7 @@ async fn do_test_client_and_server_frames<CC, SC>(
         PingAndText,
         PingBetweenFragmentedText,
         TwoPings,
+        BufferedEcho,
         // Last,
         HelloAndGoodbye,
       );
@@ -125,6 +126,7 @@ async fn do_test_client_and_server_frames<CC, SC>(
     PingAndText,
     PingBetweenFragmentedText,
     TwoPings,
+    BufferedEcho,
     // Last,
     HelloAndGoodbye,
   );
@@ -165,6 +167,57 @@ where
     let mut buffer = VectorUsize::new();
     let text = ws.read_frame(&mut buffer, WebSocketPayloadOrigin::Adaptive).await.unwrap();
     assert_eq!((OpCode::Text, "123".as_bytes()), (text.op_code(), &**text.payload()));
+  }
+}
+
+// Sixteen texts with a ping in the middle, echoed through the write queue: the first half with
+// `WebSocket` itself, the second with the `split_mut` parts. The pong has to come out after the
+// eight echoes queued in front of it.
+struct BufferedEcho;
+impl<NC> Test<NC> for BufferedEcho
+where
+  NC: NegotiatedWsCompression,
+{
+  async fn client(ws: &mut LocalWebSocket<NC, true>) {
+    for idx in 0u8..16 {
+      if idx == 8 {
+        ws.write_frame(&mut Frame::new_fin(OpCode::Ping, *b"p").unwrap()).await.unwrap();
+      }
+      ws.write_frame(&mut Frame::new_fin(OpCode::Text, [b'a' + idx]).unwrap()).await.unwrap();
+    }
+    let mut buffer = VectorUsize::new();
+    for idx in 0u8..16 {
+      if idx == 8 {
+        let pong = ws.read_frame(&mut buffer, WebSocketPayloadOrigin::Adaptive).await.unwrap();
+        assert_eq!((OpCode::Pong, &b"p"[..]), (pong.op_code(), &**pong.payload()));
+      }
+      let text = ws.read_frame(&mut buffer, WebSocketPayloadOrigin::Adaptive).await.unwrap();
+      assert_eq!((OpCode::Text, &[b'a' + idx][..]), (text.op_code(), &**text.payload()));
+    }
+  }
+
+  async fn server(ws: &mut LocalWebSocket<NC, false>) {
+    let mut buffer = VectorUsize::new();
+    for idx in 0u8..8 {
+      let text = ws.read_frame(&mut buffer, WebSocketPayloadOrigin::Adaptive).await.unwrap();
+      assert_eq!((OpCode::Text, &[b'a' + idx][..]), (text.op_code(), &**text.payload()));
+      let mut payload = [b'a' + idx];
+      ws.write_frame_buffered(&mut Frame::new_fin(OpCode::Text, &mut payload).unwrap())
+        .await
+        .unwrap();
+    }
+    let ping = ws.read_frame(&mut buffer, WebSocketPayloadOrigin::Adaptive).await.unwrap();
+    assert_eq!(OpCode::Ping, ping.op_code());
+    let (mut common, mut reader, mut writer) = ws.split_mut();
+    for idx in 8u8..16 {
+      let mut text = reader
+        .read_frame(&mut buffer, &mut common, WebSocketPayloadOrigin::Adaptive)
+        .await
+        .unwrap();
+      assert_eq!((OpCode::Text, &[b'a' + idx][..]), (text.op_code(), &**text.payload()));
+      writer.write_frame_buffered(&mut common, &mut text).await.unwrap();
+    }
+    writer.flush(&mut common).await.unwrap();
   }
 }
 

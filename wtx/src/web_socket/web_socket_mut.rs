@@ -7,7 +7,8 @@ use crate::{
   web_socket::{
     Frame, FrameMut, WebSocketBridge, WebSocketPayloadOrigin,
     is_in_continuation_frame::IsInContinuationFrame, read_frame::read_frame,
-    web_socket_compression::NegotiatedWsCompression, write_frame::write_frame,
+    web_socket_compression::NegotiatedWsCompression,
+    write_frame::{QueuedStream, flush_write_queue, write_frame, write_frame_buffered},
   },
 };
 use core::marker::PhantomData;
@@ -19,6 +20,7 @@ pub struct WebSocketCommonMut<'instance, NC, S, TCX, const IS_CLIENT: bool> {
   pub(crate) nc_rsv1: u8,
   pub(crate) rng: &'instance mut Xorshift64,
   pub(crate) stream: &'instance mut TlsStream<S, TCX, IS_CLIENT>,
+  pub(crate) write_queue: &'instance mut VectorUsize<u8>,
 }
 
 /// Auxiliary structure that can be used when it is necessary to write a received frame that belongs
@@ -65,10 +67,10 @@ where
       payload_origin,
       self.reader_buffer.lease_mut(),
       common.rng,
-      common.stream,
+      &mut QueuedStream { stream: common.stream, write_queue: common.write_queue },
       &WebSocketBridge::new(TlsStreamBridge::new()),
       buffer,
-      |el| el.connection_state = ConnectionState::ClosedGracefully,
+      |el| el.stream.connection_state = ConnectionState::ClosedGracefully,
       |local_stream| local_stream,
       |local_stream| local_stream,
     )
@@ -92,7 +94,16 @@ where
   S: Stream,
   TCX: TlsCtx,
 {
-  /// Writes a frame to the stream.
+  /// Sends the frames queued by [`Self::write_frame_buffered`], if any.
+  #[inline]
+  pub async fn flush(
+    &mut self,
+    common: &mut WebSocketCommonMut<'instance, NC, S, TCX, IS_CLIENT>,
+  ) -> crate::Result<()> {
+    flush_write_queue(common.stream, common.write_queue).await
+  }
+
+  /// Writes a frame to the stream, after any frames queued by [`Self::write_frame_buffered`].
   #[inline]
   pub async fn write_frame<P>(
     &mut self,
@@ -108,8 +119,38 @@ where
       common.nc,
       common.nc_rsv1,
       common.rng,
+      &mut QueuedStream { stream: common.stream, write_queue: common.write_queue },
+      self.writer_buffer,
+      |el| el.stream.connection_state = ConnectionState::WriteClosed,
+    )
+    .await
+  }
+
+  /// Queues a frame instead of writing it, so that several frames can go out in one syscall.
+  ///
+  /// Queued frames are sent before [`WebSocketReaderMut::read_frame`] would wait for the peer,
+  /// by [`Self::write_frame`] and [`Self::flush`], or once the queue holds 16 KiB. A close frame
+  /// is sent at once, with everything queued in front of it. Large payloads are not copied.
+  ///
+  /// Call [`Self::flush`] when no further read follows.
+  #[inline]
+  pub async fn write_frame_buffered<P>(
+    &mut self,
+    common: &mut WebSocketCommonMut<'instance, NC, S, TCX, IS_CLIENT>,
+    frame: &mut Frame<P>,
+  ) -> crate::Result<()>
+  where
+    P: LeaseMut<[u8]>,
+  {
+    write_frame_buffered::<_, _, _, _, IS_CLIENT>(
+      frame,
+      self.no_masking,
+      common.nc,
+      common.nc_rsv1,
+      common.rng,
       common.stream,
       self.writer_buffer,
+      common.write_queue,
       |el| el.connection_state = ConnectionState::WriteClosed,
     )
     .await
