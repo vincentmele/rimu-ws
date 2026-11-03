@@ -10,12 +10,19 @@ mod std_executor;
 mod std_runtime;
 #[cfg(feature = "tokio")]
 mod tokio_executor;
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+mod uring_executor;
 
 use crate::net::{TcpListener, TcpStream};
 pub use executor_error::ExecutorError;
 pub use no_std_runtime::NoStdRuntime;
 #[cfg(feature = "tokio")]
 pub use tokio_executor::{TokioExecutor, TokioSpawnFutureFuture};
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+pub use uring_executor::{
+  UringExecutor, UringJoinHandle, UringReadHalf, UringRuntime, UringTcpListener, UringTcpStream,
+  UringWriteHalf,
+};
 #[cfg(feature = "std")]
 use {crate::net::ToSocketAddrs, core::net::SocketAddr};
 #[cfg(feature = "std")]
@@ -31,6 +38,8 @@ pub enum ExecutorTy {
   Std,
   /// See [`TokioExecutor`]
   Tokio,
+  /// See `UringExecutor`
+  Uring,
 }
 
 impl ExecutorTy {
