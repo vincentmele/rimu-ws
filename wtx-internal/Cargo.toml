@@ -14,6 +14,16 @@ path = "src/bin/autobahn-server.rs"
 required-features = ["autobahn-server"]
 
 [[bin]]
+name = "autobahn-server-drain"
+path = "src/bin/autobahn-server-drain.rs"
+required-features = ["autobahn-server-drain"]
+
+[[bin]]
+name = "autobahn-server-uring"
+path = "src/bin/autobahn-server-uring.rs"
+required-features = ["autobahn-server-uring"]
+
+[[bin]]
 name = "boringssl"
 path = "src/bin/boringssl.rs"
 required-features = ["boringssl"]
@@ -63,6 +73,8 @@ wtx = { default-features = false, features = ["optimizations-std"], path = "../w
 autobahn-client = ["tokio", "wtx/tokio", "wtx/web-socket", "wtx/zlib-rs"]
 autobahn-client-concurrent = ["tokio",  "wtx/tokio", "wtx/web-socket", "wtx/zlib-rs"]
 autobahn-server = ["tokio", "wtx/tokio", "wtx/web-socket-server-framework", "wtx/zlib-rs"]
+autobahn-server-drain = ["tokio", "wtx/tokio", "wtx/web-socket-server-framework", "wtx/zlib-rs"]
+autobahn-server-uring = ["wtx/crypto-ring", "wtx/io-uring", "wtx/web-socket-server-framework", "wtx/zlib-rs"]
 boringssl = ["tokio", "wtx/tls", "wtx/tokio", "wtx/_tracing-tree", "wtx/x509"]
 boringssl-config = ["serde/derive", "serde_json/std", "wtx/hashbrown", "wtx/serde"]
 ccadb = ["tokio", "wtx/ccadb", "wtx/hashbrown", "wtx/http2-client-pool", "wtx/http2", "wtx/tokio"]
