@@ -10,12 +10,16 @@ use crate::{
   },
 };
 
+// Inlined so that a frame's header can stay in registers: out of line, it is returned through
+// memory, built with byte stores and read back wider, which stalls store forwarding.
+#[inline(always)]
 pub(crate) fn header_from_params(
   fin: bool,
   op_code: OpCode,
   payload_len: usize,
   rsv1: u8,
 ) -> ArrayVectorCopy<u8, MAX_HEADER_LEN> {
+  #[inline(always)]
   fn first_header_byte(fin: bool, op_code: OpCode, rsv1: u8) -> u8 {
     (u8::from(fin) << 7) | rsv1 | u8::from(op_code)
   }

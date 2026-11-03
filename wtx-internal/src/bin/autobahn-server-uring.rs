@@ -1,4 +1,6 @@
-//! Autobahn fuzzing-client target for the draining echo path on `UringExecutor`. Set
+//! Autobahn fuzzing-client target for the draining echo path on `UringExecutor`, echoing buffered
+//! frames with `queue_frame`: uncompressed connections queue every buffered frame, and on
+//! compressed ones `queue_frame` declines, so the awaited path is exercised too. Set
 //! `WTX_DIRECT=<slots>` to accept into direct descriptors.
 
 #![expect(clippy::print_stderr, reason = "internal")]
@@ -41,7 +43,7 @@ async fn echo(
   let origin = WebSocketPayloadOrigin::Adaptive;
   loop {
     while let Some(mut frame) = reader.read_buffered_frame(&mut buffer, &common, origin)? {
-      if !writer.try_write_frame_buffered(&mut common, &mut frame)? {
+      if !writer.queue_frame(&mut common, &mut frame)? {
         writer.write_frame_buffered(&mut common, &mut frame).await?;
       }
     }

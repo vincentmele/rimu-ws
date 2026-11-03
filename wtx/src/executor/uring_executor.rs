@@ -1799,9 +1799,11 @@ mod tests {
           let (mut common, mut reader, mut writer) = ws.split_mut();
           let origin = WebSocketPayloadOrigin::Adaptive;
           loop {
+            // `queue_frame` queues without the queue limit, so large frames, floods and slow
+            // readers here exercise unbounded queueing.
             while let Ok(Some(mut frame)) = reader.read_buffered_frame(&mut buffer, &common, origin)
             {
-              if !writer.try_write_frame_buffered(&mut common, &mut frame).unwrap()
+              if !writer.queue_frame(&mut common, &mut frame).unwrap()
                 && writer.write_frame_buffered(&mut common, &mut frame).await.is_err()
               {
                 return;

@@ -161,6 +161,7 @@ where
     })
   }
 
+  #[inline(always)]
   pub(crate) fn new(fin: bool, op_code: OpCode, payload: P, rsv1: u8) -> Self {
     let payload_len = if op_code.is_control() {
       payload.lease().len().min(MAX_CONTROL_PAYLOAD_LEN)

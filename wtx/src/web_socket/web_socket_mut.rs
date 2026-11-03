@@ -13,7 +13,8 @@ use crate::{
     },
     web_socket_compression::NegotiatedWsCompression,
     write_frame::{
-      QueuedStream, flush_write_queue, try_queue_frame, write_frame, write_frame_buffered,
+      QueuedStream, WRITE_QUEUE_FLUSH_LEN, flush_write_queue, try_queue_frame, write_frame,
+      write_frame_buffered,
     },
   },
 };
@@ -250,6 +251,35 @@ where
   {
     try_queue_frame::<NC, _, _, IS_CLIENT>(
       frame,
+      WRITE_QUEUE_FLUSH_LEN,
+      self.no_masking,
+      common.nc_rsv1,
+      common.rng,
+      common.write_queue,
+    )
+  }
+
+  /// [`Self::try_write_frame_buffered`] without the queue limit: queues an uncompressed frame other
+  /// than a close frame by copying it, without any I/O, however much is already queued. Returns
+  /// `false`, with the frame untouched, only for a close frame or when the frame would have to be
+  /// compressed.
+  ///
+  /// Meant for echoing frames returned by [`WebSocketReaderMut::read_buffered_frame`], which are
+  /// never close or compressed frames: on a connection without compression this never returns
+  /// `false` for them, so a loop over the buffered frames can run without awaiting. What it queues
+  /// is bounded by what was buffered, and it is sent before the next read would wait.
+  #[inline]
+  pub fn queue_frame<P>(
+    &mut self,
+    common: &mut WebSocketCommonMut<'instance, NC, S, TCX, IS_CLIENT>,
+    frame: &mut Frame<P>,
+  ) -> crate::Result<bool>
+  where
+    P: LeaseMut<[u8]>,
+  {
+    try_queue_frame::<NC, _, _, IS_CLIENT>(
+      frame,
+      usize::MAX,
       self.no_masking,
       common.nc_rsv1,
       common.rng,
@@ -275,6 +305,7 @@ where
   {
     if try_queue_frame::<NC, _, _, IS_CLIENT>(
       frame,
+      WRITE_QUEUE_FLUSH_LEN,
       self.no_masking,
       common.nc_rsv1,
       common.rng,

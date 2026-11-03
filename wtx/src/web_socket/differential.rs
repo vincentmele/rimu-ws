@@ -60,16 +60,31 @@ pub struct Outcome {
   pub output: Vec<u8>,
 }
 
-/// Runs `input`, read `chunks` bytes at a time (cycling), through the model and both server
-/// loops, and panics if they disagree.
+/// The server loop a case runs through.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Loop {
+  /// `read_frame` and `write_frame_buffered` only.
+  Plain,
+  /// Buffered frames echoed with `try_write_frame_buffered`, awaiting when it can't queue.
+  Drain,
+  /// Buffered frames echoed with `queue_frame`, which queues without the queue limit.
+  Queue,
+}
+
+/// Runs `input`, read `chunks` bytes at a time (cycling), through the model and every server
+/// loop, and panics if they disagree.
 pub fn check(input: &[u8], chunks: &[usize], consistent: bool) {
   let expected = reference(input);
   let origin =
     if consistent { WebSocketPayloadOrigin::Consistent } else { WebSocketPayloadOrigin::Adaptive };
-  for drain in [true, false] {
-    let got = run(input, chunks, origin, drain);
+  for mode in [Loop::Drain, Loop::Queue, Loop::Plain] {
+    let got = run(input, chunks, origin, mode);
     if got != expected {
-      let which = if drain { "draining" } else { "plain" };
+      let which = match mode {
+        Loop::Plain => "plain",
+        Loop::Drain => "draining",
+        Loop::Queue => "queueing",
+      };
       panic!(
         "{which} loop disagrees with the model (chunks {chunks:?}, consistent {consistent}, {} input bytes): {}",
         input.len(),
@@ -390,7 +405,7 @@ fn event(frame_op: OpCode, payload: &[u8]) -> Event {
   }
 }
 
-fn run(input: &[u8], chunks: &[usize], origin: WebSocketPayloadOrigin, drain: bool) -> Outcome {
+fn run(input: &[u8], chunks: &[usize], origin: WebSocketPayloadOrigin, mode: Loop) -> Outcome {
   let mem = Mem {
     chunk_idx: 0,
     chunks: chunks.to_vec(),
@@ -416,14 +431,19 @@ fn run(input: &[u8], chunks: &[usize], origin: WebSocketPayloadOrigin, drain: bo
   let mut events = Vec::new();
   let end = block_on(async {
     let mut buffer = VectorUsize::new();
-    if drain {
+    if mode != Loop::Plain {
       let (mut common, mut reader, mut writer) = ws.split_mut();
       let end = 'outer: loop {
         loop {
           match reader.read_buffered_frame(&mut buffer, &common, origin) {
             Ok(Some(mut frame)) => {
               events.push(event(frame.op_code(), frame.payload()));
-              if !writer.try_write_frame_buffered(&mut common, &mut frame).unwrap() {
+              let queued = if mode == Loop::Queue {
+                writer.queue_frame(&mut common, &mut frame).unwrap()
+              } else {
+                writer.try_write_frame_buffered(&mut common, &mut frame).unwrap()
+              };
+              if !queued {
                 writer.write_frame_buffered(&mut common, &mut frame).await.unwrap();
               }
             }

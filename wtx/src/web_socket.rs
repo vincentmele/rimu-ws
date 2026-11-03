@@ -291,6 +291,7 @@ where
   {
     if write_frame::try_queue_frame::<NC, _, _, IS_CLIENT>(
       frame,
+      write_frame::WRITE_QUEUE_FLUSH_LEN,
       self.no_masking,
       self.nc_rsv1,
       &mut self.rng,

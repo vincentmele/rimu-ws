@@ -129,12 +129,13 @@ where
   Ok(())
 }
 
-/// Queues `frame` without awaiting anything if it can be: a small, uncompressed frame that is not
-/// a close frame and leaves the queue under [`WRITE_QUEUE_FLUSH_LEN`]. Returns `false`, with the
-/// frame untouched, for everything else, which is left to [`write_frame_buffered`].
+/// Queues `frame` without awaiting anything if it can be: an uncompressed frame that is not a close
+/// frame and leaves the queue under `limit` bytes. Returns `false`, with the frame untouched, for
+/// everything else, which is left to [`write_frame_buffered`].
 #[inline(always)]
 pub(crate) fn try_queue_frame<C, P, R, const IS_CLIENT: bool>(
   frame: &mut Frame<P>,
+  limit: usize,
   no_masking: bool,
   nc_rsv1: u8,
   rng: &mut R,
@@ -151,7 +152,7 @@ where
     .len()
     .wrapping_add(frame.header().len())
     .wrapping_add(frame.payload().lease().len());
-  if !is_uncompressed || op_code.is_close() || len >= WRITE_QUEUE_FLUSH_LEN {
+  if !is_uncompressed || op_code.is_close() || len >= limit {
     return Ok(false);
   }
   mask_frame::<_, _, IS_CLIENT>(frame, no_masking, rng);
