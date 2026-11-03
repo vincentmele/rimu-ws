@@ -21,6 +21,29 @@ pub struct KeySchedule {
 }
 
 impl KeySchedule {
+  /// A schedule with nothing derived, for plaintext streams: [`Self::default`] runs three HKDF
+  /// extractions that a plaintext stream never uses.
+  #[inline]
+  pub(crate) fn unset() -> Self {
+    let cipher_suite = CipherSuite::default();
+    let state = || KeyScheduleState {
+      cipher_key: ArrayVectorCopy::new(),
+      cipher_suite,
+      counter: 0,
+      iv: [0; IV_LEN],
+      raw_traffic_secret: ArrayVectorCopy::new(),
+      traffic_secret: TlsHkdf::Unset,
+    };
+    Self {
+      cipher_suite,
+      common_hkdf: TlsHkdf::Unset,
+      common_secret: cipher_suite.zeroed_hash(),
+      exporter_secret: ArrayVectorCopy::new(),
+      read: KeyScheduleRead { state: state() },
+      write: KeyScheduleWrite { state: state() },
+    }
+  }
+
   #[inline]
   pub(crate) fn from_cipher_suite(cipher_suite: CipherSuite) -> Self {
     let counter = 0;

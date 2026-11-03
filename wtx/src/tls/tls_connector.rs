@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use crate::{
   asn1::Asn1DecodeWrapperAux,
   codec::{Decode as _, Encode as _},
@@ -69,7 +70,7 @@ pub struct TlsConnector<RNG, S, TCG, U> {
   handshake_path: HandshakePath,
   has_sent_ccs: bool,
   hash_leaf_cert: bool,
-  key_schedule: KeySchedule,
+  key_schedule: Box<KeySchedule>,
   max_fragment_length_send: u16,
   max_fragment_length: u16,
   named_group: NamedGroup,
@@ -85,13 +86,15 @@ impl<RNG, S, STR, TCG, TCX, U> TlsConnector<RNG, S, TCG, U>
 where
   STR: Lease<str>,
   TCG: Lease<TlsConfig<TCX>> + SingleTypeStorage<Item = TCX>,
+  TCX: TlsCtx,
   U: Lease<Uri<STR>> + SingleTypeStorage<Item = STR>,
 {
   /// It is preferable to construct instances through the builder.
   #[inline]
   pub fn new(config: TCG, rng: RNG, stream: S, uri: U) -> Self {
     let cfg_ref = config.lease();
-    let key_schedule = KeySchedule::default();
+    let key_schedule =
+      Box::new(if TCX::TY.is_plain_text() { KeySchedule::unset() } else { KeySchedule::default() });
     let transcript_hash = key_schedule.cipher_suite().hash_new();
     let max_fragment_length =
       cfg_ref.max_fragment_length().map_or(DLFT_MAX_FRAGMENT_LENGTH, |el| el.num());
@@ -174,7 +177,7 @@ where
         named_group: self.named_group,
         rng: self.rng,
         server_end_point: TlsServerEndPoint::new(),
-        tls_stream: TlsStream::new(
+        tls_stream: TlsStream::new_boxed(
           self.buffer,
           self.key_schedule,
           self.max_fragment_length,
@@ -233,7 +236,7 @@ where
       named_group: self.named_group,
       rng: self.rng,
       server_end_point: tls_server_end_point,
-      tls_stream: TlsStream::new(
+      tls_stream: TlsStream::new_boxed(
         self.buffer,
         self.key_schedule,
         self.max_fragment_length,

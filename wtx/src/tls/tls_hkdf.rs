@@ -4,6 +4,8 @@ use crate::crypto::{Hkdf as _, HkdfSha256Global, HkdfSha384Global};
 pub(crate) enum TlsHkdf {
   Sha256(HkdfSha256Global),
   Sha384(HkdfSha384Global),
+  /// Nothing derived: the key schedule of a plaintext stream, which never uses it.
+  Unset,
 }
 
 impl TlsHkdf {
@@ -12,6 +14,7 @@ impl TlsHkdf {
     match self {
       Self::Sha256(el) => el.expand(info, okm),
       Self::Sha384(el) => el.expand(info, okm),
+      Self::Unset => Err(crate::Error::ProgrammingError),
     }
   }
 }

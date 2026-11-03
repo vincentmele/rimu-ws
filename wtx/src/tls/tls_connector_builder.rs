@@ -61,6 +61,7 @@ where
   ) -> crate::Result<TlsConnector<RNG, EX::TcpStream, TCG, U>>
   where
     TCG: Lease<TlsConfig<TCX>> + SingleTypeStorage<Item = TCX>,
+    TCX: crate::tls::TlsCtx,
   {
     let addr = self.uri.lease().hostname_with_implied_port();
     let stream = EX::TcpStream::connect(addr, self.tcp_params).await?;

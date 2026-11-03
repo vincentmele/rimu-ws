@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use crate::{
   codec::{Decode as _, Encode as _},
   collections::{ArrayVectorCopy, SingleTypeStorage},
@@ -39,7 +40,7 @@ pub struct TlsAcceptor<RNG, S, TCG> {
   buffer: TlsBuffer,
   config: TCG,
   handshake_path: HandshakePath,
-  key_schedule: KeySchedule,
+  key_schedule: Box<KeySchedule>,
   max_fragment_length: u16,
   max_fragment_length_send: u16,
   named_group: NamedGroup,
@@ -52,12 +53,14 @@ pub struct TlsAcceptor<RNG, S, TCG> {
 impl<RNG, S, TCG, TCX> TlsAcceptor<RNG, S, TCG>
 where
   TCG: Lease<TlsConfig<TCX>> + SingleTypeStorage<Item = TCX>,
+  TCX: TlsCtx,
 {
   /// The main parameters are provided by the user.
   #[inline]
   pub fn new(config: TCG, rng: RNG, stream: S) -> Self {
     let cfg_ref = config.lease();
-    let key_schedule = KeySchedule::default();
+    let key_schedule =
+      Box::new(if TCX::TY.is_plain_text() { KeySchedule::unset() } else { KeySchedule::default() });
     let transcript_hash = key_schedule.cipher_suite().hash_new();
     let max_fragment_length =
       cfg_ref.max_fragment_length().map_or(DLFT_MAX_FRAGMENT_LENGTH, |el| el.num());
@@ -128,7 +131,7 @@ where
         handshake_path: self.handshake_path,
         named_group: self.named_group,
         rng: self.rng,
-        tls_stream: TlsStream::new(
+        tls_stream: TlsStream::new_boxed(
           self.buffer,
           self.key_schedule,
           self.max_fragment_length,
@@ -182,7 +185,7 @@ where
       handshake_path: self.handshake_path,
       named_group: self.named_group,
       rng: self.rng,
-      tls_stream: TlsStream::new(
+      tls_stream: TlsStream::new_boxed(
         self.buffer,
         self.key_schedule,
         self.max_fragment_length,

@@ -416,7 +416,7 @@ fn run(input: &[u8], chunks: &[usize], origin: WebSocketPayloadOrigin, mode: Loo
   };
   let stream = TlsStream::<_, PlaintextCtx, false>::new(
     TlsBuffer::default(),
-    KeySchedule::default(),
+    KeySchedule::unset(),
     16384,
     16384,
     mem,

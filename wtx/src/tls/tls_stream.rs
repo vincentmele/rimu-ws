@@ -40,7 +40,8 @@ pub struct TlsStream<S, TCX, const IS_CLIENT: bool> {
   pub(crate) buffer: TlsBuffer,
   pub(crate) can_reply_key_update: bool,
   pub(crate) connection_state: ConnectionState,
-  pub(crate) key_schedule: KeySchedule,
+  // Boxed: it is most of the stream's size, and a plaintext stream moves it without using it.
+  pub(crate) key_schedule: Box<KeySchedule>,
   pub(crate) key_updates: u8,
   pub(crate) max_fragment_length: u16,
   pub(crate) max_fragment_length_send: u16,
@@ -66,6 +67,23 @@ where
   pub fn new(
     buffer: TlsBuffer,
     key_schedule: KeySchedule,
+    max_fragment_length: u16,
+    max_fragment_length_send: u16,
+    stream: S,
+  ) -> crate::Result<Self> {
+    Self::new_boxed(
+      buffer,
+      Box::new(key_schedule),
+      max_fragment_length,
+      max_fragment_length_send,
+      stream,
+    )
+  }
+
+  #[inline]
+  pub(crate) fn new_boxed(
+    buffer: TlsBuffer,
+    key_schedule: Box<KeySchedule>,
     max_fragment_length: u16,
     max_fragment_length_send: u16,
     stream: S,
