@@ -714,7 +714,6 @@ mod tests {
 
   // Upstream returned the fragments received so far as the ping's payload when the origin was
   // `Consistent`, and appended the ping's bytes to the message.
-  #[cfg_attr(miri, ignore = "the test build links ring, whose C code Miri cannot run")]
   #[test]
   fn control_frame_between_fragments() {
     let mut input = masked(false, 1, b"ab");
@@ -728,7 +727,6 @@ mod tests {
 
   // Upstream only checked RSV1 when a compression type was configured, so without one a frame
   // claiming to be compressed was accepted.
-  #[cfg_attr(miri, ignore = "the test build links ring, whose C code Miri cannot run")]
   #[test]
   fn rsv1_without_compression() {
     let mut input = masked(true, 1, b"ok");
@@ -738,12 +736,13 @@ mod tests {
     super::check(&input, &[usize::MAX], false);
   }
 
-  #[cfg_attr(miri, ignore = "the test build links ring, whose C code Miri cannot run")]
   #[test]
   fn generated_cases_agree_with_the_model() {
     let seed = std::env::var("WTX_DIFF_SEED").ok().and_then(|el| el.parse().ok()).unwrap_or(1);
-    let iterations =
-      std::env::var("WTX_DIFF_ITERS").ok().and_then(|el| el.parse().ok()).unwrap_or(2000);
+    let iterations = std::env::var("WTX_DIFF_ITERS")
+      .ok()
+      .and_then(|el| el.parse().ok())
+      .unwrap_or(if cfg!(miri) { 30 } else { 2000 });
     super::check_generated(seed, iterations);
   }
 }
