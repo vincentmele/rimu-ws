@@ -385,7 +385,7 @@ where
 }
 
 /// What the buffered bytes hold at the start of a frame.
-enum BufferedFrame {
+pub(crate) enum BufferedFrame {
   /// A final, uncompressed data frame, payload included, with its header length. It can be
   /// returned without awaiting anything.
   Data(crate::Result<(ReadFrameInfo, usize)>),
@@ -397,7 +397,7 @@ enum BufferedFrame {
 }
 
 #[inline]
-fn buffered_data_frame<D, const IS_CLIENT: bool>(
+pub(crate) fn buffered_data_frame<D, const IS_CLIENT: bool>(
   max_payload_len: usize,
   nc_rsv1: u8,
   following: &[u8],

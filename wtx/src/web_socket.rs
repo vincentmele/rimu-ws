@@ -151,24 +151,34 @@ where
     let WebSocketBuffer { network_buffer, reader_buffer, writer_buffer: _, write_queue } = wsb;
     if is_in_continuation_frame.is_none() {
       buffer.clear();
-      if let Some((rfi, header_len)) = read_frame::fetch_buffered_data_frame::<NC, _, IS_CLIENT>(
-        *max_payload_len,
-        *nc_rsv1,
-        network_buffer,
-        *no_masking,
-        &mut QueuedStream { stream: &mut *stream, write_queue: &mut *write_queue },
-      )
-      .await?
-      {
-        return read_frame::take_buffered_data_frame::<IS_CLIENT>(
-          header_len,
-          network_buffer,
+      loop {
+        match read_frame::buffered_data_frame::<NC, IS_CLIENT>(
+          *max_payload_len,
           *nc_rsv1,
+          network_buffer.following(),
           *no_masking,
-          payload_origin,
-          &rfi,
-          buffer,
-        );
+        ) {
+          read_frame::BufferedFrame::Data(rslt) => {
+            let (rfi, header_len) = rslt?;
+            return read_frame::take_buffered_data_frame::<IS_CLIENT>(
+              header_len,
+              network_buffer,
+              *nc_rsv1,
+              *no_masking,
+              payload_origin,
+              &rfi,
+              buffer,
+            );
+          }
+          read_frame::BufferedFrame::Incomplete(frame_len) => {
+            let local_stream =
+              &mut QueuedStream { stream: &mut *stream, write_queue: &mut *write_queue };
+            if !network_buffer.read_following(frame_len, local_stream).await? {
+              return Err(WebSocketError::ClosedConnection.into());
+            }
+          }
+          read_frame::BufferedFrame::Other => break,
+        }
       }
     }
     read_frame::read_frame::<_, _, _, _, _, true, IS_CLIENT>(

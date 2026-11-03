@@ -5,9 +5,9 @@ use crate::{
   rng::Xorshift64,
   tls::{TlsCtx, TlsStream},
   web_socket::{
-    Frame, FrameMut, WebSocketPayloadOrigin,
+    Frame, FrameMut, WebSocketError, WebSocketPayloadOrigin,
     is_in_continuation_frame::IsInContinuationFrame,
-    read_frame::{fetch_buffered_data_frame, read_frame, take_buffered_data_frame},
+    read_frame::{BufferedFrame, buffered_data_frame, read_frame, take_buffered_data_frame},
     web_socket_compression::NegotiatedWsCompression,
     write_frame::{
       QueuedStream, flush_write_queue, try_queue_frame, write_frame, write_frame_buffered,
@@ -45,6 +45,55 @@ where
   S: Stream,
   TCX: TlsCtx,
 {
+  /// Returns the next frame without touching the stream, if it is a final, uncompressed text or
+  /// binary frame whose bytes have already been read. `None` otherwise, with nothing consumed:
+  /// [`Self::read_frame`] then handles whatever comes next (control frames, fragments, compressed
+  /// frames, or bytes that are still to arrive).
+  ///
+  /// Draining frames that arrived together with this method avoids an `await` per frame:
+  ///
+  /// ```ignore,rust
+  /// while let Some(mut frame) = reader.read_buffered_frame(&mut buffer, &common, origin)? {
+  ///   writer.write_frame_buffered(&mut common, &mut frame).await?;
+  /// }
+  /// let mut frame = reader.read_frame(&mut buffer, &mut common, origin).await?;
+  /// ```
+  #[inline]
+  pub fn read_buffered_frame<'buffer, 'frame, 'this>(
+    &'this mut self,
+    buffer: &'buffer mut VectorUsize<u8>,
+    common: &WebSocketCommonMut<'instance, NC, S, TCX, IS_CLIENT>,
+    payload_origin: WebSocketPayloadOrigin,
+  ) -> crate::Result<Option<FrameMut<'frame>>>
+  where
+    'buffer: 'frame,
+    'this: 'frame,
+  {
+    if self.is_in_continuation_frame.is_some() {
+      return Ok(None);
+    }
+    let BufferedFrame::Data(rslt) = buffered_data_frame::<NC, IS_CLIENT>(
+      self.max_payload_len,
+      common.nc_rsv1,
+      self.network_buffer.following(),
+      self.no_masking,
+    ) else {
+      return Ok(None);
+    };
+    let (rfi, header_len) = rslt?;
+    buffer.clear();
+    take_buffered_data_frame::<IS_CLIENT>(
+      header_len,
+      self.network_buffer,
+      common.nc_rsv1,
+      self.no_masking,
+      payload_origin,
+      &rfi,
+      buffer,
+    )
+    .map(Some)
+  }
+
   /// Reads a frame from the stream.
   ///
   /// If a frame is made up of other sub-frames or continuations, then everything is collected
@@ -62,24 +111,36 @@ where
   {
     if self.is_in_continuation_frame.is_none() {
       buffer.clear();
-      if let Some((rfi, header_len)) = fetch_buffered_data_frame::<NC, _, IS_CLIENT>(
-        self.max_payload_len,
-        common.nc_rsv1,
-        self.network_buffer,
-        self.no_masking,
-        &mut QueuedStream { stream: common.stream, write_queue: common.write_queue },
-      )
-      .await?
-      {
-        return take_buffered_data_frame::<IS_CLIENT>(
-          header_len,
-          self.network_buffer,
+      loop {
+        match buffered_data_frame::<NC, IS_CLIENT>(
+          self.max_payload_len,
           common.nc_rsv1,
+          self.network_buffer.following(),
           self.no_masking,
-          payload_origin,
-          &rfi,
-          buffer,
-        );
+        ) {
+          BufferedFrame::Data(rslt) => {
+            let (rfi, header_len) = rslt?;
+            return take_buffered_data_frame::<IS_CLIENT>(
+              header_len,
+              self.network_buffer,
+              common.nc_rsv1,
+              self.no_masking,
+              payload_origin,
+              &rfi,
+              buffer,
+            );
+          }
+          BufferedFrame::Incomplete(frame_len) => {
+            let stream = &mut QueuedStream {
+              stream: &mut *common.stream,
+              write_queue: &mut *common.write_queue,
+            };
+            if !self.network_buffer.read_following(frame_len, stream).await? {
+              return Err(WebSocketError::ClosedConnection.into());
+            }
+          }
+          BufferedFrame::Other => break,
+        }
       }
     }
     read_frame::<_, _, _, _, _, true, IS_CLIENT>(
@@ -149,6 +210,27 @@ where
       |el| el.stream.connection_state = ConnectionState::WriteClosed,
     )
     .await
+  }
+
+  /// [`Self::write_frame_buffered`] for a frame that can be queued without any I/O: a small,
+  /// uncompressed frame other than a close frame, while the queue has room. Returns `false`, with
+  /// the frame untouched, when it cannot, and [`Self::write_frame_buffered`] should be awaited.
+  #[inline]
+  pub fn try_write_frame_buffered<P>(
+    &mut self,
+    common: &mut WebSocketCommonMut<'instance, NC, S, TCX, IS_CLIENT>,
+    frame: &mut Frame<P>,
+  ) -> crate::Result<bool>
+  where
+    P: LeaseMut<[u8]>,
+  {
+    try_queue_frame::<NC, _, _, IS_CLIENT>(
+      frame,
+      self.no_masking,
+      common.nc_rsv1,
+      common.rng,
+      common.write_queue,
+    )
   }
 
   /// Queues a frame instead of writing it, so that several frames can go out in one syscall.
