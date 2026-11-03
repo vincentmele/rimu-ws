@@ -30,6 +30,7 @@ use core::{
   num::NonZeroUsize,
   pin::{Pin, pin},
   task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+  time::Duration,
 };
 use io_uring::{IoUring, cqueue, opcode, squeue, types};
 use std::os::fd::{IntoRawFd, RawFd};
@@ -89,6 +90,21 @@ impl Executor for UringExecutor {
 #[derive(Debug)]
 pub struct UringRuntime {
   reactor: Box<Reactor>,
+}
+
+impl UringRuntime {
+  /// A runtime that busy-polls for up to `spin` before it sleeps waiting for completions.
+  ///
+  /// Sleeping and being woken again costs several microseconds, which dominates when every turn
+  /// has little work, as with one message in flight per connection. Spinning keeps the thread on
+  /// its CPU; it only enters the kernel when the ring flags pending completions. Worth it when the
+  /// runtime has its CPU to itself.
+  #[inline]
+  pub fn with_spin(spin: Duration) -> crate::Result<Self> {
+    let mut reactor = Reactor::new()?;
+    reactor.spin = spin;
+    Ok(Self { reactor: Box::new(reactor) })
+  }
 }
 
 impl Runtime for UringRuntime {
@@ -537,6 +553,7 @@ struct Reactor {
   listeners: RefCell<Vec<ListenerState>>,
   main_woken: Cell<bool>,
   ready: RefCell<VecDeque<usize>>,
+  spin: Duration,
   tasks: RefCell<Vec<TaskSlot>>,
 }
 
@@ -582,6 +599,7 @@ impl Reactor {
       listeners: RefCell::new(Vec::new()),
       main_woken: Cell::new(false),
       ready: RefCell::new(VecDeque::new()),
+      spin: Duration::ZERO,
       tasks: RefCell::new(Vec::new()),
     })
   }
@@ -669,8 +687,32 @@ impl Reactor {
   }
 
   fn enter(&self, wait: bool) {
-    let ring = self.ring.borrow();
-    let _rslt = if wait { ring.submit_and_wait(1) } else { ring.submit() };
+    let mut ring = self.ring.borrow_mut();
+    if !wait {
+      let _rslt = ring.submit();
+      return;
+    }
+    if !self.spin.is_zero() {
+      let _rslt = ring.submit();
+      let begin = std::time::Instant::now();
+      let mut iter: u32 = 0;
+      loop {
+        let pending = {
+          let sq = ring.submission();
+          sq.taskrun() || sq.cq_overflow()
+        } || !ring.completion().is_empty();
+        if pending {
+          let _rslt = ring.submit();
+          return;
+        }
+        iter = iter.wrapping_add(1);
+        if iter % 64 == 0 && begin.elapsed() >= self.spin {
+          break;
+        }
+        core::hint::spin_loop();
+      }
+    }
+    let _rslt = ring.submit_and_wait(1);
   }
 
   fn reap(&self) {
