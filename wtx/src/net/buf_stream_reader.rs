@@ -282,6 +282,47 @@ impl BufStreamReader {
     Ok(Some(len))
   }
 
+  /// Marks the first `len` bytes of [`Self::following`] as consumed, like [`Self::read_header`]
+  /// does with the bytes it returns. `len` is capped to the following length.
+  #[cfg(feature = "web-socket")]
+  #[inline]
+  pub(crate) fn consume_following(&mut self, len: usize) {
+    let following_len = self.buffer.len().wrapping_sub(self.current_end_idx);
+    Self::remove_current(&mut self.antecedent_end_idx, &mut self.current_end_idx, len.min(following_len));
+  }
+
+  /// Reads once from the stream, appending to [`Self::following`], with room for at least
+  /// `reserve_len` following bytes.
+  ///
+  /// Returns `false` if the peer closed the connection with nothing left to read. Closing in the
+  /// middle of a message is an error.
+  #[cfg(feature = "web-socket")]
+  #[inline]
+  pub(crate) async fn read_following<SR>(
+    &mut self,
+    reserve_len: usize,
+    stream_reader: &mut SR,
+  ) -> crate::Result<bool>
+  where
+    SR: StreamReader,
+  {
+    self.manage_capacity(reserve_len)?;
+    let (init, uninit) = self.buffer.split_at_spare_mut();
+    let init_len = init.len();
+    let Some(len) = stream_reader.read(uninit.into()).await? else {
+      cold_path();
+      if init_len > self.current_end_idx {
+        return Err(NetError::AbruptDisconnect.into());
+      }
+      return Ok(false);
+    };
+    // SAFETY: `stream_reader.read` just initialized `len` bytes
+    unsafe {
+      self.buffer.set_len(init_len.wrapping_add(len.get()));
+    }
+    Ok(true)
+  }
+
   /// Both indices will be capped to avoid data corruption.
   #[cfg(feature = "web-socket")]
   pub(crate) fn set_indices(&mut self, antecedent_end_idx: usize, current_end_idx: usize) {

@@ -1,7 +1,7 @@
 use crate::{
   net::{BufStreamReader, StreamReader},
   web_socket::{
-    FIN_MASK, MAX_CONTROL_PAYLOAD_LEN, OpCode, PAYLOAD_MASK, RSV1_MASK, RSV2_MASK, RSV3_MASK,
+    FIN_MASK, MAX_CONTROL_PAYLOAD_LEN, MAX_HEADER_LEN, OpCode, PAYLOAD_MASK, RSV1_MASK, RSV2_MASK, RSV3_MASK,
     WebSocketError,
     misc::{has_masked_frame, op_code},
     web_socket_compression::WebSocketDecompression,
@@ -81,62 +81,72 @@ impl ReadFrameInfo {
     D: WebSocketDecompression,
     SR: StreamReader,
   {
-    let first_two =
-      network_buffer.read_header::<_, 2>(stream).await?.ok_or(WebSocketError::ClosedConnection)?;
-    let tuple = Self::manage_first_two_bytes::<D>(first_two, nc_rsv1)?;
-    let (fin, length_code, masked, op_code, should_decompress) = tuple;
-    let mut mask = None;
-    let payload_len = match length_code {
+    loop {
+      if let Some(rslt) =
+        Self::from_following::<D, IS_CLIENT>(max_payload_len, nc_rsv1, network_buffer, no_masking)
+      {
+        return rslt;
+      }
+      if !network_buffer.read_following(MAX_HEADER_LEN, stream).await? {
+        return Err(WebSocketError::ClosedConnection.into());
+      }
+    }
+  }
+
+  /// Parses the header in one pass if it is buffered. `None` if more bytes have to be read first.
+  #[inline]
+  fn from_following<D, const IS_CLIENT: bool>(
+    max_payload_len: usize,
+    nc_rsv1: u8,
+    network_buffer: &mut BufStreamReader,
+    no_masking: bool,
+  ) -> Option<crate::Result<Self>>
+  where
+    D: WebSocketDecompression,
+  {
+    let following = network_buffer.following();
+    let [b0, b1, rest @ ..] = following else {
+      return None;
+    };
+    let (fin, length_code, masked, op_code, should_decompress) =
+      match Self::manage_first_two_bytes::<D>([*b0, *b1], nc_rsv1) {
+        Ok(elem) => elem,
+        Err(err) => return Some(Err(err)),
+      };
+    let (payload_len, rest): (usize, _) = match length_code {
       126 => {
-        let payload_len = network_buffer
-          .read_header::<_, 2>(stream)
-          .await?
-          .ok_or(WebSocketError::ClosedConnection)?;
-        if Self::manage_mask::<IS_CLIENT>(masked, no_masking)? {
-          mask = Some(
-            network_buffer
-              .read_header::<_, 4>(stream)
-              .await?
-              .ok_or(WebSocketError::ClosedConnection)?,
-          );
-          u16::from_be_bytes(payload_len).into()
-        } else {
-          u16::from_be_bytes(payload_len).into()
-        }
+        let [l0, l1, rest @ ..] = rest else {
+          return None;
+        };
+        (u16::from_be_bytes([*l0, *l1]).into(), rest)
       }
       127 => {
-        let payload_len = network_buffer
-          .read_header::<_, 8>(stream)
-          .await?
-          .ok_or(WebSocketError::ClosedConnection)?;
-        if Self::manage_mask::<IS_CLIENT>(masked, no_masking)? {
-          mask = Some(
-            network_buffer
-              .read_header::<_, 4>(stream)
-              .await?
-              .ok_or(WebSocketError::ClosedConnection)?,
-          );
-          u64::from_be_bytes(payload_len).try_into()?
-        } else {
-          u64::from_be_bytes(payload_len).try_into()?
+        let [l0, l1, l2, l3, l4, l5, l6, l7, rest @ ..] = rest else {
+          return None;
+        };
+        match u64::from_be_bytes([*l0, *l1, *l2, *l3, *l4, *l5, *l6, *l7]).try_into() {
+          Ok(elem) => (elem, rest),
+          Err(err) => return Some(Err(err.into())),
         }
       }
-      _ => {
-        if Self::manage_mask::<IS_CLIENT>(masked, no_masking)? {
-          mask = Some(
-            network_buffer
-              .read_header::<_, 4>(stream)
-              .await?
-              .ok_or(WebSocketError::ClosedConnection)?,
-          );
-          length_code.into()
-        } else {
-          length_code.into()
-        }
-      }
+      _ => (length_code.into(), rest),
     };
-    Self::manage_final_params(fin, op_code, max_payload_len, payload_len)?;
-    Ok(ReadFrameInfo { fin, mask, op_code, payload_len, should_decompress })
+    let (mask, rest) = match Self::manage_mask::<IS_CLIENT>(masked, no_masking) {
+      Ok(true) => {
+        let [m0, m1, m2, m3, rest @ ..] = rest else {
+          return None;
+        };
+        (Some([*m0, *m1, *m2, *m3]), rest)
+      }
+      Ok(false) => (None, rest),
+      Err(err) => return Some(Err(err)),
+    };
+    let header_len = following.len().wrapping_sub(rest.len());
+    if let Err(err) = Self::manage_final_params(fin, op_code, max_payload_len, payload_len) {
+      return Some(Err(err));
+    }
+    network_buffer.consume_following(header_len);
+    Some(Ok(ReadFrameInfo { fin, mask, op_code, payload_len, should_decompress }))
   }
 
   fn manage_final_params(
