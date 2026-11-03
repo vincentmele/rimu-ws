@@ -295,6 +295,22 @@ impl BufStreamReader {
     );
   }
 
+  /// Marks `header_len` bytes of [`Self::following`] as consumed and the `payload_len` bytes after
+  /// them as the current region, like [`Self::read_header`] followed by [`Self::read_payload`],
+  /// and returns the current region. Empty and unchanged if the following bytes are fewer.
+  #[cfg(feature = "web-socket")]
+  #[inline]
+  pub(crate) fn consume_frame(&mut self, header_len: usize, payload_len: usize) -> &mut [u8] {
+    let begin = self.current_end_idx.saturating_add(header_len);
+    let end = begin.saturating_add(payload_len);
+    if end > self.buffer.len() {
+      return &mut [];
+    }
+    self.antecedent_end_idx = begin;
+    self.current_end_idx = end;
+    self.buffer.get_mut(begin..end).unwrap_or_default()
+  }
+
   /// Reads once from the stream, appending to [`Self::following`], with room for at least
   /// `reserve_len` following bytes.
   ///

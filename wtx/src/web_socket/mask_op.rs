@@ -6,6 +6,18 @@ use crate::misc::simd_bytes_mut;
 #[inline]
 #[doc = _internal_doc!()]
 pub(crate) fn mask_op(bytes: &mut [u8], mut mask: [u8; 4]) {
+  // Splitting into aligned chunks costs more than it saves on payloads this small.
+  if bytes.len() < 64 {
+    let (arrays, rem) = bytes.as_chunks_mut::<4>();
+    let local_mask = u32::from_ne_bytes(mask);
+    for array in arrays {
+      *array = (u32::from_ne_bytes(*array) ^ local_mask).to_ne_bytes();
+    }
+    for (elem, mask_elem) in rem.iter_mut().zip(mask) {
+      *elem ^= mask_elem;
+    }
+    return;
+  }
   _simd! {
     4 => {
       simd_bytes_mut(
@@ -140,7 +152,7 @@ mod tests {
 
   #[test]
   fn length_variation_unmask() {
-    for len in [0, 2, 3, 8, 16, 18, 31, 32, 40, 63, 100, 125, 256] {
+    for len in [0, 2, 3, 5, 8, 16, 18, 31, 32, 40, 63, 64, 65, 100, 125, 256] {
       let mut payload = VectorUsize::from_cloneable_elem(len, 0).unwrap();
       let mask = [1, 2, 3, 4];
       mask_op(&mut payload, mask);

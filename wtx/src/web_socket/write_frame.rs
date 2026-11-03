@@ -129,6 +129,37 @@ where
   Ok(())
 }
 
+/// Queues `frame` without awaiting anything if it can be: a small, uncompressed frame that is not
+/// a close frame and leaves the queue under [`WRITE_QUEUE_FLUSH_LEN`]. Returns `false`, with the
+/// frame untouched, for everything else, which is left to [`write_frame_buffered`].
+#[inline]
+pub(crate) fn try_queue_frame<C, P, R, const IS_CLIENT: bool>(
+  frame: &mut Frame<P>,
+  no_masking: bool,
+  nc_rsv1: u8,
+  rng: &mut R,
+  write_queue: &mut VectorUsize<u8>,
+) -> crate::Result<bool>
+where
+  C: WebSocketCompression,
+  P: LeaseMut<[u8]>,
+  R: Rng,
+{
+  let op_code = frame.op_code();
+  let is_uncompressed = C::IS_NOOP || nc_rsv1 == 0 || op_code.is_control();
+  let len = write_queue
+    .len()
+    .wrapping_add(frame.header().len())
+    .wrapping_add(frame.payload().lease().len());
+  if !is_uncompressed || op_code.is_close() || len >= WRITE_QUEUE_FLUSH_LEN {
+    return Ok(false);
+  }
+  mask_frame::<_, _, IS_CLIENT>(frame, no_masking, rng);
+  let (header, payload) = frame.header_and_payload_mut();
+  let _ = write_queue.extend_from_copyable_slices([&*header, payload.lease()])?;
+  Ok(true)
+}
+
 async fn enqueue<SW>(
   header: &[u8],
   payload: &[u8],

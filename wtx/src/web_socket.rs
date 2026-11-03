@@ -149,6 +149,28 @@ where
       wsb,
     } = self;
     let WebSocketBuffer { network_buffer, reader_buffer, writer_buffer: _, write_queue } = wsb;
+    if is_in_continuation_frame.is_none() {
+      buffer.clear();
+      if let Some((rfi, header_len)) = read_frame::fetch_buffered_data_frame::<NC, _, IS_CLIENT>(
+        *max_payload_len,
+        *nc_rsv1,
+        network_buffer,
+        *no_masking,
+        &mut QueuedStream { stream: &mut *stream, write_queue: &mut *write_queue },
+      )
+      .await?
+      {
+        return read_frame::take_buffered_data_frame::<IS_CLIENT>(
+          header_len,
+          network_buffer,
+          *nc_rsv1,
+          *no_masking,
+          payload_origin,
+          &rfi,
+          buffer,
+        );
+      }
+    }
     read_frame::read_frame::<_, _, _, _, _, true, IS_CLIENT>(
       is_in_continuation_frame,
       *max_payload_len,
@@ -241,6 +263,15 @@ where
   where
     P: LeaseMut<[u8]>,
   {
+    if write_frame::try_queue_frame::<NC, _, _, IS_CLIENT>(
+      frame,
+      self.no_masking,
+      self.nc_rsv1,
+      &mut self.rng,
+      &mut self.wsb.write_queue,
+    )? {
+      return Ok(());
+    }
     write_frame::write_frame_buffered::<_, _, _, _, IS_CLIENT>(
       frame,
       self.no_masking,

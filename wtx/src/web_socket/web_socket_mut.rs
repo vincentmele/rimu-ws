@@ -7,9 +7,11 @@ use crate::{
   web_socket::{
     Frame, FrameMut, WebSocketPayloadOrigin,
     is_in_continuation_frame::IsInContinuationFrame,
-    read_frame::read_frame,
+    read_frame::{fetch_buffered_data_frame, read_frame, take_buffered_data_frame},
     web_socket_compression::NegotiatedWsCompression,
-    write_frame::{QueuedStream, flush_write_queue, write_frame, write_frame_buffered},
+    write_frame::{
+      QueuedStream, flush_write_queue, try_queue_frame, write_frame, write_frame_buffered,
+    },
   },
 };
 use core::marker::PhantomData;
@@ -58,6 +60,28 @@ where
     'buffer: 'frame,
     'this: 'frame,
   {
+    if self.is_in_continuation_frame.is_none() {
+      buffer.clear();
+      if let Some((rfi, header_len)) = fetch_buffered_data_frame::<NC, _, IS_CLIENT>(
+        self.max_payload_len,
+        common.nc_rsv1,
+        self.network_buffer,
+        self.no_masking,
+        &mut QueuedStream { stream: common.stream, write_queue: common.write_queue },
+      )
+      .await?
+      {
+        return take_buffered_data_frame::<IS_CLIENT>(
+          header_len,
+          self.network_buffer,
+          common.nc_rsv1,
+          self.no_masking,
+          payload_origin,
+          &rfi,
+          buffer,
+        );
+      }
+    }
     read_frame::<_, _, _, _, _, true, IS_CLIENT>(
       self.is_in_continuation_frame,
       self.max_payload_len,
@@ -143,6 +167,15 @@ where
   where
     P: LeaseMut<[u8]>,
   {
+    if try_queue_frame::<NC, _, _, IS_CLIENT>(
+      frame,
+      self.no_masking,
+      common.nc_rsv1,
+      common.rng,
+      common.write_queue,
+    )? {
+      return Ok(());
+    }
     write_frame_buffered::<_, _, _, _, IS_CLIENT>(
       frame,
       self.no_masking,

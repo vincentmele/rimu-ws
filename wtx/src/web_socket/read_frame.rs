@@ -17,7 +17,7 @@ use crate::{
   net::{BufStreamReader, StreamReader, StreamWriter},
   rng::Rng,
   web_socket::{
-    CloseCode, Frame, FrameMut, MAX_CONTROL_PAYLOAD_LEN, OpCode, WebSocketError,
+    CloseCode, Frame, FrameMut, MAX_CONTROL_PAYLOAD_LEN, MAX_HEADER_LEN, OpCode, WebSocketError,
     WebSocketPayloadOrigin,
     is_in_continuation_frame::IsInContinuationFrame,
     mask_op::mask_op,
@@ -211,6 +211,25 @@ where
     elem
   } else {
     user_buffer.clear();
+    if let Some((rfi, header_len)) = fetch_buffered_data_frame::<D, _, IS_CLIENT>(
+      max_payload_len,
+      nc_rsv1,
+      network_buffer,
+      no_masking,
+      stream_reader_cb(&mut *stream),
+    )
+    .await?
+    {
+      return take_buffered_data_frame::<IS_CLIENT>(
+        header_len,
+        network_buffer,
+        nc_rsv1,
+        no_masking,
+        payload_origin,
+        &rfi,
+        user_buffer,
+      );
+    }
     let first_rfi = fetch_frame_from_stream::<D, _, IS_CLIENT>(
       max_payload_len,
       nc_rsv1,
@@ -305,6 +324,104 @@ where
     (op_code, user_buffer.as_slice_mut())
   };
   Ok(Frame::new(true, op_code, payload, nc_rsv1))
+}
+
+/// Reads until the buffer holds a whole final, uncompressed data frame and returns its header and
+/// header length, for [`take_buffered_data_frame`]. `None`, with nothing consumed, as soon as the
+/// frame turns out to be something else, which is left to the general path.
+///
+/// Callers that try this before building the general path's much larger future save that cost on
+/// every ordinary frame.
+#[inline]
+pub(crate) async fn fetch_buffered_data_frame<D, SR, const IS_CLIENT: bool>(
+  max_payload_len: usize,
+  nc_rsv1: u8,
+  network_buffer: &mut BufStreamReader,
+  no_masking: bool,
+  stream_reader: &mut SR,
+) -> crate::Result<Option<(ReadFrameInfo, usize)>>
+where
+  D: WebSocketDecompression,
+  SR: StreamReader,
+{
+  loop {
+    match buffered_data_frame::<D, IS_CLIENT>(
+      max_payload_len,
+      nc_rsv1,
+      network_buffer.following(),
+      no_masking,
+    ) {
+      BufferedFrame::Data(rslt) => return rslt.map(Some),
+      BufferedFrame::Incomplete(frame_len) => {
+        if !network_buffer.read_following(frame_len, stream_reader).await? {
+          return Err(WebSocketError::ClosedConnection.into());
+        }
+      }
+      BufferedFrame::Other => return Ok(None),
+    }
+  }
+}
+
+/// Consumes the frame found by [`fetch_buffered_data_frame`] and returns it, unmasked and checked.
+#[inline]
+pub(crate) fn take_buffered_data_frame<'frame, 'nb, 'ub, const IS_CLIENT: bool>(
+  header_len: usize,
+  network_buffer: &'nb mut BufStreamReader,
+  nc_rsv1: u8,
+  no_masking: bool,
+  payload_origin: WebSocketPayloadOrigin,
+  rfi: &ReadFrameInfo,
+  user_buffer: &'ub mut VectorUsize<u8>,
+) -> crate::Result<FrameMut<'frame>>
+where
+  'nb: 'frame,
+  'ub: 'frame,
+{
+  let payload = network_buffer.consume_frame(header_len, rfi.payload_len);
+  unmask_nb::<IS_CLIENT>(rfi.mask, payload, no_masking)?;
+  let payload = payload_origin.manage_payload(payload, user_buffer)?;
+  manage_op_code_of_first_final_frame(rfi.op_code, payload)?;
+  Ok(Frame::new(true, rfi.op_code, payload, nc_rsv1))
+}
+
+/// What the buffered bytes hold at the start of a frame.
+enum BufferedFrame {
+  /// A final, uncompressed data frame, payload included, with its header length. It can be
+  /// returned without awaiting anything.
+  Data(crate::Result<(ReadFrameInfo, usize)>),
+  /// The frame isn't all there. Holds its length, or `MAX_HEADER_LEN` while the header is
+  /// incomplete, as the room to reserve for the next read.
+  Incomplete(usize),
+  /// Anything else (control frames, fragments, compressed frames), for the general path.
+  Other,
+}
+
+#[inline]
+fn buffered_data_frame<D, const IS_CLIENT: bool>(
+  max_payload_len: usize,
+  nc_rsv1: u8,
+  following: &[u8],
+  no_masking: bool,
+) -> BufferedFrame
+where
+  D: WebSocketDecompression,
+{
+  let Some(rslt) =
+    ReadFrameInfo::parse_header::<D, IS_CLIENT>(following, max_payload_len, nc_rsv1, no_masking)
+  else {
+    return BufferedFrame::Incomplete(MAX_HEADER_LEN);
+  };
+  let Ok((rfi, header_len)) = &rslt else {
+    return BufferedFrame::Data(rslt);
+  };
+  if !rfi.fin || rfi.op_code.is_control() || rfi.should_decompress {
+    return BufferedFrame::Other;
+  }
+  let frame_len = header_len.wrapping_add(rfi.payload_len);
+  if following.len() < frame_len {
+    return BufferedFrame::Incomplete(frame_len);
+  }
+  BufferedFrame::Data(rslt)
 }
 
 pub(crate) fn unmask_nb<const IS_CLIENT: bool>(

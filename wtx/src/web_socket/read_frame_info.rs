@@ -104,8 +104,31 @@ impl ReadFrameInfo {
   where
     D: WebSocketDecompression,
   {
-    let following = network_buffer.following();
-    let [b0, b1, rest @ ..] = following else {
+    let rslt = Self::parse_header::<D, IS_CLIENT>(
+      network_buffer.following(),
+      max_payload_len,
+      nc_rsv1,
+      no_masking,
+    )?;
+    Some(rslt.map(|(rfi, header_len)| {
+      network_buffer.consume_following(header_len);
+      rfi
+    }))
+  }
+
+  /// Parses the header at the start of `bytes` without consuming anything, returning it with its
+  /// length. `None` if `bytes` ends before the header does.
+  #[inline]
+  pub(crate) fn parse_header<D, const IS_CLIENT: bool>(
+    bytes: &[u8],
+    max_payload_len: usize,
+    nc_rsv1: u8,
+    no_masking: bool,
+  ) -> Option<crate::Result<(Self, usize)>>
+  where
+    D: WebSocketDecompression,
+  {
+    let [b0, b1, rest @ ..] = bytes else {
       return None;
     };
     let (fin, length_code, masked, op_code, should_decompress) =
@@ -141,12 +164,11 @@ impl ReadFrameInfo {
       Ok(false) => (None, rest),
       Err(err) => return Some(Err(err)),
     };
-    let header_len = following.len().wrapping_sub(rest.len());
+    let header_len = bytes.len().wrapping_sub(rest.len());
     if let Err(err) = Self::manage_final_params(fin, op_code, max_payload_len, payload_len) {
       return Some(Err(err));
     }
-    network_buffer.consume_following(header_len);
-    Some(Ok(ReadFrameInfo { fin, mask, op_code, payload_len, should_decompress }))
+    Some(Ok((ReadFrameInfo { fin, mask, op_code, payload_len, should_decompress }, header_len)))
   }
 
   fn manage_final_params(
