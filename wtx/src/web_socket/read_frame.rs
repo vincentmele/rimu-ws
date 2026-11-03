@@ -396,7 +396,7 @@ pub(crate) enum BufferedFrame {
   Other,
 }
 
-#[inline]
+#[inline(always)]
 pub(crate) fn buffered_data_frame<D, const IS_CLIENT: bool>(
   max_payload_len: usize,
   nc_rsv1: u8,
@@ -424,6 +424,7 @@ where
   BufferedFrame::Data(rslt)
 }
 
+#[inline]
 pub(crate) fn unmask_nb<const IS_CLIENT: bool>(
   mask: Option<[u8; 4]>,
   network_buffer: &mut [u8],

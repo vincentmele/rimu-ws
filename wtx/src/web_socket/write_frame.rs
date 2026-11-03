@@ -156,8 +156,70 @@ where
   }
   mask_frame::<_, _, IS_CLIENT>(frame, no_masking, rng);
   let (header, payload) = frame.header_and_payload_mut();
-  let _ = write_queue.extend_from_copyable_slices([&*header, payload.lease()])?;
+  let payload = payload.lease();
+  let header_len = header.len();
+  let added = header_len.wrapping_add(payload.len());
+  write_queue.reserve(added)?;
+  let (_, spare) = write_queue.split_at_spare_mut();
+  if spare.len() < added {
+    cold_path();
+    let _ = write_queue.extend_from_copyable_slices([&*header, payload])?;
+    return Ok(true);
+  }
+  let dst = spare.as_mut_ptr().cast::<u8>();
+  // SAFETY: `spare` has room for `added` bytes, which the two copies fill
+  unsafe {
+    copy_small(dst, header);
+    copy_small(dst.add(header_len), payload);
+    write_queue.set_len(write_queue.len().wrapping_add(added));
+  }
   Ok(true)
+}
+
+/// Copies `src` to `dst` without calling `memcpy` for the short lengths that frame headers and
+/// small payloads have, where the call costs more than the copy: up to 32 bytes become at most
+/// two fixed-size, possibly overlapping, moves.
+///
+/// # Safety
+///
+/// `dst` must be valid for `src.len()` bytes and not overlap `src`.
+#[inline(always)]
+unsafe fn copy_small(dst: *mut u8, src: &[u8]) {
+  let len = src.len();
+  let from = src.as_ptr();
+  // SAFETY: every read is within `src` and every write within the `len` bytes of `dst`
+  unsafe {
+    match len {
+      0 => {}
+      1..=3 => {
+        *dst = *from;
+        *dst.add(len / 2) = *from.add(len / 2);
+        *dst.add(len - 1) = *from.add(len - 1);
+      }
+      4..=7 => {
+        dst.cast::<[u8; 4]>().write_unaligned(from.cast::<[u8; 4]>().read_unaligned());
+        dst
+          .add(len - 4)
+          .cast::<[u8; 4]>()
+          .write_unaligned(from.add(len - 4).cast::<[u8; 4]>().read_unaligned());
+      }
+      8..=15 => {
+        dst.cast::<[u8; 8]>().write_unaligned(from.cast::<[u8; 8]>().read_unaligned());
+        dst
+          .add(len - 8)
+          .cast::<[u8; 8]>()
+          .write_unaligned(from.add(len - 8).cast::<[u8; 8]>().read_unaligned());
+      }
+      16..=32 => {
+        dst.cast::<[u8; 16]>().write_unaligned(from.cast::<[u8; 16]>().read_unaligned());
+        dst
+          .add(len - 16)
+          .cast::<[u8; 16]>()
+          .write_unaligned(from.add(len - 16).cast::<[u8; 16]>().read_unaligned());
+      }
+      _ => core::ptr::copy_nonoverlapping(from, dst, len),
+    }
+  }
 }
 
 async fn enqueue<SW>(
@@ -294,4 +356,21 @@ where
   let mut compressed_frame = compress_frame(frame, nc, nc_rsv1, writer_buffer)?;
   mask_frame::<_, _, IS_CLIENT>(&mut compressed_frame, no_masking, rng);
   Ok(compressed_frame)
+}
+
+#[cfg(test)]
+mod tests {
+  use crate::web_socket::write_frame::copy_small;
+
+  #[test]
+  fn copy_small_copies_every_length() {
+    let src: alloc::vec::Vec<u8> = (0..80u8).collect();
+    for len in 0..80 {
+      let mut dst = [0xAAu8; 81];
+      // SAFETY: `dst` has room for `len` bytes
+      unsafe { copy_small(dst.as_mut_ptr(), &src[..len]) };
+      assert_eq!(&dst[..len], &src[..len]);
+      assert!(dst[len..].iter().all(|el| *el == 0xAA), "wrote past {len}");
+    }
+  }
 }

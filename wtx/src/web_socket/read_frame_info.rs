@@ -118,7 +118,7 @@ impl ReadFrameInfo {
 
   /// Parses the header at the start of `bytes` without consuming anything, returning it with its
   /// length. `None` if `bytes` ends before the header does.
-  #[inline]
+  #[inline(always)]
   pub(crate) fn parse_header<D, const IS_CLIENT: bool>(
     bytes: &[u8],
     max_payload_len: usize,
