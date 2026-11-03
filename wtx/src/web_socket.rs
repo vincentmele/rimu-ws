@@ -27,7 +27,7 @@ use crate::{
   misc::LeaseMut,
   net::{ConnectionState, Stream},
   rng::{SeedableRng as _, Xorshift64},
-  tls::{TlsCtx, TlsStream, TlsStreamBridge},
+  tls::{TlsCtx, TlsStream},
   web_socket::{web_socket_compression::NegotiatedWsCompression, write_frame::QueuedStream},
 };
 pub use close_code::CloseCode;
@@ -160,7 +160,7 @@ where
       reader_buffer,
       rng,
       &mut QueuedStream { stream, write_queue },
-      &WebSocketBridge::new(TlsStreamBridge::new()),
+      None,
       buffer,
       |el| el.stream.connection_state = ConnectionState::ClosedGracefully,
       |local_stream| local_stream,

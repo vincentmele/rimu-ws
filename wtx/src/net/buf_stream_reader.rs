@@ -288,7 +288,11 @@ impl BufStreamReader {
   #[inline]
   pub(crate) fn consume_following(&mut self, len: usize) {
     let following_len = self.buffer.len().wrapping_sub(self.current_end_idx);
-    Self::remove_current(&mut self.antecedent_end_idx, &mut self.current_end_idx, len.min(following_len));
+    Self::remove_current(
+      &mut self.antecedent_end_idx,
+      &mut self.current_end_idx,
+      len.min(following_len),
+    );
   }
 
   /// Reads once from the stream, appending to [`Self::following`], with room for at least

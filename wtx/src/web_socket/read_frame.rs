@@ -37,7 +37,7 @@ pub(crate) async fn manage_auto_reply<A, RNG, const HAS_AUTO_REPLY: bool, const 
   op_code: OpCode,
   payload: &mut [u8],
   rng: &mut RNG,
-  stream_bridge: &WebSocketBridge<IS_CLIENT>,
+  stream_bridge: Option<&WebSocketBridge<IS_CLIENT>>,
   write_control_frame_cb: impl for<'any> FnMutFut<
     (A, &'any [u8], &'any [u8]),
     Result = crate::Result<()>,
@@ -62,8 +62,8 @@ where
           write_control_frame_cb,
         )
         .await?;
-      } else {
-        stream_bridge.update((OpCode::Close, control_payload));
+      } else if let Some(elem) = stream_bridge {
+        elem.update((OpCode::Close, control_payload));
       }
       Ok(true)
     }
@@ -79,8 +79,8 @@ where
           write_control_frame_cb,
         )
         .await?;
-      } else {
-        stream_bridge.update((OpCode::Pong, control_payload));
+      } else if let Some(elem) = stream_bridge {
+        elem.update((OpCode::Pong, control_payload));
       }
       Ok(true)
     }
@@ -193,7 +193,7 @@ pub(crate) async fn read_frame<
   reader_buffer: &mut VectorUsize<u8>,
   rng: &mut R,
   stream: &mut S,
-  stream_bridge: &WebSocketBridge<IS_CLIENT>,
+  stream_bridge: Option<&WebSocketBridge<IS_CLIENT>>,
   user_buffer: &'ub mut VectorUsize<u8>,
   mut closed_conn_cb: impl FnMut(&mut S),
   mut stream_reader_cb: impl FnMut(&mut S) -> &mut SR,
@@ -431,7 +431,7 @@ async fn manage_first_finished_frame<
   payload_origin: WebSocketPayloadOrigin,
   rfi: &ReadFrameInfo,
   rng: &mut R,
-  stream_bridge: &WebSocketBridge<IS_CLIENT>,
+  stream_bridge: Option<&WebSocketBridge<IS_CLIENT>>,
   stream_writer: &mut SW,
   user_buffer: &'rbf mut VectorUsize<u8>,
 ) -> crate::Result<FrameMut<'frame>>
@@ -517,7 +517,7 @@ async fn read_continuation_frames<
   no_masking: bool,
   rng: &mut R,
   stream: &mut S,
-  stream_bridge: &WebSocketBridge<IS_CLIENT>,
+  stream_bridge: Option<&WebSocketBridge<IS_CLIENT>>,
   reader_buffer_first_cb: &mut impl FnMut(
     OpCode,
     usize,

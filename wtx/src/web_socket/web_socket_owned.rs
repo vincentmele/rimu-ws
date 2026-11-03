@@ -62,7 +62,7 @@ where
       &mut self.reader_buffer,
       &mut self.rng,
       &mut (&mut self.stream_reader, &mut ()),
-      &self.stream_bridge,
+      Some(&self.stream_bridge),
       buffer,
       |el| {
         el.0.common().connection_state.store(ConnectionState::ReadClosed.into(), Ordering::Relaxed);

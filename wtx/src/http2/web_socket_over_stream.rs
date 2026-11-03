@@ -9,9 +9,9 @@ use crate::{
   misc::LeaseMut,
   net::StreamWriter,
   rng::Xorshift64,
-  tls::{TlsCtx, TlsStreamBridge},
+  tls::TlsCtx,
   web_socket::{
-    Frame, FrameMut, OpCode, WebSocketBridge,
+    Frame, FrameMut, OpCode,
     read_frame::{manage_auto_reply, manage_op_code_of_first_final_frame, unmask_nb},
     read_frame_info::ReadFrameInfo,
     write_frame::mask_frame,
@@ -77,7 +77,7 @@ where
         rfi.op_code,
         buffer,
         &mut self.rng,
-        &WebSocketBridge::new(TlsStreamBridge::new()),
+        None,
         write_control_frame_cb,
       )
       .await?;

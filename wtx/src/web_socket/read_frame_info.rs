@@ -1,8 +1,8 @@
 use crate::{
   net::{BufStreamReader, StreamReader},
   web_socket::{
-    FIN_MASK, MAX_CONTROL_PAYLOAD_LEN, MAX_HEADER_LEN, OpCode, PAYLOAD_MASK, RSV1_MASK, RSV2_MASK, RSV3_MASK,
-    WebSocketError,
+    FIN_MASK, MAX_CONTROL_PAYLOAD_LEN, MAX_HEADER_LEN, OpCode, PAYLOAD_MASK, RSV1_MASK, RSV2_MASK,
+    RSV3_MASK, WebSocketError,
     misc::{has_masked_frame, op_code},
     web_socket_compression::WebSocketDecompression,
   },
