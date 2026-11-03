@@ -14,7 +14,7 @@ use crate::{
   net::{Stream, StreamCommon, StreamReader, StreamWriter},
   rng::Xorshift64,
   tls::{KeySchedule, PlaintextCtx, TlsBuffer, TlsStream},
-  web_socket::{Frame, OpCode, WebSocket, WebSocketBuffer, WebSocketPayloadOrigin},
+  web_socket::{Fill, Frame, OpCode, WebSocket, WebSocketBuffer, WebSocketPayloadOrigin},
 };
 use alloc::{format, vec::Vec};
 use core::{
@@ -67,7 +67,8 @@ enum Loop {
   Plain,
   /// Buffered frames echoed with `try_write_frame_buffered`, awaiting when it can't queue.
   Drain,
-  /// Buffered frames echoed with `queue_frame`, which queues without the queue limit.
+  /// Buffered frames echoed with `queue_frame`, which queues without the queue limit, waiting
+  /// with `fill` and leaving `read_frame` to what `read_buffered_frame` declines.
   Queue,
 }
 
@@ -449,6 +450,16 @@ fn run(input: &[u8], chunks: &[usize], origin: WebSocketPayloadOrigin, mode: Loo
             }
             Ok(None) => break,
             Err(err) => break 'outer classify(&err),
+          }
+        }
+        // The queueing loop waits with `fill`, so every data frame is parsed by
+        // `read_buffered_frame`, and only what that declines reaches `read_frame`.
+        if mode == Loop::Queue {
+          match reader.fill(&mut common).await {
+            Ok(Fill::Buffered) => continue,
+            Ok(Fill::Closed) => break End::Eof,
+            Ok(Fill::ReadFrame) => {}
+            Err(err) => break classify(&err),
           }
         }
         match reader.read_frame(&mut buffer, &mut common, origin).await {

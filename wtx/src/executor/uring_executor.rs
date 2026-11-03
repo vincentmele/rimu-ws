@@ -1368,7 +1368,7 @@ mod tests {
     rng::{ChaCha20, CryptoSeedableRng},
     tests::_uri,
     tls::{TlsAcceptor, TlsConfig},
-    web_socket::{OpCode, WebSocketAcceptor, WebSocketPayloadOrigin},
+    web_socket::{Fill, OpCode, WebSocketAcceptor, WebSocketPayloadOrigin},
   };
   use alloc::vec::Vec;
   use core::{future::poll_fn, task::Poll};
@@ -1799,8 +1799,8 @@ mod tests {
           let (mut common, mut reader, mut writer) = ws.split_mut();
           let origin = WebSocketPayloadOrigin::Adaptive;
           loop {
-            // `queue_frame` queues without the queue limit, so large frames, floods and slow
-            // readers here exercise unbounded queueing.
+            // `queue_frame` queues without the queue limit and `fill` waits without parsing, so
+            // large frames, floods, resets and slow readers here exercise both.
             while let Ok(Some(mut frame)) = reader.read_buffered_frame(&mut buffer, &common, origin)
             {
               if !writer.queue_frame(&mut common, &mut frame).unwrap()
@@ -1808,6 +1808,11 @@ mod tests {
               {
                 return;
               }
+            }
+            match reader.fill(&mut common).await {
+              Ok(Fill::Buffered) => continue,
+              Ok(Fill::ReadFrame) => {}
+              Ok(Fill::Closed) | Err(_) => return,
             }
             let Ok(mut frame) = reader.read_frame(&mut buffer, &mut common, origin).await else {
               return;

@@ -220,6 +220,13 @@ where
 {
   #[inline]
   async fn read(&mut self, bytes: MaybeUninitSlice<'_, u8>) -> crate::Result<Option<NonZeroUsize>> {
+    // An open plaintext connection reads straight from the stream: `poll_pending_read` below only
+    // ever passes `Pending` through for these states.
+    if TCX::TY.is_plain_text()
+      && matches!(self.connection_state, ConnectionState::Draining | ConnectionState::Open)
+    {
+      return self.stream.read(bytes).await;
+    }
     let Self {
       buffer,
       can_reply_key_update,

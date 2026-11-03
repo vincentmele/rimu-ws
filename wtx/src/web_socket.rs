@@ -45,7 +45,7 @@ pub use web_socket_buffer::WebSocketBuffer;
 pub use web_socket_compression::{DeflateConfig, WsCompression};
 pub use web_socket_connector::WebSocketConnector;
 pub use web_socket_error::WebSocketError;
-pub use web_socket_mut::{WebSocketCommonMut, WebSocketReaderMut, WebSocketWriterMut};
+pub use web_socket_mut::{Fill, WebSocketCommonMut, WebSocketReaderMut, WebSocketWriterMut};
 pub use web_socket_owned::{WebSocketReaderOwned, WebSocketWriterOwned};
 pub use web_socket_payload_origin::WebSocketPayloadOrigin;
 

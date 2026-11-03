@@ -30,6 +30,18 @@ pub struct WebSocketCommonMut<'instance, NC, S, TCX, const IS_CLIENT: bool> {
   pub(crate) write_queue: &'instance mut VectorUsize<u8>,
 }
 
+/// What [`WebSocketReaderMut::fill`] did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Fill {
+  /// More bytes were read: [`WebSocketReaderMut::read_buffered_frame`] may now return frames.
+  Buffered,
+  /// The peer closed the connection.
+  Closed,
+  /// The next frame needs [`WebSocketReaderMut::read_frame`]: a control, fragmented or compressed
+  /// frame, or a frame that is invalid and whose error that method reports.
+  ReadFrame,
+}
+
 /// Auxiliary structure that can be used when it is necessary to write a received frame that belongs
 /// to the same instance.
 #[derive(Debug)]
@@ -49,6 +61,56 @@ where
   S: Stream,
   TCX: TlsCtx,
 {
+  /// Waits for more of the next frame without parsing it, sending the queued frames first, so that
+  /// a loop can parse with [`Self::read_buffered_frame`] instead of awaiting [`Self::read_frame`]
+  /// for each frame:
+  ///
+  /// ```ignore,rust
+  /// loop {
+  ///   while let Some(mut frame) = reader.read_buffered_frame(&mut buffer, &common, origin)? {
+  ///     writer.queue_frame(&mut common, &mut frame)?;
+  ///   }
+  ///   match reader.fill(&mut common).await? {
+  ///     Fill::Buffered => {}
+  ///     Fill::Closed => break,
+  ///     Fill::ReadFrame => { let frame = reader.read_frame(&mut buffer, &mut common, origin).await?; }
+  ///   }
+  /// }
+  /// ```
+  ///
+  /// Call it once [`Self::read_buffered_frame`] returns `None`: a complete frame still buffered is
+  /// then one that method declined, so this returns [`Fill::ReadFrame`] for it without reading.
+  #[inline]
+  pub async fn fill(
+    &mut self,
+    common: &mut WebSocketCommonMut<'instance, NC, S, TCX, IS_CLIENT>,
+  ) -> crate::Result<Fill> {
+    if self.is_in_continuation_frame.is_some() {
+      return Ok(Fill::ReadFrame);
+    }
+    let frame_len = match buffered_data_frame::<NC, IS_CLIENT>(
+      self.max_payload_len,
+      common.nc_rsv1,
+      self.network_buffer.following(),
+      self.no_masking,
+    ) {
+      BufferedFrame::Incomplete(elem) => elem,
+      BufferedFrame::Data(_) | BufferedFrame::Other => return Ok(Fill::ReadFrame),
+    };
+    let stream =
+      &mut QueuedStream { stream: &mut *common.stream, write_queue: &mut *common.write_queue };
+    match self.network_buffer.read_following(frame_len, stream).await {
+      Ok(true) => Ok(Fill::Buffered),
+      Ok(false) => Ok(Fill::Closed),
+      Err(err) => {
+        cold_path();
+        // Like `read_frame`: what was queued before the error still goes out.
+        let _rslt = flush_write_queue(common.stream, common.write_queue).await;
+        Err(err)
+      }
+    }
+  }
+
   /// Returns the next frame without touching the stream, if it is a final, uncompressed text or
   /// binary frame whose bytes have already been read. `None` otherwise, with nothing consumed:
   /// [`Self::read_frame`] then handles whatever comes next (control frames, fragments, compressed

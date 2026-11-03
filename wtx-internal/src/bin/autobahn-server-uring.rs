@@ -1,6 +1,6 @@
 //! Autobahn fuzzing-client target for the draining echo path on `UringExecutor`, echoing buffered
-//! frames with `queue_frame`: uncompressed connections queue every buffered frame, and on
-//! compressed ones `queue_frame` declines, so the awaited path is exercised too. Set
+//! frames with `queue_frame` and waiting with `fill`: uncompressed connections queue every buffered
+//! frame, and on compressed ones both decline, so the awaited path is exercised too. Set
 //! `WTX_DIRECT=<slots>` to accept into direct descriptors.
 
 #![expect(clippy::print_stderr, reason = "internal")]
@@ -12,7 +12,7 @@ use rimu_ws::{
   rng::{ChaCha20, CryptoSeedableRng},
   tls::{PlaintextCtx, TlsConfig},
   web_socket::{
-    OpCode, WebSocket, WebSocketPayloadOrigin,
+    Fill, OpCode, WebSocket, WebSocketPayloadOrigin,
     web_socket_compression::{NegotiatedZlibRs, ZlibRs},
   },
 };
@@ -46,6 +46,11 @@ async fn echo(
       if !writer.queue_frame(&mut common, &mut frame)? {
         writer.write_frame_buffered(&mut common, &mut frame).await?;
       }
+    }
+    match reader.fill(&mut common).await? {
+      Fill::Buffered => continue,
+      Fill::Closed => break,
+      Fill::ReadFrame => {}
     }
     let mut frame = reader.read_frame(&mut buffer, &mut common, origin).await?;
     match frame.op_code() {
