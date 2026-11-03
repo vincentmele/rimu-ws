@@ -7,10 +7,10 @@
 //! `wtx-client-concurrent` is an example that uses a channel.
 
 extern crate tokio;
-extern crate wtx;
-extern crate wtx_examples;
+extern crate rimu_ws;
+extern crate rimu_ws_examples;
 
-use wtx::{
+use rimu_ws::{
   collections::VectorUsize,
   net::Uri,
   rng::{ChaCha20, CryptoSeedableRng as _},
@@ -18,10 +18,10 @@ use wtx::{
   tls::{TlsConfig, TlsConnectorBuilder},
   web_socket::{Frame, OpCode, WebSocketConnector, WebSocketPayloadOrigin},
 };
-use wtx_examples::{ROOT_CA, uri_from_args};
+use rimu_ws_examples::{ROOT_CA, uri_from_args};
 
 #[tokio::main]
-async fn main() -> wtx::Result<()> {
+async fn main() -> rimu_ws::Result<()> {
   let uri = Uri::new(uri_from_args());
   let tls_connector = TlsConnectorBuilder::tokio(uri)
     .build(TlsConfig::from_trust_anchors_pem([ROOT_CA])?, ChaCha20::from_std_random()?)
@@ -38,7 +38,7 @@ async fn main() -> wtx::Result<()> {
         break;
       }
     }
-    wtx::Result::Ok(())
+    rimu_ws::Result::Ok(())
   };
 
   let reader_fut = async {
@@ -57,7 +57,7 @@ async fn main() -> wtx::Result<()> {
         }
       }
     }
-    wtx::Result::Ok(())
+    rimu_ws::Result::Ok(())
   };
 
   let writer_fut = async {
@@ -66,7 +66,7 @@ async fn main() -> wtx::Result<()> {
       .await
       .write_frame(&mut Frame::new_fin(OpCode::Close, *b"Bye")?)
       .await?;
-    wtx::Result::Ok(())
+    rimu_ws::Result::Ok(())
   };
 
   let (bridge_rslt, reader_rslt, writer_rslt) = tokio::join!(bridge_fut, reader_fut, writer_fut);

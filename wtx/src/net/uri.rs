@@ -85,7 +85,7 @@ where
   /// <https://datatracker.ietf.org/doc/html/rfc3986#section-3.2>
   ///
   /// ```rust
-  /// let uri = wtx::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
+  /// let uri = rimu_ws::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
   /// assert_eq!(uri.authority(), "user:password@hostname:80");
   /// ```
   #[inline]
@@ -96,7 +96,7 @@ where
   /// <https://datatracker.ietf.org/doc/html/rfc3986#section-3.5>
   ///
   /// ```rust
-  /// let uri = wtx::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
+  /// let uri = rimu_ws::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
   /// assert_eq!(uri.fragment(), "#hash");
   /// ```
   #[inline]
@@ -107,7 +107,7 @@ where
   /// <https://datatracker.ietf.org/doc/html/rfc3986#section-3.2.2>
   ///
   /// ```rust
-  /// let uri = wtx::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
+  /// let uri = rimu_ws::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
   /// assert_eq!(uri.host(), "hostname:80");
   /// ```
   #[inline]
@@ -119,7 +119,7 @@ where
   /// <https://datatracker.ietf.org/doc/html/rfc3986#section-3.2.2>
   ///
   /// ```rust
-  /// let uri = wtx::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
+  /// let uri = rimu_ws::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
   /// assert_eq!(uri.hostname(), "hostname");
   /// ```
   #[inline]
@@ -133,7 +133,7 @@ where
   /// Returns the hostname with a zeroed port if [`Self::port`] is [`Option::None`].
   ///
   /// ```rust
-  /// let uri = wtx::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
+  /// let uri = rimu_ws::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
   /// assert_eq!(uri.hostname_with_implied_port(), ("hostname", 80));
   /// ```
   #[inline]
@@ -150,7 +150,7 @@ where
   /// Returns the number of characters.
   ///
   /// ```rust
-  /// let uri = wtx::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
+  /// let uri = rimu_ws::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
   /// assert_eq!(uri.len(), 53);
   /// ```
   #[inline]
@@ -161,7 +161,7 @@ where
   /// Everything before path
   ///
   /// ```rust
-  /// let uri = wtx::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
+  /// let uri = rimu_ws::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
   /// assert_eq!(uri.origin(), "foo://user:password@hostname:80");
   /// ```
   #[inline]
@@ -172,7 +172,7 @@ where
   /// <https://datatracker.ietf.org/doc/html/rfc3986#section-3.2.1>
   ///
   /// ```rust
-  /// let uri = wtx::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
+  /// let uri = rimu_ws::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
   /// assert_eq!(uri.password(), "password");
   /// ```
   #[inline]
@@ -183,7 +183,7 @@ where
   /// <https://datatracker.ietf.org/doc/html/rfc3986#section-3.3>
   ///
   /// ```rust
-  /// let uri = wtx::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
+  /// let uri = rimu_ws::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
   /// assert_eq!(uri.path(), "/path");
   /// ```
   #[inline]
@@ -197,7 +197,7 @@ where
   /// an explicit `... :SOME_NUMBER ...` declaration.
   ///
   /// ```rust
-  /// let uri = wtx::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
+  /// let uri = rimu_ws::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
   /// assert_eq!(uri.port(), Some(80));
   /// ```
   #[inline]
@@ -208,7 +208,7 @@ where
   /// <https://datatracker.ietf.org/doc/html/rfc3986#section-3.4>
   ///
   /// ```rust
-  /// let uri = wtx::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
+  /// let uri = rimu_ws::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
   /// assert_eq!(uri.query(), "?query=value");
   /// ```
   #[inline]
@@ -220,7 +220,7 @@ where
   /// <https://datatracker.ietf.org/doc/html/rfc3986#section-3.5>
   ///
   /// ```rust
-  /// let uri = wtx::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
+  /// let uri = rimu_ws::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
   /// assert_eq!(uri.query_and_fragment(), "?query=value#hash");
   /// ```
   #[inline]
@@ -231,7 +231,7 @@ where
   /// Iterator that returns the key/value pairs of a query, if any.
   ///
   /// ```rust
-  /// let uri = wtx::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
+  /// let uri = rimu_ws::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
   /// let mut iter = uri.query_params();
   /// assert_eq!(iter.next(), Some(("query", "value")));
   /// assert_eq!(iter.next(), None);
@@ -246,7 +246,7 @@ where
   /// <https://datatracker.ietf.org/doc/html/rfc3986#section-4.2>
   ///
   /// ```rust
-  /// let uri = wtx::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
+  /// let uri = rimu_ws::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
   /// assert_eq!(uri.relative_reference(), "/path?query=value#hash");
   /// ```
   #[inline]
@@ -260,7 +260,7 @@ where
   /// Like [`Self::relative_reference`] with the additional feature of returning `/` if empty.
   ///
   /// ```rust
-  /// let uri = wtx::net::Uri::new("");
+  /// let uri = rimu_ws::net::Uri::new("");
   /// assert_eq!(uri.relative_reference_slash(), "/");
   /// ```
   #[inline]
@@ -272,7 +272,7 @@ where
   /// <https://datatracker.ietf.org/doc/html/rfc3986#section-3.1>
   ///
   /// ```rust
-  /// let uri = wtx::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
+  /// let uri = rimu_ws::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
   /// assert_eq!(uri.scheme(), "foo");
   /// ```
   #[inline]
@@ -313,7 +313,7 @@ where
   }
 
   /// ```rust
-  /// let uri = wtx::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
+  /// let uri = rimu_ws::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
   /// assert_eq!(uri.user(), "user");
   /// ```
   #[inline]
@@ -322,7 +322,7 @@ where
   }
 
   /// ```rust
-  /// let uri = wtx::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
+  /// let uri = rimu_ws::net::Uri::new("foo://user:password@hostname:80/path?query=value#hash");
   /// assert_eq!(uri.userinfo(), "user:password");
   /// ```
   #[inline]

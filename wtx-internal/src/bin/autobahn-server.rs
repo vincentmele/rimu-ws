@@ -3,7 +3,7 @@
 #![expect(clippy::print_stderr, reason = "internal")]
 
 use tokio::net::TcpStream;
-use wtx::{
+use rimu_ws::{
   collections::VectorUsize,
   http::WebSocketServerFramework,
   tls::{PlaintextCtx, TlsConfig},
@@ -14,7 +14,7 @@ use wtx::{
 };
 
 #[tokio::main]
-async fn main() -> wtx::Result<()> {
+async fn main() -> rimu_ws::Result<()> {
   WebSocketServerFramework::tokio(TlsConfig::plaintext())?
     .set_compression(ZlibRs::default())
     .set_error_cb(|error| eprintln!("{error}"))
@@ -25,7 +25,7 @@ async fn main() -> wtx::Result<()> {
 async fn echo(
   mut buffer: VectorUsize<u8>,
   mut ws: WebSocket<Option<NegotiatedZlibRs>, TcpStream, PlaintextCtx, false>,
-) -> wtx::Result<()> {
+) -> rimu_ws::Result<()> {
   let (mut common, mut reader, mut writer) = ws.split_mut();
   loop {
     let origin = WebSocketPayloadOrigin::Adaptive;

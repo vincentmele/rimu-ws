@@ -4,10 +4,10 @@
 //! ```
 
 extern crate tokio;
-extern crate wtx;
-extern crate wtx_examples;
+extern crate rimu_ws;
+extern crate rimu_ws_examples;
 
-use wtx::{
+use rimu_ws::{
   codec::{Decode, Encode},
   database::{
     DbClient as _, Record, Typed,
@@ -16,9 +16,9 @@ use wtx::{
 };
 
 #[tokio::main]
-async fn main() -> wtx::Result<()> {
+async fn main() -> rimu_ws::Result<()> {
   let uri = "postgres://USER:PASSWORD@localhost/DATABASE";
-  let mut executor = wtx_examples::postgres_client(uri).await?;
+  let mut executor = rimu_ws_examples::postgres_client(uri).await?;
   executor
     .execute_stmt_none("INSERT INTO custom_enum_table VALUES ($1, $2)", (1, Enum::Bar))
     .await?;
@@ -35,33 +35,33 @@ enum Enum {
   Baz,
 }
 
-impl Decode<'_, Postgres<wtx::Error>> for Enum {
+impl Decode<'_, Postgres<rimu_ws::Error>> for Enum {
   #[inline]
-  fn decode(dw: &mut PostgresDecodeWrapper<'_, '_>) -> Result<Self, wtx::Error> {
-    let string = <&str as Decode<Postgres<wtx::Error>>>::decode(dw)?;
+  fn decode(dw: &mut PostgresDecodeWrapper<'_, '_>) -> Result<Self, rimu_ws::Error> {
+    let string = <&str as Decode<Postgres<rimu_ws::Error>>>::decode(dw)?;
     Ok(match string {
       "foo" => Self::Foo,
       "bar" => Self::Bar,
       "baz" => Self::Baz,
-      _ => return Err(wtx::Error::UnexpectedString { length: 3 }),
+      _ => return Err(rimu_ws::Error::UnexpectedString { length: 3 }),
     })
   }
 }
 
-impl Encode<Postgres<wtx::Error>> for Enum {
+impl Encode<Postgres<rimu_ws::Error>> for Enum {
   #[inline]
-  fn encode(&self, ew: &mut PostgresEncodeWrapper<'_>) -> Result<(), wtx::Error> {
+  fn encode(&self, ew: &mut PostgresEncodeWrapper<'_>) -> Result<(), rimu_ws::Error> {
     let string = match self {
       Self::Foo => "foo",
       Self::Bar => "bar",
       Self::Baz => "baz",
     };
-    <_ as Encode<Postgres<wtx::Error>>>::encode(&string, ew)?;
+    <_ as Encode<Postgres<rimu_ws::Error>>>::encode(&string, ew)?;
     Ok(())
   }
 }
 
-impl Typed<Postgres<wtx::Error>> for Enum {
+impl Typed<Postgres<rimu_ws::Error>> for Enum {
   #[inline]
   fn runtime_ty(&self) -> Option<Ty> {
     None

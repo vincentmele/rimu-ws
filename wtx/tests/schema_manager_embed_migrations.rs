@@ -4,7 +4,7 @@
 
 mod schema_manager_embedded_migrations;
 
-use wtx::database::schema_manager::Commands;
+use rimu_ws::database::schema_manager::Commands;
 
 /// Compiles
 pub async fn compiles() {

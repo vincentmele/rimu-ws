@@ -37,9 +37,9 @@ impl SirFinalValues {
   fn transport_params(transport_group: &TransportGroup) -> TokenStream {
     match transport_group {
       TransportGroup::Custom(tt) => tt.clone(),
-      TransportGroup::Http => quote::quote!(wtx::client_api_framework::network::HttpParams),
+      TransportGroup::Http => quote::quote!(rimu_ws::client_api_framework::network::HttpParams),
       TransportGroup::Stub => quote::quote!(()),
-      TransportGroup::WebSocket => quote::quote!(wtx::client_api_framework::network::WsParams),
+      TransportGroup::WebSocket => quote::quote!(rimu_ws::client_api_framework::network::WsParams),
     }
   }
 }
@@ -162,12 +162,12 @@ impl<'module, 'others>
         package_impls.push(quote::quote!(
           impl<
             #(#is_mut_lf,)* #(#lts,)* #(#tys,)* __API, __APIPARAMS, __DRSR, __TRANSPORT
-          > wtx::client_api_framework::pkg::Package<
+          > rimu_ws::client_api_framework::pkg::Package<
             __API, __DRSR, __TRANSPORT, #tp
           > for #camel_case_pkg_ident<
             #(#fpiv_params_iter0,)*
             #(#fresdiv_params_iter0,)*
-            wtx::codec::protocol::#dfe_ext_req_ctnt_wrapper<#freqdiv_ident<#freqdiv_params>>
+            rimu_ws::codec::protocol::#dfe_ext_req_ctnt_wrapper<#freqdiv_ident<#freqdiv_params>>
           >
           where
             #faftsiv_fn_where_predicates
@@ -175,23 +175,23 @@ impl<'module, 'others>
             #(#fpiv_where_predicates_iter,)*
             #(#freqdiv_where_predicates_iter,)*
             #(#fresdiv_where_predicates_iter0,)*
-            for<'__drsr> wtx::codec::protocol::#dfe_ext_req_ctnt_wrapper<
+            for<'__drsr> rimu_ws::codec::protocol::#dfe_ext_req_ctnt_wrapper<
               #freqdiv_ident<#freqdiv_params>
-            >: wtx::codec::Encode<wtx::codec::GenericCodec<&'__drsr mut __DRSR, &'__drsr mut __DRSR>>,
-            for<'__de, '__drsr> wtx::codec::protocol::#dfe_ext_res_ctnt_wrapper<
+            >: rimu_ws::codec::Encode<rimu_ws::codec::GenericCodec<&'__drsr mut __DRSR, &'__drsr mut __DRSR>>,
+            for<'__de, '__drsr> rimu_ws::codec::protocol::#dfe_ext_res_ctnt_wrapper<
               #fresdiv_ident<#(#res_lf_iter0,)*>
-            >: wtx::codec::DecodeSeq<'__de, wtx::codec::GenericCodec<&'__drsr mut __DRSR, &'__drsr mut __DRSR>>,
-            __API: wtx::client_api_framework::Api<
-                Error = <<#id as wtx::client_api_framework::ApiId>::Api<__APIPARAMS> as wtx::client_api_framework::Api>::Error,
+            >: rimu_ws::codec::DecodeSeq<'__de, rimu_ws::codec::GenericCodec<&'__drsr mut __DRSR, &'__drsr mut __DRSR>>,
+            __API: rimu_ws::client_api_framework::Api<
+                Error = <<#id as rimu_ws::client_api_framework::ApiId>::Api<__APIPARAMS> as rimu_ws::client_api_framework::Api>::Error,
                 Id = #id
               >
-              + wtx::misc::LeaseMut<<#id as wtx::client_api_framework::ApiId>::Api<__APIPARAMS>>
-              + wtx::collections::SingleTypeStorage<Item = __APIPARAMS>
+              + rimu_ws::misc::LeaseMut<<#id as rimu_ws::client_api_framework::ApiId>::Api<__APIPARAMS>>
+              + rimu_ws::collections::SingleTypeStorage<Item = __APIPARAMS>
           {
-            type ExternalRequestContent = wtx::codec::protocol::#dfe_ext_req_ctnt_wrapper<
+            type ExternalRequestContent = rimu_ws::codec::protocol::#dfe_ext_req_ctnt_wrapper<
               #freqdiv_ident<#freqdiv_params>
             >;
-            type ExternalResponseContent<'__de> = wtx::codec::protocol::#dfe_ext_res_ctnt_wrapper<
+            type ExternalResponseContent<'__de> = rimu_ws::codec::protocol::#dfe_ext_res_ctnt_wrapper<
               #fresdiv_ident<#(#res_lf_iter1,)*>
             >;
             type PackageParams = #fpiv_ident< #(#fpiv_params_iter1,)* >;
@@ -199,7 +199,7 @@ impl<'module, 'others>
             #[inline]
             async fn after_sending(
               &mut self,
-              (_api, _bytes, _drsr): (&mut __API, &mut wtx::collections::VectorUsize<u8>, &mut __DRSR),
+              (_api, _bytes, _drsr): (&mut __API, &mut rimu_ws::collections::VectorUsize<u8>, &mut __DRSR),
               (_trans, _trans_params): (&mut __TRANSPORT, &mut #tp),
             ) -> Result<(), __API::Error> {
               #( #fasiv_fn_name_ident_iter(#fasiv_fn_call_idents).await?; )*
@@ -209,7 +209,7 @@ impl<'module, 'others>
             #[inline]
             async fn before_sending(
               &mut self,
-              (_api, _bytes, _drsr): (&mut __API, &mut wtx::collections::VectorUsize<u8>, &mut __DRSR),
+              (_api, _bytes, _drsr): (&mut __API, &mut rimu_ws::collections::VectorUsize<u8>, &mut __DRSR),
               (_trans, _trans_params): (&mut __TRANSPORT, &mut #tp),
             ) -> Result<(), __API::Error> {
               #before_sending_defaults

@@ -70,7 +70,7 @@ impl Headers {
   /// Clears the internal buffer "erasing" all previously inserted elements.
   ///
   /// ```rust
-  /// use wtx::http::{Header, Headers};
+  /// use rimu_ws::http::{Header, Headers};
   /// let mut headers = Headers::new();
   /// headers.push_from_iter(Header::from_name_and_value("name", ["value"])).unwrap();
   /// assert_eq!(headers.bytes_len(), 14);
@@ -98,7 +98,7 @@ impl Headers {
   /// Returns all last optional headers that are referenced by `names`.
   ///
   /// ```rust
-  /// use wtx::http::{Header, Headers};
+  /// use rimu_ws::http::{Header, Headers};
   /// let mut headers = Headers::new();
   /// headers.push_from_iter(Header::from_name_and_value("name0", [])).unwrap();
   /// let array = headers.get_by_names([b"name0", b"name1"]);
@@ -139,7 +139,7 @@ impl Headers {
   /// Removes the last element.
   ///
   /// ```rust
-  /// use wtx::http::{Header, Headers};
+  /// use rimu_ws::http::{Header, Headers};
   /// let mut headers = Headers::new();
   /// headers.push_from_iter(Header::from_name_and_value("name", ["value"])).unwrap();
   /// assert_eq!(headers.bytes_len(), 14);
@@ -166,7 +166,7 @@ impl Headers {
   /// Pushes a new header with its value composed by [`Arguments`].
   ///
   /// ```rust
-  /// use wtx::http::{Header, Headers};
+  /// use rimu_ws::http::{Header, Headers};
   /// let mut headers = Headers::new();
   /// headers.push_from_fmt(Header::from_name_and_value("name", format_args!("{}", 1))).unwrap();
   /// assert_eq!(headers.iter().next().unwrap(), Header::from_name_and_value("name", "1"));
@@ -204,7 +204,7 @@ impl Headers {
   /// Pushes a new header with its value composed by several slices.
   ///
   /// ```rust
-  /// use wtx::http::{Header, Headers};
+  /// use rimu_ws::http::{Header, Headers};
   /// let mut headers = Headers::new();
   /// headers.push_from_iter(Header::from_name_and_value("name", ["value0", "_value1"])).unwrap();
   /// assert_eq!(headers.iter().next().unwrap(), Header::from_name_and_value("name", "value0_value1"));

@@ -1,7 +1,7 @@
-#[wtx::pkg(data_format(json), id(FooId))]
+#[rimu_ws::pkg(data_format(json), id(FooId))]
 mod pkg {
   #[pkg::after_sending]
-  async fn after_sending(foo: i32) -> wtx::Result<()> {
+  async fn after_sending(foo: i32) -> rimu_ws::Result<()> {
     Ok(())
   }
 

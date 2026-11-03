@@ -1,8 +1,8 @@
 extern crate alloc;
 
-use wtx::collections::VectorUsize;
+use rimu_ws::collections::VectorUsize;
 
-#[derive(wtx::FromVars)]
+#[derive(rimu_ws::FromVars)]
 pub struct Foo {
   bar0: String,
   bar1: Option<String>,
@@ -13,11 +13,11 @@ pub struct Foo {
   bar4: VectorUsize<u8>
 }
 
-fn parse_bar2(value: String) -> wtx::Result<u16> {
+fn parse_bar2(value: String) -> rimu_ws::Result<u16> {
     Ok(value.parse()?)
 }
 
-fn parse_bar3(value: String) -> wtx::Result<u32> {
+fn parse_bar3(value: String) -> rimu_ws::Result<u32> {
     Ok(value.parse()?)
 }
 

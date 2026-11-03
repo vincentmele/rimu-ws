@@ -1,10 +1,10 @@
 //! Endpoint with data and parameters
 
-wtx::create_packages_aux_wrapper!();
+rimu_ws::create_packages_aux_wrapper!();
 
 type Api = ();
 
-#[wtx::pkg(data_format(json), id(super::Api), transport(http))]
+#[rimu_ws::pkg(data_format(json), id(super::Api), transport(http))]
 mod pkg {
   #[pkg::aux]
   impl super::PkgsAux<(), (), ()> {}

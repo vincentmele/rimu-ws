@@ -4,10 +4,10 @@
 //! ```
 
 extern crate tokio;
-extern crate wtx;
-extern crate wtx_examples;
+extern crate rimu_ws;
+extern crate rimu_ws_examples;
 
-use wtx::{
+use rimu_ws::{
   codec::{Decode, Encode},
   database::{
     DbClient as _, Record, Typed,
@@ -18,9 +18,9 @@ use wtx::{
 };
 
 #[tokio::main]
-async fn main() -> wtx::Result<()> {
+async fn main() -> rimu_ws::Result<()> {
   let uri = "postgres://USER:PASSWORD@localhost/DATABASE";
-  let mut executor = wtx_examples::postgres_client(uri).await?;
+  let mut executor = rimu_ws_examples::postgres_client(uri).await?;
   executor
     .execute_stmt_none(
       "INSERT INTO custom_composite_table VALUES ($1, $2::custom_composite_type)",
@@ -36,23 +36,23 @@ async fn main() -> wtx::Result<()> {
 #[derive(Debug, PartialEq)]
 struct CustomCompositeType(u32, u64);
 
-impl Decode<'_, Postgres<wtx::Error>> for CustomCompositeType {
+impl Decode<'_, Postgres<rimu_ws::Error>> for CustomCompositeType {
   #[inline]
-  fn decode(dw: &mut PostgresDecodeWrapper<'_, '_>) -> Result<Self, wtx::Error> {
-    let mut sd = StructDecoder::<wtx::Error>::new(dw);
+  fn decode(dw: &mut PostgresDecodeWrapper<'_, '_>) -> Result<Self, rimu_ws::Error> {
+    let mut sd = StructDecoder::<rimu_ws::Error>::new(dw);
     Ok(Self(sd.decode()?, sd.decode()?))
   }
 }
 
-impl Encode<Postgres<wtx::Error>> for CustomCompositeType {
+impl Encode<Postgres<rimu_ws::Error>> for CustomCompositeType {
   #[inline]
-  fn encode(&self, ew: &mut PostgresEncodeWrapper<'_>) -> Result<(), wtx::Error> {
-    let _ev = StructEncoder::<wtx::Error>::new(ew)?.encode(self.0)?.encode(self.1)?;
+  fn encode(&self, ew: &mut PostgresEncodeWrapper<'_>) -> Result<(), rimu_ws::Error> {
+    let _ev = StructEncoder::<rimu_ws::Error>::new(ew)?.encode(self.0)?.encode(self.1)?;
     Ok(())
   }
 }
 
-impl Typed<Postgres<wtx::Error>> for CustomCompositeType {
+impl Typed<Postgres<rimu_ws::Error>> for CustomCompositeType {
   #[inline]
   fn runtime_ty(&self) -> Option<Ty> {
     None

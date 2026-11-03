@@ -1,18 +1,18 @@
 //! Demonstrates different interactions with a PostgreSQL database.
 
 extern crate tokio;
-extern crate wtx;
-extern crate wtx_examples;
+extern crate rimu_ws;
+extern crate rimu_ws_examples;
 
-use wtx::{
+use rimu_ws::{
   database::{DbClient as _, Record, Records},
   misc::into_rslt,
 };
 
 #[tokio::main]
-async fn main() -> wtx::Result<()> {
+async fn main() -> rimu_ws::Result<()> {
   let uri = "postgres://USER:PASSWORD@localhost/DATABASE";
-  let mut executor = wtx_examples::postgres_client(uri).await?;
+  let mut executor = rimu_ws_examples::postgres_client(uri).await?;
   executor
     .transaction(|this| async {
       this.execute_ignored("CREATE TABLE IF NOT EXISTS example(id INT, name VARCHAR)").await?;
@@ -23,7 +23,7 @@ async fn main() -> wtx::Result<()> {
     })
     .await?;
   let records = executor
-    .execute_stmt_many("SELECT id, name FROM example", (), |_| Ok::<_, wtx::Error>(()))
+    .execute_stmt_many("SELECT id, name FROM example", (), |_| Ok::<_, rimu_ws::Error>(()))
     .await?;
   let record0 = into_rslt(records.get(0))?;
   let record1 = into_rslt(records.get(1))?;

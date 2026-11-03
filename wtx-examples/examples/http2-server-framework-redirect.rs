@@ -1,6 +1,6 @@
 //! Different types of redirects.
 
-use wtx::{
+use rimu_ws::{
   executor::TokioExecutor,
   http::{
     StatusCode,
@@ -9,13 +9,13 @@ use wtx::{
   rng::{ChaCha20, CryptoSeedableRng as _},
   tls::TlsConfig,
 };
-use wtx_examples::{PUBLIC_KEY, SECRET_KEY, host_from_args};
+use rimu_ws_examples::{PUBLIC_KEY, SECRET_KEY, host_from_args};
 
-fn main() -> wtx::Result<()> {
+fn main() -> rimu_ws::Result<()> {
   let rng = ChaCha20::from_std_random()?;
   let tls_config = TlsConfig::from_keys_pem(PUBLIC_KEY, SECRET_KEY)?;
   let router =
-    HttpRouter::paths(wtx::paths!(("/permanent", get(permanent)), ("/temporary", get(temporary))))?;
+    HttpRouter::paths(rimu_ws::paths!(("/permanent", get(permanent)), ("/temporary", get(temporary))))?;
   Http2ServerFramework::new(TokioExecutor::default(), rng, tls_config)?
     .set_error_cb(|err| eprintln!("Error: {err}"))
     .run_in_threads(&host_from_args(), router)
@@ -25,6 +25,6 @@ async fn permanent() -> Redirect {
   Redirect::permanent("/some/path")
 }
 
-async fn temporary(StateClean { req, data: _ }: StateClean<'_, ()>) -> wtx::Result<StatusCode> {
+async fn temporary(StateClean { req, data: _ }: StateClean<'_, ()>) -> rimu_ws::Result<StatusCode> {
   Redirect::temporary_raw(&mut req.msg_data.headers, "/another/path")
 }

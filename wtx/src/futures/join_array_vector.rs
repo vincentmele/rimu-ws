@@ -154,7 +154,7 @@ mod tests {
     task::{Context, Poll},
   };
 
-  #[wtx::test]
+  #[rimu_ws::test]
   async fn polls_array_vector() {
     let futures = ArrayVectorU16::<_, 2>::from([One, One]);
     let fut = &mut JoinArrayVector::new(futures);

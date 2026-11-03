@@ -81,12 +81,12 @@ pub fn main(_: proc_macro::TokenStream, item: proc_macro::TokenStream) -> proc_m
 /// Package
 ///
 /// A framework-like attribute placed in inline modules that creates all the mandatory elements
-/// and optional elements related to `wtx::pkg::Package`.
+/// and optional elements related to `rimu_ws::pkg::Package`.
 ///
 /// ```rust
 /// struct SomeApi;
 ///
-/// #[wtx_macros::pkg(data_format(json_rpc("SomeEndpoint")), id(SomeApiId))]
+/// #[rimu_ws_macros::pkg(data_format(json_rpc("SomeEndpoint")), id(SomeApiId))]
 /// mod pkg {
 ///   #[pkg::req_data]
 ///   pub struct SomeEndpointReq<'string> {

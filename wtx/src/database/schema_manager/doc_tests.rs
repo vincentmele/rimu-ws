@@ -6,7 +6,7 @@
 use crate::database::schema_manager::{UserMigrationGroup, UserMigrationRef};
 
 /// ```rust
-/// let _ = wtx::database::schema_manager::UserMigrationRef::from_user_parts(
+/// let _ = rimu_ws::database::schema_manager::UserMigrationRef::from_user_parts(
 ///   &[],
 ///   "create_author",
 ///   None,
@@ -33,7 +33,7 @@ pub fn user_migration() -> UserMigrationRef<'static, 'static> {
 }
 
 /// ```rust
-/// let _ = wtx::database::schema_manager::UserMigrationGroup::new("initial", 1);
+/// let _ = rimu_ws::database::schema_manager::UserMigrationGroup::new("initial", 1);
 /// ```
 #[inline]
 pub const fn user_migration_group() -> UserMigrationGroup<&'static str> {

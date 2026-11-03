@@ -2,7 +2,7 @@
 
 #![no_main]
 
-use wtx::{
+use rimu_ws::{
   codec::{FormUrlDecode, PercentDecode},
   collections::VectorUsize,
 };

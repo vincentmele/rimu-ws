@@ -5,7 +5,7 @@ use std::{
   fs,
   io::BufReader,
 };
-use wtx::{
+use rimu_ws::{
   calendar::{Date, Datetime, IDuration, Time, Utc, parse_bytes_into_tokens},
   codec::{Csv, HexDisplay, HexEncMode},
   collections::{ArrayVectorCopy, HashSet, VectorUsize},
@@ -58,7 +58,7 @@ async fn main() {
     }
     let cert = match Certificate::<&[u8]>::from_pem(&mut pem_buffer, cm.pem_info) {
       Ok(cert) => cert.0,
-      Err(wtx::Error::X509(X509Error::InvalidSerialNumberBytes)) => continue,
+      Err(rimu_ws::Error::X509(X509Error::InvalidSerialNumberBytes)) => continue,
       Err(err) => panic!("{err}"),
     };
     let ta = CvTrustAnchor::from_certificate_ref(&cert).unwrap();

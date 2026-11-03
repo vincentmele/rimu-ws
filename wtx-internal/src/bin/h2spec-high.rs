@@ -4,7 +4,7 @@
 
 use core::mem;
 use tokio::net::TcpListener;
-use wtx::{
+use rimu_ws::{
   collections::VectorUsize,
   http::{HttpRecvParams, Response, StatusCode},
   http2::{Http2, Http2Buffer, Http2ErrorCode, Http2RecvStatus},
@@ -14,7 +14,7 @@ use wtx::{
 };
 
 #[tokio::main]
-async fn main() -> wtx::Result<()> {
+async fn main() -> rimu_ws::Result<()> {
   let listener = TcpListener::bind("127.0.0.1:9000").await?;
   loop {
     let (stream, _) = listener.accept().await?;
@@ -30,7 +30,7 @@ async fn main() -> wtx::Result<()> {
         let _frame_reader_jh = tokio::spawn(frame_reader);
         loop {
           let stream = match http2.stream(|req, _| mem::take(&mut req.msg_data.headers)).await? {
-            None => return wtx::Result::Ok(()),
+            None => return rimu_ws::Result::Ok(()),
             Some(elem) => elem,
           };
           let (mut http2_stream, headers) = stream;
@@ -42,7 +42,7 @@ async fn main() -> wtx::Result<()> {
             let res = Response::new(("Hello", &headers), StatusCode::Ok);
             let _ = http2_stream.send_res(&mut VectorUsize::new(), res).await?;
             http2_stream.common().send_reset(Http2ErrorCode::NoError).await;
-            wtx::Result::Ok(())
+            rimu_ws::Result::Ok(())
           });
         }
       };

@@ -1,6 +1,6 @@
-use wtx::database::client::postgres::Postgres;
+use rimu_ws::database::client::postgres::Postgres;
 
-#[derive(wtx::FromRecords)]
+#[derive(rimu_ws::FromRecords)]
 #[from_records(Postgres<E>, bound = "E: Default", modifier = foo::modifier)]
 pub struct Foo {
   pub a: i32,

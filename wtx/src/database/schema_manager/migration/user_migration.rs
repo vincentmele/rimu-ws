@@ -76,7 +76,7 @@ where
   /// # Example
   ///
   /// ```rust
-  /// use wtx::database::schema_manager::doc_tests::user_migration;
+  /// use rimu_ws::database::schema_manager::doc_tests::user_migration;
   /// assert_eq!(user_migration().checksum(), 9297329847391907999)
   /// ```
   #[inline]
@@ -91,7 +91,7 @@ where
   /// # Example
   ///
   /// ```rust
-  /// use wtx::database::schema_manager::doc_tests::user_migration;
+  /// use rimu_ws::database::schema_manager::doc_tests::user_migration;
   /// assert_eq!(user_migration().dbs(), [])
   /// ```
   #[inline]
@@ -104,7 +104,7 @@ where
   /// # Example
   ///
   /// ```rust
-  /// use wtx::database::schema_manager::doc_tests::user_migration;
+  /// use rimu_ws::database::schema_manager::doc_tests::user_migration;
   /// assert_eq!(user_migration().name(), "create_author")
   /// ```
   #[inline]
@@ -117,7 +117,7 @@ where
   /// # Example
   ///
   /// ```rust
-  /// use wtx::database::schema_manager::doc_tests::user_migration;
+  /// use rimu_ws::database::schema_manager::doc_tests::user_migration;
   /// assert_eq!(user_migration().repeatability(), None)
   /// ```
   #[inline]
@@ -130,7 +130,7 @@ where
   /// # Example
   ///
   /// ```rust
-  /// use wtx::database::schema_manager::doc_tests::user_migration;
+  /// use rimu_ws::database::schema_manager::doc_tests::user_migration;
   /// assert_eq!(user_migration().sql_down(), "DROP TABLE author");
   /// ```
   #[inline]
@@ -143,7 +143,7 @@ where
   /// # Example
   ///
   /// ```rust
-  /// use wtx::database::schema_manager::doc_tests::user_migration;
+  /// use rimu_ws::database::schema_manager::doc_tests::user_migration;
   /// let mg = assert_eq!(
   ///   user_migration().sql_up(),
   ///   "CREATE TABLE author (id INT NOT NULL PRIMARY KEY, name VARCHAR(50) NOT NULL)"
@@ -158,7 +158,7 @@ where
   /// # Example
   ///
   /// ```rust
-  /// use wtx::database::schema_manager::doc_tests::user_migration;
+  /// use rimu_ws::database::schema_manager::doc_tests::user_migration;
   /// assert_eq!(user_migration().uid(), 1)
   /// ```
   #[inline]

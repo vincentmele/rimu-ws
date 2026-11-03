@@ -27,7 +27,7 @@ impl<T> AtomicCell<T> {
   /// Returns inner data.
   ///
   /// ```rust
-  /// let ac = wtx::sync::AtomicCell::new(7);
+  /// let ac = rimu_ws::sync::AtomicCell::new(7);
   /// assert_eq!(ac.into_inner(), 7);
   /// ```
   #[inline]
@@ -42,7 +42,7 @@ impl<T> AtomicCell<T> {
   /// Stores `value` into the atomic cell.
   ///
   /// ```
-  /// let ac = wtx::sync::AtomicCell::new(7);
+  /// let ac = rimu_ws::sync::AtomicCell::new(7);
   /// assert_eq!(ac.load(), 7);
   /// ac.store(8);
   /// assert_eq!(ac.load(), 8);
@@ -64,7 +64,7 @@ impl<T> AtomicCell<T> {
   /// Stores `value` into the atomic cell and returns the previous value.
   ///
   /// ```
-  /// let ac = wtx::sync::AtomicCell::new(7);
+  /// let ac = rimu_ws::sync::AtomicCell::new(7);
   /// assert_eq!(ac.load(), 7);
   /// assert_eq!(ac.swap(8), 7);
   /// assert_eq!(ac.load(), 8);
@@ -89,7 +89,7 @@ where
   /// Loads a value from the atomic cell.
   ///
   /// ```rust
-  /// let ac = wtx::sync::AtomicCell::new(7);
+  /// let ac = rimu_ws::sync::AtomicCell::new(7);
   /// assert_eq!(ac.load(), 7);
   /// ```
   #[inline]
@@ -123,7 +123,7 @@ where
   /// the previous value. On success this value is guaranteed to be equal to `curr`.
   ///
   /// ```
-  /// let num = wtx::sync::AtomicCell::new(1);
+  /// let num = rimu_ws::sync::AtomicCell::new(1);
   /// assert_eq!(num.compare_exchange(2, 3), Err(1));
   /// assert_eq!(num.load(), 1);
   /// assert_eq!(num.compare_exchange(1, 2), Ok(1));
@@ -148,7 +148,7 @@ where
   /// Fetches the value, and applies a function to it that returns a new value.
   ///
   /// ```rust
-  /// let num = wtx::sync::AtomicCell::new(7);
+  /// let num = rimu_ws::sync::AtomicCell::new(7);
   /// assert_eq!(num.update(|local_num| local_num + 1), 7);
   /// assert_eq!(num.load(), 8);
   /// ```
@@ -169,7 +169,7 @@ where
   /// `Err(previous_value)`.
   ///
   /// ```rust
-  /// let num = wtx::sync::AtomicCell::new(7);
+  /// let num = rimu_ws::sync::AtomicCell::new(7);
   /// assert_eq!(num.try_update(|_| None), Err(7));
   /// assert_eq!(num.try_update(|local_num| Some(local_num + 1)), Ok(7));
   /// assert_eq!(num.try_update(|local_num| Some(local_num + 1)), Ok(8));

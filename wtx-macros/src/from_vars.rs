@@ -54,7 +54,7 @@ pub(crate) fn from_vars(item: proc_macro::TokenStream) -> crate::Result<proc_mac
         quote::quote! { #name: #var }
       } else {
         quote::quote! {
-          #name: #var.ok_or_else(|| wtx::Error::MissingVar(wtx::collections::ShortStrU8::new_truncated_u8(#name_str)))?
+          #name: #var.ok_or_else(|| rimu_ws::Error::MissingVar(rimu_ws::collections::ShortStrU8::new_truncated_u8(#name_str)))?
         }
       }
     });
@@ -66,8 +66,8 @@ pub(crate) fn from_vars(item: proc_macro::TokenStream) -> crate::Result<proc_mac
   };
 
   let expanded = quote::quote! {
-    impl wtx::misc::FromVars for #struct_name {
-      fn from_vars(vars: impl IntoIterator<Item = (#string_path String, #string_path String)>) -> wtx::Result<Self> {
+    impl rimu_ws::misc::FromVars for #struct_name {
+      fn from_vars(vars: impl IntoIterator<Item = (#string_path String, #string_path String)>) -> rimu_ws::Result<Self> {
         #(#var_declarations)*
         for (key, value) in vars {
           match key.as_str() {

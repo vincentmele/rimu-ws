@@ -62,8 +62,8 @@ impl<TP> SendingTransport<TP> for () {
 /// Does absolutely nothing. Good for demonstration purposes.
 ///
 /// ```rust,no_run
-/// # async fn fun() -> wtx::Result<()> {
-/// use wtx::client_api_framework::{network::transport::SendingReceivingTransport, pkg::PkgsAux};
+/// # async fn fun() -> rimu_ws::Result<()> {
+/// use rimu_ws::client_api_framework::{network::transport::SendingReceivingTransport, pkg::PkgsAux};
 /// let _ =
 ///   ().send_req_recv_res_pkg_decoded(&mut (), &mut PkgsAux::from_minimum((), (), ())).await?;
 /// # Ok(()) }

@@ -102,7 +102,7 @@ impl<'module, 'others>
     let data_builder_ident = &create_ident(camel_case_id, ["DataBuilder"]);
     let data_format_builder_ident = &create_ident(camel_case_id, ["DataFormatBuilder"]);
     let fn_stmts = quote::quote!({
-      use wtx::client_api_framework::network::transport::TransportParams;
+      use rimu_ws::client_api_framework::network::transport::TransportParams;
       self.bytes_buffer.clear();
       self.encode_data = true;
       self.tp.reset();

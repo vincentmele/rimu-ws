@@ -2,7 +2,7 @@
 
 #![cfg(feature = "database")]
 
-use wtx::{
+use rimu_ws::{
   collections::VectorU8,
   database::{
     DbClient, FromRecords,
@@ -12,9 +12,9 @@ use wtx::{
 
 // 1 2 | 1 1 2
 // 1 2 | 2 3 4
-#[wtx::test]
+#[rimu_ws::test]
 async fn from_records_basic_nested() {
-  #[derive(Debug, PartialEq, wtx::FromRecords)]
+  #[derive(Debug, PartialEq, rimu_ws::FromRecords)]
   #[from_records(MockDb)]
   struct Group {
     #[from_records(id)]
@@ -25,7 +25,7 @@ async fn from_records_basic_nested() {
     field1: VectorU8<Single>,
   }
 
-  #[derive(Debug, PartialEq, wtx::FromRecords)]
+  #[derive(Debug, PartialEq, rimu_ws::FromRecords)]
   #[from_records(MockDb)]
   struct Single {
     #[from_records(id)]
@@ -69,7 +69,7 @@ async fn from_records_basic_nested() {
     }
   );
   assert_eq!(
-    Group::many(&records).collect::<Result<Vec<_>, wtx::Error>>().unwrap(),
+    Group::many(&records).collect::<Result<Vec<_>, rimu_ws::Error>>().unwrap(),
     vec![Group {
       id: 1,
       field0: 2,
@@ -84,9 +84,9 @@ async fn from_records_basic_nested() {
 
 // 1 2 | 1 1 2
 // 1
-#[wtx::test]
-async fn from_records_no_progress_error() -> wtx::Result<()> {
-  #[derive(Debug, PartialEq, wtx::FromRecords)]
+#[rimu_ws::test]
+async fn from_records_no_progress_error() -> rimu_ws::Result<()> {
+  #[derive(Debug, PartialEq, rimu_ws::FromRecords)]
   #[from_records(MockDb)]
   struct Group {
     #[from_records(id)]
@@ -97,7 +97,7 @@ async fn from_records_no_progress_error() -> wtx::Result<()> {
     field1: VectorU8<Single>,
   }
 
-  #[derive(Debug, PartialEq, wtx::FromRecords)]
+  #[derive(Debug, PartialEq, rimu_ws::FromRecords)]
   #[from_records(MockDb)]
   struct Single {
     #[from_records(id)]
@@ -133,8 +133,8 @@ async fn from_records_no_progress_error() -> wtx::Result<()> {
     }
   );
   assert!(matches!(
-    Group::many(&records).collect::<Result<Vec<_>, wtx::Error>>(),
-    Err(wtx::Error::TryFromSlice(_))
+    Group::many(&records).collect::<Result<Vec<_>, rimu_ws::Error>>(),
+    Err(rimu_ws::Error::TryFromSlice(_))
   ));
   Ok(())
 }

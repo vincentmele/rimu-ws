@@ -3,7 +3,7 @@
 
 #![expect(clippy::print_stderr, reason = "internal")]
 
-use wtx::{
+use rimu_ws::{
   collections::VectorUsize,
   executor::{UringExecutor, UringParams, UringRuntime, UringTcpStream},
   http::WebSocketServerFramework,
@@ -15,18 +15,18 @@ use wtx::{
   },
 };
 
-fn main() -> wtx::Result<()> {
+fn main() -> rimu_ws::Result<()> {
   let direct = std::env::var("WTX_DIRECT").ok().and_then(|el| el.parse().ok()).unwrap_or(0);
   WebSocketServerFramework::<
     (),
-    fn(wtx::Error),
+    fn(rimu_ws::Error),
     UringExecutor,
-    fn() -> wtx::Result<UringRuntime>,
+    fn() -> rimu_ws::Result<UringRuntime>,
     ChaCha20,
     PlaintextCtx,
   >::new(UringExecutor::default(), ChaCha20::from_std_random()?, TlsConfig::plaintext())?
   .set_compression(ZlibRs::default())
-  .set_error_cb(|error: wtx::Error| eprintln!("{error}"))
+  .set_error_cb(|error: rimu_ws::Error| eprintln!("{error}"))
   .set_local_runtime_cb(move || {
     UringRuntime::with_params(UringParams::new().set_direct_files(direct))
   })
@@ -36,7 +36,7 @@ fn main() -> wtx::Result<()> {
 async fn echo(
   mut buffer: VectorUsize<u8>,
   mut ws: WebSocket<Option<NegotiatedZlibRs>, UringTcpStream, PlaintextCtx, false>,
-) -> wtx::Result<()> {
+) -> rimu_ws::Result<()> {
   let (mut common, mut reader, mut writer) = ws.split_mut();
   let origin = WebSocketPayloadOrigin::Adaptive;
   loop {

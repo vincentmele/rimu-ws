@@ -1,9 +1,9 @@
 //! The TLS feature allows the creation of custom signers.
 
 extern crate tokio;
-extern crate wtx;
+extern crate rimu_ws;
 
-use wtx::{
+use rimu_ws::{
   collections::ShortBoxSliceU16,
   rng::CryptoRng,
   secret::SecretSlice,
@@ -11,7 +11,7 @@ use wtx::{
 };
 
 #[tokio::main]
-async fn main() -> wtx::Result<()> {
+async fn main() -> rimu_ws::Result<()> {
   // Secure connection with an encrypted secret key
   let _enc_sk = TlsConfig::from_keys_der([], SecretSlice::new(&mut [][..])?)?;
   // Unencrypted connection
@@ -37,7 +37,7 @@ impl TlsCtx for TopSecretSuperSecureSigner {
 impl TlsCtxSk for TopSecretSuperSecureSigner {
   type Signature = [u8; 0];
 
-  fn sign<RNG>(&self, _: &[u8], _: &mut RNG, _: SignatureScheme) -> wtx::Result<Self::Signature>
+  fn sign<RNG>(&self, _: &[u8], _: &mut RNG, _: SignatureScheme) -> rimu_ws::Result<Self::Signature>
   where
     RNG: CryptoRng,
   {

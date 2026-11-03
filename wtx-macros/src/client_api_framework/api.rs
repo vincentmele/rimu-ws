@@ -51,14 +51,14 @@ pub(crate) fn api(
     #[doc = concat!("Identifier of the `", stringify!(#api_ident), "` API")]
     pub struct #id_ident;
 
-    impl wtx::client_api_framework::ApiId for #id_ident {
+    impl rimu_ws::client_api_framework::ApiId for #id_ident {
       type Api<__ApiParams> = #api_ident<#api_id_gat_ty>;
     }
   );
 
   let api_impl = if let mode::Mode::Auto = ty {
     Some(quote::quote_spanned!(api_ident.span() =>
-      impl<#api_params> wtx::client_api_framework::Api for #api_ident<#api_params> {
+      impl<#api_params> rimu_ws::client_api_framework::Api for #api_ident<#api_params> {
         type Error = #error;
         type Id = #id_ident;
       }
@@ -71,8 +71,8 @@ pub(crate) fn api(
   let generic_pair_ident = create_ident(&mut buffer, ["Pair"]);
   let generic_pair_tt = quote::quote_spanned!(api_ident.span() =>
     #[allow(unused_qualifications)]
-    #[doc = concat!("[`wtx::client_api_framework::misc::Pair`] with [`", stringify!(#api_ident), "`] as the API.")]
-    pub type #generic_pair_ident<DRSR, T, TP, #api_params> = wtx::client_api_framework::misc::Pair<
+    #[doc = concat!("[`rimu_ws::client_api_framework::misc::Pair`] with [`", stringify!(#api_ident), "`] as the API.")]
+    pub type #generic_pair_ident<DRSR, T, TP, #api_params> = rimu_ws::client_api_framework::misc::Pair<
       #pkgs_aux_path<#api_ident<#api_params>, DRSR, TP>,
       T
     >;
@@ -114,29 +114,29 @@ pub(crate) fn api(
       #[doc = concat!(
         "[`", stringify!(#pkgs_aux_path), "`] with an owned [`",
         stringify!(#api_ident),
-        "`] as the API and [`wtx::client_api_framework::network::",
+        "`] as the API and [`rimu_ws::client_api_framework::network::",
         stringify!(#local_tp_ident),
         "`] as the transport parameter."
       )]
-      pub type #local_ty_ident_api_tp<DRSR, #api_params> = #pkgs_aux_path<#api_ident<#api_params>, DRSR, wtx::client_api_framework::network::#local_tp_ident>;
+      pub type #local_ty_ident_api_tp<DRSR, #api_params> = #pkgs_aux_path<#api_ident<#api_params>, DRSR, rimu_ws::client_api_framework::network::#local_tp_ident>;
 
       #[allow(unused_qualifications)]
       #[doc = concat!(
         "[`", stringify!(#pkgs_aux_path), "`] with a mutable reference of [`",
         stringify!(#api_ident),
-        "`] as the API and [`wtx::client_api_framework::network::",
+        "`] as the API and [`rimu_ws::client_api_framework::network::",
         stringify!(#local_tp_ident),
         "`] as the transport parameter."
       )]
-      pub type #local_ty_ident_api_mut_tp<'api, DRSR, #api_params> = #pkgs_aux_path<&'api mut #api_ident<#api_params>, DRSR, wtx::client_api_framework::network::#local_tp_ident>;
+      pub type #local_ty_ident_api_mut_tp<'api, DRSR, #api_params> = #pkgs_aux_path<&'api mut #api_ident<#api_params>, DRSR, rimu_ws::client_api_framework::network::#local_tp_ident>;
 
       #[allow(unused_qualifications)]
       #[doc = concat!(
-        "[`", stringify!(#pkgs_aux_path), "`] with [`wtx::client_api_framework::network::",
+        "[`", stringify!(#pkgs_aux_path), "`] with [`rimu_ws::client_api_framework::network::",
         stringify!(#local_tp_ident),
         "`] as the transport parameter."
       )]
-      pub type #local_ty_ident_tp<A, DRSR> = #pkgs_aux_path<A, DRSR, wtx::client_api_framework::network::#local_tp_ident>;
+      pub type #local_ty_ident_tp<A, DRSR> = #pkgs_aux_path<A, DRSR, rimu_ws::client_api_framework::network::#local_tp_ident>;
     ));
   }
 
@@ -144,21 +144,21 @@ pub(crate) fn api(
 
   Ok(
     quote::quote!(
-      impl<#api_params> wtx::misc::Lease<#api_ident<#api_params>> for #api_ident<#api_params> {
+      impl<#api_params> rimu_ws::misc::Lease<#api_ident<#api_params>> for #api_ident<#api_params> {
         #[inline]
         fn lease(&self) -> &#api_ident<#api_params> {
           self
         }
       }
 
-      impl<#api_params> wtx::misc::LeaseMut<#api_ident<#api_params>> for #api_ident<#api_params> {
+      impl<#api_params> rimu_ws::misc::LeaseMut<#api_ident<#api_params>> for #api_ident<#api_params> {
         #[inline]
         fn lease_mut(&mut self) -> &mut #api_ident<#api_params> {
           self
         }
       }
 
-      impl<#api_params> wtx::collections::SingleTypeStorage for #api_ident<#api_params> {
+      impl<#api_params> rimu_ws::collections::SingleTypeStorage for #api_ident<#api_params> {
         type Item = #sts_ty;
       }
 

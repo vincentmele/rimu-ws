@@ -1,9 +1,9 @@
 //! TLS client that makes a HTTP/1.1 request.
 
 extern crate tokio;
-extern crate wtx;
+extern crate rimu_ws;
 
-use wtx::{
+use rimu_ws::{
   misc::process_utf8_stream,
   net::{StreamReader, StreamWriter, Uri},
   rng::{ChaCha20, CryptoSeedableRng as _},
@@ -11,7 +11,7 @@ use wtx::{
 };
 
 #[tokio::main]
-async fn main() -> wtx::Result<()> {
+async fn main() -> rimu_ws::Result<()> {
   let domain = Uri::new("github.com:443");
   let tls_connector = TlsConnectorBuilder::tokio(domain)
     .build(TlsConfig::from_ccadb()?, ChaCha20::from_std_random()?)

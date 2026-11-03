@@ -1,12 +1,12 @@
 //! lifetime in responses
 
-wtx::create_packages_aux_wrapper!();
+rimu_ws::create_packages_aux_wrapper!();
 
 type Api = ();
 
-#[wtx::pkg(data_format(json), id(super::Api), transport(http))]
+#[rimu_ws::pkg(data_format(json), id(super::Api), transport(http))]
 mod pkg {
-  use wtx::client_api_framework::network::transport::TransportParams;
+  use rimu_ws::client_api_framework::network::transport::TransportParams;
 
   #[pkg::aux]
   impl<A, DRSR, TP> super::PkgsAux<A, DRSR, TP>
@@ -17,7 +17,7 @@ mod pkg {
   #[pkg::before_sending]
   async fn before_sending<I>(
     params: &mut FooParams<I>,
-  ) -> wtx::Result<()>
+  ) -> rimu_ws::Result<()>
   where
     I: Iterator<Item = u64>,
   {
@@ -38,7 +38,7 @@ mod pkg {
 }
 
 fn main() {
-  use wtx::{
+  use rimu_ws::{
     client_api_framework::misc::Pair,
     client_api_framework::network::{HttpParams, transport::SendingReceivingTransport},
     codec::format::SerdeJson,

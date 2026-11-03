@@ -7,9 +7,9 @@
 //! Everything that is not inside `main` should be constructed only once in your program.
 
 extern crate serde;
-extern crate wtx;
+extern crate rimu_ws;
 
-use wtx::{
+use rimu_ws::{
   client_api_framework::{
     Api,
     misc::{Pair, RequestCounter, RequestLimit},
@@ -25,16 +25,16 @@ use wtx::{
 use core::time::Duration;
 use std::net::TcpStream;
 
-wtx::create_packages_aux_wrapper!();
+rimu_ws::create_packages_aux_wrapper!();
 
 #[derive(Debug)]
-#[wtx::api(error(wtx::Error), pkgs_aux(PkgsAux), transport(http, ws))]
+#[rimu_ws::api(error(rimu_ws::Error), pkgs_aux(PkgsAux), transport(http, ws))]
 pub struct GenericThrottlingApi {
   pub rc: RequestCounter,
 }
 
 impl Api for GenericThrottlingApi {
-  type Error = wtx::Error;
+  type Error = rimu_ws::Error;
   type Id = GenericThrottlingApiId;
 
   async fn before_sending(&mut self) -> Result<(), Self::Error> {
@@ -43,7 +43,7 @@ impl Api for GenericThrottlingApi {
   }
 }
 
-#[wtx::pkg(
+#[rimu_ws::pkg(
   data_format(json_rpc("genericHttpRequest")),
   id(crate::GenericThrottlingApiId),
   transport(http)
@@ -60,7 +60,7 @@ mod generic_http_request {
   pub type GenericHttpRequestRes = (u8, u16, u32);
 }
 
-#[wtx::pkg(
+#[rimu_ws::pkg(
   data_format(json_rpc("genericWebSocketSubscription")),
   id(crate::GenericThrottlingApiId),
   transport(ws)
@@ -97,7 +97,7 @@ async fn http_pair() -> Pair<
   )
 }
 
-async fn web_socket_pair() -> wtx::Result<
+async fn web_socket_pair() -> rimu_ws::Result<
   Pair<
     PkgsAux<GenericThrottlingApi, SerdeJson, WsParams>,
     WebSocket<(), TcpStream, WebSocketBuffer, true>,
@@ -119,8 +119,8 @@ async fn web_socket_pair() -> wtx::Result<
   ))
 }
 
-#[wtx::main]
-async fn main() -> wtx::Result<()> {
+#[rimu_ws::main]
+async fn main() -> rimu_ws::Result<()> {
   let mut hp = http_pair().await;
   let _http_response_tuple = hp
     .trans

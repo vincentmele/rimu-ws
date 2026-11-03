@@ -1,6 +1,6 @@
 use clap::Parser as _;
 
-pub(crate) async fn init() -> wtx::Result<()> {
+pub(crate) async fn init() -> rimu_ws::Result<()> {
   let _args = Cli::parse();
 
   #[cfg(feature = "unified")]
@@ -105,7 +105,7 @@ enum Commands {
 #[derive(Debug, clap::Args)]
 pub(crate) struct EmbedMigrations {
   /// Configuration file path
-  #[arg(default_value_t = wtx::database::schema_manager::DEFAULT_CFG_FILE_NAME.into(), short = 'i', value_name = "Path")]
+  #[arg(default_value_t = rimu_ws::database::schema_manager::DEFAULT_CFG_FILE_NAME.into(), short = 'i', value_name = "Path")]
   pub(crate) input: String,
   /// Rust file path
   #[arg(default_value = "embedded_migrations.rs", short = 'o', value_name = "Path")]
@@ -126,7 +126,7 @@ pub(crate) struct HttpClient {
 
   /// Specify request command to use
   #[arg(default_value = "GET", long, short = 'X')]
-  pub(crate) method: wtx::http::Method,
+  pub(crate) method: rimu_ws::http::Method,
 
   /// Write to file instead of stdout
   #[arg(long, short)]
@@ -157,7 +157,7 @@ pub(crate) struct SchemaManager {
 
   /// Number of files (migrations or seeds) that is going to be sent to the database in a
   /// single transaction.
-  #[arg(default_value_t = wtx::database::schema_manager::DEFAULT_BATCH_SIZE, short = 'f')]
+  #[arg(default_value_t = rimu_ws::database::schema_manager::DEFAULT_BATCH_SIZE, short = 'f')]
   pub(crate) files_num: usize,
 
   /// Seeds directory. If not specified, defaults to the optional directory specified in the
@@ -168,7 +168,7 @@ pub(crate) struct SchemaManager {
   pub(crate) seeds: Option<std::path::PathBuf>,
 
   /// Environment variable name that contains the database URI.
-  #[arg(default_value_t = wtx::database::DEFAULT_URI_VAR.into(), short = 'v')]
+  #[arg(default_value_t = rimu_ws::database::DEFAULT_URI_VAR.into(), short = 'v')]
   pub(crate) var: String,
 }
 
@@ -206,7 +206,7 @@ struct WebSocket {
 }
 
 #[cfg(feature = "web-socket")]
-async fn manage_web_socket(elem: WebSocket) -> wtx::Result<()> {
+async fn manage_web_socket(elem: WebSocket) -> rimu_ws::Result<()> {
   match (elem.connect, elem.serve) {
     (None, None) | (Some(_), Some(_)) => {
       panic!("Please connect to a server using `-c` or listen to requests using `-s`");

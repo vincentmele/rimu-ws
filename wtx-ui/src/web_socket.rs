@@ -2,7 +2,7 @@ use tokio::{
   io::{AsyncBufReadExt as _, BufReader},
   net::TcpListener,
 };
-use wtx::{
+use rimu_ws::{
   collections::VectorUsize,
   net::UriRef,
   rng::{ChaCha20, CryptoSeedableRng as _},
@@ -10,7 +10,7 @@ use wtx::{
   web_socket::{Frame, OpCode, WebSocketAcceptor, WebSocketConnector, WebSocketPayloadOrigin},
 };
 
-pub(crate) async fn connect(uri: &str, cb: impl Fn(&str)) -> wtx::Result<()> {
+pub(crate) async fn connect(uri: &str, cb: impl Fn(&str)) -> rimu_ws::Result<()> {
   let uri_ref = UriRef::new(uri);
   let mut ws = WebSocketConnector::default()
     .connect(
@@ -44,9 +44,9 @@ pub(crate) async fn connect(uri: &str, cb: impl Fn(&str)) -> wtx::Result<()> {
 pub(crate) async fn serve(
   uri: &str,
   binary: fn(&[u8]),
-  error: fn(wtx::Error),
+  error: fn(rimu_ws::Error),
   str: fn(&str),
-) -> wtx::Result<()> {
+) -> rimu_ws::Result<()> {
   let uri_ref = UriRef::new(uri);
   let listener = TcpListener::bind(uri_ref.hostname_with_implied_port()).await?;
   loop {
@@ -66,7 +66,7 @@ pub(crate) async fn serve(
             _ => {}
           }
         }
-        wtx::Result::Ok(())
+        rimu_ws::Result::Ok(())
       };
       if let Err(err) = fun.await {
         error(err);

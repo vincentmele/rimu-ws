@@ -1,4 +1,4 @@
-//! The DB isolation provided by `#[wtx::db]` allows the concurrent execution of identical queries
+//! The DB isolation provided by `#[rimu_ws::db]` allows the concurrent execution of identical queries
 //! without causing conflicts.
 //!
 //! The `dir` parameter is optional.
@@ -8,24 +8,24 @@ fn main() {}
 #[cfg(test)]
 mod tests {
   use tokio::net::TcpStream;
-  use wtx::{
+  use rimu_ws::{
     database::{DbClient, Record, client::postgres::PostgresClient},
     tls::PlaintextCtx,
   };
 
-  type LocalPostgresClient = PostgresClient<wtx::Error, TcpStream, PlaintextCtx>;
+  type LocalPostgresClient = PostgresClient<rimu_ws::Error, TcpStream, PlaintextCtx>;
 
-  #[wtx::db(dir("../.test-utils"))]
+  #[rimu_ws::db(dir("../.test-utils"))]
   async fn first_test(client: LocalPostgresClient) {
     common(client).await;
   }
 
-  #[wtx::db(dir("../.test-utils"))]
+  #[rimu_ws::db(dir("../.test-utils"))]
   async fn second_test(client: LocalPostgresClient) {
     common(client).await;
   }
 
-  #[wtx::db(dir("../.test-utils"))]
+  #[rimu_ws::db(dir("../.test-utils"))]
   async fn third_test(client: LocalPostgresClient) {
     common(client).await;
   }

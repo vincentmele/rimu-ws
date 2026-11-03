@@ -4,19 +4,19 @@
 
 # WTX
 
-$rt test-with-features wtx serde
-$rt test-with-features wtx serde_json
-$rt test-with-features wtx sha3
-$rt test-with-features wtx simdutf8
-$rt test-with-features wtx std
-$rt test-with-features wtx tokio
-$rt test-with-features wtx tracing
-$rt test-with-features wtx tracing-subscriber
-$rt test-with-features wtx tracing-tree
-$rt test-with-features wtx uuid
-$rt test-with-features wtx web-socket,crypto-ring
-$rt test-with-features wtx wtx-macros
-$rt test-with-features wtx x509
+$rt test-with-features rimu-ws serde
+$rt test-with-features rimu-ws serde_json
+$rt test-with-features rimu-ws sha3
+$rt test-with-features rimu-ws simdutf8
+$rt test-with-features rimu-ws std
+$rt test-with-features rimu-ws tokio
+$rt test-with-features rimu-ws tracing
+$rt test-with-features rimu-ws tracing-subscriber
+$rt test-with-features rimu-ws tracing-tree
+$rt test-with-features rimu-ws uuid
+$rt test-with-features rimu-ws web-socket,crypto-ring
+$rt test-with-features rimu-ws rimu-ws-macros
+$rt test-with-features rimu-ws x509
 
 # WTX Macros
 
@@ -24,9 +24,9 @@ $rt test-generic wtx-macros
 
 # WTX UI
 
-$rt check-generic wtx-ui
-$rt test-with-features wtx-ui embed-migrations
-$rt test-with-features wtx-ui schema-manager
-$rt test-with-features wtx-ui schema-manager-dev
-$rt test-with-features wtx-ui http-client
-$rt test-with-features wtx-ui web-socket
+$rt check-generic rimu-ws-ui
+$rt test-with-features rimu-ws-ui embed-migrations
+$rt test-with-features rimu-ws-ui schema-manager
+$rt test-with-features rimu-ws-ui schema-manager-dev
+$rt test-with-features rimu-ws-ui http-client
+$rt test-with-features rimu-ws-ui web-socket

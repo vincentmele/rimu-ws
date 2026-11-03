@@ -7,7 +7,7 @@
 
 extern crate alloc;
 #[cfg(test)]
-extern crate self as wtx;
+extern crate self as rimu_ws;
 #[cfg(feature = "std")]
 extern crate std;
 #[allow(unused_extern_crates, reason = "selection of features")]
@@ -63,7 +63,7 @@ pub mod x509;
 
 pub use error::{Error, RecvError, SendError};
 #[cfg(feature = "macros")]
-pub use wtx_macros::*;
+pub use rimu_ws_macros::*;
 
 #[cfg(any(feature = "http2", feature = "tls"))]
 const AFTER_CLOSE_TIMEOUT_MS: u64 = 50;

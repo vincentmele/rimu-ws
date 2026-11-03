@@ -1,9 +1,9 @@
 //! Fetches an URI using low-level HTTP/2 resources.
 
 extern crate tokio;
-extern crate wtx;
+extern crate rimu_ws;
 
-use wtx::{
+use rimu_ws::{
   collections::VectorUsize,
   http::{HttpClient, HttpRecvParams, ReqBuilder},
   http2::{Http2, Http2Buffer, Http2ErrorCode},
@@ -14,7 +14,7 @@ use wtx::{
 };
 
 #[tokio::main]
-async fn main() -> wtx::Result<()> {
+async fn main() -> rimu_ws::Result<()> {
   let uri = Uri::new("https://github.com/c410-f3r/wtx");
   let mut rng = ChaCha20::from_std_random()?;
   let hb = Http2Buffer::new(&mut rng);

@@ -4,5 +4,5 @@
 #![no_main]
 
 libfuzzer_sys::fuzz_target!(|data: &[u8]| {
-  wtx::web_socket::differential::check_bytes(data);
+  rimu_ws::web_socket::differential::check_bytes(data);
 });

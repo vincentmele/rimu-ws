@@ -1,4 +1,4 @@
-use wtx::codec::FromRadix10;
+use rimu_ws::codec::FromRadix10;
 
 const DECIMALS: &[&str] = &[
   "-0.",

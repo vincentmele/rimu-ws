@@ -113,7 +113,7 @@ use crate::boringssl_options::{OptionsIter, cert_pem_from_pem_file};
 use boringssl_options::Options;
 use std::{env, time::Duration};
 use tokio::net::TcpStream;
-use wtx::{
+use rimu_ws::{
   collections::VectorUsize,
   net::{Stream, StreamReader, StreamWriter as _, Uri},
   rng::{ChaCha20, CryptoSeedableRng as _},
@@ -133,7 +133,7 @@ async fn main() {
       break;
     }
   }
-  wtx::misc::tracing_tree_init(None).unwrap();
+  rimu_ws::misc::tracing_tree_init(None).unwrap();
   let mut options = Options::default();
   for _ in OptionsIter::new(env::args().skip(1), &mut options) {}
   if options.is_client {
@@ -200,7 +200,7 @@ async fn exec_tests<TCX, const IS_CLIENT: bool>(
       };
       fut.await
     };
-    wtx::futures::Sleep::new(Duration::from_millis(200)).unwrap().await.unwrap();
+    rimu_ws::futures::Sleep::new(Duration::from_millis(200)).unwrap().await.unwrap();
     boringssl_handle_err::handle_err(&options, rslt);
   }
 }
@@ -210,7 +210,7 @@ async fn manage_after_handshake<const IS_CLIENT: bool, TCX>(
   options: &Options,
   mut _sent_message: bool,
   mut tls_stream: TlsStream<TcpStream, TCX, IS_CLIENT>,
-) -> wtx::Result<()>
+) -> rimu_ws::Result<()>
 where
   TCX: TlsCtx + Send + 'static,
 {
@@ -225,7 +225,7 @@ where
           break;
         }
       }
-      wtx::Result::Ok(())
+      rimu_ws::Result::Ok(())
     });
     let traffic_secrets_vec = (
       reader.export_traffic_secret().to_vec(),

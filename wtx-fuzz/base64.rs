@@ -2,7 +2,7 @@
 
 #![no_main]
 
-use wtx::codec::{
+use rimu_ws::codec::{
   Base64Alphabet, base64_decode, base64_decoded_len_ub, base64_encode, base64_encoded_len,
 };
 

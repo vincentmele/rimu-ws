@@ -3,7 +3,7 @@
 #![no_main]
 
 use core::str;
-use wtx::{
+use rimu_ws::{
   collections::VectorUsize,
   http::{HeaderName, KnownHeaderName, Method, Protocol, Version, cookie::CookieStr},
 };

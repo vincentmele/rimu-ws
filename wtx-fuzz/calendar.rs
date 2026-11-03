@@ -2,7 +2,7 @@
 
 #![no_main]
 
-use wtx::calendar::{Date, Datetime, Time, Utc};
+use rimu_ws::calendar::{Date, Datetime, Time, Utc};
 
 libfuzzer_sys::fuzz_target!(|data: (&[u8], &[u8])| {
   let (value, fmt) = data;

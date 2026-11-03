@@ -2,23 +2,23 @@
 //! module.
 
 extern crate tokio;
-extern crate wtx;
-extern crate wtx_examples;
+extern crate rimu_ws;
+extern crate rimu_ws_examples;
 
 use std::borrow::Cow;
-use wtx::{
+use rimu_ws::{
   codec::format::QuickProtobuf,
   grpc::GrpcClient,
   http::{MsgBufferStr, http2_client_pool::Http2ClientPoolBuilder},
   tls::TlsConfig,
 };
-use wtx_examples::{
+use rimu_ws_examples::{
   ROOT_CA,
-  grpc_bindings::wtx::{GenericRequest, GenericResponse},
+  grpc_bindings::rimu_ws::{GenericRequest, GenericResponse},
 };
 
 #[tokio::main]
-async fn main() -> wtx::Result<()> {
+async fn main() -> rimu_ws::Result<()> {
   let uri = "https://127.0.0.1:9000/wtx.GenericService/generic_method";
   let mut client = GrpcClient::new(
     Http2ClientPoolBuilder::tokio(1, TlsConfig::from_trust_anchors_pem([ROOT_CA])?)?.build(),

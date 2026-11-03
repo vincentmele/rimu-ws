@@ -1,4 +1,4 @@
-#[wtx::pkg(data_format(json), id(FooId))]
+#[rimu_ws::pkg(data_format(json), id(FooId))]
 mod pkg {
   #[pkg::req_data]
   fn foo() {}
@@ -7,7 +7,7 @@ mod pkg {
   struct Res;
 }
 
-#[wtx::pkg(data_format(json), id(FooId))]
+#[rimu_ws::pkg(data_format(json), id(FooId))]
 mod pkg {
   #[pkg::req_data]
   struct Req;
@@ -16,7 +16,7 @@ mod pkg {
   fn foo() {}
 }
 
-#[wtx::pkg(data_format(json), id(FooId))]
+#[rimu_ws::pkg(data_format(json), id(FooId))]
 mod pkg {
   #[pkg::params]
   fn foo() {}

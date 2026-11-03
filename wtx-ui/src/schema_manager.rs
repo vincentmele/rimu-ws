@@ -1,7 +1,7 @@
 use crate::clap::{SchemaManager, SchemaManagerCommands};
 use alloc::borrow::Cow;
 use std::{env::current_dir, path::Path};
-use wtx::{
+use rimu_ws::{
   codec::CodecController,
   collections::VectorUsize,
   database::{
@@ -17,10 +17,10 @@ use wtx::{
   tls::{TlsConfig, TlsConnectorBuilder},
 };
 
-pub(crate) async fn schema_manager(sm: SchemaManager) -> wtx::Result<()> {
+pub(crate) async fn schema_manager(sm: SchemaManager) -> rimu_ws::Result<()> {
   #[cfg(feature = "schema-manager-dev")]
   let var = {
-    wtx::misc::tracing_tree_init(None)?;
+    rimu_ws::misc::tracing_tree_init(None)?;
     EnvVars::<DatabaseUriFromVars>::from_available([])?.finish().wtx_database_uri
   };
   #[cfg(not(feature = "schema-manager-dev"))]
@@ -32,7 +32,7 @@ pub(crate) async fn schema_manager(sm: SchemaManager) -> wtx::Result<()> {
       let mut tls_connector = TlsConnectorBuilder::tokio(uri)
         .build(TlsConfig::plaintext(), ChaCha20::from_std_random()?)
         .await?;
-      let executor = PostgresClient::<wtx::Error, _, _>::connect(
+      let executor = PostgresClient::<rimu_ws::Error, _, _>::connect(
         ClientBuffer::new(usize::MAX, tls_connector.rng_mut()),
         &Config::from_uri(&uri)?,
         tls_connector,
@@ -40,12 +40,12 @@ pub(crate) async fn schema_manager(sm: SchemaManager) -> wtx::Result<()> {
       .await?;
       handle_commands(executor, &sm).await?;
     }
-    _ => return Err(wtx::Error::InvalidUri),
+    _ => return Err(rimu_ws::Error::InvalidUri),
   }
   Ok(())
 }
 
-fn toml_file_path(sm: &SchemaManager) -> wtx::Result<Cow<'_, Path>> {
+fn toml_file_path(sm: &SchemaManager) -> rimu_ws::Result<Cow<'_, Path>> {
   Ok(if let Some(el) = sm.toml.as_deref() {
     Cow::Borrowed(el)
   } else {
@@ -75,7 +75,7 @@ where
       let (Some("_wtx"), None) = (iter.next().as_deref(), iter.next()) else {
         eprintln!("{_buffer_idents:?}");
         return Err(
-          wtx::Error::GenericStatic(
+          rimu_ws::Error::GenericStatic(
             "The rollback operation didn't leave the database in a clean state".try_into()?,
           )
           .into(),
@@ -91,7 +91,7 @@ where
     }
     #[cfg(feature = "schema-manager-dev")]
     SchemaManagerCommands::MigrateAndSeed {} => {
-      use wtx::database::schema_manager::misc::parse_root_toml;
+      use rimu_ws::database::schema_manager::misc::parse_root_toml;
       let (migration_groups, seeds) = parse_root_toml(&toml_file_path(sm)?)?;
       commands.migrate_from_groups_paths(&migration_groups).await?;
       commands.seed_from_dir(seeds_file_path(sm, seeds.as_deref())).await?;
@@ -101,7 +101,7 @@ where
     }
     #[cfg(feature = "schema-manager-dev")]
     SchemaManagerCommands::Seed {} => {
-      use wtx::database::schema_manager::misc::parse_root_toml;
+      use rimu_ws::database::schema_manager::misc::parse_root_toml;
       let (_, seeds) = parse_root_toml(&toml_file_path(sm)?)?;
       commands.seed_from_dir(seeds_file_path(sm, seeds.as_deref())).await?;
     }

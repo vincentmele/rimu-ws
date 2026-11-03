@@ -1,6 +1,6 @@
 use crate::clap::HttpClient;
 use std::{fs::OpenOptions, io::Write as _};
-use wtx::{
+use rimu_ws::{
   collections::VectorUsize,
   http::{
     Header, HttpClient as _, KnownHeaderName, MsgBuffer, ReqBuilder,
@@ -10,7 +10,7 @@ use wtx::{
   tls::TlsConfig,
 };
 
-pub(crate) async fn http_client(http_client: HttpClient) -> wtx::Result<()> {
+pub(crate) async fn http_client(http_client: HttpClient) -> rimu_ws::Result<()> {
   let HttpClient { data, header, method, output, uri, user_agent, verbose } = http_client;
   match verbose {
     0 => {}

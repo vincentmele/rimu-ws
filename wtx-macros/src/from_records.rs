@@ -69,10 +69,10 @@ pub(crate) fn from_records(
     };
     let ident = &type_param.ident;
     if struct_type_is_field_ty(ones_tys, ident) || struct_type_is_field_ty(ones_opts_tys, ident) {
-      return Some(quote::quote!(#ident: wtx::database::FromRecords<'exec, #database>));
+      return Some(quote::quote!(#ident: rimu_ws::database::FromRecords<'exec, #database>));
     }
     if !struct_type_is_field_ty(ignores_tys, ident) && !struct_type_is_field_ty(manys_tys, ident) {
-      return Some(quote::quote!(#ident: wtx::codec::Decode<'exec, #database>));
+      return Some(quote::quote!(#ident: rimu_ws::codec::Decode<'exec, #database>));
     }
     None
   });
@@ -90,9 +90,9 @@ pub(crate) fn from_records(
 
   let _maybe_comma = fields_base.pop();
   let expanded = quote::quote!(
-    impl<'exec, #(#database_generic_err_param,)* #params> wtx::database::FromRecords<'exec, #database> for #name<#params>
+    impl<'exec, #(#database_generic_err_param,)* #params> rimu_ws::database::FromRecords<'exec, #database> for #name<#params>
     where
-      #(#database_generic_err_where_predicate: From<wtx::Error>,)*
+      #(#database_generic_err_where_predicate: From<rimu_ws::Error>,)*
       #(#custom_bounds,)*
       #(#additional_bounds,)*
       #where_predicates
@@ -105,10 +105,10 @@ pub(crate) fn from_records(
 
       #[inline]
       fn from_records(
-        _curr_params: &mut wtx::database::FromRecordsParams<<#database as wtx::database::Database>::Record<'exec>>,
-        _records: &<#database as wtx::database::Database>::Records<'exec>,
-      ) -> Result<Self, <#database as wtx::codec::CodecController>::Error> {
-        use wtx::database::Record as _;
+        _curr_params: &mut rimu_ws::database::FromRecordsParams<<#database as rimu_ws::database::Database>::Record<'exec>>,
+        _records: &<#database as rimu_ws::database::Database>::Records<'exec>,
+      ) -> Result<Self, <#database as rimu_ws::codec::CodecController>::Error> {
+        use rimu_ws::database::Record as _;
 
         let is_in_one_relationship = _curr_params.is_in_one_relationship;
         _curr_params.is_in_one_relationship = false;
@@ -134,7 +134,7 @@ pub(crate) fn from_records(
         #(
           let #ones = {
             _curr_params.is_in_one_relationship = true;
-            let rslt = <_ as wtx::database::FromRecords::<#database>>::from_records(_curr_params, _records);
+            let rslt = <_ as rimu_ws::database::FromRecords::<#database>>::from_records(_curr_params, _records);
             _curr_params.is_in_one_relationship = false;
             rslt?
           };
@@ -144,17 +144,17 @@ pub(crate) fn from_records(
           let #ones_opts = {
             _curr_params.is_in_one_relationship = true;
             let prev_curr_field_idx = _curr_params.curr_field_idx;
-            let local_id_idx = <#ones_opts_tys as wtx::database::FromRecords::<#database>>::ID_IDX.unwrap_or(0);
+            let local_id_idx = <#ones_opts_tys as rimu_ws::database::FromRecords::<#database>>::ID_IDX.unwrap_or(0);
             let probe_idx = prev_curr_field_idx.wrapping_add(local_id_idx);
             let is_present = _curr_params.curr_record.value(probe_idx).is_some();
             if !is_present {
               let curr_field_idx = prev_curr_field_idx.wrapping_add(
-                <#ones_opts_tys as wtx::database::FromRecords::<#database>>::FIELDS_NUM.into()
+                <#ones_opts_tys as rimu_ws::database::FromRecords::<#database>>::FIELDS_NUM.into()
               );
               _curr_params.curr_field_idx = curr_field_idx;
               None
             } else {
-              let rslt = <#ones_opts_tys as wtx::database::FromRecords::<#database>>::from_records(
+              let rslt = <#ones_opts_tys as rimu_ws::database::FromRecords::<#database>>::from_records(
                 _curr_params, _records
               );
               _curr_params.is_in_one_relationship = false;
@@ -166,11 +166,11 @@ pub(crate) fn from_records(
         #(
           let mut #manys: #manys_tys = Default::default();
           #[allow(clippy::needless_question_mark, reason = "sometimes the error type is the same")]
-          wtx::database::seek_related_entities(
+          rimu_ws::database::seek_related_entities(
             _curr_params,
             (_parent_id_iter0, _parent_id_column_idx),
             _records,
-            |elem| Ok(wtx::collections::TryExtend::try_extend(&mut #manys, [elem]).map_err(#database_err_ty::from)?)
+            |elem| Ok(rimu_ws::collections::TryExtend::try_extend(&mut #manys, [elem]).map_err(#database_err_ty::from)?)
           )?;
         )*
         if prev_consumed_records == _curr_params.consumed_records && !is_in_one_relationship {
@@ -335,7 +335,7 @@ fn database_generic_params<'any>(
   let database_err_ty = if let Some(elem) = database_generic_err {
     quote::quote!(#elem)
   } else {
-    quote::quote!(wtx::Error)
+    quote::quote!(rimu_ws::Error)
   };
   let database_generic_err_param =
     if has_struct_type_named_e { None.into_iter() } else { database_generic_err.into_iter() };

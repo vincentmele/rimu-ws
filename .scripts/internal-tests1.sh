@@ -4,28 +4,28 @@
 
 # WTX
 
-$rt check-generic wtx
-$rt test-with-features wtx _bench
-$rt test-with-features wtx _hack
-$rt test-with-features wtx _integration-tests
-$rt test-with-features wtx _tracing-tree
-$rt test-with-features wtx 32-tuple-impls
-$rt test-with-features wtx arbitrary
-$rt test-with-features wtx argon2
-$rt test-with-features wtx asn1
-$rt test-with-features wtx client-api-framework
-$rt test-with-features wtx crossbeam-channel
-$rt test-with-features wtx crypto
-$rt test-with-features wtx crypto-alr,_hack
-$rt test-with-features wtx crypto-graviola
-$rt test-with-features wtx crypto-ring
-$rt test-with-features wtx database
-$rt test-with-features wtx database-tests
-$rt test-with-features wtx default
-$rt test-with-features wtx embassy-net,_hack
-$rt test-with-features wtx embassy-time,_hack
-$rt test-with-features wtx executor
-$rt test-with-features wtx foldhash
-$rt test-with-features wtx getrandom
-$rt test-with-features wtx grpc
-$rt test-with-features wtx grpc-client,crypto-ring
+$rt check-generic rimu-ws
+$rt test-with-features rimu-ws _bench
+$rt test-with-features rimu-ws _hack
+$rt test-with-features rimu-ws _integration-tests
+$rt test-with-features rimu-ws _tracing-tree
+$rt test-with-features rimu-ws 32-tuple-impls
+$rt test-with-features rimu-ws arbitrary
+$rt test-with-features rimu-ws argon2
+$rt test-with-features rimu-ws asn1
+$rt test-with-features rimu-ws client-api-framework
+$rt test-with-features rimu-ws crossbeam-channel
+$rt test-with-features rimu-ws crypto
+$rt test-with-features rimu-ws crypto-alr,_hack
+$rt test-with-features rimu-ws crypto-graviola
+$rt test-with-features rimu-ws crypto-ring
+$rt test-with-features rimu-ws database
+$rt test-with-features rimu-ws database-tests
+$rt test-with-features rimu-ws default
+$rt test-with-features rimu-ws embassy-net,_hack
+$rt test-with-features rimu-ws embassy-time,_hack
+$rt test-with-features rimu-ws executor
+$rt test-with-features rimu-ws foldhash
+$rt test-with-features rimu-ws getrandom
+$rt test-with-features rimu-ws grpc
+$rt test-with-features rimu-ws grpc-client,crypto-ring

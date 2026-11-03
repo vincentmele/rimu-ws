@@ -3,7 +3,7 @@
 #![no_main]
 
 use std::io::Cursor;
-use wtx::{codec::Csv, collections::VectorUsize};
+use rimu_ws::{codec::Csv, collections::VectorUsize};
 
 libfuzzer_sys::fuzz_target!(|data: &[u8]| {
   let mut csv = Csv::from_buf_read(Cursor::new(data));

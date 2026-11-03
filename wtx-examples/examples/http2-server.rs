@@ -1,11 +1,11 @@
 //! Low-level HTTP/2 server that servers a single response.
 
 extern crate tokio;
-extern crate wtx;
-extern crate wtx_examples;
+extern crate rimu_ws;
+extern crate rimu_ws_examples;
 
 use tokio::net::TcpListener;
-use wtx::{
+use rimu_ws::{
   collections::VectorUsize,
   http::{HttpRecvParams, Response, StatusCode},
   http2::{Http2, Http2Buffer, Http2ErrorCode, Http2RecvStatus},
@@ -13,10 +13,10 @@ use wtx::{
   rng::{ChaCha20, CryptoSeedableRng},
   tls::{TlsAcceptor, TlsConfig},
 };
-use wtx_examples::{PUBLIC_KEY, SECRET_KEY, host_from_args};
+use rimu_ws_examples::{PUBLIC_KEY, SECRET_KEY, host_from_args};
 
 #[tokio::main]
-async fn main() -> wtx::Result<()> {
+async fn main() -> rimu_ws::Result<()> {
   let uri = Uri::new(host_from_args());
   let listener = TcpListener::bind(uri.hostname_with_implied_port()).await?;
   let (stream, _) = listener.accept().await?;

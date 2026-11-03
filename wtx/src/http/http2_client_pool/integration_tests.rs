@@ -8,7 +8,7 @@ use crate::{
 };
 
 #[cfg_attr(miri, ignore)]
-#[wtx::test]
+#[rimu_ws::test]
 async fn popular_sites() {
   send_recv("https://www.google.com".into()).await;
   send_recv("https://github.com".into()).await;

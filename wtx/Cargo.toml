@@ -27,7 +27,7 @@ tracing = { default-features = false, optional = true, version = "0.1" }
 tracing-subscriber = { default-features = false, optional = true, version = "0.3" }
 tracing-tree = { default-features = false, optional = true, version = "0.4" }
 uuid = { default-features = false, optional = true, version = "1.0" }
-wtx-macros = { default-features = false, optional = true, path = "../wtx-macros", version = "0.12.1" }
+rimu-ws-macros = { default-features = false, optional = true, path = "../wtx-macros", version = "0.12.1" }
 zip = { default-features = false, optional = true, version = "9.0" }
 zlib-rs = { default-features = false, optional = true, version = "0.6" }
 
@@ -59,7 +59,7 @@ spki = { default-features = false, optional = true, version = "0.8" }
 x25519-dalek = { default-features = false, optional = true, version = "3.0" }
 
 [dev-dependencies]
-wtx = { default-features = false, features = ["crypto-ring", "macros", "std"], path = "." }
+rimu-ws = { default-features = false, features = ["crypto-ring", "macros", "std"], path = "." }
 
 [features]
 32-tuple-impls = []
@@ -138,7 +138,7 @@ http-session = ["http-cookie-secure", "secret", "serde_json"]
 httparse = ["dep:httparse"]
 io-uring = ["dep:io-uring", "libc", "socket2", "std"]
 libc = ["dep:libc"]
-macros = ["dep:wtx-macros"]
+macros = ["dep:rimu-ws-macros"]
 memchr = ["dep:memchr"]
 odf = ["quick-xml", "std", "zip"]
 optimizations = ["memchr", "simdutf8"]
@@ -161,7 +161,7 @@ sha3 = ["dep:sha3"]
 simdutf8 = ["dep:simdutf8"]
 smtp = []
 socket2 = ["dep:socket2", "socket2?/all", "std"]
-std = ["foldhash?/std", "httparse?/std", "memchr?/std", "ring?/std", "simdutf8?/std", "wtx-macros?/std", "zlib-rs?/std"]
+std = ["foldhash?/std", "httparse?/std", "memchr?/std", "ring?/std", "simdutf8?/std", "rimu-ws-macros?/std", "zlib-rs?/std"]
 tls = ["secret", "x509"]
 tokio = ["pin-project-lite", "dep:tokio", "tokio?/io-util", "tokio?/net", "tokio?/rt", "std", "tokio?/sync", "tokio?/time"]
 tracing = ["dep:tracing", "tracing?/attributes"]
@@ -170,7 +170,7 @@ tracing-tree = ["std", "dep:tracing-tree"]
 uuid = ["dep:uuid"]
 web-socket = ["crypto", "http", "httparse", "tls"]
 web-socket-server-framework = ["web-socket"]
-wtx-macros = ["dep:wtx-macros"]
+rimu-ws-macros = ["dep:rimu-ws-macros"]
 x509 = ["asn1", "crypto", "hashbrown"]
 zlib-rs = ["dep:zlib-rs", "zlib-rs?/rust-allocator"]
 
@@ -192,8 +192,8 @@ edition = "2024"
 homepage = "https://c410-f3r.github.io/wtx"
 keywords = ["api", "database", "http", "tls", "websocket"]
 license = "MPL-2.0"
-name = "wtx"
-repository = "https://github.com/c410-f3r/wtx"
+name = "rimu-ws"
+repository = "https://github.com/vincentmele/rimu-ws"
 version = "0.52.1"
 
 [package.metadata.docs.rs]

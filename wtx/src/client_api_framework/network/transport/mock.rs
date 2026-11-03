@@ -36,8 +36,8 @@ pub type MockStr<TP> = Mock<str, TP>;
 /// Almost all methods panic at runtime.
 ///
 /// ```rust,no_run
-/// # async fn fun() -> wtx::Result<()> {
-/// use wtx::client_api_framework::{
+/// # async fn fun() -> rimu_ws::Result<()> {
+/// use rimu_ws::client_api_framework::{
 ///   network::transport::{MockStr, SendingReceivingTransport},
 ///   pkg::PkgsAux,
 /// };

@@ -1288,6 +1288,117 @@ dependencies = [
 ]
 
 [[package]]
+name = "rimu-ws"
+version = "0.52.1"
+dependencies = [
+ "aead",
+ "aes-gcm",
+ "arbitrary",
+ "argon2",
+ "aws-lc-rs",
+ "chacha20",
+ "chacha20poly1305",
+ "crossbeam-channel",
+ "crypto-common",
+ "digest",
+ "ed25519-dalek",
+ "elliptic-curve",
+ "embassy-net",
+ "embassy-time",
+ "foldhash",
+ "getrandom 0.4.3",
+ "graviola",
+ "hashbrown",
+ "hkdf",
+ "hmac",
+ "httparse",
+ "io-uring",
+ "libc",
+ "memchr",
+ "p256",
+ "p384",
+ "parking_lot",
+ "pin-project-lite",
+ "pkcs1",
+ "pkcs8",
+ "portable-atomic",
+ "portable-atomic-util",
+ "quick-protobuf",
+ "quick-xml",
+ "rand_core",
+ "rimu-ws",
+ "rimu-ws-macros",
+ "ring",
+ "rsa",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "sha3",
+ "signature",
+ "simdutf8",
+ "socket2",
+ "spki",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tracing-tree",
+ "uuid",
+ "x25519-dalek",
+ "zip",
+ "zlib-rs",
+]
+
+[[package]]
+name = "rimu-ws-examples"
+version = "0.0.0"
+dependencies = [
+ "pb-rs",
+ "quick-protobuf",
+ "rimu-ws",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "rimu-ws-fuzz"
+version = "0.0.0"
+dependencies = [
+ "libfuzzer-sys",
+ "rimu-ws",
+]
+
+[[package]]
+name = "rimu-ws-internal"
+version = "0.0.0"
+dependencies = [
+ "rimu-ws",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "rimu-ws-macros"
+version = "0.12.1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
+
+[[package]]
+name = "rimu-ws-ui"
+version = "0.8.3"
+dependencies = [
+ "clap",
+ "rimu-ws",
+ "tokio",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1859,117 +1970,6 @@ dependencies = [
  "group",
  "hybrid-array",
  "primefield",
-]
-
-[[package]]
-name = "wtx"
-version = "0.52.1"
-dependencies = [
- "aead",
- "aes-gcm",
- "arbitrary",
- "argon2",
- "aws-lc-rs",
- "chacha20",
- "chacha20poly1305",
- "crossbeam-channel",
- "crypto-common",
- "digest",
- "ed25519-dalek",
- "elliptic-curve",
- "embassy-net",
- "embassy-time",
- "foldhash",
- "getrandom 0.4.3",
- "graviola",
- "hashbrown",
- "hkdf",
- "hmac",
- "httparse",
- "io-uring",
- "libc",
- "memchr",
- "p256",
- "p384",
- "parking_lot",
- "pin-project-lite",
- "pkcs1",
- "pkcs8",
- "portable-atomic",
- "portable-atomic-util",
- "quick-protobuf",
- "quick-xml",
- "rand_core",
- "ring",
- "rsa",
- "rust_decimal",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "sha3",
- "signature",
- "simdutf8",
- "socket2",
- "spki",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "tracing-tree",
- "uuid",
- "wtx",
- "wtx-macros",
- "x25519-dalek",
- "zip",
- "zlib-rs",
-]
-
-[[package]]
-name = "wtx-examples"
-version = "0.0.0"
-dependencies = [
- "pb-rs",
- "quick-protobuf",
- "serde",
- "serde_json",
- "tokio",
- "wtx",
-]
-
-[[package]]
-name = "wtx-fuzz"
-version = "0.0.0"
-dependencies = [
- "libfuzzer-sys",
- "wtx",
-]
-
-[[package]]
-name = "wtx-internal"
-version = "0.0.0"
-dependencies = [
- "serde",
- "serde_json",
- "tokio",
- "wtx",
-]
-
-[[package]]
-name = "wtx-macros"
-version = "0.12.1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.9",
-]
-
-[[package]]
-name = "wtx-ui"
-version = "0.8.3"
-dependencies = [
- "clap",
- "tokio",
- "wtx",
 ]
 
 [[package]]

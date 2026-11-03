@@ -1,14 +1,14 @@
 //! Uses mutable references to send packages
 
-wtx::create_packages_aux_wrapper!();
+rimu_ws::create_packages_aux_wrapper!();
 
-use wtx::client_api_framework::network::transport::SendingTransport;
+use rimu_ws::client_api_framework::network::transport::SendingTransport;
 
 type Api = ();
 
-#[wtx::pkg(data_format(json), id(super::Api), transport(stub))]
+#[rimu_ws::pkg(data_format(json), id(super::Api), transport(stub))]
 mod pkg {
-  use wtx::client_api_framework::network::transport::TransportParams;
+  use rimu_ws::client_api_framework::network::transport::TransportParams;
 
   #[pkg::aux]
   impl<A, DRSR, TP> super::PkgsAux<A, DRSR, TP> where TP: TransportParams {}

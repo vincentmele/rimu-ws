@@ -23,7 +23,7 @@ mod schema_manager;
 mod web_socket;
 
 #[tokio::main]
-async fn main() -> wtx::Result<()> {
+async fn main() -> rimu_ws::Result<()> {
   #[cfg(feature = "clap")]
   clap::init().await?;
   Ok(())

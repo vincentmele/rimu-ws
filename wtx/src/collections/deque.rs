@@ -163,7 +163,7 @@ where
   /// Returns a pair of slices which contain, in order, the contents of the queue.
   ///
   /// ```rust
-  /// let mut queue = wtx::collections::DequeU8::with_capacity(8).unwrap();
+  /// let mut queue = rimu_ws::collections::DequeU8::with_capacity(8).unwrap();
   /// queue.push_front(3).unwrap();
   /// queue.push_back(1).unwrap();
   /// queue.push_back(2).unwrap();
@@ -177,7 +177,7 @@ where
   /// Mutable version of [`Self::as_slices`].
   ///
   /// ```rust
-  /// let mut queue = wtx::collections::DequeU8::new();
+  /// let mut queue = rimu_ws::collections::DequeU8::new();
   /// queue.push_front(3);
   /// queue.push_back(1);
   /// queue.push_back(2);
@@ -205,8 +205,8 @@ where
   /// Does nothing if the calculated length is equal or less than the current length.
   ///
   /// ```rust
-  /// let mut queue = wtx::collections::DequeU8::new();
-  /// queue.expand_back(wtx::collections::ExpansionTy::Len(4), 1);
+  /// let mut queue = rimu_ws::collections::DequeU8::new();
+  /// queue.expand_back(rimu_ws::collections::ExpansionTy::Len(4), 1);
   /// assert_eq!(queue.as_slices(), (&[1, 1, 1, 1][..], &[][..]));
   /// ```
   #[inline(always)]
@@ -232,8 +232,8 @@ where
   /// Does nothing if the calculated length is equal or less than the current length.
   ///
   /// ```rust
-  /// let mut queue = wtx::collections::DequeU8::new();
-  /// queue.expand_front(wtx::collections::ExpansionTy::Len(4), 1);
+  /// let mut queue = rimu_ws::collections::DequeU8::new();
+  /// queue.expand_front(rimu_ws::collections::ExpansionTy::Len(4), 1);
   /// assert_eq!(queue.as_slices(), (&[1, 1, 1, 1][..], &[][..]));
   /// ```
   #[inline(always)]
@@ -257,7 +257,7 @@ where
   /// Appends all elements of the iterator.
   ///
   /// ```rust
-  /// let mut queue = wtx::collections::DequeU8::new();
+  /// let mut queue = rimu_ws::collections::DequeU8::new();
   /// queue.extend_back_from_iter([1, 2]);
   /// assert_eq!(queue.len(), 2);
   /// ```
@@ -274,7 +274,7 @@ where
   /// Prepends all elements of the iterator.
   ///
   /// ```rust
-  /// let mut queue = wtx::collections::DequeU8::new();
+  /// let mut queue = rimu_ws::collections::DequeU8::new();
   /// queue.extend_front_from_iter([1, 2]);
   /// assert_eq!(queue.len(), 2);
   /// ```
@@ -291,7 +291,7 @@ where
   /// Provides a reference to the element at the given index.
   ///
   /// ```rust
-  /// let mut queue = wtx::collections::DequeU8::new();
+  /// let mut queue = rimu_ws::collections::DequeU8::new();
   /// queue.push_back(1);
   /// queue.push_back(3);
   /// assert_eq!(queue.get(0), Some(&1));
@@ -311,7 +311,7 @@ where
   /// Mutable version of [`Self::get`].
   ///
   /// ```rust
-  /// let mut queue = wtx::collections::DequeU8::new();
+  /// let mut queue = rimu_ws::collections::DequeU8::new();
   /// queue.push_back(1);
   /// queue.push_back(3);
   /// assert_eq!(queue.get_mut(0), Some(&mut 1));
@@ -331,7 +331,7 @@ where
   /// Returns a front-to-back iterator.
   ///
   /// ```rust
-  /// let mut queue = wtx::collections::DequeU8::new();
+  /// let mut queue = rimu_ws::collections::DequeU8::new();
   /// queue.push_back(1);
   /// queue.push_front(3);
   /// let mut iter = queue.iter();
@@ -348,7 +348,7 @@ where
   /// Mutable version of [`Self::iter`].
   ///
   /// ```rust
-  /// let mut queue = wtx::collections::DequeU8::new();
+  /// let mut queue = rimu_ws::collections::DequeU8::new();
   /// queue.push_back(1);
   /// queue.push_front(3);
   /// let mut iter = queue.iter_mut();
@@ -389,7 +389,7 @@ where
   /// Removes the last element from the queue and returns it, or `None` if it is empty.
   ///
   /// ```rust
-  /// let mut queue = wtx::collections::DequeU8::new();
+  /// let mut queue = rimu_ws::collections::DequeU8::new();
   /// queue.push_back(1);
   /// queue.push_back(3);
   /// queue.pop_back();
@@ -413,7 +413,7 @@ where
   /// Removes the first element and returns it, or [`Option::None`] if the queue is empty.
   ///
   /// ```rust
-  /// let mut queue = wtx::collections::DequeU8::new();
+  /// let mut queue = rimu_ws::collections::DequeU8::new();
   /// queue.push_back(1);
   /// queue.push_back(3);
   /// queue.pop_front();
@@ -437,7 +437,7 @@ where
   /// Appends an element to the back of the queue.
   ///
   /// ```rust
-  /// let mut queue = wtx::collections::DequeU8::new();
+  /// let mut queue = rimu_ws::collections::DequeU8::new();
   /// queue.push_back(1);
   /// queue.push_back(3);
   /// assert_eq!(queue.as_slices(), (&[1, 3][..], &[][..]));
@@ -464,7 +464,7 @@ where
   /// Prepends an element to the queue.
   ///
   /// ```rust
-  /// let mut queue = wtx::collections::DequeU8::new();
+  /// let mut queue = rimu_ws::collections::DequeU8::new();
   /// queue.push_front(1);
   /// queue.push_front(3);
   /// assert_eq!(queue.as_slices(), (&[3, 1][..], &[][..]));
@@ -506,7 +506,7 @@ where
   /// Shortens the queue, keeping the first `new_len` elements.
   ///
   /// ```rust
-  /// let mut queue = wtx::collections::DequeU8::new();
+  /// let mut queue = rimu_ws::collections::DequeU8::new();
   /// queue.push_front(1);
   /// queue.push_front(3);
   /// queue.push_back(5);
@@ -579,7 +579,7 @@ where
   /// Shortens the queue, keeping the last `new_len` elements.
   ///
   /// ```rust
-  /// let mut queue = wtx::collections::DequeU8::new();
+  /// let mut queue = rimu_ws::collections::DequeU8::new();
   /// queue.push_front(1);
   /// queue.push_front(3);
   /// queue.push_back(5);
@@ -699,7 +699,7 @@ where
   /// them to this instance. `others` are traversed in-order.
   ///
   /// ```rust
-  /// let mut queue = wtx::collections::DequeU8::new();
+  /// let mut queue = rimu_ws::collections::DequeU8::new();
   /// queue.push_back(4);
   /// queue.extend_back_from_copyable_slices([&[2, 3][..]]);
   /// queue.extend_back_from_copyable_slices([&[0, 1][..], &[1][..]]);
@@ -737,7 +737,7 @@ where
   /// them to this instance. `others` are traversed in-order.
   ///
   /// ```rust
-  /// let mut queue = wtx::collections::DequeU8::new();
+  /// let mut queue = rimu_ws::collections::DequeU8::new();
   /// queue.push_front(4);
   /// queue.extend_front_from_copyable_slices([&[2, 3][..]]);
   /// queue.extend_front_from_copyable_slices([&[0, 1][..], &[1][..]]);

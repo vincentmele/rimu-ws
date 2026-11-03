@@ -3,18 +3,18 @@
 //! There is no HTTP, WebSocket or any other protocol, only TLS!
 
 extern crate tokio;
-extern crate wtx;
+extern crate rimu_ws;
 
 use tokio::net::{TcpListener, TcpStream};
-use wtx::{
+use rimu_ws::{
   net::{StreamReader, StreamWriter},
   rng::{ChaCha20, CryptoSeedableRng as _},
   tls::{TlsAcceptor, TlsConfig},
 };
-use wtx_examples::{PUBLIC_KEY, SECRET_KEY, host_from_args};
+use rimu_ws_examples::{PUBLIC_KEY, SECRET_KEY, host_from_args};
 
 #[tokio::main]
-async fn main() -> wtx::Result<()> {
+async fn main() -> rimu_ws::Result<()> {
   let listener = TcpListener::bind(&host_from_args()).await?;
   loop {
     let (stream, _) = listener.accept().await?;
@@ -26,7 +26,7 @@ async fn main() -> wtx::Result<()> {
   }
 }
 
-async fn connection(stream: TcpStream) -> wtx::Result<()> {
+async fn connection(stream: TcpStream) -> rimu_ws::Result<()> {
   let rng = ChaCha20::from_std_random()?;
   let tls_config = TlsConfig::from_keys_pem(PUBLIC_KEY, SECRET_KEY)?;
   let tls_connector = TlsAcceptor::new(tls_config, rng, stream);

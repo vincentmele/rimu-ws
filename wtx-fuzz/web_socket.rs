@@ -2,7 +2,7 @@
 
 #![no_main]
 
-use wtx::web_socket::{Frame, OpCode};
+use rimu_ws::web_socket::{Frame, OpCode};
 
 libfuzzer_sys::fuzz_target!(|data: &[u8]| {
   for op_code in OpCode::all() {

@@ -1,9 +1,9 @@
 //! Fetches and prints the response body of a provided URI.
 
 extern crate tokio;
-extern crate wtx;
+extern crate rimu_ws;
 
-use wtx::{
+use rimu_ws::{
   collections::VectorUsize,
   http::{HttpClient, ReqBuilder, http2_client_pool::Http2ClientPoolBuilder},
   misc::from_utf8_basic,
@@ -12,7 +12,7 @@ use wtx::{
 };
 
 #[tokio::main]
-async fn main() -> wtx::Result<()> {
+async fn main() -> rimu_ws::Result<()> {
   let uri = Uri::new("https://github.com/c410-f3r/wtx");
   let res = Http2ClientPoolBuilder::tokio(1, TlsConfig::from_ccadb()?)?
     .build()

@@ -3,7 +3,7 @@
 #![no_main]
 
 use core::ops::Range;
-use wtx::{
+use rimu_ws::{
   codec::{Decode, DecodeWrapper, Pem},
   collections::VectorUsize,
 };

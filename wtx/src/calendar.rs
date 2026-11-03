@@ -123,7 +123,7 @@ pub fn timestamp_str(
 #[cfg(test)]
 mod tests {
   #[cfg(all(feature = "embassy-time", feature = "_hack", feature = "_integration-tests"))]
-  #[wtx::test]
+  #[rimu_ws::test]
   async fn fetch_and_set_epoch_offset_works_as_expected() {
     use crate::calendar::{Datetime, EPOCH_OFFSET, fetch_and_set_epoch_offset};
     use std::net::{ToSocketAddrs, UdpSocket};

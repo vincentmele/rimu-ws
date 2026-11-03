@@ -2,7 +2,7 @@
 
 use core::{fmt::Debug, mem, ops::Range, slice};
 use std::{borrow::Cow, fs::File, io::BufReader};
-use wtx::{
+use rimu_ws::{
   asn1::{Asn1Error, parse_der_from_pem_range, parse_der_from_pem_range_many},
   calendar::{Datetime, Utc},
   codec::{Decode as _, DecodeWrapper, Pem},
@@ -393,39 +393,39 @@ fn evaluate_test_case<'bytes>(
   mem::swap(cvp.crls_mut(), crls);
 }
 
-fn eval_eager_checks<T>(rslt: wtx::Result<T>, testcase: &Testcase) -> Option<T>
+fn eval_eager_checks<T>(rslt: rimu_ws::Result<T>, testcase: &Testcase) -> Option<T>
 where
   T: Debug,
 {
   match rslt {
     Ok(elem) => Some(elem),
-    Err(wtx::Error::Asn1(Asn1Error::LargeData))
-    | Err(wtx::Error::Vector(VectorError::StdConversionOverflow))
-    | Err(wtx::Error::X509(X509Error::InvalidCertificateVersion))
-    | Err(wtx::Error::X509(X509Error::InvalidExtendedKeyUsage))
-    | Err(wtx::Error::X509(X509Error::InvalidExtensionKeyUsage))
-    | Err(wtx::Error::X509(X509Error::InvalidExtensionNameConstraints))
-    | Err(wtx::Error::X509(X509Error::InvalidSan))
-    | Err(wtx::Error::X509(X509Error::InvalidSerialNumberBytes))
-    | Err(wtx::Error::X509Cv(X509CvError::AuthorityKeyIdentifierMustNotBeCritical))
-    | Err(wtx::Error::X509Cv(X509CvError::CertCanNotHaveDuplicateExtensions))
-    | Err(wtx::Error::X509Cv(X509CvError::CertificateAlgorithmMismatch))
-    | Err(wtx::Error::X509Cv(X509CvError::CrlNumberMustNotBeCritical))
-    | Err(wtx::Error::X509Cv(X509CvError::HasIncompatibleKeyUsage))
-    | Err(wtx::Error::X509Cv(X509CvError::IcasMustHaveASubjectSequence))
-    | Err(wtx::Error::X509Cv(X509CvError::IcasMustHaveBasicConstraints))
-    | Err(wtx::Error::X509Cv(X509CvError::IcasMustHaveCriticalBasicConstraints))
-    | Err(wtx::Error::X509Cv(X509CvError::IcasMustHaveSki))
-    | Err(wtx::Error::X509Cv(X509CvError::InvalidAuthorityKeyIdentifier))
-    | Err(wtx::Error::X509Cv(X509CvError::InvalidNameConstraints))
-    | Err(wtx::Error::X509Cv(X509CvError::KeyUsageKeyCertSignMismatch))
-    | Err(wtx::Error::X509Cv(X509CvError::MissingCrlNumber))
-    | Err(wtx::Error::X509Cv(X509CvError::NameConstraintsMustBeCritical))
-    | Err(wtx::Error::X509Cv(X509CvError::NameConstraintsOverflow))
-    | Err(wtx::Error::X509Cv(X509CvError::PolicyConstraintMustBeCritical))
-    | Err(wtx::Error::X509Cv(X509CvError::RootCasMustHaveKeyIdentifiers))
-    | Err(wtx::Error::X509Cv(X509CvError::RootCasMustHaveMatchingAkiAndSki))
-    | Err(wtx::Error::X509Cv(X509CvError::SubjectKeyIdentifierMustNotBeCritical)) => {
+    Err(rimu_ws::Error::Asn1(Asn1Error::LargeData))
+    | Err(rimu_ws::Error::Vector(VectorError::StdConversionOverflow))
+    | Err(rimu_ws::Error::X509(X509Error::InvalidCertificateVersion))
+    | Err(rimu_ws::Error::X509(X509Error::InvalidExtendedKeyUsage))
+    | Err(rimu_ws::Error::X509(X509Error::InvalidExtensionKeyUsage))
+    | Err(rimu_ws::Error::X509(X509Error::InvalidExtensionNameConstraints))
+    | Err(rimu_ws::Error::X509(X509Error::InvalidSan))
+    | Err(rimu_ws::Error::X509(X509Error::InvalidSerialNumberBytes))
+    | Err(rimu_ws::Error::X509Cv(X509CvError::AuthorityKeyIdentifierMustNotBeCritical))
+    | Err(rimu_ws::Error::X509Cv(X509CvError::CertCanNotHaveDuplicateExtensions))
+    | Err(rimu_ws::Error::X509Cv(X509CvError::CertificateAlgorithmMismatch))
+    | Err(rimu_ws::Error::X509Cv(X509CvError::CrlNumberMustNotBeCritical))
+    | Err(rimu_ws::Error::X509Cv(X509CvError::HasIncompatibleKeyUsage))
+    | Err(rimu_ws::Error::X509Cv(X509CvError::IcasMustHaveASubjectSequence))
+    | Err(rimu_ws::Error::X509Cv(X509CvError::IcasMustHaveBasicConstraints))
+    | Err(rimu_ws::Error::X509Cv(X509CvError::IcasMustHaveCriticalBasicConstraints))
+    | Err(rimu_ws::Error::X509Cv(X509CvError::IcasMustHaveSki))
+    | Err(rimu_ws::Error::X509Cv(X509CvError::InvalidAuthorityKeyIdentifier))
+    | Err(rimu_ws::Error::X509Cv(X509CvError::InvalidNameConstraints))
+    | Err(rimu_ws::Error::X509Cv(X509CvError::KeyUsageKeyCertSignMismatch))
+    | Err(rimu_ws::Error::X509Cv(X509CvError::MissingCrlNumber))
+    | Err(rimu_ws::Error::X509Cv(X509CvError::NameConstraintsMustBeCritical))
+    | Err(rimu_ws::Error::X509Cv(X509CvError::NameConstraintsOverflow))
+    | Err(rimu_ws::Error::X509Cv(X509CvError::PolicyConstraintMustBeCritical))
+    | Err(rimu_ws::Error::X509Cv(X509CvError::RootCasMustHaveKeyIdentifiers))
+    | Err(rimu_ws::Error::X509Cv(X509CvError::RootCasMustHaveMatchingAkiAndSki))
+    | Err(rimu_ws::Error::X509Cv(X509CvError::SubjectKeyIdentifierMustNotBeCritical)) => {
       match testcase.expected_result {
         ExpectedResult::Success => {
           panic!("{:?}", TestcaseResult::fail(testcase, rslt.unwrap_err().to_string()));
@@ -470,7 +470,7 @@ fn fill_cvp(
     }
   }
 
-  let mut ku: wtx::x509::extensions::KeyUsage = wtx::x509::extensions::KeyUsage::default();
+  let mut ku: rimu_ws::x509::extensions::KeyUsage = rimu_ws::x509::extensions::KeyUsage::default();
   for elem in &testcase.key_usage {
     match elem {
       KeyUsage::DigitalSignature => {

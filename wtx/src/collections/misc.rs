@@ -10,7 +10,7 @@ use core::{
 /// at each `push_front` invocation.
 ///
 /// ```rust
-/// use wtx::collections::{Deque, backward_deque_idx};
+/// use rimu_ws::collections::{Deque, backward_deque_idx};
 ///
 /// let mut deque = Deque::new();
 ///

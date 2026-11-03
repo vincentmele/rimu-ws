@@ -98,7 +98,7 @@ where
   /// Constructs a new instance based on an arbitrary [Vec].
   ///
   /// ```rust
-  /// let mut vec = wtx::collections::VectorU8::<u8>::from_vec(Vec::new()).unwrap();
+  /// let mut vec = rimu_ws::collections::VectorU8::<u8>::from_vec(Vec::new()).unwrap();
   /// assert_eq!(vec.len(), 0);
   /// ```
   #[inline]
@@ -109,7 +109,7 @@ where
   /// Constructs a new, empty instance.
   ///
   /// ```rust
-  /// let mut vec = wtx::collections::VectorU8::<u8>::new();
+  /// let mut vec = rimu_ws::collections::VectorU8::<u8>::new();
   /// assert_eq!(vec.len(), 0);
   /// ```
   #[inline]
@@ -121,7 +121,7 @@ where
   /// Constructs a new instance based on an arbitrary [Vec].
   ///
   /// ```rust
-  /// let mut vec = wtx::collections::VectorU8::<u8>::with_capacity(2).unwrap();
+  /// let mut vec = rimu_ws::collections::VectorU8::<u8>::with_capacity(2).unwrap();
   /// assert!(vec.capacity() >= 2);
   /// ```
   #[inline(always)]
@@ -136,7 +136,7 @@ where
   /// Constructs a new, empty instance with the exact specified capacity.
   ///
   /// ```rust
-  /// let mut vec = wtx::collections::VectorU8::<u8>::with_exact_capacity(2).unwrap();
+  /// let mut vec = rimu_ws::collections::VectorU8::<u8>::with_exact_capacity(2).unwrap();
   /// assert_eq!(vec.capacity(), 2);
   /// ```
   #[inline(always)]
@@ -149,7 +149,7 @@ where
   /// Transfers memory ownership to the vector of the standard library.
   ///
   /// ```rust
-  /// let vec = wtx::collections::VectorU8::<u8>::new();
+  /// let vec = rimu_ws::collections::VectorU8::<u8>::new();
   /// assert_eq!(vec.into_vec(), Vec::<u8>::new());
   /// ```
   #[inline]

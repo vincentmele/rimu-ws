@@ -20,14 +20,14 @@ pub(crate) fn lease(item: proc_macro::TokenStream) -> crate::Result<proc_macro::
   }
   let expanded = quote!(
     #(
-      impl wtx::misc::Lease<#field_tys> for #name {
+      impl rimu_ws::misc::Lease<#field_tys> for #name {
         #[inline]
         fn lease(&self) -> &#field_tys {
           &self.#field_names
         }
       }
 
-      impl wtx::misc::LeaseMut<#field_tys> for #name {
+      impl rimu_ws::misc::LeaseMut<#field_tys> for #name {
           #[inline]
           fn lease_mut(&mut self) -> &mut #field_tys {
             &mut self.#field_names

@@ -2,11 +2,11 @@
 //! module.
 
 extern crate tokio;
-extern crate wtx;
-extern crate wtx_examples;
+extern crate rimu_ws;
+extern crate rimu_ws_examples;
 
 use std::borrow::Cow;
-use wtx::{
+use rimu_ws::{
   codec::format::QuickProtobuf,
   executor::TokioExecutor,
   grpc::{GrpcManager, GrpcMiddleware},
@@ -17,17 +17,17 @@ use wtx::{
   rng::{ChaCha20, CryptoSeedableRng},
   tls::TlsConfig,
 };
-use wtx_examples::{
+use rimu_ws_examples::{
   PUBLIC_KEY, SECRET_KEY,
-  grpc_bindings::wtx::{GenericRequest, GenericResponse},
+  grpc_bindings::rimu_ws::{GenericRequest, GenericResponse},
   host_from_args,
 };
 
-fn main() -> wtx::Result<()> {
+fn main() -> rimu_ws::Result<()> {
   let rng = ChaCha20::from_std_random()?;
   let tls_config = TlsConfig::from_keys_pem(PUBLIC_KEY, SECRET_KEY)?;
   let router = HttpRouter::new(
-    wtx::paths!(("wtx.GenericService/generic_method", post(wtx_generic_service_generic_method))),
+    rimu_ws::paths!(("wtx.GenericService/generic_method", post(wtx_generic_service_generic_method))),
     GrpcMiddleware,
   )?;
   Http2ServerFramework::new(TokioExecutor::default(), rng, tls_config)?
@@ -38,7 +38,7 @@ fn main() -> wtx::Result<()> {
 
 async fn wtx_generic_service_generic_method(
   State { data, req }: State<'_, GrpcManager<QuickProtobuf>>,
-) -> wtx::Result<StatusCode> {
+) -> rimu_ws::Result<StatusCode> {
   let _generic_request: GenericRequest = data.des_from_req_bytes(&req.msg_data.body)?;
   req.clear();
   data.ser_to_res_bytes(

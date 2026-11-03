@@ -1,21 +1,21 @@
 //! High-level WebSocket server that supports the routing of paths.
 
 extern crate tokio;
-extern crate wtx;
-extern crate wtx_examples;
+extern crate rimu_ws;
+extern crate rimu_ws_examples;
 
 use tokio::net::TcpStream;
-use wtx::{
+use rimu_ws::{
   collections::VectorUsize,
   http::WebSocketServerFramework,
   tls::{SkCtx, TlsConfig},
   web_socket::{OpCode, WebSocket, WebSocketPayloadOrigin},
 };
-use wtx_examples::{PUBLIC_KEY, SECRET_KEY, host_from_args};
+use rimu_ws_examples::{PUBLIC_KEY, SECRET_KEY, host_from_args};
 
 type LocalWebSocket = WebSocket<(), TcpStream, SkCtx, false>;
 
-fn main() -> wtx::Result<()> {
+fn main() -> rimu_ws::Result<()> {
   let tls_config = TlsConfig::from_keys_pem(PUBLIC_KEY, SECRET_KEY)?;
   let router = (("/echo", echo),);
   WebSocketServerFramework::tokio(tls_config)?
@@ -23,7 +23,7 @@ fn main() -> wtx::Result<()> {
     .run_in_threads(&host_from_args(), router)
 }
 
-async fn echo(mut buffer: VectorUsize<u8>, mut ws: LocalWebSocket) -> wtx::Result<()> {
+async fn echo(mut buffer: VectorUsize<u8>, mut ws: LocalWebSocket) -> rimu_ws::Result<()> {
   let (mut common, mut reader, mut writer) = ws.split_mut();
   loop {
     let origin = WebSocketPayloadOrigin::Adaptive;

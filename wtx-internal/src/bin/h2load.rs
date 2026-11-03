@@ -1,6 +1,6 @@
 //! h2load
 
-use wtx::{
+use rimu_ws::{
   http::{
     HttpRecvParams,
     http2_server_framework::{Http2ServerFramework, HttpRouter, get},
@@ -9,8 +9,8 @@ use wtx::{
 };
 
 #[tokio::main]
-async fn main() -> wtx::Result<()> {
-  let router = HttpRouter::paths(wtx::paths!(("/", get(root)),))?;
+async fn main() -> rimu_ws::Result<()> {
+  let router = HttpRouter::paths(rimu_ws::paths!(("/", get(root)),))?;
   Http2ServerFramework::tokio(TlsConfig::plaintext())?
     .set_http_recv_params(HttpRecvParams::with_permissive_params())
     .set_error_cb(|err| println!("Error: {err}"))
@@ -18,6 +18,6 @@ async fn main() -> wtx::Result<()> {
     .await
 }
 
-async fn root() -> wtx::Result<()> {
+async fn root() -> rimu_ws::Result<()> {
   Ok(())
 }

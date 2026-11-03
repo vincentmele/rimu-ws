@@ -1,10 +1,10 @@
 use crate::boringssl_options::{Options, quit};
-use wtx::tls::{AlertDescription, TlsError};
+use rimu_ws::tls::{AlertDescription, TlsError};
 
-pub fn handle_err(_opts: &Options, rslt: wtx::Result<()>) {
+pub fn handle_err(_opts: &Options, rslt: rimu_ws::Result<()>) {
   let reason = match &rslt {
     Ok(_) => return,
-    Err(wtx::Error::Tls(err)) => match err {
+    Err(rimu_ws::Error::Tls(err)) => match err {
       TlsError::AbortedHandshake(alert)
         if alert.description() == AlertDescription::HandshakeFailure =>
       {
@@ -29,7 +29,7 @@ pub fn handle_err(_opts: &Options, rslt: wtx::Result<()>) {
       TlsError::UnsupportedCipherSuite => ":WRONG_CIPHER_RETURNED:",
       _ => ":FIXME:",
     },
-    Err(wtx::Error::TlsErrorReply(err, _)) => match err {
+    Err(rimu_ws::Error::TlsErrorReply(err, _)) => match err {
       TlsError::ClientExpectedFinished => ":UNEXPECTED_MESSAGE:",
       TlsError::DiffieHellmanError => ":WRONG_CURVE:",
       TlsError::EmptyCertificateAuthorities => ":ERROR_PARSING_EXTENSION:",

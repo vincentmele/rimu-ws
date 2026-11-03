@@ -1,14 +1,14 @@
 //! The `executor` feature allows the execution of asynchronous operations
 
-extern crate wtx;
+extern crate rimu_ws;
 
-#[wtx::main]
+#[rimu_ws::main]
 async fn main() {
   println!("With great power comes great electricity bills");
 }
 
-#[wtx::test]
-async fn test_with_runtime(runtime: &wtx::executor::StdRuntime) {
+#[rimu_ws::test]
+async fn test_with_runtime(runtime: &rimu_ws::executor::StdRuntime) {
   runtime
     .spawn(async move {
       println!("Behind every successful diet is an unwatched pizza");

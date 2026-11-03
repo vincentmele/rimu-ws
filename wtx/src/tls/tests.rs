@@ -8,7 +8,7 @@ use crate::{
 use std::net::TcpListener;
 
 #[cfg_attr(miri, ignore)]
-#[wtx::test]
+#[rimu_ws::test]
 async fn simple_connection(runtime: &StdRuntime) {
   let uri = _uri();
   let mut client_rng = ChaCha20::from_std_random().unwrap();

@@ -4,12 +4,12 @@
 extern crate serde;
 extern crate serde_json;
 extern crate tokio;
-extern crate wtx;
-extern crate wtx_examples;
+extern crate rimu_ws;
+extern crate rimu_ws_examples;
 
 use core::{fmt::Write, ops::ControlFlow};
 use tokio::net::tcp::OwnedWriteHalf;
-use wtx::{
+use rimu_ws::{
   database::{DbClient, Record},
   executor::TokioExecutor,
   http::{
@@ -25,11 +25,11 @@ use wtx::{
   secret::SecretStr,
   tls::{SkCtx, TlsConfig, TrustedCtx},
 };
-use wtx_examples::{PUBLIC_KEY, ROOT_CA, SECRET_KEY, host_from_args};
+use rimu_ws_examples::{PUBLIC_KEY, ROOT_CA, SECRET_KEY, host_from_args};
 
-type LocalPool = SimplePool<PostgresRMDefault<wtx::Error, TokioExecutor, TrustedCtx>>;
+type LocalPool = SimplePool<PostgresRMDefault<rimu_ws::Error, TokioExecutor, TrustedCtx>>;
 
-fn main() -> wtx::Result<()> {
+fn main() -> rimu_ws::Result<()> {
   let mut rng = ChaCha20::from_std_random()?;
   let db_pool = LocalPool::new(
     4,
@@ -40,13 +40,13 @@ fn main() -> wtx::Result<()> {
     )?,
   );
   let tls_config = TlsConfig::from_keys_pem(PUBLIC_KEY, SECRET_KEY)?;
-  let router = HttpRouter::paths(wtx::paths!(
+  let router = HttpRouter::paths(rimu_ws::paths!(
     ("/db/{id}", get(db)),
     ("/json", json(Method::Post, deserialization_and_serialization)),
     (
       "/say",
       HttpRouter::new(
-        wtx::paths!(("/hello", get(hello)), ("/world", get(world))),
+        rimu_ws::paths!(("/hello", get(hello)), ("/world", get(world))),
         CustomMiddleware,
       )?,
     ),
@@ -61,7 +61,7 @@ fn main() -> wtx::Result<()> {
 async fn db(
   StateClean { data, req }: StateClean<'_, LocalPool>,
   Path(id): Path<u32>,
-) -> wtx::Result<VerbatimParams> {
+) -> rimu_ws::Result<VerbatimParams> {
   let mut lock = data.get_with_unit().await?;
   let record = lock.execute_stmt_single("SELECT name FROM persons WHERE id = $1", (id,)).await?;
   let name = record.decode::<_, &str>(0)?;
@@ -71,7 +71,7 @@ async fn db(
 
 async fn deserialization_and_serialization(
   State { req, data: _ }: State<'_, LocalPool>,
-) -> wtx::Result<JsonReply> {
+) -> rimu_ws::Result<JsonReply> {
   let deserialize_example: DeserializeExample = serde_json::from_slice(&req.msg_data.body)?;
   let serialize_example = SerializeExample {
     _baz: [u32::from(deserialize_example._bar / 2), u32::from(deserialize_example._bar % 2)],
@@ -87,7 +87,7 @@ async fn hello() -> &'static str {
 
 async fn stream(
   mut manual_stream: ManualStream<LocalPool, ServerStream<OwnedWriteHalf, SkCtx>>,
-) -> wtx::Result<()> {
+) -> rimu_ws::Result<()> {
   manual_stream.stream.common().send_go_away(Http2ErrorCode::NoError).await;
   Ok(())
 }
@@ -98,7 +98,7 @@ async fn world() -> &'static str {
 
 struct CustomMiddleware;
 
-impl Middleware<LocalPool, wtx::Error> for CustomMiddleware {
+impl Middleware<LocalPool, rimu_ws::Error> for CustomMiddleware {
   type Aux = ();
 
   fn aux(&self) -> Self::Aux {}
@@ -108,7 +108,7 @@ impl Middleware<LocalPool, wtx::Error> for CustomMiddleware {
     _: &mut LocalPool,
     _: &mut Self::Aux,
     _: &mut Request<MsgBufferString>,
-  ) -> wtx::Result<ControlFlow<StatusCode, ()>> {
+  ) -> rimu_ws::Result<ControlFlow<StatusCode, ()>> {
     println!("Inspecting request");
     Ok(ControlFlow::Continue(()))
   }
@@ -118,7 +118,7 @@ impl Middleware<LocalPool, wtx::Error> for CustomMiddleware {
     _: &mut LocalPool,
     _: &mut Self::Aux,
     _: Response<&mut MsgBufferString>,
-  ) -> wtx::Result<ControlFlow<StatusCode, ()>> {
+  ) -> rimu_ws::Result<ControlFlow<StatusCode, ()>> {
     println!("Inspecting response");
     Ok(ControlFlow::Continue(()))
   }

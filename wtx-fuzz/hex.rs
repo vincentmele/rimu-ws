@@ -2,7 +2,7 @@
 
 #![no_main]
 
-use wtx::codec::{HexEncMode, hex_decode, hex_encode};
+use rimu_ws::codec::{HexEncMode, hex_decode, hex_encode};
 
 libfuzzer_sys::fuzz_target!(|data: &[u8]| {
   let mut decoded = vec![0; data.len() / 2];

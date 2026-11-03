@@ -449,7 +449,7 @@ impl Default for BufStreamReader {
 mod tests {
   use crate::net::{BufStreamReader, BytesStream, StreamWriter};
 
-  #[wtx::test]
+  #[rimu_ws::test]
   async fn read_header_and_payload() {
     let mut stream = BytesStream::default();
     stream.write_all(&[0, 2, 1, 2]).await.unwrap();
@@ -460,7 +460,7 @@ mod tests {
     assert_eq!(nrb.current(), &[1, 2][..]);
   }
 
-  #[wtx::test]
+  #[rimu_ws::test]
   async fn zero_payload() {
     let mut stream = BytesStream::default();
     stream.write_all(&[0, 0]).await.unwrap();

@@ -1,4 +1,4 @@
-#[wtx::pkg(data_format(json), id(FooId))]
+#[rimu_ws::pkg(data_format(json), id(FooId))]
 mod pkg {
   #[pkg::req_data]
   struct Req;

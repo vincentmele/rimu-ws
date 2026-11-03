@@ -2,7 +2,7 @@
 
 #![no_main]
 
-use wtx::{
+use rimu_ws::{
   asn1::Asn1DecodeWrapperAux,
   codec::{Decode, DecodeWrapper, GenericCodec},
   collections::VectorUsize,

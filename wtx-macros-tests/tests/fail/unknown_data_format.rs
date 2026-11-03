@@ -1,4 +1,4 @@
-#[wtx::pkg(data_format(fdsdfs), id(Foo))]
+#[rimu_ws::pkg(data_format(fdsdfs), id(Foo))]
 mod pkg {
   #[pkg::req_data]
   struct Req;

@@ -20,17 +20,17 @@ impl DataFormat {
     macro_rules! http_method_and_mime_type {
       ($method:ident, $mime:ident) => {
         quote::quote!({
-          use wtx::client_api_framework::network::transport::TransportParams;
-          _trans_params.ext_req_params_mut().method = wtx::http::Method::$method;
-          _trans_params.ext_req_params_mut().mime = Some(wtx::http::Mime::$mime);
+          use rimu_ws::client_api_framework::network::transport::TransportParams;
+          _trans_params.ext_req_params_mut().method = rimu_ws::http::Method::$method;
+          _trans_params.ext_req_params_mut().mime = Some(rimu_ws::http::Mime::$mime);
         })
       };
     }
     macro_rules! http_mime_type {
       ($mime:ident) => {
         quote::quote!({
-          use wtx::client_api_framework::network::transport::TransportParams;
-          _trans_params.ext_req_params_mut().mime = Some(wtx::http::Mime::$mime);
+          use rimu_ws::client_api_framework::network::transport::TransportParams;
+          _trans_params.ext_req_params_mut().mime = Some(rimu_ws::http::Mime::$mime);
         })
       };
     }

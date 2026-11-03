@@ -1,8 +1,8 @@
-#[wtx::pkg]
+#[rimu_ws::pkg]
 mod a {
 }
 
-#[wtx::pkg]
+#[rimu_ws::pkg]
 mod b {
   #[pkg::req_data]
   struct Req(
@@ -10,7 +10,7 @@ mod b {
   );
 }
 
-#[wtx::pkg]
+#[rimu_ws::pkg]
 mod c {
   #[pkg::res_data]
   struct Res;

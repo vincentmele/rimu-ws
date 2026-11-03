@@ -17,8 +17,8 @@ edition = "2024"
 exclude = ["tests"]
 keywords = ["api", "client", "io", "network"]
 license = "MPL-2.0"
-name = "wtx-macros"
-repository = "https://github.com/c410-f3r/wtx"
+name = "rimu-ws-macros"
+repository = "https://github.com/vincentmele/rimu-ws"
 version = "0.12.1"
 
 [package.metadata.docs.rs]

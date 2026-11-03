@@ -1,20 +1,20 @@
 //! Serves requests using low-level WebSockets resources alongside self-made certificates.
 
 extern crate tokio;
-extern crate wtx;
-extern crate wtx_examples;
+extern crate rimu_ws;
+extern crate rimu_ws_examples;
 
 use tokio::net::TcpListener;
-use wtx::{
+use rimu_ws::{
   collections::VectorUsize,
   rng::{ChaCha20, CryptoSeedableRng},
   tls::{TlsAcceptor, TlsConfig},
   web_socket::{OpCode, WebSocketAcceptor, WebSocketPayloadOrigin},
 };
-use wtx_examples::{PUBLIC_KEY, SECRET_KEY, host_from_args};
+use rimu_ws_examples::{PUBLIC_KEY, SECRET_KEY, host_from_args};
 
 #[tokio::main]
-async fn main() -> wtx::Result<()> {
+async fn main() -> rimu_ws::Result<()> {
   let listener = TcpListener::bind(&host_from_args()).await?;
   let mut rng = ChaCha20::from_std_random()?;
   loop {
@@ -37,7 +37,7 @@ async fn main() -> wtx::Result<()> {
             _ => {}
           }
         }
-        wtx::Result::Ok(())
+        rimu_ws::Result::Ok(())
       };
       if let Err(err) = fut.await {
         eprintln!("Error: {err}");

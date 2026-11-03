@@ -24,7 +24,7 @@ where
   /// # Example
   ///
   /// ```rust
-  /// use wtx::database::schema_manager::doc_tests::user_migration_group;
+  /// use rimu_ws::database::schema_manager::doc_tests::user_migration_group;
   /// assert_eq!(user_migration_group().name(), "initial");
   /// ```
   #[inline]
@@ -37,7 +37,7 @@ where
   /// # Example
   ///
   /// ```rust
-  /// use wtx::database::schema_manager::doc_tests::user_migration_group;
+  /// use rimu_ws::database::schema_manager::doc_tests::user_migration_group;
   /// assert_eq!(user_migration_group().uid(), 1);
   /// ```
   #[inline]

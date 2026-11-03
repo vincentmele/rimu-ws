@@ -5,7 +5,7 @@ set -euxo pipefail
 # Successful tests expect no output but this variable is kept for debugging.
 #export RUST_LOG=trace
 
-BACKENDS=("wtx/crypto-alr wtx/_hack" "wtx/crypto-graviola" "wtx/crypto-ring" "wtx/crypto-ruco")
+BACKENDS=("rimu-ws/crypto-alr rimu-ws/_hack" "rimu-ws/crypto-graviola" "rimu-ws/crypto-ring" "rimu-ws/crypto-ruco")
 IS_CONCURRENT=("0" "1")
 
 if [ ! -d "./boringssl" ]; then

@@ -1,9 +1,9 @@
 //! X.509 chain validation
 
-extern crate wtx;
+extern crate rimu_ws;
 
 use core::slice;
-use wtx::{
+use rimu_ws::{
   asn1::parse_der_from_pem_range,
   calendar::Datetime,
   codec::{Decode as _, DecodeWrapper, Pem},
@@ -84,7 +84,7 @@ oAIwOWZbwmSNuJ5Q3KjVSaLtx9zRSX8XAbjIho9OjIgrqJqpisXRAL34VOKa5Vt8
 sycX
 -----END CERTIFICATE-----";
 
-fn main() -> wtx::Result<()> {
+fn main() -> rimu_ws::Result<()> {
   let mut buffer = VectorUsize::new();
 
   let end_entity_range = Pem::decode(&mut DecodeWrapper::new(END_ENTITY, &mut buffer))?;
@@ -106,7 +106,7 @@ fn validate_chain<'any>(
   end_entity: &CvEndEntity<&'any [u8]>,
   intermediate: &CvIntermediate<&'any [u8]>,
   trust_anchor: &CvTrustAnchor<&'any [u8]>,
-) -> wtx::Result<()> {
+) -> rimu_ws::Result<()> {
   let cvp = CvPolicy::new(VectorU8::new(), Datetime::from_timestamp_secs(1779000000)?);
   let verified_path = end_entity.validate_chain(
     slice::from_ref(intermediate),
