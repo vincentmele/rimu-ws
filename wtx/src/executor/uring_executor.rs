@@ -36,12 +36,8 @@ use io_uring::{IoUring, cqueue, opcode, squeue, types};
 use std::os::fd::{IntoRawFd, RawFd};
 
 const BUF_GROUP: u16 = 0;
-const BUF_LEN: usize = 4096;
-const BUFS: u16 = 512;
 const CQ_ENTRIES: u32 = 4096;
 const SQ_ENTRIES: u32 = 1024;
-// A write waits for the connection's earlier bytes to be sent once this many are queued.
-const TX_HIGH_WATER: usize = 4 * 1024 * 1024;
 
 const KIND_RECV: u64 = 1;
 const KIND_SEND: u64 = 2;
@@ -93,6 +89,11 @@ pub struct UringRuntime {
 }
 
 impl UringRuntime {
+  #[cfg(test)]
+  fn open_conns(&self) -> usize {
+    self.reactor.conns.borrow().iter().filter(|conn| conn.in_use).count()
+  }
+
   /// A runtime with the given settings.
   #[inline]
   pub fn with_params(params: UringParams) -> crate::Result<Self> {
@@ -105,14 +106,45 @@ impl UringRuntime {
 pub struct UringParams {
   direct_files: u32,
   peer_addrs: bool,
+  recv_buffer_len: u32,
+  recv_buffers: u16,
   spin: Duration,
+  tx_high_water: usize,
 }
 
 impl UringParams {
   /// Peer addresses resolved, no spinning.
   #[inline]
   pub const fn new() -> Self {
-    Self { direct_files: 0, peer_addrs: true, spin: Duration::ZERO }
+    Self {
+      direct_files: 0,
+      peer_addrs: true,
+      recv_buffer_len: 4096,
+      recv_buffers: 512,
+      spin: Duration::ZERO,
+      tx_high_water: 4 * 1024 * 1024,
+    }
+  }
+
+  /// The ring of buffers that receives are made into: `count` buffers (rounded up to a power of
+  /// two) of `len` bytes each, shared by the connections of a runtime. Received bytes are copied
+  /// out as soon as they complete, so the ring only has to cover one turn. Defaults to 512 of
+  /// 4096 bytes.
+  #[inline]
+  #[must_use]
+  pub const fn set_recv_buffers(mut self, count: u16, len: u32) -> Self {
+    self.recv_buffers = count;
+    self.recv_buffer_len = len;
+    self
+  }
+
+  /// How many written bytes a connection can have waiting to be sent before a write waits for
+  /// them. Defaults to 4 MiB.
+  #[inline]
+  #[must_use]
+  pub const fn set_tx_high_water(mut self, value: usize) -> Self {
+    self.tx_high_water = value;
+    self
   }
 
   /// Accepts connections as direct descriptors in a table of `value` slots registered with the
@@ -298,6 +330,18 @@ pub struct UringTcpListener {
   idx: usize,
   // Accepted sockets inherit it from the listening one.
   nodelay: bool,
+}
+
+impl Drop for UringTcpListener {
+  #[inline]
+  fn drop(&mut self) {
+    let reactor = CURRENT.with(Cell::get);
+    if reactor.is_null() {
+      return;
+    }
+    // SAFETY: set by `block_on`, which outlives everything it polls
+    unsafe { &*reactor }.drop_listener(self.idx);
+  }
 }
 
 impl TcpListener for UringTcpListener {
@@ -615,27 +659,30 @@ struct Conn {
 
 struct ListenerState {
   armed: bool,
+  closed: bool,
   fd: RawFd,
   queue: VecDeque<RawFd>,
   waker: Option<Waker>,
 }
 
 struct BufRing {
+  count: u16,
   entries: *mut u8,
   layout: Layout,
+  len: usize,
   mem: Vec<u8>,
   tail: u16,
 }
 
 impl BufRing {
   fn push(&mut self, bid: u16) {
-    let idx = usize::from(self.tail & (BUFS - 1));
-    let addr = self.mem.as_ptr() as u64 + u64::from(bid) * BUF_LEN as u64;
-    // SAFETY: `entries` holds `BUFS` entries of 16 bytes: addr u64, len u32, bid u16, resv u16
+    let idx = usize::from(self.tail & (self.count - 1));
+    let addr = self.mem.as_ptr() as u64 + u64::from(bid) * self.len as u64;
+    // SAFETY: `entries` holds `count` entries of 16 bytes: addr u64, len u32, bid u16, resv u16
     unsafe {
       let entry = self.entries.add(idx * 16);
       entry.cast::<u64>().write(addr);
-      entry.add(8).cast::<u32>().write(BUF_LEN as u32);
+      entry.add(8).cast::<u32>().write(self.len as u32);
       entry.add(12).cast::<u16>().write(bid);
     }
     self.tail = self.tail.wrapping_add(1);
@@ -671,6 +718,21 @@ struct Reactor {
   tasks: RefCell<Vec<TaskSlot>>,
 }
 
+impl Drop for Reactor {
+  fn drop(&mut self) {
+    // Listeners whose handles outlive the runtime can no longer reach it to close themselves.
+    let direct = self.params.direct_files > 0;
+    for listener in self.listeners.get_mut().iter_mut().filter(|el| !el.closed) {
+      listener.closed = true;
+      let accepted = listener.queue.drain(..).filter(|_| !direct);
+      for fd in accepted.chain(core::iter::once(listener.fd)) {
+        // SAFETY: closed once, here; the ring that could still use them is dropped right after
+        let _rslt = unsafe { libc::close(fd) };
+      }
+    }
+  }
+}
+
 impl core::fmt::Debug for Reactor {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.debug_struct("Reactor").finish()
@@ -686,20 +748,28 @@ impl Reactor {
       .setup_submit_all()
       .setup_cqsize(CQ_ENTRIES)
       .build(SQ_ENTRIES)?;
-    let layout =
-      Layout::from_size_align(usize::from(BUFS) * 16, 4096).map_err(|_err| io_err(libc::EINVAL))?;
+    let count = params.recv_buffers.max(1).next_power_of_two();
+    let len = params.recv_buffer_len.max(1) as usize;
+    let layout = Layout::from_size_align(usize::from(count) * 16, 4096)
+      .map_err(|_err| io_err(libc::EINVAL))?;
     // SAFETY: `layout` has a non-zero size
     let entries = unsafe { alloc::alloc::alloc_zeroed(layout) };
     if entries.is_null() {
       return Err(io_err(libc::ENOMEM));
     }
-    let mut bufs =
-      BufRing { entries, layout, mem: alloc::vec![0; usize::from(BUFS) * BUF_LEN], tail: 0 };
+    let mut bufs = BufRing {
+      count,
+      entries,
+      layout,
+      len,
+      mem: alloc::vec![0; usize::from(count) * len],
+      tail: 0,
+    };
     // SAFETY: `entries` stays allocated, and registered, for as long as the ring
     unsafe {
-      ring.submitter().register_buf_ring_with_flags(entries as u64, BUFS, BUF_GROUP, 0)?;
+      ring.submitter().register_buf_ring_with_flags(entries as u64, count, BUF_GROUP, 0)?;
     }
-    for bid in 0..BUFS {
+    for bid in 0..count {
       bufs.push(bid);
     }
     bufs.publish();
@@ -860,7 +930,13 @@ impl Reactor {
 
   fn add_listener(&self, fd: RawFd) -> crate::Result<usize> {
     let mut listeners = self.listeners.borrow_mut();
-    listeners.push(ListenerState { armed: false, fd, queue: VecDeque::new(), waker: None });
+    listeners.push(ListenerState {
+      armed: false,
+      closed: false,
+      fd,
+      queue: VecDeque::new(),
+      waker: None,
+    });
     let idx = listeners.len() - 1;
     drop(listeners);
     self.arm_accept(idx);
@@ -887,6 +963,14 @@ impl Reactor {
       let Some(listener) = listeners.get_mut(idx) else {
         return;
       };
+      if listener.closed {
+        listener.armed = false;
+        drop(listeners);
+        if res >= 0 {
+          self.close_accepted(res);
+        }
+        return;
+      }
       if res >= 0 {
         listener.queue.push_back(res);
         if let Some(elem) = listener.waker.take() {
@@ -900,6 +984,41 @@ impl Reactor {
     };
     if rearm {
       self.arm_accept(idx);
+    }
+  }
+
+  /// Stops listening: the armed accept is cancelled, and the connections it took that nobody
+  /// claimed are closed, along with any it still completes.
+  fn drop_listener(&self, idx: usize) {
+    let (armed, fd, queue) = {
+      let mut listeners = self.listeners.borrow_mut();
+      let Some(listener) = listeners.get_mut(idx).filter(|el| !el.closed) else {
+        return;
+      };
+      listener.closed = true;
+      listener.waker = None;
+      (listener.armed, listener.fd, core::mem::take(&mut listener.queue))
+    };
+    for accepted in queue {
+      self.close_accepted(accepted);
+    }
+    if armed {
+      let target = user_data(KIND_ACCEPT, 0, idx as u32);
+      let sqe = opcode::AsyncCancel::new(target).build().user_data(user_data(KIND_CANCEL, 0, 0));
+      self.push_sqe(&sqe);
+    }
+    // SAFETY: closed once, here; the accept still armed keeps its own reference until cancelled
+    let _rslt = unsafe { libc::close(fd) };
+  }
+
+  fn close_accepted(&self, fd: RawFd) {
+    if self.params.direct_files > 0 {
+      let sqe =
+        opcode::Close::new(types::Fixed(fd as u32)).build().user_data(user_data(KIND_CANCEL, 0, 0));
+      self.push_sqe(&sqe);
+    } else {
+      // SAFETY: an accepted socket that no handle owns
+      let _rslt = unsafe { libc::close(fd) };
     }
   }
 
@@ -995,7 +1114,8 @@ impl Reactor {
     };
     if res > 0 {
       if let Some(bid) = cqueue::buffer_select(flags) {
-        let begin = usize::from(bid) * BUF_LEN;
+        let bufs_len = self.bufs.borrow().len;
+        let begin = usize::from(bid) * bufs_len;
         let len = res as usize;
         if conn.rx_off == conn.rx.len() {
           conn.rx.clear();
@@ -1009,7 +1129,10 @@ impl Reactor {
       }
     } else if res == 0 {
       conn.rx_eof = true;
-    } else if res != -libc::ENOBUFS && res != -libc::ECANCELED {
+    } else if res == -libc::ENOBUFS {
+      #[cfg(test)]
+      let _ = tests::ENOBUFS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    } else if res != -libc::ECANCELED {
       conn.rx_err = -res;
     }
     if let Some(elem) = conn.reader.take() {
@@ -1150,7 +1273,7 @@ impl Reactor {
     if conn.tx_err != 0 {
       return Poll::Ready(Err(io_err(conn.tx_err)));
     }
-    if conn.tx_pending.len() < TX_HIGH_WATER {
+    if conn.tx_pending.len() < self.params.tx_high_water {
       return Poll::Ready(Ok(()));
     }
     conn.writer = Some(cx.waker().clone());
@@ -1231,6 +1354,7 @@ mod tests {
     web_socket::{OpCode, WebSocketAcceptor, WebSocketPayloadOrigin},
   };
   use alloc::vec::Vec;
+  use core::{future::poll_fn, task::Poll};
   use std::io::{Read, Write};
 
   // Sixteen texts with a ping in the middle sent in one write, then a close: the server echoes
@@ -1344,5 +1468,381 @@ mod tests {
       handle.await.unwrap();
     });
     client.join().unwrap();
+  }
+
+  // ---- stress
+
+  struct Gen(u64);
+
+  impl Gen {
+    fn next(&mut self) -> u64 {
+      self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+      let mut z = self.0;
+      z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+      z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+      z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+      if n == 0 { 0 } else { self.next() % n }
+    }
+  }
+
+  fn client_frame(out: &mut Vec<u8>, fin: bool, op: u8, payload: &[u8], key: [u8; 4]) {
+    out.push(if fin { 0x80 } else { 0 } | op);
+    let len = payload.len();
+    if len < 126 {
+      out.push(0x80 | len as u8);
+    } else if len <= 0xFFFF {
+      out.push(0x80 | 126);
+      out.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+      out.push(0x80 | 127);
+      out.extend_from_slice(&(len as u64).to_be_bytes());
+    }
+    out.extend_from_slice(&key);
+    out.extend(payload.iter().enumerate().map(|(idx, el)| el ^ key[idx % 4]));
+  }
+
+  fn server_frame(out: &mut Vec<u8>, op: u8, payload: &[u8]) {
+    out.push(0x80 | op);
+    let len = payload.len();
+    if len < 126 {
+      out.push(len as u8);
+    } else if len <= 0xFFFF {
+      out.push(126);
+      out.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+      out.push(127);
+      out.extend_from_slice(&(len as u64).to_be_bytes());
+    }
+    out.extend_from_slice(payload);
+  }
+
+  async fn yield_once() {
+    let mut yielded = false;
+    poll_fn(|cx| {
+      if yielded {
+        return Poll::Ready(());
+      }
+      yielded = true;
+      cx.waker().wake_by_ref();
+      Poll::Pending
+    })
+    .await;
+  }
+
+  // A dropped listener stops listening: a connection it accepted but nobody took is closed, and
+  // new connections are refused.
+  fn dropped_listener_closes_on(runtime: UringRuntime) {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Arc;
+    let uri = _uri();
+    let (host, port) = uri.hostname_with_implied_port();
+    let addr = alloc::format!("{host}:{port}");
+    let client_addr = addr.clone();
+    let stage = Arc::new(AtomicU8::new(0));
+    let client_stage = stage.clone();
+    let client = std::thread::spawn(move || {
+      let _first = loop {
+        if let Ok(elem) = std::net::TcpStream::connect(&client_addr) {
+          break elem;
+        }
+        std::thread::sleep(core::time::Duration::from_millis(5));
+      };
+      while client_stage.load(Ordering::Acquire) < 1 {
+        std::thread::sleep(core::time::Duration::from_millis(1));
+      }
+      let mut second = std::net::TcpStream::connect(&client_addr).unwrap();
+      client_stage.store(2, Ordering::Release);
+      second.set_read_timeout(Some(core::time::Duration::from_secs(5))).unwrap();
+      let mut byte = [0; 1];
+      match second.read(&mut byte) {
+        Ok(0) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("the unclaimed connection is still open: {other:?}"),
+      }
+      for _ in 0..200 {
+        if std::net::TcpStream::connect(&client_addr).is_err() {
+          return;
+        }
+        std::thread::sleep(core::time::Duration::from_millis(10));
+      }
+      panic!("the dropped listener still accepts connections");
+    });
+    runtime.block_on(async {
+      let tcp_params = TcpParams::default().set_reuse_port(Some(false));
+      let listener = UringTcpListener::bind(addr.as_str(), tcp_params).await.unwrap();
+      let (first, _) = listener.accept(TcpParams::default()).await.unwrap();
+      stage.store(1, Ordering::Release);
+      while stage.load(Ordering::Acquire) < 2 {
+        yield_once().await;
+      }
+      // Turns enough for the multishot accept to take the second connection off the backlog.
+      for _ in 0..64 {
+        yield_once().await;
+      }
+      drop(listener);
+      while !client.is_finished() {
+        yield_once().await;
+      }
+      drop(first);
+    });
+    client.join().unwrap();
+  }
+
+  #[test]
+  fn dropped_listener_closes() {
+    dropped_listener_closes_on(UringRuntime::new().unwrap());
+  }
+
+  #[test]
+  fn dropped_listener_closes_with_direct_files() {
+    dropped_listener_closes_on(
+      UringRuntime::with_params(crate::executor::UringParams::new().set_direct_files(64)).unwrap(),
+    );
+  }
+
+  enum Scenario {
+    Normal,
+    SlowReader,
+    Reset,
+    Flood,
+  }
+
+  // The bytes a client sends after the upgrade, and the bytes it must get back.
+  fn script(rng: &mut Gen, scenario: &Scenario) -> (Vec<u8>, Vec<u8>) {
+    let (mut send, mut expect) = (Vec::new(), Vec::new());
+    let messages = match scenario {
+      Scenario::Flood => 400,
+      _ => 1 + rng.below(20),
+    };
+    for _ in 0..messages {
+      let key = (rng.next() as u32).to_be_bytes();
+      if rng.below(6) == 0 {
+        let ping: Vec<u8> = (0..rng.below(126)).map(|_| rng.next() as u8).collect();
+        client_frame(&mut send, true, 0x9, &ping, key);
+        server_frame(&mut expect, 0xA, &ping);
+        continue;
+      }
+      let len = match scenario {
+        Scenario::Flood => rng.below(8) as usize,
+        _ => match rng.below(10) {
+          0 => 70_000 + rng.below(130_000) as usize,
+          1..=3 => rng.below(4000) as usize,
+          _ => rng.below(130) as usize,
+        },
+      };
+      let text = rng.below(2) == 0;
+      let payload: Vec<u8> = (0..len)
+        .map(|_| if text { b'a' + (rng.below(26) as u8) } else { rng.next() as u8 })
+        .collect();
+      let op = if text { 0x1 } else { 0x2 };
+      let parts = if len > 2 && rng.below(4) == 0 { 2 + rng.below(3) as usize } else { 1 };
+      let step = len.div_ceil(parts);
+      for (idx, chunk) in payload.chunks(step.max(1)).enumerate() {
+        let last = (idx + 1) * step >= len;
+        client_frame(&mut send, last, if idx == 0 { op } else { 0 }, chunk, key);
+        if !last && rng.below(5) == 0 {
+          client_frame(&mut send, true, 0x9, b"mid", key);
+          server_frame(&mut expect, 0xA, b"mid");
+        }
+      }
+      if len == 0 {
+        client_frame(&mut send, true, op, &[], key);
+      }
+      server_frame(&mut expect, op, &payload);
+    }
+    let key = (rng.next() as u32).to_be_bytes();
+    client_frame(&mut send, true, 0x8, &[3, 232], key);
+    server_frame(&mut expect, 0x8, &[3, 232]);
+    (send, expect)
+  }
+
+  fn run_client(addr: &str, seed: u64) {
+    use std::os::fd::AsRawFd;
+    let mut rng = Gen(seed);
+    let scenario = match rng.below(10) {
+      0 => Scenario::Reset,
+      1 => Scenario::SlowReader,
+      2 => Scenario::Flood,
+      _ => Scenario::Normal,
+    };
+    let (send, expect) = script(&mut rng, &scenario);
+    let mut stream = loop {
+      if let Ok(elem) = std::net::TcpStream::connect(addr) {
+        break elem;
+      }
+      std::thread::sleep(core::time::Duration::from_millis(5));
+    };
+    let small: libc::c_int = 4096;
+    // SAFETY: valid socket and option buffer
+    unsafe {
+      libc::setsockopt(
+        stream.as_raw_fd(),
+        libc::SOL_SOCKET,
+        libc::SO_RCVBUF,
+        (&raw const small).cast(),
+        size_of::<libc::c_int>() as libc::socklen_t,
+      );
+    }
+    stream
+      .write_all(
+        b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+      )
+      .unwrap();
+    let mut res = Vec::new();
+    while !res.windows(4).any(|el| el == b"\r\n\r\n") {
+      let mut byte = [0; 1];
+      stream.read_exact(&mut byte).unwrap();
+      res.push(byte[0]);
+    }
+    assert!(res.starts_with(b"HTTP/1.1 101"));
+    if let Scenario::Reset = scenario {
+      let cut = rng.below(send.len() as u64) as usize;
+      stream.write_all(&send[..cut]).unwrap();
+      let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+      // SAFETY: valid socket and option buffer
+      unsafe {
+        libc::setsockopt(
+          stream.as_raw_fd(),
+          libc::SOL_SOCKET,
+          libc::SO_LINGER,
+          (&raw const linger).cast(),
+          size_of::<libc::linger>() as libc::socklen_t,
+        );
+      }
+      return;
+    }
+    let slow = matches!(scenario, Scenario::SlowReader);
+    let mut reader = stream.try_clone().unwrap();
+    let reading = std::thread::spawn(move || {
+      let mut got = Vec::new();
+      let mut buf = [0; 8192];
+      loop {
+        if slow {
+          std::thread::sleep(core::time::Duration::from_micros(200));
+        }
+        match reader.read(&mut buf) {
+          Ok(0) | Err(_) => break,
+          Ok(len) => got.extend_from_slice(&buf[..len]),
+        }
+      }
+      got
+    });
+    let mut written = 0;
+    while written < send.len() {
+      let step = (1 + rng.below(70_000) as usize).min(send.len() - written);
+      stream.write_all(&send[written..written + step]).unwrap();
+      written += step;
+    }
+    let got = reading.join().unwrap();
+    assert!(got == expect, "seed {seed}: got {} bytes, expected {}", got.len(), expect.len());
+  }
+
+  fn stress(params: crate::executor::UringParams, conns: u64, seed: u64) {
+    let uri = _uri();
+    let (host, port) = uri.hostname_with_implied_port();
+    let addr = alloc::format!("{host}:{port}");
+    let runtime = UringRuntime::with_params(params).unwrap();
+    let client_addr = addr.clone();
+    let clients = std::thread::spawn(move || {
+      let handles: Vec<_> = (0..conns)
+        .map(|idx| {
+          let local_addr = client_addr.clone();
+          std::thread::spawn(move || {
+            run_client(&local_addr, seed.wrapping_mul(1000).wrapping_add(idx))
+          })
+        })
+        .collect();
+      for handle in handles {
+        handle.join().unwrap();
+      }
+    });
+    runtime.block_on(async {
+      // Without `SO_REUSEPORT`, another test run on the same ports fails to bind instead of
+      // quietly taking some of the connections.
+      let tcp_params = TcpParams::default().set_reuse_port(Some(false));
+      let listener = UringTcpListener::bind(addr.as_str(), tcp_params).await.unwrap();
+      let mut handles = Vec::new();
+      for _ in 0..conns {
+        let (stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+        let handler = async move {
+          let Ok(mut ws) = WebSocketAcceptor::default()
+            .accept(TlsAcceptor::new(
+              &TlsConfig::plaintext(),
+              &mut ChaCha20::from_std_random().unwrap(),
+              stream,
+            ))
+            .await
+          else {
+            return;
+          };
+          let mut buffer = VectorUsize::new();
+          let (mut common, mut reader, mut writer) = ws.split_mut();
+          let origin = WebSocketPayloadOrigin::Adaptive;
+          loop {
+            while let Ok(Some(mut frame)) = reader.read_buffered_frame(&mut buffer, &common, origin)
+            {
+              if !writer.try_write_frame_buffered(&mut common, &mut frame).unwrap()
+                && writer.write_frame_buffered(&mut common, &mut frame).await.is_err()
+              {
+                return;
+              }
+            }
+            let Ok(mut frame) = reader.read_frame(&mut buffer, &mut common, origin).await else {
+              return;
+            };
+            match frame.op_code() {
+              OpCode::Text | OpCode::Binary => {
+                if writer.write_frame_buffered(&mut common, &mut frame).await.is_err() {
+                  return;
+                }
+              }
+              OpCode::Close => return,
+              _ => {}
+            }
+          }
+        };
+        handles.push(crate::executor::Executor::spawn_local(
+          &UringExecutor::default(),
+          handler,
+          &runtime,
+        ));
+      }
+      for handle in handles {
+        handle.await.unwrap();
+      }
+    });
+    clients.join().unwrap();
+    assert_eq!(runtime.open_conns(), 0, "connections left open");
+  }
+
+  fn stress_conns() -> u64 {
+    std::env::var("WTX_STRESS_CONNS").ok().and_then(|el| el.parse().ok()).unwrap_or(48)
+  }
+
+  #[test]
+  fn stress_default() {
+    stress(crate::executor::UringParams::new(), stress_conns(), 1);
+  }
+
+  pub(super) static ENOBUFS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+  #[test]
+  fn stress_starved_buffers_and_small_queue() {
+    let params =
+      crate::executor::UringParams::new().set_recv_buffers(8, 512).set_tx_high_water(16 * 1024);
+    stress(params, stress_conns(), 2);
+    let starved = ENOBUFS.load(core::sync::atomic::Ordering::Relaxed);
+    std::eprintln!("receives that found the buffer ring empty: {starved}");
+    assert!(starved > 0, "the ring was never exhausted, so the test didn't exercise it");
+  }
+
+  #[test]
+  fn stress_direct_files() {
+    let params = crate::executor::UringParams::new().set_direct_files(1024).set_peer_addrs(false);
+    stress(params, stress_conns(), 3);
   }
 }
