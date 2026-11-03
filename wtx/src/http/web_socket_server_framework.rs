@@ -10,7 +10,7 @@ use crate::{
   tls::{TlsAcceptor, TlsConfig, TlsCtxSk},
   web_socket::{WebSocket, WebSocketAcceptor, WsCompression},
 };
-use alloc::string::String;
+use alloc::{boxed::Box, string::String};
 use core::num::NonZeroUsize;
 
 type LocalWebSocket<CO, EX, TCX> = WebSocket<
@@ -384,8 +384,15 @@ where
   Ok(Arc::new(matcher))
 }
 
+// The handshake is boxed and freed once the upgrade is done. Inline, its state (the TLS
+// acceptor, the RNG and the request parse, about 6 KiB) would set the size of every
+// connection's task for as long as the connection stays open, though the handler never
+// touches it. A plain `fn` returning `async move` also keeps the parameters from being stored
+// twice, as an `async fn` stores its arguments.
 #[inline]
-async fn conn_fut<CO, EC, ER, EX, RNG, TCX, WSR>(conn_params: ConnParams<CO, EC, EX, RNG, TCX, WSR>)
+fn conn_fut<CO, EC, ER, EX, RNG, TCX, WSR>(
+  conn_params: ConnParams<CO, EC, EX, RNG, TCX, WSR>,
+) -> impl Future<Output = ()>
 where
   CO: WsCompression<false>,
   EC: Fn(ER),
@@ -395,23 +402,31 @@ where
   TCX: TlsCtxSk,
   WSR: WebSocketRouter<CO, ER, EX, TCX>,
 {
-  let fun = async {
+  let ConnParams { compression, error_cb, rng, router, stream, tls_config, web_socket_router } =
+    conn_params;
+  let handshake = Box::pin(async move {
     let mut path = String::new();
     let web_socket = WebSocketAcceptor::default()
-      .set_compression(conn_params.compression)
+      .set_compression(compression)
       .set_req(|req| {
         if let Some(elem) = req.path {
           path.push_str(elem);
         }
         crate::Result::Ok(true)
       })
-      .accept(TlsAcceptor::new(&*conn_params.tls_config, conn_params.rng, conn_params.stream))
+      .accept(TlsAcceptor::new(&*tls_config, rng, stream))
       .await?;
-    conn_params.web_socket_router.call(&conn_params.router, path, web_socket).await?;
-    Ok::<_, ER>(())
-  };
-  if let Err(err) = fun.await {
-    (conn_params.error_cb)(err);
+    crate::Result::Ok((path, web_socket))
+  });
+  async move {
+    let fun = async {
+      let (path, web_socket) = handshake.await?;
+      web_socket_router.call(&router, path, web_socket).await?;
+      Ok::<_, ER>(())
+    };
+    if let Err(err) = fun.await {
+      error_cb(err);
+    }
   }
 }
 
