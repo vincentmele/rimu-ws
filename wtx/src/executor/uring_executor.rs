@@ -36,8 +36,6 @@ use io_uring::{IoUring, cqueue, opcode, squeue, types};
 use std::os::fd::{IntoRawFd, RawFd};
 
 const BUF_GROUP: u16 = 0;
-const CQ_ENTRIES: u32 = 4096;
-const SQ_ENTRIES: u32 = 1024;
 
 const KIND_RECV: u64 = 1;
 const KIND_SEND: u64 = 2;
@@ -104,11 +102,13 @@ impl UringRuntime {
 /// Settings of a [`UringRuntime`].
 #[derive(Clone, Copy, Debug)]
 pub struct UringParams {
+  cq_entries: u32,
   direct_files: u32,
   peer_addrs: bool,
   recv_buffer_len: u32,
   recv_buffers: u16,
   spin: Duration,
+  sq_entries: u32,
   tx_high_water: usize,
 }
 
@@ -117,11 +117,13 @@ impl UringParams {
   #[inline]
   pub const fn new() -> Self {
     Self {
+      cq_entries: 4096,
       direct_files: 0,
       peer_addrs: true,
       recv_buffer_len: 4096,
       recv_buffers: 512,
       spin: Duration::ZERO,
+      sq_entries: 1024,
       tx_high_water: 4 * 1024 * 1024,
     }
   }
@@ -135,6 +137,19 @@ impl UringParams {
   pub const fn set_recv_buffers(mut self, count: u16, len: u32) -> Self {
     self.recv_buffers = count;
     self.recv_buffer_len = len;
+    self
+  }
+
+  /// The submission and completion ring sizes, each rounded up to a power of two (the completion
+  /// ring is also raised to at least the submission ring). Larger rings submit fewer times and
+  /// tolerate more completions per turn, which helps a server with many pipelined connections, at
+  /// the cost of more locked memory per runtime. Defaults to 1024 submission and 4096 completion
+  /// entries.
+  #[inline]
+  #[must_use]
+  pub const fn set_ring_entries(mut self, submission: u32, completion: u32) -> Self {
+    self.sq_entries = submission;
+    self.cq_entries = completion;
     self
   }
 
@@ -741,13 +756,15 @@ impl core::fmt::Debug for Reactor {
 
 impl Reactor {
   fn new(params: UringParams) -> crate::Result<Self> {
+    let sq_entries = params.sq_entries.max(1).next_power_of_two();
+    let cq_entries = params.cq_entries.max(sq_entries).next_power_of_two();
     let ring = IoUring::builder()
       .setup_single_issuer()
       .setup_defer_taskrun()
       .setup_taskrun_flag()
       .setup_submit_all()
-      .setup_cqsize(CQ_ENTRIES)
-      .build(SQ_ENTRIES)?;
+      .setup_cqsize(cq_entries)
+      .build(sq_entries)?;
     let count = params.recv_buffers.max(1).next_power_of_two();
     let len = params.recv_buffer_len.max(1) as usize;
     let layout = Layout::from_size_align(usize::from(count) * 16, 4096)
@@ -779,7 +796,7 @@ impl Reactor {
     Ok(Self {
       ring: RefCell::new(ring),
       bufs: RefCell::new(bufs),
-      cqes: RefCell::new(Vec::with_capacity(CQ_ENTRIES as usize)),
+      cqes: RefCell::new(Vec::with_capacity(cq_entries as usize)),
       conns: RefCell::new(Vec::new()),
       free_conns: RefCell::new(Vec::new()),
       free_tasks: RefCell::new(Vec::new()),
