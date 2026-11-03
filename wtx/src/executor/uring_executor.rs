@@ -96,15 +96,14 @@ impl UringRuntime {
   /// A runtime with the given settings.
   #[inline]
   pub fn with_params(params: UringParams) -> crate::Result<Self> {
-    let mut reactor = Reactor::new()?;
-    reactor.params = params;
-    Ok(Self { reactor: Box::new(reactor) })
+    Ok(Self { reactor: Box::new(Reactor::new(params)?) })
   }
 }
 
 /// Settings of a [`UringRuntime`].
 #[derive(Clone, Copy, Debug)]
 pub struct UringParams {
+  direct_files: u32,
   peer_addrs: bool,
   spin: Duration,
 }
@@ -113,7 +112,21 @@ impl UringParams {
   /// Peer addresses resolved, no spinning.
   #[inline]
   pub const fn new() -> Self {
-    Self { peer_addrs: true, spin: Duration::ZERO }
+    Self { direct_files: 0, peer_addrs: true, spin: Duration::ZERO }
+  }
+
+  /// Accepts connections as direct descriptors in a table of `value` slots registered with the
+  /// ring, `0` to use ordinary file descriptors.
+  ///
+  /// Direct descriptors live in the ring rather than the process, so sends skip the file lookup
+  /// and closing a connection is a queued operation instead of a syscall. They cannot be passed to
+  /// other syscalls: accepted connections keep the listener's `TCP_NODELAY` and report the
+  /// unspecified peer address, and at most `value` of them can be open at once.
+  #[inline]
+  #[must_use]
+  pub const fn set_direct_files(mut self, value: u32) -> Self {
+    self.direct_files = value;
+    self
   }
 
   /// Whether accepting a connection looks up its peer's address, which costs a `getpeername` per
@@ -149,7 +162,7 @@ impl Default for UringParams {
 impl Runtime for UringRuntime {
   #[inline]
   fn new() -> crate::Result<Self> {
-    Ok(Self { reactor: Box::new(Reactor::new()?) })
+    Ok(Self { reactor: Box::new(Reactor::new(UringParams::new())?) })
   }
 
   #[inline]
@@ -304,16 +317,17 @@ impl TcpListener for UringTcpListener {
   #[inline]
   async fn accept(&self, tcp_params: TcpParams) -> crate::Result<(Self::TcpStream, SocketAddr)> {
     let fd = poll_fn(|cx| poll_reactor(|reactor| reactor.poll_accept(self.idx, cx))).await?;
-    if tcp_params.tcp_nodelay() != self.nodelay {
+    let params = with_reactor(|reactor| Ok(reactor.params))?;
+    let direct = params.direct_files > 0;
+    if !direct && tcp_params.tcp_nodelay() != self.nodelay {
       set_nodelay(fd, tcp_params.tcp_nodelay())?;
     }
-    let peer_addrs = with_reactor(|reactor| Ok(reactor.params.peer_addrs))?;
-    let peer_addr = if peer_addrs {
+    let peer_addr = if params.peer_addrs && !direct {
       peer_addr(fd)?
     } else {
       SocketAddr::V4(core::net::SocketAddrV4::new(core::net::Ipv4Addr::UNSPECIFIED, 0))
     };
-    let (idx, generation) = with_reactor(|reactor| reactor.add_conn(fd, 1))?;
+    let (idx, generation) = with_reactor(|reactor| reactor.add_conn(fd, 1, direct))?;
     Ok((UringTcpStream { generation, idx }, peer_addr))
   }
 }
@@ -384,13 +398,16 @@ impl TcpStream for UringTcpStream {
     .await?;
     stream.set_nodelay(tcp_params.tcp_nodelay())?;
     let fd = stream.into_raw_fd();
-    let (idx, generation) = with_reactor(|reactor| reactor.add_conn(fd, 1))?;
+    let (idx, generation) = with_reactor(|reactor| reactor.add_conn(fd, 1, false))?;
     Ok(Self { generation, idx })
   }
 
   #[inline]
   fn peer_addr(&self) -> crate::Result<SocketAddr> {
-    let fd = with_reactor(|reactor| reactor.conn_fd(self.idx, self.generation))?;
+    let (fd, direct) = with_reactor(|reactor| reactor.conn_fd(self.idx, self.generation))?;
+    if direct {
+      return Err(io_err(libc::EOPNOTSUPP));
+    }
     peer_addr(fd)
   }
 }
@@ -576,6 +593,8 @@ struct TaskSlot {
 struct Conn {
   cancel_sent: bool,
   closing: bool,
+  // `fd` is an index into the ring's table of direct descriptors
+  direct: bool,
   fd: RawFd,
   generation: u32,
   in_use: bool,
@@ -659,7 +678,7 @@ impl core::fmt::Debug for Reactor {
 }
 
 impl Reactor {
-  fn new() -> crate::Result<Self> {
+  fn new(params: UringParams) -> crate::Result<Self> {
     let ring = IoUring::builder()
       .setup_single_issuer()
       .setup_defer_taskrun()
@@ -684,6 +703,9 @@ impl Reactor {
       bufs.push(bid);
     }
     bufs.publish();
+    if params.direct_files > 0 {
+      ring.submitter().register_files_sparse(params.direct_files)?;
+    }
     Ok(Self {
       ring: RefCell::new(ring),
       bufs: RefCell::new(bufs),
@@ -693,7 +715,7 @@ impl Reactor {
       free_tasks: RefCell::new(Vec::new()),
       listeners: RefCell::new(Vec::new()),
       main_woken: Cell::new(false),
-      params: UringParams::new(),
+      params,
       ready: RefCell::new(VecDeque::new()),
       tasks: RefCell::new(Vec::new()),
     })
@@ -769,6 +791,8 @@ impl Reactor {
       self.enter(self.ready.borrow().is_empty());
       self.reap();
     }
+    // Closing a direct descriptor is itself a queued operation.
+    self.enter(false);
   }
 
   // ---- ring
@@ -850,11 +874,10 @@ impl Reactor {
       listener.armed = true;
       listener.fd
     };
-    let sqe = opcode::AcceptMulti::new(types::Fd(fd)).build().user_data(user_data(
-      KIND_ACCEPT,
-      0,
-      idx as u32,
-    ));
+    let sqe = opcode::AcceptMulti::new(types::Fd(fd))
+      .allocate_file_index(self.params.direct_files > 0)
+      .build()
+      .user_data(user_data(KIND_ACCEPT, 0, idx as u32));
     self.push_sqe(&sqe);
   }
 
@@ -894,7 +917,7 @@ impl Reactor {
 
   // ---- connections
 
-  fn add_conn(&self, fd: RawFd, refs: u8) -> crate::Result<(u32, u32)> {
+  fn add_conn(&self, fd: RawFd, refs: u8, direct: bool) -> crate::Result<(u32, u32)> {
     let (idx, generation) = {
       let mut conns = self.conns.borrow_mut();
       let idx = if let Some(idx) = self.free_conns.borrow_mut().pop() {
@@ -906,6 +929,7 @@ impl Reactor {
       let conn = &mut conns[idx as usize];
       conn.cancel_sent = false;
       conn.closing = false;
+      conn.direct = direct;
       conn.fd = fd;
       conn.in_use = true;
       conn.reader = None;
@@ -936,22 +960,26 @@ impl Reactor {
     Ok(())
   }
 
-  fn conn_fd(&self, idx: u32, generation: u32) -> crate::Result<RawFd> {
+  fn conn_fd(&self, idx: u32, generation: u32) -> crate::Result<(RawFd, bool)> {
     let conns = self.conns.borrow();
     match conns.get(idx as usize) {
-      Some(conn) if conn.generation == generation && conn.in_use => Ok(conn.fd),
+      Some(conn) if conn.generation == generation && conn.in_use => Ok((conn.fd, conn.direct)),
       _ => Err(io_err(libc::EBADF)),
     }
   }
 
   fn arm_recv(&self, idx: u32, generation: u32, fd: RawFd) {
+    let mut direct = false;
     if let Some(conn) = self.conns.borrow_mut().get_mut(idx as usize) {
       conn.recv_armed = true;
+      direct = conn.direct;
     }
-    let sqe = opcode::RecvMulti::new(types::Fd(fd), BUF_GROUP)
-      .build()
-      .user_data(user_data(KIND_RECV, generation, idx));
-    self.push_sqe(&sqe);
+    let sqe = if direct {
+      opcode::RecvMulti::new(types::Fixed(fd as u32), BUF_GROUP).build()
+    } else {
+      opcode::RecvMulti::new(types::Fd(fd), BUF_GROUP).build()
+    };
+    self.push_sqe(&sqe.user_data(user_data(KIND_RECV, generation, idx)));
   }
 
   /// Returns `true` if a provided buffer was given back to the ring.
@@ -1068,14 +1096,7 @@ impl Reactor {
       conn.tx_pending.clear();
       conn.tx_done = 0;
       conn.sending = true;
-      opcode::Send::new(
-        types::Fd(conn.fd),
-        conn.tx_inflight.as_ptr(),
-        conn.tx_inflight.len() as u32,
-      )
-      .flags(libc::MSG_NOSIGNAL)
-      .build()
-      .user_data(user_data(KIND_SEND, generation, idx))
+      send_sqe(conn, &conn.tx_inflight).user_data(user_data(KIND_SEND, generation, idx))
     };
     self.push_sqe(&sqe);
   }
@@ -1093,10 +1114,7 @@ impl Reactor {
       conn.tx_done += res as usize;
       if conn.tx_done < conn.tx_inflight.len() {
         let rest = conn.tx_inflight.get(conn.tx_done..).unwrap_or_default();
-        let sqe = opcode::Send::new(types::Fd(conn.fd), rest.as_ptr(), rest.len() as u32)
-          .flags(libc::MSG_NOSIGNAL)
-          .build()
-          .user_data(user_data(KIND_SEND, generation, idx));
+        let sqe = send_sqe(conn, rest).user_data(user_data(KIND_SEND, generation, idx));
         drop(conns);
         self.push_sqe(&sqe);
         return;
@@ -1176,12 +1194,28 @@ impl Reactor {
       self.push_sqe(&sqe);
       return;
     }
-    // SAFETY: no operation on `fd` is in flight any more
-    let _rslt = unsafe { libc::close(fd) };
+    let direct = conn.direct;
     conn.in_use = false;
     conn.generation = conn.generation.wrapping_add(1) & 0x0FFF_FFFF;
     drop(conns);
+    if direct {
+      let sqe =
+        opcode::Close::new(types::Fixed(fd as u32)).build().user_data(user_data(KIND_CANCEL, 0, 0));
+      self.push_sqe(&sqe);
+    } else {
+      // SAFETY: no operation on `fd` is in flight any more
+      let _rslt = unsafe { libc::close(fd) };
+    }
     self.free_conns.borrow_mut().push(idx);
+  }
+}
+
+fn send_sqe(conn: &Conn, bytes: &[u8]) -> squeue::Entry {
+  let (ptr, len) = (bytes.as_ptr(), bytes.len() as u32);
+  if conn.direct {
+    opcode::Send::new(types::Fixed(conn.fd as u32), ptr, len).flags(libc::MSG_NOSIGNAL).build()
+  } else {
+    opcode::Send::new(types::Fd(conn.fd), ptr, len).flags(libc::MSG_NOSIGNAL).build()
   }
 }
 
@@ -1203,10 +1237,20 @@ mod tests {
   // through the write queue and the drain API, and the client must see every reply in order.
   #[test]
   fn pipelined_echo_ping_and_close() {
+    pipelined_echo_ping_and_close_on(UringRuntime::new().unwrap());
+  }
+
+  #[test]
+  fn pipelined_echo_ping_and_close_with_direct_files() {
+    pipelined_echo_ping_and_close_on(
+      UringRuntime::with_params(crate::executor::UringParams::new().set_direct_files(64)).unwrap(),
+    );
+  }
+
+  fn pipelined_echo_ping_and_close_on(runtime: UringRuntime) {
     let uri = _uri();
     let (host, port) = uri.hostname_with_implied_port();
     let addr = alloc::format!("{host}:{port}");
-    let runtime = UringRuntime::new().unwrap();
     let client_addr = addr.clone();
     let client = std::thread::spawn(move || {
       let mut stream = loop {
