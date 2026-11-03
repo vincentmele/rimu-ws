@@ -1,5 +1,4 @@
 use crate::{
-  AFTER_CLOSE_TIMEOUT_MS,
   collections::{MaybeUninitSlice, ShortBoxSliceU16},
   futures::Sleep,
   misc::Either,
@@ -22,7 +21,6 @@ use core::{
   pin::{Pin, pin},
   sync::atomic::Ordering,
   task::{Poll, ready},
-  time::Duration,
 };
 
 /// Reader that can be used in concurrent scenarios.
@@ -41,7 +39,7 @@ pub struct TlsStreamReader<SR, TCX, const IS_CLIENT: bool> {
   split_len: usize,
   stream_bridge: TlsStreamBridge<IS_CLIENT>,
   stream_reader: SR,
-  timer: Pin<Box<Sleep>>,
+  timer: Option<Pin<Box<Sleep>>>,
   warning_alerts: u8,
 }
 
@@ -72,7 +70,7 @@ impl<SR, TCX, const IS_CLIENT: bool> TlsStreamReader<SR, TCX, IS_CLIENT> {
       split_len: 0,
       stream_bridge,
       stream_reader,
-      timer: Box::pin(Sleep::new(Duration::from_millis(AFTER_CLOSE_TIMEOUT_MS))?),
+      timer: None,
       warning_alerts: 0,
     })
   }
@@ -192,6 +190,10 @@ where
           // is a graceful stop.
           ConnectionState::WriteClosed => {
             cold_path();
+            let timer = match crate::tls::tls_stream::after_close_timer(timer) {
+              Ok(elem) => elem,
+              Err(err) => return Poll::Ready(Err(err)),
+            };
             let _rslt = ready!(timer.as_mut().poll(cx));
             common
               .connection_state

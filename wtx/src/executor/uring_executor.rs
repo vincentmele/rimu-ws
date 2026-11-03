@@ -93,17 +93,56 @@ pub struct UringRuntime {
 }
 
 impl UringRuntime {
-  /// A runtime that busy-polls for up to `spin` before it sleeps waiting for completions.
+  /// A runtime with the given settings.
+  #[inline]
+  pub fn with_params(params: UringParams) -> crate::Result<Self> {
+    let mut reactor = Reactor::new()?;
+    reactor.params = params;
+    Ok(Self { reactor: Box::new(reactor) })
+  }
+}
+
+/// Settings of a [`UringRuntime`].
+#[derive(Clone, Copy, Debug)]
+pub struct UringParams {
+  peer_addrs: bool,
+  spin: Duration,
+}
+
+impl UringParams {
+  /// Peer addresses resolved, no spinning.
+  #[inline]
+  pub const fn new() -> Self {
+    Self { peer_addrs: true, spin: Duration::ZERO }
+  }
+
+  /// Whether accepting a connection looks up its peer's address, which costs a `getpeername` per
+  /// connection. When `false`, accepted connections report the unspecified address `0.0.0.0:0`.
+  #[inline]
+  #[must_use]
+  pub const fn set_peer_addrs(mut self, value: bool) -> Self {
+    self.peer_addrs = value;
+    self
+  }
+
+  /// Busy-polls for up to `value` before sleeping while waiting for completions.
   ///
   /// Sleeping and being woken again costs several microseconds, which dominates when every turn
   /// has little work, as with one message in flight per connection. Spinning keeps the thread on
   /// its CPU; it only enters the kernel when the ring flags pending completions. Worth it when the
   /// runtime has its CPU to itself.
   #[inline]
-  pub fn with_spin(spin: Duration) -> crate::Result<Self> {
-    let mut reactor = Reactor::new()?;
-    reactor.spin = spin;
-    Ok(Self { reactor: Box::new(reactor) })
+  #[must_use]
+  pub const fn set_spin(mut self, value: Duration) -> Self {
+    self.spin = value;
+    self
+  }
+}
+
+impl Default for UringParams {
+  #[inline]
+  fn default() -> Self {
+    Self::new()
   }
 }
 
@@ -149,16 +188,16 @@ impl Drop for RestoreCurrent {
 }
 
 /// Resolves to the output of a spawned task. Dropping it leaves the task running.
-#[derive(Debug)]
 pub struct UringJoinHandle<T> {
-  state: Rc<RefCell<JoinState<T>>>,
+  // `None` if there was no runtime to spawn on.
+  task: Option<Rc<dyn JoinTask<T>>>,
 }
 
-#[derive(Debug)]
-struct JoinState<T> {
-  no_runtime: bool,
-  value: Option<T>,
-  waker: Option<Waker>,
+impl<T> core::fmt::Debug for UringJoinHandle<T> {
+  #[inline]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("UringJoinHandle").finish()
+  }
 }
 
 impl<T> Future for UringJoinHandle<T> {
@@ -166,14 +205,76 @@ impl<T> Future for UringJoinHandle<T> {
 
   #[inline]
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    let mut state = self.state.borrow_mut();
-    if state.no_runtime {
+    let Some(task) = &self.task else {
       return Poll::Ready(Err(ExecutorError::MissingRuntime.into()));
+    };
+    task.poll_join(cx).map(Ok)
+  }
+}
+
+// A spawned future and its output share one allocation, seen by the runtime as a `RunTask` and by
+// the join handle as a `JoinTask`.
+struct TaskCell<F>
+where
+  F: Future,
+{
+  inner: RefCell<(TaskState<F>, Option<Waker>)>,
+}
+
+enum TaskState<F>
+where
+  F: Future,
+{
+  Done(Option<F::Output>),
+  Running(F),
+}
+
+trait RunTask {
+  fn poll_task(&self, cx: &mut Context<'_>) -> Poll<()>;
+}
+
+trait JoinTask<T> {
+  fn poll_join(&self, cx: &mut Context<'_>) -> Poll<T>;
+}
+
+impl<F> RunTask for TaskCell<F>
+where
+  F: Future,
+{
+  #[inline]
+  fn poll_task(&self, cx: &mut Context<'_>) -> Poll<()> {
+    let mut inner = self.inner.borrow_mut();
+    let TaskState::Running(future) = &mut inner.0 else {
+      return Poll::Ready(());
+    };
+    // SAFETY: the future lives in the `Rc` allocation and is only dropped in place, never moved
+    let future = unsafe { Pin::new_unchecked(future) };
+    let Poll::Ready(value) = future.poll(cx) else {
+      return Poll::Pending;
+    };
+    inner.0 = TaskState::Done(Some(value));
+    let waker = inner.1.take();
+    drop(inner);
+    if let Some(elem) = waker {
+      elem.wake();
     }
-    if let Some(elem) = state.value.take() {
-      return Poll::Ready(Ok(elem));
+    Poll::Ready(())
+  }
+}
+
+impl<F> JoinTask<F::Output> for TaskCell<F>
+where
+  F: Future,
+{
+  #[inline]
+  fn poll_join(&self, cx: &mut Context<'_>) -> Poll<F::Output> {
+    let mut inner = self.inner.borrow_mut();
+    if let TaskState::Done(value) = &mut inner.0
+      && let Some(elem) = value.take()
+    {
+      return Poll::Ready(elem);
     }
-    state.waker = Some(cx.waker().clone());
+    inner.1 = Some(cx.waker().clone());
     Poll::Pending
   }
 }
@@ -182,6 +283,8 @@ impl<T> Future for UringJoinHandle<T> {
 #[derive(Debug)]
 pub struct UringTcpListener {
   idx: usize,
+  // Accepted sockets inherit it from the listening one.
+  nodelay: bool,
 }
 
 impl TcpListener for UringTcpListener {
@@ -195,16 +298,21 @@ impl TcpListener for UringTcpListener {
     let listener = tcp_listener_std(addr, &UringExecutor::default(), tcp_params).await?;
     let fd = listener.into_raw_fd();
     let idx = with_reactor(|reactor| reactor.add_listener(fd))?;
-    Ok(Self { idx })
+    Ok(Self { idx, nodelay: tcp_params.tcp_nodelay() })
   }
 
   #[inline]
   async fn accept(&self, tcp_params: TcpParams) -> crate::Result<(Self::TcpStream, SocketAddr)> {
     let fd = poll_fn(|cx| poll_reactor(|reactor| reactor.poll_accept(self.idx, cx))).await?;
-    if tcp_params.tcp_nodelay() {
-      set_nodelay(fd)?;
+    if tcp_params.tcp_nodelay() != self.nodelay {
+      set_nodelay(fd, tcp_params.tcp_nodelay())?;
     }
-    let peer_addr = peer_addr(fd)?;
+    let peer_addrs = with_reactor(|reactor| Ok(reactor.params.peer_addrs))?;
+    let peer_addr = if peer_addrs {
+      peer_addr(fd)?
+    } else {
+      SocketAddr::V4(core::net::SocketAddrV4::new(core::net::Ipv4Addr::UNSPECIFIED, 0))
+    };
     let (idx, generation) = with_reactor(|reactor| reactor.add_conn(fd, 1))?;
     Ok((UringTcpStream { generation, idx }, peer_addr))
   }
@@ -365,27 +473,14 @@ where
   F: Future + 'static,
   F::Output: 'static,
 {
-  let state = Rc::new(RefCell::new(JoinState { no_runtime: false, value: None, waker: None }));
   let reactor = CURRENT.with(Cell::get);
   if reactor.is_null() {
-    state.borrow_mut().no_runtime = true;
-    return UringJoinHandle { state };
+    return UringJoinHandle { task: None };
   }
-  let task_state = state.clone();
-  let task = async move {
-    let value = future.await;
-    let waker = {
-      let mut local = task_state.borrow_mut();
-      local.value = Some(value);
-      local.waker.take()
-    };
-    if let Some(elem) = waker {
-      elem.wake();
-    }
-  };
+  let cell = Rc::new(TaskCell { inner: RefCell::new((TaskState::Running(future), None)) });
   // SAFETY: set by `block_on`, which outlives everything it polls
-  unsafe { &*reactor }.spawn(Box::pin(task));
-  UringJoinHandle { state }
+  unsafe { &*reactor }.spawn(cell.clone());
+  UringJoinHandle { task: Some(cell) }
 }
 
 fn with_reactor<T>(cb: impl FnOnce(&Reactor) -> crate::Result<T>) -> crate::Result<T> {
@@ -418,15 +513,15 @@ fn peer_addr(fd: RawFd) -> crate::Result<SocketAddr> {
   Ok(stream.peer_addr()?)
 }
 
-fn set_nodelay(fd: RawFd) -> crate::Result<()> {
-  let one: libc::c_int = 1;
-  // SAFETY: `one` outlives the call and its size is passed
+fn set_nodelay(fd: RawFd, value: bool) -> crate::Result<()> {
+  let flag = libc::c_int::from(value);
+  // SAFETY: `flag` outlives the call and its size is passed
   let rslt = unsafe {
     libc::setsockopt(
       fd,
       libc::IPPROTO_TCP,
       libc::TCP_NODELAY,
-      (&raw const one).cast(),
+      (&raw const flag).cast(),
       size_of::<libc::c_int>() as libc::socklen_t,
     )
   };
@@ -472,7 +567,7 @@ fn waker_drop(_: *const ()) {}
 // ---- the reactor
 
 struct TaskSlot {
-  future: Option<Pin<Box<dyn Future<Output = ()>>>>,
+  future: Option<Rc<dyn RunTask>>,
   generation: u32,
   scheduled: bool,
 }
@@ -552,8 +647,8 @@ struct Reactor {
   free_tasks: RefCell<Vec<u32>>,
   listeners: RefCell<Vec<ListenerState>>,
   main_woken: Cell<bool>,
+  params: UringParams,
   ready: RefCell<VecDeque<usize>>,
-  spin: Duration,
   tasks: RefCell<Vec<TaskSlot>>,
 }
 
@@ -598,15 +693,15 @@ impl Reactor {
       free_tasks: RefCell::new(Vec::new()),
       listeners: RefCell::new(Vec::new()),
       main_woken: Cell::new(false),
+      params: UringParams::new(),
       ready: RefCell::new(VecDeque::new()),
-      spin: Duration::ZERO,
       tasks: RefCell::new(Vec::new()),
     })
   }
 
   // ---- tasks
 
-  fn spawn(&self, future: Pin<Box<dyn Future<Output = ()>>>) {
+  fn spawn(&self, future: Rc<dyn RunTask>) {
     let mut tasks = self.tasks.borrow_mut();
     let idx = if let Some(idx) = self.free_tasks.borrow_mut().pop() {
       let slot = &mut tasks[idx as usize];
@@ -649,11 +744,11 @@ impl Reactor {
         slot.scheduled = false;
         (slot.future.take(), slot.generation)
       };
-      let Some(mut future) = future else {
+      let Some(future) = future else {
         continue;
       };
       let waker = waker(((generation as usize) << 32) | idx);
-      if future.as_mut().poll(&mut Context::from_waker(&waker)).is_ready() {
+      if future.poll_task(&mut Context::from_waker(&waker)).is_ready() {
         drop(future);
         let mut tasks = self.tasks.borrow_mut();
         let slot = &mut tasks[idx];
@@ -692,7 +787,7 @@ impl Reactor {
       let _rslt = ring.submit();
       return;
     }
-    if !self.spin.is_zero() {
+    if !self.params.spin.is_zero() {
       let _rslt = ring.submit();
       let begin = std::time::Instant::now();
       let mut iter: u32 = 0;
@@ -706,7 +801,7 @@ impl Reactor {
           return;
         }
         iter = iter.wrapping_add(1);
-        if iter % 64 == 0 && begin.elapsed() >= self.spin {
+        if iter % 64 == 0 && begin.elapsed() >= self.params.spin {
           break;
         }
         core::hint::spin_loop();

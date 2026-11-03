@@ -51,7 +51,8 @@ pub struct TlsStream<S, TCX, const IS_CLIENT: bool> {
   pub(crate) split_begin: usize,
   pub(crate) split_len: usize,
   pub(crate) stream: S,
-  pub(crate) timer: Pin<Box<Sleep>>,
+  // Created when first needed: after we sent a close notify and still read.
+  pub(crate) timer: Option<Pin<Box<Sleep>>>,
   pub(crate) warning_alerts: u8,
 }
 
@@ -84,7 +85,7 @@ where
       split_begin: 0,
       split_len: 0,
       stream,
-      timer: Box::pin(Sleep::new(Duration::from_millis(AFTER_CLOSE_TIMEOUT_MS))?),
+      timer: None,
       warning_alerts: 0,
     })
   }
@@ -344,7 +345,7 @@ where
 /// What a pending read becomes given the state of the connection when the read started.
 fn poll_pending_read(
   local_connection_state: ConnectionState,
-  timer: &mut Pin<Box<Sleep>>,
+  timer: &mut Option<Pin<Box<Sleep>>>,
   cx: &mut core::task::Context<'_>,
 ) -> Poll<crate::Result<Option<NonZeroUsize>>> {
   match local_connection_state {
@@ -362,10 +363,24 @@ fn poll_pending_read(
     // Only called when the user sent a close notify and also decided to read data.
     ConnectionState::WriteClosed => {
       cold_path();
+      let timer = match after_close_timer(timer) {
+        Ok(elem) => elem,
+        Err(err) => return Poll::Ready(Err(err)),
+      };
       let _rslt = ready!(timer.as_mut().poll(cx));
       Poll::Ready(Ok(None))
     }
   }
+}
+
+/// The timer that bounds reads after a close notify was sent, started on first use.
+pub(crate) fn after_close_timer(
+  timer: &mut Option<Pin<Box<Sleep>>>,
+) -> crate::Result<&mut Pin<Box<Sleep>>> {
+  if let Some(elem) = timer {
+    return Ok(elem);
+  }
+  Ok(timer.insert(Box::pin(Sleep::new(Duration::from_millis(AFTER_CLOSE_TIMEOUT_MS))?)))
 }
 
 async fn alert_cb<S>(aux: &mut Aux<'_>, alert: Alert, stream: &mut S) -> crate::Result<bool>

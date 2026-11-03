@@ -1,5 +1,4 @@
 use crate::{calendar::Instant, misc::Usize};
-use alloc::boxed::Box;
 use core::{panic::Location, ptr};
 
 const BEGIN: u64 = 5_871_781_006_564_002_453;
@@ -8,7 +7,7 @@ const MIX: u64 = 10_526_836_309_316_205_339;
 /// Uses a combination of weak strategies that will likely result in poor results. This method
 /// is usually good enough for non-cryptography hashing algorithms.
 ///
-/// 1. The address of a stack and a heap allocation.
+/// 1. The address of a stack and, without `std`, a heap allocation.
 /// 2. The line and column of the caller location.
 /// 3. The current timestamp, if a provider like `std` or `embassy-time` is active.
 /// 4. The random state of `std::hash::RandomState` if `std` is active.
@@ -17,10 +16,16 @@ const MIX: u64 = 10_526_836_309_316_205_339;
 #[track_caller]
 pub fn simple_seed() -> u64 {
   let location = Location::caller();
-  let (stack, heap) = (7, Box::new(7));
+  let stack = 7;
   let mut seed = BEGIN;
   seed = mix(seed, Usize::from_usize(ptr::addr_of!(stack).addr()).into_u64());
-  seed = mix(seed, Usize::from_usize(ptr::addr_of!(heap).addr()).into_u64());
+  // With `std`, the state below already differs between calls, so the allocation is only made
+  // without it.
+  #[cfg(not(feature = "std"))]
+  {
+    let heap = alloc::boxed::Box::new(7);
+    seed = mix(seed, Usize::from_usize(ptr::addr_of!(heap).addr()).into_u64());
+  }
   seed = mix(seed, location.column().into());
   seed = mix(seed, location.line().into());
   if let Ok(timestamp) = Instant::now_timestamp().map(|dur| dur.as_nanos()) {

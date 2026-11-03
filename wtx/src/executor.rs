@@ -20,8 +20,8 @@ pub use no_std_runtime::NoStdRuntime;
 pub use tokio_executor::{TokioExecutor, TokioSpawnFutureFuture};
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 pub use uring_executor::{
-  UringExecutor, UringJoinHandle, UringReadHalf, UringRuntime, UringTcpListener, UringTcpStream,
-  UringWriteHalf,
+  UringExecutor, UringJoinHandle, UringParams, UringReadHalf, UringRuntime, UringTcpListener,
+  UringTcpStream, UringWriteHalf,
 };
 #[cfg(feature = "std")]
 use {crate::net::ToSocketAddrs, core::net::SocketAddr};
