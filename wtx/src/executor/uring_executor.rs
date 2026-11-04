@@ -681,6 +681,8 @@ fn waker_drop(_: *const ()) {}
 
 // ---- the reactor
 
+// 32 bytes, so that no slot straddles two cache lines: a wake reads one.
+#[repr(align(32))]
 struct TaskSlot {
   future: Option<Rc<dyn RunTask>>,
   generation: u32,

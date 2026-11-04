@@ -418,13 +418,17 @@ where
       .await?;
     crate::Result::Ok((path, web_socket))
   });
+  // Errors handled inline rather than through an inner `async` block: each nested future is
+  // another state the task walks through on every poll.
   async move {
-    let fun = async {
-      let (path, web_socket) = handshake.await?;
-      web_socket_router.call(&router, path, web_socket).await?;
-      Ok::<_, ER>(())
+    let (path, web_socket) = match handshake.await {
+      Ok(elem) => elem,
+      Err(err) => {
+        error_cb(err.into());
+        return;
+      }
     };
-    if let Err(err) = fun.await {
+    if let Err(err) = web_socket_router.call(&router, path, web_socket).await {
       error_cb(err);
     }
   }
