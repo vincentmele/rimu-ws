@@ -247,6 +247,74 @@ recommendations, corrected where the code says otherwise, amend the plan above:
      `server_max_window_bits` and the memory level. It is worth a test of its own: RSS per
      connection with compression negotiated.
 
+## Progress on 2026-11-05
+
+**Fixed and committed** (lib 217/217; 219/219 with zlib-rs, framework and ring):
+
+- **164d445b, handshake:**
+  - F-A: a 16 KiB request cap, answered with 431, and re-parsing only once a blank line can have
+    arrived (linear, not quadratic).
+  - F-B: the full RFC 6455 4.2.1 gate, with a 400 naming version 13 when the version is wrong.
+  - F-C: 64 headers; too many get a 431.
+  - Two more bugs:
+    - **A request or response split across reads was never parsed** (upstream wtx has it too).
+      `read_arbitrary` reads went to `current`, which the next read cleared, so any upgrade head
+      bigger than one TCP segment failed on a real network. Reads now go to `following`.
+    - **The client accepted any 101.** The Sec-WebSocket-Accept, Upgrade and Connection checks
+      were computed and dropped with `drop(...)`. It now fails as RFC 6455 4.1 says.
+- **de4b8234, framework:** the route is matched on the path without its query, and before the
+  101. Before, a `?query` or a path over 255 bytes got a 101 and was then dropped. A path with no
+  route gets a 400.
+- **d2667dc5, fuzz target:** `wtx-fuzz/web_socket_handshake.rs`; the oracle is
+  `web_socket::handshake_check`, shared with the tests. 3.3M runs in 3 minutes found nothing.
+  Run it with `cargo +nightly-2026-10-12 fuzz run --fuzz-dir wtx-fuzz web_socket_handshake --
+  -timeout=2 -rss_limit_mb=512`.
+- **soak-server-tokio** had no crypto backend, so the upgrade panicked; fixed.
+
+**Soak results** (100 slots, 30 s, `MALLOC_MMAP_THRESHOLD_=262144`, `--rss-ceiling 2048`):
+
+| Server | Profile | Runs | Fails | Violations | Probe p50/p99/p99.9 |
+|---|---|---|---|---|---|
+| rimu-ws uring, queue loop | attack | 7,977 | 0 | drain check (see below), 2 latency seconds | 41/859/5635 us |
+| rimu-ws tokio, queue loop | untimed | 24,247 | 0 | none | 40/298/1150 us |
+| tokio-tungstenite 0.30, defaults | untimed | died | | RSS climbed about 4 GB/s to 23 GB on `ping_no_read`, then the process was gone | |
+| tokio-tungstenite, defaults, without `ping_no_read` | untimed | 27,829 | 3,475 | latency | 43/371/2049 us |
+| tokio-tungstenite, `max_write_buffer_size` 1 MiB | untimed | 9,786 | 1,375 | latency | 2025/10487/16343 us |
+
+The tokio-tungstenite echo server is in `/mnt/nvme1tb/claude-tmp/tt-echo` (not in the repo); the
+runner is `/mnt/nvme1tb/claude-tmp/soak/run-other.sh`. **Always pass `--rss-ceiling` against
+other servers:** colossus is a trading box, and the default tokio-tungstenite took 23 GB.
+
+tokio-tungstenite findings:
+
+- With the default `max_write_buffer_size` (unbounded), pongs to a peer that never reads are
+  queued without bound.
+- It closes TCP without a close frame on protocol errors, oversized lengths, bad UTF-8 and an
+  over-limit fragmented message. That is the RFC 6455 7.1.7 gap rimu-ws closed in F2.
+- It refuses frames pipelined behind the upgrade request.
+
+**Questions for the user, about oracles (do not change these without them):**
+
+1. `bad_upgrade::Pipelined` requires an upgrade. RFC 6455 4.1 says a client must wait for the 101
+   before sending frames, so a refusal is allowed too. Suggestion: accept a refusal, or an
+   upgrade followed by the echo.
+2. `ping_no_read` requires a send to block. A server may answer only the most recent ping (RFC
+   6455 5.5.3) and keep reading without growing, as hardened tokio-tungstenite does. Suggestion:
+   judge it by memory (the monitor) plus a pong check, not by blocking.
+3. The drain leak check compares against the warmup's RSS. On uring the receive buffers (about
+   2 MiB per thread) are only touched under load, so after an attack cycle the drained RSS is
+   about 32 MB over the warmup without being a leak. Confirm it stays flat across several cycles
+   (`--cycles 3`); if so, take the baseline after the first cycle's drain and rely on `--trend`.
+
+**Still to do:**
+
+- item 2 (`soak.sh` modes: malloc setting, `SOAK_SERVER`, `SOAK_SNDBUF`, the `long` preset;
+  README);
+- the rest of the matrix (plain and drain loops, the drip profile, `close_linger` with a send
+  buffer, deflate);
+- item 4 (compression);
+- the open questions above.
+
 ## Where further work could go
 
 - **TLS (`wss://`).** Public servers usually terminate TLS. Malformed ClientHellos, slow TLS
