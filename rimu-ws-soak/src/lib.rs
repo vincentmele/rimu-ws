@@ -4,6 +4,7 @@
 //! It speaks raw bytes through its own codec and doesn't depend on rimu-ws, so its clients can
 //! misbehave freely and a bug the two shared couldn't hide.
 
+pub mod burst;
 pub mod codec;
 pub mod conn;
 pub mod cycle;

@@ -41,6 +41,7 @@ fn cfg(addr: SocketAddr, pid: u32) -> CycleConfig {
     probes: 2,
     probe_rate: 50,
     fd_flood: None,
+    ext: rimu_ws_soak::cycle::Extended::default(),
   }
 }
 

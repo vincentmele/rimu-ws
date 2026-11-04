@@ -4,7 +4,7 @@
 use clap::Parser as _;
 use rimu_ws_soak::{
   conn::ConnOpts,
-  cycle::{self, CycleConfig},
+  cycle::{self, CycleConfig, Extended, RecordMode},
   runner::{RunConfig, parse_replay, replay},
   scenario::{Ctx, Limits, Weights, parse_weights, profile},
 };
@@ -35,7 +35,8 @@ struct Common {
   /// The server's WebSocket URL (plain `ws://` only).
   #[arg(long, default_value = "ws://127.0.0.1:9080/")]
   url: String,
-  /// Weighted mix: `baseline`, `hostile` or `storm`.
+  /// Weighted mix: `baseline`, `hostile`, `storm`, `untimed`, `drip` or `deflate`. A comma
+  /// list (`hostile,storm`) rotates them by cycle; replay with the failing cycle's profile.
   #[arg(long, default_value = "hostile")]
   profile: String,
   /// Overrides `--profile`, as `echo=40,garbage=4`.
@@ -91,6 +92,35 @@ struct RunArgs {
   /// Source addresses to spread the slots over, as `a-b` ranges or a comma list.
   #[arg(long)]
   source_ips: Option<String>,
+  /// Which scenario runs `--out` keeps: `all`, or `failures` (and harness errors) for long runs.
+  #[arg(long, value_enum, default_value_t = Records::All)]
+  records: Records,
+  /// How often to sum up the run so far, on stderr and as a `heartbeat` line.
+  #[arg(long, value_parser = parse_duration)]
+  heartbeat: Option<Duration>,
+  /// Cycles in a row the memory after the drain, or its peak, may rise (by over 8 MiB and 2% in
+  /// all) before that is a violation. 0 turns the check off.
+  #[arg(long, default_value_t = 0)]
+  trend: u32,
+  /// Kills the server past this RSS in MiB (needs --pid), which ends the run.
+  #[arg(long)]
+  rss_ceiling: Option<u64>,
+  /// Starts no cycle, and stops the load, this long into the run.
+  #[arg(long, value_parser = parse_duration)]
+  max_time: Option<Duration>,
+  /// Ends the run at the first failure or violation.
+  #[arg(long)]
+  stop_on_first: bool,
+  /// After each cycle's recovery check, opens this many connections at once; each must upgrade
+  /// and echo within 5 s.
+  #[arg(long)]
+  burst: Option<u32>,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Records {
+  All,
+  Failures,
 }
 
 #[derive(clap::Args)]
@@ -127,7 +157,8 @@ fn parse_ips(s: &str) -> Result<Vec<IpAddr>, String> {
   Ok(ips)
 }
 
-fn ctx(common: &Common) -> Result<(Ctx, Weights), String> {
+/// The context, the first profile's weights, and every profile when `--profile` lists several.
+fn ctx(common: &Common) -> Result<(Ctx, Weights, Vec<(String, Weights)>), String> {
   let rest = common.url.strip_prefix("ws://").ok_or("only ws:// URLs are supported")?;
   let (authority, path) = rest.find('/').map_or((rest, "/"), |at| rest.split_at(at));
   let addr: SocketAddr = authority
@@ -135,10 +166,19 @@ fn ctx(common: &Common) -> Result<(Ctx, Weights), String> {
     .map_err(|err| format!("{authority}: {err}"))?
     .next()
     .ok_or_else(|| format!("{authority} resolves to nothing"))?;
+  let mut rotation = Vec::new();
   let weights = match &common.weights {
     Some(spec) => parse_weights(spec)?,
     None => {
-      profile(&common.profile).ok_or_else(|| format!("unknown profile {}", common.profile))?
+      for name in common.profile.split(',').map(str::trim) {
+        let weights = profile(name).ok_or_else(|| format!("unknown profile {name}"))?;
+        rotation.push((name.to_owned(), weights));
+      }
+      let first = rotation.first().map(|el| el.1.clone()).ok_or("no profile")?;
+      if rotation.len() == 1 {
+        rotation.clear();
+      }
+      first
     }
   };
   let limits = Limits {
@@ -149,7 +189,7 @@ fn ctx(common: &Common) -> Result<(Ctx, Weights), String> {
     ..Limits::default()
   };
   let host = authority.to_owned();
-  Ok((Ctx { addr, host, path: path.to_owned(), limits, opts: ConnOpts::default() }, weights))
+  Ok((Ctx { addr, host, path: path.to_owned(), limits, opts: ConnOpts::default() }, weights, rotation))
 }
 
 /// Raises the descriptor limit to its hard limit: every slot holds a socket or two.
@@ -178,7 +218,7 @@ fn main() -> ExitCode {
 }
 
 async fn run(args: RunArgs) -> Result<ExitCode, String> {
-  let (ctx, weights) = ctx(&args.common)?;
+  let (ctx, weights, rotation) = ctx(&args.common)?;
   let source_ips = args.source_ips.as_deref().map(parse_ips).transpose()?.unwrap_or_default();
   let out_path = args
     .out
@@ -207,16 +247,34 @@ async fn run(args: RunArgs) -> Result<ExitCode, String> {
     probes: args.probes,
     probe_rate: args.probe_rate,
     fd_flood: args.fd_flood,
+    ext: Extended {
+      rotation,
+      records: match args.records {
+        Records::All => RecordMode::All,
+        Records::Failures => RecordMode::Failures,
+      },
+      heartbeat: args.heartbeat,
+      trend: args.trend,
+      rss_ceiling_kib: args.rss_ceiling.map(|el| el * 1024),
+      max_time: args.max_time,
+      stop_on_first: args.stop_on_first,
+      burst: args.burst,
+    },
   };
   let summary = cycle::run(cfg, &mut out).await;
   eprintln!(
-    "cycles {}, records {}, fails {}, harness errors {}, violations {}, saturated cycles {}; {}",
+    "cycles {}, records {}, fails {}, harness errors {}, violations {}, saturated cycles {}; probe p50/p99/p99.9/max {}/{}/{}/{} us{}; {}",
     summary.cycles,
     summary.records,
     summary.fails,
     summary.harness_errors,
     summary.violations.len(),
     summary.client_saturated_cycles,
+    summary.latency.p50_us,
+    summary.latency.p99_us,
+    summary.latency.p999_us,
+    summary.latency.max_us,
+    summary.stopped.as_deref().map(|el| format!("; stopped: {el}")).unwrap_or_default(),
     out_path.display()
   );
   Ok(ExitCode::from(if summary.fails > 0 || !summary.violations.is_empty() {
@@ -229,7 +287,10 @@ async fn run(args: RunArgs) -> Result<ExitCode, String> {
 }
 
 async fn replay_one(args: ReplayArgs) -> Result<ExitCode, String> {
-  let (ctx, weights) = ctx(&args.common)?;
+  let (ctx, weights, rotation) = ctx(&args.common)?;
+  if !rotation.is_empty() {
+    return Err("replay one profile: the one of the failing cycle".into());
+  }
   let id = parse_replay(&args.id).ok_or_else(|| format!("bad replay id `{}`", args.id))?;
   let record = replay(&ctx, &weights, id).await;
   println!(

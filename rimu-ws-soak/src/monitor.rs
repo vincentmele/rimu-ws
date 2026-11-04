@@ -173,6 +173,18 @@ pub enum Violation {
   },
   NoRecovery(String),
   Leak(String),
+  /// Memory after the drain, or its peak, rose cycle after cycle.
+  Trend(String),
+  /// The server passed `--rss-ceiling` and was killed.
+  RssCeiling {
+    rss_kib: u64,
+    ceiling_kib: u64,
+  },
+  /// Connections of a burst that were never served.
+  Burst {
+    unserved: u32,
+    n: u32,
+  },
 }
 
 /// While clients are connected.

@@ -44,10 +44,24 @@ pub fn lag_exceeds(lag_p99_us: u64, baseline_lag_p99_us: u64) -> bool {
   lag_p99_us > baseline_lag_p99_us + MAX_LAG_US
 }
 
+/// Probe results over the whole run.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub struct ProbeTotals {
+  pub count: u64,
+  pub p50_us: u64,
+  pub p99_us: u64,
+  pub p999_us: u64,
+  pub max_us: u64,
+  pub failures: u64,
+}
+
 struct Hists {
   failures: u64,
   lag: Histogram<u64>,
   rtt: Histogram<u64>,
+  // Never reset: the whole run's
+  total: Histogram<u64>,
+  total_failures: u64,
 }
 
 fn histogram() -> Histogram<u64> {
@@ -71,7 +85,13 @@ impl Probes {
   /// `connections` connections, each echoing a 32-byte text `rate_hz` times a second, their
   /// schedules spread evenly over the period.
   pub fn spawn(ctx: Ctx, connections: u32, rate_hz: u32) -> Probes {
-    let hists = Arc::new(Mutex::new(Hists { failures: 0, lag: histogram(), rtt: histogram() }));
+    let hists = Arc::new(Mutex::new(Hists {
+      failures: 0,
+      lag: histogram(),
+      rtt: histogram(),
+      total: histogram(),
+      total_failures: 0,
+    }));
     let stop = Arc::new(AtomicBool::new(false));
     let (thread_hists, thread_stop) = (hists.clone(), stop.clone());
     let thread = std::thread::spawn(move || {
@@ -111,6 +131,19 @@ impl Probes {
     stats
   }
 
+  /// The results since the probes started.
+  pub fn totals(&self) -> ProbeTotals {
+    let Ok(hists) = self.hists.lock() else { return ProbeTotals::default() };
+    ProbeTotals {
+      count: hists.total.len(),
+      p50_us: hists.total.value_at_quantile(0.5),
+      p99_us: hists.total.value_at_quantile(0.99),
+      p999_us: hists.total.value_at_quantile(0.999),
+      max_us: hists.total.max(),
+      failures: hists.total_failures,
+    }
+  }
+
   pub fn stop(mut self) {
     self.stop.store(true, Ordering::Relaxed);
     if let Some(thread) = self.thread.take() {
@@ -138,6 +171,7 @@ async fn probe(
   let failed = |hists: &Mutex<Hists>| {
     if let Ok(mut el) = hists.lock() {
       el.failures += 1;
+      el.total_failures += 1;
     }
   };
   while !stop.load(Ordering::Relaxed) {
@@ -185,6 +219,7 @@ async fn probe(
       let rtt = (prev_end - start).as_micros() as u64;
       if let Ok(mut el) = hists.lock() {
         let _ = el.rtt.record(rtt.max(1));
+        let _ = el.total.record(rtt.max(1));
         let _ = el.lag.record(lag.max(1));
       }
     }

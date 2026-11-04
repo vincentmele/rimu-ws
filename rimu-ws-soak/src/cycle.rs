@@ -7,10 +7,10 @@ use crate::{
   monitor::{
     Baseline, Budgets, Monitor, MonitorError, Sample, Violation, check_drained, check_running,
   },
-  probe::{ProbeStats, Probes, lag_exceeds},
+  probe::{ProbeStats, ProbeTotals, Probes, lag_exceeds},
   rng::rng,
   runner::{Record, RunConfig, run_slots},
-  scenario::Ctx,
+  scenario::{Ctx, Weights},
 };
 use std::{
   io::Write,
@@ -27,6 +27,10 @@ const RECOVERY: Duration = Duration::from_secs(1);
 const FLOOD_RECOVERY: Duration = Duration::from_secs(2);
 /// How long the flood is held.
 const FLOOD_HOLD: Duration = Duration::from_secs(10);
+/// How long each connection of a burst may take to connect, upgrade and echo.
+const BURST_WITHIN: Duration = Duration::from_secs(5);
+/// The least rise, over the cycles judged, that counts as a trend.
+const TREND_MIN_KIB: u64 = 8 * 1024;
 
 /// Whether one second of probe results breaks the latency invariant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +89,52 @@ pub struct CycleConfig {
   pub probe_rate: u32,
   /// Connections the descriptor flood opens after each drain check, if any.
   pub fd_flood: Option<u32>,
+  pub ext: Extended,
+}
+
+/// Which scenario runs `--out` keeps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RecordMode {
+  #[default]
+  All,
+  /// Failures and harness errors only: a long run makes millions of passing records.
+  Failures,
+}
+
+/// What long runs add to the cycles.
+#[derive(Clone, Debug, Default)]
+pub struct Extended {
+  /// Cycle `i` runs profile `i % len`; empty runs `RunConfig::weights` every cycle.
+  pub rotation: Vec<(String, Weights)>,
+  pub records: RecordMode,
+  /// How often a `heartbeat` line sums up the run so far.
+  pub heartbeat: Option<Duration>,
+  /// Cycles in a row the memory after the drain, or its peak, may rise before that counts as a
+  /// leak. 0 turns the check off.
+  pub trend: u32,
+  /// RSS past which the server is killed, which ends the run.
+  pub rss_ceiling_kib: Option<u64>,
+  /// No new cycle, and no more load, this long into the run.
+  pub max_time: Option<Duration>,
+  /// Ends the run at the first failure or violation.
+  pub stop_on_first: bool,
+  /// After each cycle's recovery check, this many connections at once.
+  pub burst: Option<u32>,
+}
+
+/// A `Trend` if `values` (one per cycle, in KiB) rose in each of the last `cycles` cycles, by more
+/// than 8 MiB and 2% in all.
+pub fn trend_violation(what: &str, values: &[u64], cycles: u32) -> Option<Violation> {
+  let k = cycles as usize;
+  if k == 0 || values.len() <= k {
+    return None;
+  }
+  let window = &values[values.len() - k - 1..];
+  let rising = window.windows(2).all(|el| el[1] > el[0]);
+  let rise = window[k].saturating_sub(window[0]);
+  (rising && rise > TREND_MIN_KIB.max(window[0] / 50)).then(|| {
+    Violation::Trend(format!("{what} rose in each of the last {k} cycles: {window:?} KiB"))
+  })
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -97,6 +147,11 @@ pub struct Summary {
   pub client_saturated_cycles: u32,
   /// Fails while the probes showed the harness saturated: some may be the harness's.
   pub fails_while_saturated: u64,
+  /// The probes over the whole run.
+  pub latency: ProbeTotals,
+  /// Why the run ended before its last cycle, if it did: `max time`, `first failure` or `rss
+  /// ceiling`.
+  pub stopped: Option<String>,
 }
 
 /// Writes `value` as one JSON line tagged with `kind`.
@@ -114,10 +169,22 @@ fn line(out: &mut dyn Write, kind: &str, value: impl serde::Serialize) {
 
 /// The run so far, for `Monitor` failures that end it.
 struct State<'out> {
+  ceiling_kib: Option<u64>,
+  // Memory after each drain, and its peak, for the trend check.
+  drained: Vec<u64>,
   // Set once the server is gone, which is reported once.
   gone: bool,
+  last_beat: Instant,
+  last_sample: Option<Sample>,
   monitor: Option<Monitor>,
   out: &'out mut dyn Write,
+  peaks: Vec<u64>,
+  // The cycle's profile, when they rotate
+  profile: Option<String>,
+  started: Instant,
+  // Why the run is to end early.
+  stop: Option<&'static str>,
+  stop_on_first: bool,
   summary: Summary,
 }
 
@@ -126,6 +193,50 @@ impl State<'_> {
     eprintln!("VIOLATION cycle {cycle}: {violation:?}");
     line(self.out, "violation", serde_json::json!({ "cycle": cycle, "violation": violation }));
     self.summary.violations.push(violation);
+    if self.stop_on_first {
+      let _ = self.stop.get_or_insert("first failure");
+    }
+  }
+
+  fn heartbeat(&mut self, cycle: u32, probes: Option<&Probes>) {
+    self.last_beat = Instant::now();
+    let latency = probes.map(Probes::totals).unwrap_or_default();
+    let elapsed_s = self.started.elapsed().as_secs();
+    let s = &self.summary;
+    eprintln!(
+      "heartbeat {elapsed_s}s cycle {cycle}: {} records, {} fails, {} harness errors, {} violations, rss {:?} KiB, p99 {} us",
+      s.records,
+      s.fails,
+      s.harness_errors,
+      s.violations.len(),
+      self.last_sample.map(|el| el.rss_kib),
+      latency.p99_us,
+    );
+    let beat = serde_json::json!({
+      "elapsed_s": elapsed_s,
+      "cycle": cycle,
+      "records": s.records,
+      "fails": s.fails,
+      "harness_errors": s.harness_errors,
+      "violations": s.violations.len(),
+      "sample": self.last_sample,
+      "latency": latency,
+    });
+    line(self.out, "heartbeat", beat);
+  }
+
+  /// Checks the memory after a drain, and its peak so far, for a rise over the last `cycles`.
+  fn trend(&mut self, cycle: u32, sample: &Sample, cycles: u32) {
+    self.drained.push(sample.rss_kib);
+    self.peaks.push(sample.hwm_kib);
+    for (what, peak) in [("RSS after the drain", false), ("peak RSS", true)] {
+      let values = if peak { &mut self.peaks } else { &mut self.drained };
+      if let Some(violation) = trend_violation(what, values, cycles) {
+        // Judged afresh from here, so a rise is reported once per `cycles` cycles.
+        values.clear();
+        self.violation(cycle, violation);
+      }
+    }
   }
 
   /// A sample, or `None` if the server is gone (recorded the first time). Without a monitor,
@@ -144,9 +255,21 @@ impl State<'_> {
       Ok(el) => el,
       Err(_) => return Some(None),
     };
+    let pid = monitor.pid();
     self.monitor = Some(monitor);
     match rslt {
-      Ok(sample) => Some(Some(sample)),
+      Ok(sample) => {
+        self.last_sample = Some(sample);
+        if let Some(ceiling_kib) = self.ceiling_kib.filter(|el| sample.rss_kib > *el) {
+          // SAFETY: no pointers
+          let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+          self.gone = true;
+          let _ = self.stop.get_or_insert("rss ceiling");
+          self.violation(cycle, Violation::RssCeiling { rss_kib: sample.rss_kib, ceiling_kib });
+          return None;
+        }
+        Some(Some(sample))
+      }
       Err(MonitorError::PidGone) => {
         self.gone = true;
         self.violation(cycle, Violation::PidGone);
@@ -162,7 +285,22 @@ impl State<'_> {
 
 /// Runs the cycles, writing every sample, record and violation to `out` as JSONL.
 pub async fn run(cfg: CycleConfig, out: &mut dyn Write) -> Summary {
-  let mut state = State { gone: false, monitor: None, out, summary: Summary::default() };
+  let started = Instant::now();
+  let mut state = State {
+    ceiling_kib: cfg.ext.rss_ceiling_kib,
+    drained: Vec::new(),
+    gone: false,
+    last_beat: started,
+    last_sample: None,
+    monitor: None,
+    out,
+    peaks: Vec::new(),
+    profile: None,
+    started,
+    stop: None,
+    stop_on_first: cfg.ext.stop_on_first,
+    summary: Summary::default(),
+  };
   match cfg.pid.map(|pid| Monitor::new(pid, cfg.port)) {
     Some(Ok(monitor)) => state.monitor = Some(monitor),
     Some(Err(_)) => {
@@ -171,22 +309,45 @@ pub async fn run(cfg: CycleConfig, out: &mut dyn Write) -> Summary {
     }
     None => eprintln!("warning: no --pid, so the server is not monitored"),
   }
+  let deadline = cfg.ext.max_time.map(|el| started + el);
   let probes =
     (cfg.probes > 0).then(|| Probes::spawn(cfg.run.ctx.clone(), cfg.probes, cfg.probe_rate));
   let mut first_base: Option<Baseline> = None;
   for cycle in 0..cfg.cycles {
+    if deadline.is_some_and(|el| Instant::now() >= el) {
+      let _ = state.stop.get_or_insert("max time");
+    }
+    if state.stop.is_some() {
+      break;
+    }
     state.summary.cycles = cycle + 1;
     sleep(cfg.warmup).await;
     let warm = probes.as_ref().map(Probes::snapshot).unwrap_or_default();
     let Some(sample) = state.sample(cycle).await else { break };
     let base = sample.map(|el| Baseline { rss_kib: el.rss_kib, fds: el.fds });
     let first = *first_base.get_or_insert(base.unwrap_or(Baseline { rss_kib: 0, fds: 0 }));
+    let rotation = (!cfg.ext.rotation.is_empty())
+      .then(|| &cfg.ext.rotation[cycle as usize % cfg.ext.rotation.len()]);
     line(
       state.out,
       "warmup",
-      serde_json::json!({ "cycle": cycle, "probes": warm, "baseline": base }),
+      serde_json::json!({
+        "cycle": cycle,
+        "probes": warm,
+        "baseline": base,
+        "profile": rotation.map(|el| &el.0),
+      }),
     );
-    if !mix(&cfg, cycle, &mut state, probes.as_ref(), base, &warm).await {
+    let mut run = cfg.run.clone();
+    if let Some((name, weights)) = rotation {
+      run.weights = weights.clone();
+      state.profile = Some(name.clone());
+    }
+    let end = deadline.map_or(Instant::now() + run.duration, |el| el.min(Instant::now() + run.duration));
+    if !mix(&cfg, run, end, cycle, &mut state, probes.as_ref(), base, &warm).await {
+      break;
+    }
+    if state.stop.is_some() {
       break;
     }
     sleep(cfg.drain).await;
@@ -200,9 +361,17 @@ pub async fn run(cfg: CycleConfig, out: &mut dyn Write) -> Summary {
       for violation in check_drained(&first, &sample) {
         state.violation(cycle, violation);
       }
+      state.trend(cycle, &sample, cfg.ext.trend);
     }
     if let Err(reason) = recovery(&cfg.run.ctx, RECOVERY).await {
       state.violation(cycle, Violation::NoRecovery(reason));
+    }
+    if let Some(n) = cfg.ext.burst {
+      let found = crate::burst::burst(&cfg.run.ctx, &cfg.run.source_ips, n, BURST_WITHIN).await;
+      line(state.out, "burst", serde_json::json!({ "cycle": cycle, "n": n, "violation": found }));
+      if let Some(violation) = found {
+        state.violation(cycle, violation);
+      }
     }
     if let Some(n) = cfg.fd_flood {
       let Some(monitor) = state.monitor.as_mut() else {
@@ -226,20 +395,25 @@ pub async fn run(cfg: CycleConfig, out: &mut dyn Write) -> Summary {
     }
   }
   if let Some(probes) = probes {
+    state.summary.latency = probes.totals();
     probes.stop();
   }
   finish(state)
 }
 
-fn finish(state: State<'_>) -> Summary {
+fn finish(mut state: State<'_>) -> Summary {
+  state.summary.stopped = state.stop.map(String::from);
   line(state.out, "summary", &state.summary);
   let _ = state.out.flush();
   state.summary
 }
 
 /// The mixed load, sampled once a second. `false` if the server is gone.
+#[expect(clippy::too_many_arguments, reason = "the cycle's parts")]
 async fn mix(
   cfg: &CycleConfig,
+  mut run: RunConfig,
+  end: Instant,
   cycle: u32,
   state: &mut State<'_>,
   probes: Option<&Probes>,
@@ -248,13 +422,11 @@ async fn mix(
 ) -> bool {
   let (tx, mut rx) = tokio::sync::mpsc::channel::<Record>(4096);
   let stop = Arc::new(AtomicBool::new(false));
-  let mut run = cfg.run.clone();
   run.global_seed = cycle_seed(cfg.run.global_seed, cycle);
   let runner = {
     let stop = stop.clone();
     tokio::spawn(async move { run_slots(&run, stop, tx).await })
   };
-  let end = Instant::now() + cfg.run.duration;
   let mut tick = interval(Duration::from_secs(1));
   let _ = tick.tick().await;
   let budgets = Budgets { slots: cfg.run.slots };
@@ -273,15 +445,24 @@ async fn mix(
             if saturated_now {
               state.summary.fails_while_saturated += 1;
             }
-            eprintln!("{}", fail_line(&record));
+            match &state.profile {
+              Some(name) => eprintln!("{} (profile {name})", fail_line(&record)),
+              None => eprintln!("{}", fail_line(&record)),
+            }
+            if cfg.ext.stop_on_first {
+              let _ = state.stop.get_or_insert("first failure");
+              stop.store(true, Ordering::Relaxed);
+            }
           }
           "harness_error" => state.summary.harness_errors += 1,
           _ => {}
         }
-        line(state.out, "record", &record);
+        if cfg.ext.records == RecordMode::All || record.outcome != "pass" {
+          line(state.out, "record", &record);
+        }
       }
       _ = tick.tick() => {
-        if Instant::now() >= end {
+        if Instant::now() >= end || state.stop.is_some() {
           stop.store(true, Ordering::Relaxed);
         }
         let Some(sample) = state.sample(cycle).await else {
@@ -290,6 +471,11 @@ async fn mix(
           continue;
         };
         let stats = probes.map(Probes::snapshot).unwrap_or_default();
+        if let Some(every) = cfg.ext.heartbeat {
+          if state.last_beat.elapsed() >= every {
+            state.heartbeat(cycle, probes);
+          }
+        }
         line(state.out, "sample", serde_json::json!({ "cycle": cycle, "sample": sample, "probes": stats }));
         if let (Some(sample), Some(base)) = (sample, base) {
           let live = cfg.run.slots + cfg.probes;
