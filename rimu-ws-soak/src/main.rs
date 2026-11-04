@@ -16,7 +16,8 @@ use std::{
 };
 
 #[derive(clap::Parser)]
-#[command(about = "Soak and abuse harness for WebSocket servers")]
+// A later occurrence of an option overrides an earlier one: `soak.sh long` puts its defaults first.
+#[command(about = "Soak and abuse harness for WebSocket servers", args_override_self = true)]
 struct Cli {
   #[command(subcommand)]
   cmd: Cmd,
