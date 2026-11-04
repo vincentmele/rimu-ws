@@ -43,6 +43,11 @@ esac
 
 taskset -c 0-5,12-17 "${server[@]}" &
 pid=$!
+# The server must not outlive the script: Ctrl-C would otherwise leave it on port 9080 (a
+# background job ignores SIGINT).
+trap 'kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 for _ in $(seq 100); do
 	ss -ltn | grep -q ':9080 ' && break
 	sleep 0.1
@@ -50,6 +55,4 @@ done
 set +e
 taskset -c 6-11,18-23 ./target/release/rimu-ws-soak run --url ws://127.0.0.1:9080/ --pid "$pid" "$@"
 rc=$?
-kill "$pid"
-wait "$pid" 2>/dev/null
 exit $rc

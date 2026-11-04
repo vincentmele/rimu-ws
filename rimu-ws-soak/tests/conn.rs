@@ -77,3 +77,13 @@ async fn transcript_keeps_last_64_events_and_limits_hex() {
     assert!(hex.len() <= 128, "{line}");
   }
 }
+
+// A dropped SYN (an address nothing answers) must not stall a slot for the kernel's two minutes.
+#[tokio::test]
+async fn connect_gives_up_after_a_few_seconds() {
+  let addr: std::net::SocketAddr = "10.255.255.1:9".parse().unwrap();
+  let begin = Instant::now();
+  let rslt =
+    tokio::time::timeout(Duration::from_secs(10), Conn::connect(addr, &ConnOpts::default())).await;
+  assert!(matches!(rslt, Ok(Err(_))), "{rslt:?} after {:?}", begin.elapsed());
+}

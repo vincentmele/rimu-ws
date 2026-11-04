@@ -36,12 +36,36 @@ pub enum Verdict {
   Violation(u64, u64),
   /// The probes ran late: the harness, not the server, set their latency.
   Saturated,
+  /// Probes whose echo never came.
+  Failures(u64),
 }
 
-pub fn latency_verdict(baseline_p99: u64, stats: &ProbeStats) -> Verdict {
-  if lag_exceeds(stats.lag_p99_us) {
+/// The seed cycle `cycle` runs its slots with: cycle 0 keeps `global`, later cycles draw new
+/// inputs. Replay ids carry it, so they replay as they are.
+pub fn cycle_seed(global: u64, cycle: u32) -> u64 {
+  if cycle == 0 { global } else { crate::rng::seed_for(global, u32::MAX, cycle) }
+}
+
+/// The stderr line of a failed run.
+pub fn fail_line(record: &Record) -> String {
+  format!(
+    "FAIL {:?} replay={} — {}{}",
+    record.scenario,
+    record.replay,
+    record.reason.as_deref().unwrap_or_default(),
+    if record.client_saturated { " (client saturated: may be the harness)" } else { "" }
+  )
+}
+
+/// One second of probe results against the warmup's.
+pub fn latency_verdict(warm: &ProbeStats, stats: &ProbeStats) -> Verdict {
+  if stats.failures > 0 {
+    return Verdict::Failures(stats.failures);
+  }
+  if lag_exceeds(stats.lag_p99_us, warm.lag_p99_us) {
     return Verdict::Saturated;
   }
+  let baseline_p99 = warm.p99_us;
   let limit = (5 * baseline_p99).max(baseline_p99 + 1000);
   if stats.count > 0 && stats.p99_us > limit {
     return Verdict::Violation(stats.p99_us, limit);
@@ -71,6 +95,8 @@ pub struct Summary {
   pub harness_errors: u64,
   pub violations: Vec<Violation>,
   pub client_saturated_cycles: u32,
+  /// Fails while the probes showed the harness saturated: some may be the harness's.
+  pub fails_while_saturated: u64,
 }
 
 /// Writes `value` as one JSON line tagged with `kind`.
@@ -88,6 +114,8 @@ fn line(out: &mut dyn Write, kind: &str, value: impl serde::Serialize) {
 
 /// The run so far, for `Monitor` failures that end it.
 struct State<'out> {
+  // Set once the server is gone, which is reported once.
+  gone: bool,
   monitor: Option<Monitor>,
   out: &'out mut dyn Write,
   summary: Summary,
@@ -100,13 +128,27 @@ impl State<'_> {
     self.summary.violations.push(violation);
   }
 
-  /// A sample, or `None` (after recording `PidGone`) if the server is gone. Without a monitor,
-  /// `Some(None)`.
-  fn sample(&mut self, cycle: u32) -> Option<Option<Sample>> {
-    let Some(monitor) = &mut self.monitor else { return Some(None) };
-    match monitor.sample() {
+  /// A sample, or `None` if the server is gone (recorded the first time). Without a monitor,
+  /// `Some(None)`. Sampling reads the whole TCP table, so it runs off the runtime's workers.
+  async fn sample(&mut self, cycle: u32) -> Option<Option<Sample>> {
+    if self.gone {
+      return None;
+    }
+    let mut monitor = self.monitor.take()?;
+    let (monitor, rslt) = match tokio::task::spawn_blocking(move || {
+      let rslt = monitor.sample();
+      (monitor, rslt)
+    })
+    .await
+    {
+      Ok(el) => el,
+      Err(_) => return Some(None),
+    };
+    self.monitor = Some(monitor);
+    match rslt {
       Ok(sample) => Some(Some(sample)),
       Err(MonitorError::PidGone) => {
+        self.gone = true;
         self.violation(cycle, Violation::PidGone);
         None
       }
@@ -120,7 +162,7 @@ impl State<'_> {
 
 /// Runs the cycles, writing every sample, record and violation to `out` as JSONL.
 pub async fn run(cfg: CycleConfig, out: &mut dyn Write) -> Summary {
-  let mut state = State { monitor: None, out, summary: Summary::default() };
+  let mut state = State { gone: false, monitor: None, out, summary: Summary::default() };
   match cfg.pid.map(|pid| Monitor::new(pid, cfg.port)) {
     Some(Ok(monitor)) => state.monitor = Some(monitor),
     Some(Err(_)) => {
@@ -136,7 +178,7 @@ pub async fn run(cfg: CycleConfig, out: &mut dyn Write) -> Summary {
     state.summary.cycles = cycle + 1;
     sleep(cfg.warmup).await;
     let warm = probes.as_ref().map(Probes::snapshot).unwrap_or_default();
-    let Some(sample) = state.sample(cycle) else { break };
+    let Some(sample) = state.sample(cycle).await else { break };
     let base = sample.map(|el| Baseline { rss_kib: el.rss_kib, fds: el.fds });
     let first = *first_base.get_or_insert(base.unwrap_or(Baseline { rss_kib: 0, fds: 0 }));
     line(
@@ -144,11 +186,11 @@ pub async fn run(cfg: CycleConfig, out: &mut dyn Write) -> Summary {
       "warmup",
       serde_json::json!({ "cycle": cycle, "probes": warm, "baseline": base }),
     );
-    if !mix(&cfg, cycle, &mut state, probes.as_ref(), base, warm.p99_us).await {
+    if !mix(&cfg, cycle, &mut state, probes.as_ref(), base, &warm).await {
       break;
     }
     sleep(cfg.drain).await;
-    let Some(sample) = state.sample(cycle) else { break };
+    let Some(sample) = state.sample(cycle).await else { break };
     if let Some(sample) = sample {
       line(
         state.out,
@@ -202,11 +244,12 @@ async fn mix(
   state: &mut State<'_>,
   probes: Option<&Probes>,
   base: Option<Baseline>,
-  baseline_p99: u64,
+  warm: &ProbeStats,
 ) -> bool {
   let (tx, mut rx) = tokio::sync::mpsc::channel::<Record>(4096);
   let stop = Arc::new(AtomicBool::new(false));
-  let run = cfg.run.clone();
+  let mut run = cfg.run.clone();
+  run.global_seed = cycle_seed(cfg.run.global_seed, cycle);
   let runner = {
     let stop = stop.clone();
     tokio::spawn(async move { run_slots(&run, stop, tx).await })
@@ -216,20 +259,21 @@ async fn mix(
   let _ = tick.tick().await;
   let budgets = Budgets { slots: cfg.run.slots };
   let (mut streak, mut saturated, mut alive) = (0, false, true);
+  // Whether the last second's probes showed the harness saturated.
+  let mut saturated_now = false;
   loop {
     tokio::select! {
       record = rx.recv() => {
-        let Some(record) = record else { break };
+        let Some(mut record) = record else { break };
+        record.client_saturated = saturated_now;
         state.summary.records += 1;
         match record.outcome {
           "fail" => {
             state.summary.fails += 1;
-            eprintln!(
-              "FAIL {:?} replay={} — {}",
-              record.scenario,
-              record.replay,
-              record.reason.as_deref().unwrap_or_default()
-            );
+            if saturated_now {
+              state.summary.fails_while_saturated += 1;
+            }
+            eprintln!("{}", fail_line(&record));
           }
           "harness_error" => state.summary.harness_errors += 1,
           _ => {}
@@ -240,7 +284,7 @@ async fn mix(
         if Instant::now() >= end {
           stop.store(true, Ordering::Relaxed);
         }
-        let Some(sample) = state.sample(cycle) else {
+        let Some(sample) = state.sample(cycle).await else {
           stop.store(true, Ordering::Relaxed);
           alive = false;
           continue;
@@ -253,9 +297,14 @@ async fn mix(
             state.violation(cycle, violation);
           }
         }
-        match latency_verdict(baseline_p99, &stats) {
+        let verdict = latency_verdict(warm, &stats);
+        saturated_now = verdict == Verdict::Saturated;
+        match verdict {
           Verdict::Ok => {}
           Verdict::Saturated => saturated = true,
+          Verdict::Failures(failures) => {
+            state.violation(cycle, Violation::ProbeFailures { failures, count: stats.count });
+          }
           Verdict::Violation(p99_us, limit_us) => {
             state.violation(cycle, Violation::Latency { p99_us, limit_us });
           }

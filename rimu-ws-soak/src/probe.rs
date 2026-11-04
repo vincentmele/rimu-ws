@@ -18,8 +18,11 @@ use std::{
 };
 use tokio::time::{Instant, sleep, sleep_until};
 
-/// Probe schedule lag beyond which latencies say more about the harness than the server.
+/// Probe schedule lag, beyond the idle harness's own, past which latencies say more about the
+/// harness than the server.
 const MAX_LAG_US: u64 = 1000;
+/// tokio's timers fire on 1 ms ticks: a wakeup up to a tick late is the timer, not saturation.
+const TIMER_TICK: Duration = Duration::from_millis(1);
 /// How long an echo may take before the probe counts a failure and reconnects.
 const ECHO_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -34,9 +37,11 @@ pub struct ProbeStats {
   pub failures: u64,
 }
 
-/// Whether the probes ran so late that their latencies say more about the harness than the server.
-pub fn lag_exceeds(lag_p99_us: u64) -> bool {
-  lag_p99_us > MAX_LAG_US
+/// Whether the probes ran so late, compared with `baseline_lag_p99_us` from the warmup (timer
+/// lateness the idle harness shows too), that their latencies say more about the harness than the
+/// server.
+pub fn lag_exceeds(lag_p99_us: u64, baseline_lag_p99_us: u64) -> bool {
+  lag_p99_us > baseline_lag_p99_us + MAX_LAG_US
 }
 
 struct Hists {
@@ -150,10 +155,16 @@ async fn probe(
       continue;
     }
     let text = [b'p'; 32];
+    // When an echo outlasts the period, the next send is due before the echo is back. That
+    // lateness is the server's; lag counts only the timer's, from whichever came last.
+    let mut prev_end = Instant::now();
     while !stop.load(Ordering::Relaxed) {
-      sleep_until(next).await;
+      let due = next.max(prev_end);
+      if due > Instant::now() {
+        sleep_until(due).await;
+      }
       let start = Instant::now();
-      let lag = start.saturating_duration_since(next).as_micros() as u64;
+      let lag = start.saturating_duration_since(due).saturating_sub(TIMER_TICK).as_micros() as u64;
       next += period;
       if next < start {
         // Fell behind by more than a period: skip the missed sends instead of bursting.
@@ -170,7 +181,8 @@ async fn probe(
         failed(&hists);
         break;
       }
-      let rtt = start.elapsed().as_micros() as u64;
+      prev_end = Instant::now();
+      let rtt = (prev_end - start).as_micros() as u64;
       if let Ok(mut el) = hists.lock() {
         let _ = el.rtt.record(rtt.max(1));
         let _ = el.lag.record(lag.max(1));

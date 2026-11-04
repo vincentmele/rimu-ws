@@ -148,11 +148,29 @@ pub struct Budgets {
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub enum Violation {
   PidGone,
-  Fds { fds: u32, limit: u32 },
-  Rss { rss_kib: u64, limit_kib: u64 },
-  CloseWait { count: u32 },
-  Busy { cpu_pct: f64 },
-  Latency { p99_us: u64, limit_us: u64 },
+  Fds {
+    fds: u32,
+    limit: u32,
+  },
+  Rss {
+    rss_kib: u64,
+    limit_kib: u64,
+  },
+  CloseWait {
+    count: u32,
+  },
+  Busy {
+    cpu_pct: f64,
+  },
+  Latency {
+    p99_us: u64,
+    limit_us: u64,
+  },
+  /// Probe echoes that never came (or broke their connection) in one second.
+  ProbeFailures {
+    failures: u64,
+    count: u64,
+  },
   NoRecovery(String),
   Leak(String),
 }

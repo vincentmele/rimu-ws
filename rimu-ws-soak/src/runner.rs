@@ -38,6 +38,9 @@ pub struct Record {
   pub reason: Option<String>,
   pub transcript: Option<String>,
   pub elapsed_ms: u64,
+  /// Set by the cycle when the probes showed the harness's CPU saturated in this run's second.
+  #[serde(skip_serializing_if = "core::ops::Not::not")]
+  pub client_saturated: bool,
 }
 
 pub fn replay_id(global: u64, slot: u32, generation: u32) -> String {
@@ -110,5 +113,6 @@ async fn run_one(ctx: &Ctx, weights: &Weights, global: u64, slot: u32, generatio
     reason,
     transcript,
     elapsed_ms,
+    client_saturated: false,
   }
 }

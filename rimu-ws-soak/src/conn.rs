@@ -23,6 +23,9 @@ const MAX_FRAME: usize = 64 << 20;
 /// Events a transcript keeps, and bytes of each.
 const TRANSCRIPT_EVENTS: usize = 64;
 const TRANSCRIPT_BYTES: usize = 64;
+/// How long a connect may take: a full accept queue drops SYNs, which the kernel retries for
+/// two minutes.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long an upgrade may take.
 const UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -165,7 +168,12 @@ impl Conn {
     if let Some(ip) = opts.source_ip {
       socket.bind(SocketAddr::new(ip, 0)).map_err(|err| classify("bind", &err))?;
     }
-    let stream = socket.connect(addr).await.map_err(|err| classify("connect", &err))?;
+    let stream = match tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(addr)).await {
+      Ok(rslt) => rslt.map_err(|err| classify("connect", &err))?,
+      Err(_) => {
+        return Err(ConnError::server(format!("connect timed out after {CONNECT_TIMEOUT:?}")));
+      }
+    };
     stream.set_nodelay(opts.nodelay).map_err(|err| classify("TCP_NODELAY", &err))?;
     Ok(Conn { parser: Parser::new(MAX_FRAME), stream, transcript: Transcript::new() })
   }

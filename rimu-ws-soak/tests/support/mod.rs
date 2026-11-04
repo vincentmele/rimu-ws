@@ -31,6 +31,8 @@ pub struct Faults {
   /// The largest message, and the code a longer declared length is refused with.
   pub max_payload: u64,
   pub huge_len_code: u16,
+  /// How long each echo of a data message is held back.
+  pub echo_delay: Option<Duration>,
 }
 
 impl Default for Faults {
@@ -46,6 +48,7 @@ impl Default for Faults {
       unbounded_reads: false,
       max_payload: 1 << 20,
       huge_len_code: 1009,
+      echo_delay: None,
     }
   }
 }
@@ -279,6 +282,9 @@ async fn echo(peer: &mut Peer) {
     }
     if peer.faults.close_mid_echo_after == Some(echoed) {
       return;
+    }
+    if let Some(delay) = peer.faults.echo_delay {
+      tokio::time::sleep(delay).await;
     }
     if peer.faults.corrupt_echo && !data.is_empty() {
       data[0] ^= 0xFF;
