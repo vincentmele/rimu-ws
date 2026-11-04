@@ -730,6 +730,25 @@ fn errno(res: i32) -> i16 {
   i16::try_from(res.unsigned_abs()).unwrap_or(i16::MAX)
 }
 
+// The queue views are read through `ManuallyDrop`: dropping one stores its index back to the
+// rings' first cache line, which other CPUs write the task-work flag to, and a spinning reactor
+// would keep pulling that line away from them.
+
+/// Deferred task work to run or overflowed completions to flush.
+fn needs_kernel(ring: &mut IoUring) -> bool {
+  let sq = core::mem::ManuallyDrop::new(ring.submission());
+  sq.taskrun() || sq.cq_overflow()
+}
+
+/// Whether an `io_uring_enter` has anything to do.
+fn needs_enter(ring: &mut IoUring) -> bool {
+  !core::mem::ManuallyDrop::new(ring.submission()).is_empty() || needs_kernel(ring)
+}
+
+fn cq_is_empty(ring: &mut IoUring) -> bool {
+  core::mem::ManuallyDrop::new(ring.completion()).is_empty()
+}
+
 fn set_waker(slot: &mut Option<Waker>, cx: &Context<'_>) {
   if !slot.as_ref().is_some_and(|el| el.will_wake(cx.waker())) {
     *slot = Some(cx.waker().clone());
@@ -821,6 +840,8 @@ struct Reactor {
   listeners: RefCell<Vec<ListenerState>>,
   main_woken: Cell<bool>,
   params: UringParams,
+  // The task `run_ready` is polling, or `usize::MAX`
+  polling: Cell<usize>,
   ready: RefCell<VecDeque<usize>>,
   tasks: RefCell<Vec<TaskSlot>>,
 }
@@ -895,6 +916,7 @@ impl Reactor {
       listeners: RefCell::new(Vec::new()),
       main_woken: Cell::new(false),
       params,
+      polling: Cell::new(usize::MAX),
       ready: RefCell::new(VecDeque::new()),
       tasks: RefCell::new(Vec::new()),
     })
@@ -923,9 +945,10 @@ impl Reactor {
     }
     let (idx, generation) = (data as u32, (data >> 32) as u32);
     let mut tasks = self.tasks.borrow_mut();
+    // A task being polled has its future taken out of the slot, and can still wake itself.
     if let Some(slot) = tasks.get_mut(idx as usize)
       && slot.generation == generation
-      && slot.future.is_some()
+      && (slot.future.is_some() || self.polling.get() == idx as usize)
       && !slot.scheduled
     {
       slot.scheduled = true;
@@ -949,7 +972,10 @@ impl Reactor {
         continue;
       };
       let waker = waker(((generation as usize) << 32) | idx);
-      if future.poll_task(&mut Context::from_waker(&waker)).is_ready() {
+      self.polling.set(idx);
+      let poll = future.poll_task(&mut Context::from_waker(&waker));
+      self.polling.set(usize::MAX);
+      if poll.is_ready() {
         drop(future);
         let mut tasks = self.tasks.borrow_mut();
         let slot = &mut tasks[idx];
@@ -1001,20 +1027,30 @@ impl Reactor {
   fn enter(&self, wait: bool) {
     let mut ring = self.ring.borrow_mut();
     if !wait {
-      let _rslt = ring.submit();
+      if needs_enter(&mut ring) {
+        let _rslt = ring.submit();
+      }
       return;
     }
     if !self.params.spin.is_zero() {
-      let _rslt = ring.submit();
+      // Sends usually complete inside this submit and post their completions at once; `reap`
+      // takes those without another syscall.
+      if needs_enter(&mut ring) {
+        let _rslt = ring.submit();
+      }
+      if !cq_is_empty(&mut ring) {
+        return;
+      }
       let begin = std::time::Instant::now();
       let mut iter: u32 = 0;
       loop {
-        let pending = {
-          let sq = ring.submission();
-          sq.taskrun() || sq.cq_overflow()
-        } || !ring.completion().is_empty();
-        if pending {
+        // With `DEFER_TASKRUN` the kernel only flags task work while this thread is out of the
+        // kernel, and `submit` runs it.
+        if needs_kernel(&mut ring) {
           let _rslt = ring.submit();
+          return;
+        }
+        if !cq_is_empty(&mut ring) {
           return;
         }
         iter = iter.wrapping_add(1);
@@ -1673,6 +1709,26 @@ mod tests {
       out.extend_from_slice(&(len as u64).to_be_bytes());
     }
     out.extend_from_slice(payload);
+  }
+
+  // A spawned task that wakes itself while it is being polled, as a yield does, is polled
+  // again: its future is out of its slot during the poll, and the wake used to be dropped.
+  #[test]
+  fn spawned_task_woken_during_its_own_poll() {
+    let out = UringRuntime::new().unwrap().block_on(async {
+      let task = async {
+        yield_once().await;
+        yield_once().await;
+        7u8
+      };
+      let handle = crate::executor::Executor::spawn_local(
+        &UringExecutor::default(),
+        task,
+        &UringRuntime::new().unwrap(),
+      );
+      handle.await.unwrap()
+    });
+    assert_eq!(out, 7);
   }
 
   async fn yield_once() {
