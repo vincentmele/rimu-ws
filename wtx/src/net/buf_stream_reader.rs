@@ -334,6 +334,7 @@ impl BufStreamReader {
   where
     SR: StreamReader,
   {
+    self.compact_for(reserve_len);
     self.manage_capacity(reserve_len)?;
     let (init, uninit) = self.buffer.split_at_spare_mut();
     let init_len = init.len();
@@ -363,6 +364,7 @@ impl BufStreamReader {
     SR: StreamReader,
   {
     use crate::net::TryRead;
+    self.compact_for(reserve_len);
     self.manage_capacity(reserve_len)?;
     let (init, uninit) = self.buffer.split_at_spare_mut();
     let init_len = init.len();
@@ -383,6 +385,28 @@ impl BufStreamReader {
       TryRead::Pending | TryRead::Unsupported => {}
     }
     Ok(rslt)
+  }
+
+  /// Moves the following bytes to the front when there is no room for `reserve_len` of them past
+  /// the consumed ones. A stream of small frames always leaves part of one unread, so the buffer
+  /// never empties and [`Self::manage_capacity`] would grow it towards `capacity_ub` on every
+  /// connection. Only for callers that keep no indices into the buffer across reads.
+  #[cfg(feature = "web-socket")]
+  #[inline]
+  fn compact_for(&mut self, reserve_len: usize) {
+    let current_end_idx = self.current_end_idx;
+    if current_end_idx == 0
+      || self.forbid_clear
+      || self.buffer.capacity() >= current_end_idx.wrapping_add(reserve_len)
+    {
+      return;
+    }
+    cold_path();
+    let following_len = self.buffer.len().wrapping_sub(current_end_idx);
+    self.buffer.copy_within(current_end_idx.., 0);
+    self.buffer.truncate(following_len);
+    self.antecedent_end_idx = 0;
+    self.current_end_idx = 0;
   }
 
   /// Both indices will be capped to avoid data corruption.
@@ -494,6 +518,50 @@ mod tests {
     let len = u16::from_be_bytes(header);
     nrb.read_payload(len.into(), &mut stream).await.unwrap();
     assert_eq!(nrb.current(), &[1, 2][..]);
+  }
+
+  // A peer that streams small frames back to back always leaves part of one unread, so the
+  // buffer is never empty: the room already consumed must be reused instead of the buffer growing
+  // towards `capacity_ub` on every connection.
+  #[cfg(feature = "web-socket")]
+  #[rimu_ws::test]
+  async fn an_unread_tail_does_not_grow_the_buffer() {
+    use crate::{
+      collections::MaybeUninitSlice,
+      net::{StreamCommon, StreamReader},
+    };
+    use core::num::NonZeroUsize;
+
+    struct Chunks(usize);
+
+    impl StreamCommon for Chunks {}
+
+    impl StreamReader for Chunks {
+      async fn read(
+        &mut self,
+        mut bytes: MaybeUninitSlice<'_, u8>,
+      ) -> crate::Result<Option<NonZeroUsize>> {
+        let initialized = bytes.initialize_all_bytes();
+        let len = initialized.len().min(100);
+        self.0 += len;
+        Ok(NonZeroUsize::new(len))
+      }
+    }
+
+    let mut nrb = BufStreamReader::default();
+    let mut stream = Chunks(0);
+    // One byte off: what is read (100 a time) never ends on a frame boundary, so following
+    // bytes always remain.
+    assert!(nrb.read_following(64, &mut stream).await.unwrap());
+    nrb.consume_following(1);
+    while stream.0 < 1 << 20 {
+      assert!(nrb.read_following(64, &mut stream).await.unwrap());
+      while nrb.following().len() >= 64 {
+        nrb.consume_following(64);
+      }
+    }
+    let capacity = nrb.buffer.capacity();
+    assert!(capacity <= 64 * 1024, "{capacity} bytes for 64-byte frames");
   }
 
   #[rimu_ws::test]
