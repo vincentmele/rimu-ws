@@ -33,7 +33,7 @@ pub use net_error::NetError;
 pub use role::{Client, Role, RoleTy, Server};
 pub use stream::Stream;
 pub use stream_common::StreamCommon;
-pub use stream_reader::StreamReader;
+pub use stream_reader::{StreamReader, TryRead};
 pub use stream_writer::StreamWriter;
 pub use tcp_listener::TcpListener;
 pub use tcp_params::TcpParams;

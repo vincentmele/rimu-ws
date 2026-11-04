@@ -1,7 +1,7 @@
 use crate::{
   collections::VectorUsize,
   misc::LeaseMut,
-  net::{BufStreamReader, ConnectionState, Stream, StreamWriter},
+  net::{BufStreamReader, ConnectionState, Stream, StreamReader, StreamWriter, TryRead},
   rng::Xorshift64,
   tls::{TlsCtx, TlsStream},
   web_socket::{
@@ -97,7 +97,21 @@ where
       BufferedFrame::Incomplete(elem) => elem,
       BufferedFrame::Data(_) | BufferedFrame::Other => return Ok(Fill::ReadFrame),
     };
-    // With nothing queued (`WebSocketWriterMut::try_flush` sent it), read the stream directly.
+    // With nothing queued (`WebSocketWriterMut::try_flush` sent it), take what already arrived
+    // and await only readiness, whose future holds two ids. `read_following` below nests half a
+    // dozen futures, and with their state spread over the task each frame touched a dozen cache
+    // lines of it.
+    if common.write_queue.is_empty() {
+      loop {
+        match self.network_buffer.try_read_following(frame_len, &mut *common.stream)? {
+          TryRead::Read(_) => return Ok(Fill::Buffered),
+          TryRead::Closed => return Ok(Fill::Closed),
+          TryRead::Pending => common.stream.readable().await?,
+          TryRead::Unsupported => break,
+        }
+      }
+    }
+    // With nothing queued, read the stream directly.
     let rslt = if common.write_queue.is_empty() {
       self.network_buffer.read_following(frame_len, &mut *common.stream).await
     } else {

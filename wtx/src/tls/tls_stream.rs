@@ -2,7 +2,7 @@ use crate::{
   AFTER_CLOSE_TIMEOUT_MS,
   collections::{MaybeUninitSlice, ShortBoxSliceU16},
   futures::Sleep,
-  net::{ConnectionState, Stream, StreamCommon, StreamReader, StreamWriter},
+  net::{ConnectionState, Stream, StreamCommon, StreamReader, StreamWriter, TryRead},
   sync::{Arc, AtomicBool, AtomicU8, AtomicWaker},
   tls::{
     AlertDescription, AlertLevel, TlsBuffer, TlsCtx, TlsError, TlsStreamBridge, TlsStreamReader,
@@ -35,26 +35,30 @@ use core::{
 /// Transport Layer Security (TLS)
 ///
 /// This structure assumes a previously established handshake.
+// `repr(C)` with the stream and its state first: they are all a plaintext stream touches per
+// read or write, and in the compiler's order they sat at opposite ends of the struct. The other
+// small fields follow them, filling what would be padding.
 #[derive(Debug)]
+#[repr(C)]
 pub struct TlsStream<S, TCX, const IS_CLIENT: bool> {
-  pub(crate) buffer: TlsBuffer,
-  pub(crate) can_reply_key_update: bool,
+  pub(crate) stream: S,
   pub(crate) connection_state: ConnectionState,
-  // Boxed: it is most of the stream's size, and a plaintext stream moves it without using it.
-  pub(crate) key_schedule: Box<KeySchedule>,
+  pub(crate) can_reply_key_update: bool,
   pub(crate) key_updates: u8,
+  pub(crate) warning_alerts: u8,
   pub(crate) max_fragment_length: u16,
   pub(crate) max_fragment_length_send: u16,
-  pub(crate) new_session_ticket: Option<NewSessionTicket<ShortBoxSliceU16<u8>>>,
   pub(crate) phantom: PhantomData<TCX>,
+  pub(crate) buffer: TlsBuffer,
+  // Boxed: it is most of the stream's size, and a plaintext stream moves it without using it.
+  pub(crate) key_schedule: Box<KeySchedule>,
+  pub(crate) new_session_ticket: Option<NewSessionTicket<ShortBoxSliceU16<u8>>>,
   pub(crate) plaintext_consumed: usize,
   pub(crate) plaintext_len: usize,
   pub(crate) split_begin: usize,
   pub(crate) split_len: usize,
-  pub(crate) stream: S,
   // Created when first needed: after we sent a close notify and still read.
   pub(crate) timer: Option<Pin<Box<Sleep>>>,
-  pub(crate) warning_alerts: u8,
 }
 
 impl<S, TCX, const IS_CLIENT: bool> TlsStream<S, TCX, IS_CLIENT>
@@ -314,6 +318,25 @@ where
       Poll::Pending => poll_pending_read(local_connection_state, timer, cx),
     })
     .await
+  }
+
+  /// Plaintext forwards to the stream while open, as [`Self::read`] does; anything else reads
+  /// records or tracks a closing connection, which only [`Self::read`] does.
+  #[inline]
+  fn try_read(&mut self, bytes: MaybeUninitSlice<'_, u8>) -> crate::Result<TryRead> {
+    if TCX::TY.is_plain_text()
+      && matches!(self.connection_state, ConnectionState::Draining | ConnectionState::Open)
+    {
+      return self.stream.try_read(bytes);
+    }
+    Ok(TryRead::Unsupported)
+  }
+
+  /// The stream's own future, with no state of this one's: only a plaintext stream ever returns
+  /// [`TryRead::Pending`], and its bytes are the stream's.
+  #[inline]
+  fn readable(&mut self) -> impl Future<Output = crate::Result<()>> {
+    self.stream.readable()
   }
 }
 

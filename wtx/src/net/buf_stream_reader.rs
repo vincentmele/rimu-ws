@@ -351,6 +351,40 @@ impl BufStreamReader {
     Ok(true)
   }
 
+  /// [`Self::read_following`] without awaiting: see [`StreamReader::try_read`].
+  #[cfg(feature = "web-socket")]
+  #[inline]
+  pub(crate) fn try_read_following<SR>(
+    &mut self,
+    reserve_len: usize,
+    stream_reader: &mut SR,
+  ) -> crate::Result<crate::net::TryRead>
+  where
+    SR: StreamReader,
+  {
+    use crate::net::TryRead;
+    self.manage_capacity(reserve_len)?;
+    let (init, uninit) = self.buffer.split_at_spare_mut();
+    let init_len = init.len();
+    let rslt = stream_reader.try_read(uninit.into())?;
+    match rslt {
+      TryRead::Read(len) => {
+        // SAFETY: `stream_reader.try_read` just initialized `len` bytes
+        unsafe {
+          self.buffer.set_len(init_len.wrapping_add(len.get()));
+        }
+      }
+      TryRead::Closed => {
+        cold_path();
+        if init_len > self.current_end_idx {
+          return Err(NetError::AbruptDisconnect.into());
+        }
+      }
+      TryRead::Pending | TryRead::Unsupported => {}
+    }
+    Ok(rslt)
+  }
+
   /// Both indices will be capped to avoid data corruption.
   #[cfg(feature = "web-socket")]
   pub(crate) fn set_indices(&mut self, antecedent_end_idx: usize, current_end_idx: usize) {

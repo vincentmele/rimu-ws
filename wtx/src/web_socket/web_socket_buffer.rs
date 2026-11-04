@@ -1,14 +1,16 @@
 use crate::{collections::VectorUsize, net::BufStreamReader};
 
+// `repr(C)`: the two buffers every frame touches come first, the decompression ones after.
 #[derive(Debug)]
 #[doc = _internal_buffer_doc!()]
+#[repr(C)]
 pub struct WebSocketBuffer {
   pub(crate) network_buffer: BufStreamReader,
+  // Frames written with `write_frame_buffered` that haven't been sent yet
+  pub(crate) write_queue: VectorUsize<u8>,
   // Used for decompression
   pub(crate) reader_buffer: VectorUsize<u8>,
   pub(crate) writer_buffer: VectorUsize<u8>,
-  // Frames written with `write_frame_buffered` that haven't been sent yet
-  pub(crate) write_queue: VectorUsize<u8>,
 }
 
 impl WebSocketBuffer {

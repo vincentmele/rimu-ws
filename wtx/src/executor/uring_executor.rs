@@ -18,7 +18,7 @@ use crate::{
   executor::{Executor, ExecutorError, ExecutorTy, Runtime, resolve_addrs, tcp_listener_std},
   net::{
     Stream, StreamCommon, StreamReader, StreamWriter, TcpListener, TcpParams, TcpStream,
-    ToSocketAddrs,
+    ToSocketAddrs, TryRead,
   },
 };
 use alloc::{boxed::Box, collections::VecDeque, rc::Rc, vec::Vec};
@@ -428,6 +428,16 @@ impl StreamReader for UringTcpStream {
   async fn read(&mut self, bytes: MaybeUninitSlice<'_, u8>) -> crate::Result<Option<NonZeroUsize>> {
     read(self.idx, self.generation, bytes).await
   }
+
+  #[inline]
+  fn try_read(&mut self, mut bytes: MaybeUninitSlice<'_, u8>) -> crate::Result<TryRead> {
+    with_reactor(|reactor| reactor.try_read(self.idx, self.generation, &mut bytes))
+  }
+
+  #[inline]
+  fn readable(&mut self) -> impl Future<Output = crate::Result<()>> {
+    readable(self.idx, self.generation)
+  }
 }
 
 impl StreamWriter for UringTcpStream {
@@ -497,6 +507,16 @@ impl StreamReader for UringReadHalf {
   async fn read(&mut self, bytes: MaybeUninitSlice<'_, u8>) -> crate::Result<Option<NonZeroUsize>> {
     read(self.idx, self.generation, bytes).await
   }
+
+  #[inline]
+  fn try_read(&mut self, mut bytes: MaybeUninitSlice<'_, u8>) -> crate::Result<TryRead> {
+    with_reactor(|reactor| reactor.try_read(self.idx, self.generation, &mut bytes))
+  }
+
+  #[inline]
+  fn readable(&mut self) -> impl Future<Output = crate::Result<()>> {
+    readable(self.idx, self.generation)
+  }
 }
 
 /// Writing part of a split [`UringTcpStream`].
@@ -538,6 +558,11 @@ async fn read(
   mut bytes: MaybeUninitSlice<'_, u8>,
 ) -> crate::Result<Option<NonZeroUsize>> {
   poll_fn(|cx| poll_reactor(|reactor| reactor.poll_read(idx, generation, &mut bytes, cx))).await
+}
+
+// A plain `fn`: the future holds the two ids and nothing else.
+fn readable(idx: u32, generation: u32) -> impl Future<Output = crate::Result<()>> {
+  poll_fn(move |cx| poll_reactor(|reactor| reactor.poll_readable(idx, generation, cx)))
 }
 
 async fn write_all_vectored(idx: u32, generation: u32, bytes: &[&[u8]]) -> crate::Result<()> {
@@ -662,28 +687,79 @@ struct TaskSlot {
   scheduled: bool,
 }
 
+// Every frame reads or writes a connection's slot in several passes (the receive completion,
+// the read, the send, the send completion), with the kernel's network work in between evicting
+// it. So the fields those passes touch fill the first two cache lines exactly, and the slot is
+// line-aligned: one frame costs two lines here instead of the three a 144-byte slot spanned.
+// Fields only setup and teardown touch come after.
 #[derive(Default)]
+#[repr(C, align(64))]
 struct Conn {
-  cancel_sent: bool,
+  generation: u32,
+  fd: RawFd,
+  rx: Vec<u8>,
+  rx_off: u32,
+  rx_err: i16,
+  tx_err: i16,
+  reader: Option<Waker>,
+  tx_inflight: Vec<u8>,
+  tx_pending: Vec<u8>,
+  tx_done: u32,
   closing: bool,
   // `fd` is an index into the ring's table of direct descriptors
   direct: bool,
-  fd: RawFd,
-  generation: u32,
+  rx_eof: bool,
+  sending: bool,
+  writer: Option<Waker>,
+  // Setup and teardown only
+  cancel_sent: bool,
   in_use: bool,
-  reader: Option<Waker>,
   recv_armed: bool,
   refs: u8,
-  rx: Vec<u8>,
-  rx_eof: bool,
-  rx_err: i32,
-  rx_off: usize,
-  sending: bool,
-  tx_done: usize,
-  tx_err: i32,
-  tx_inflight: Vec<u8>,
-  tx_pending: Vec<u8>,
-  writer: Option<Waker>,
+}
+
+const _: () = {
+  assert!(size_of::<Conn>() == 192);
+  assert!(core::mem::offset_of!(Conn, writer) + size_of::<Option<Waker>>() == 128);
+};
+
+/// An errno from a negative completion result. Linux errnos fit an `i16`.
+fn errno(res: i32) -> i16 {
+  i16::try_from(res.unsigned_abs()).unwrap_or(i16::MAX)
+}
+
+fn set_waker(slot: &mut Option<Waker>, cx: &Context<'_>) {
+  if !slot.as_ref().is_some_and(|el| el.will_wake(cx.waker())) {
+    *slot = Some(cx.waker().clone());
+  }
+}
+
+/// Moves received bytes into `bytes`. Never [`TryRead::Unsupported`].
+fn take_rx(conn: &mut Conn, bytes: &mut MaybeUninitSlice<'_, u8>) -> crate::Result<TryRead> {
+  let available = conn.rx.get(conn.rx_off as usize..).unwrap_or_default();
+  if !available.is_empty() {
+    let dst = bytes.uninitialized_mut();
+    let len = available.len().min(dst.len());
+    // SAFETY: `dst` has room for `len` bytes, and the regions don't overlap
+    unsafe {
+      core::ptr::copy_nonoverlapping(available.as_ptr(), dst.as_mut_ptr().cast(), len);
+    }
+    // `len` is at most what `rx` holds past `rx_off`, which `rx_off` already indexes
+    conn.rx_off += len as u32;
+    if conn.rx_off as usize == conn.rx.len() {
+      conn.rx.clear();
+      conn.rx_off = 0;
+    }
+    // An empty `bytes` reads nothing, which `read` reports as the end of the stream
+    return Ok(NonZeroUsize::new(len).map_or(TryRead::Closed, TryRead::Read));
+  }
+  if conn.rx_err != 0 {
+    return Err(io_err(conn.rx_err.into()));
+  }
+  if conn.rx_eof {
+    return Ok(TryRead::Closed);
+  }
+  Ok(TryRead::Pending)
 }
 
 struct ListenerState {
@@ -1162,7 +1238,7 @@ impl Reactor {
         let bufs_len = self.bufs.borrow().len;
         let begin = usize::from(bid) * bufs_len;
         let len = res as usize;
-        if conn.rx_off == conn.rx.len() {
+        if conn.rx_off as usize == conn.rx.len() {
           conn.rx.clear();
           conn.rx_off = 0;
         }
@@ -1178,7 +1254,7 @@ impl Reactor {
       #[cfg(test)]
       let _ = tests::ENOBUFS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     } else if res != -libc::ECANCELED {
-      conn.rx_err = -res;
+      conn.rx_err = errno(res);
     }
     if let Some(elem) = conn.reader.take() {
       elem.wake();
@@ -1211,31 +1287,45 @@ impl Reactor {
     let Some(conn) = conns.get_mut(idx as usize).filter(|el| el.generation == generation) else {
       return Poll::Ready(Err(io_err(libc::EBADF)));
     };
-    let available = conn.rx.get(conn.rx_off..).unwrap_or_default();
-    if !available.is_empty() {
-      let dst = bytes.uninitialized_mut();
-      let len = available.len().min(dst.len());
-      // SAFETY: `dst` has room for `len` bytes, and the regions don't overlap
-      unsafe {
-        core::ptr::copy_nonoverlapping(available.as_ptr(), dst.as_mut_ptr().cast(), len);
+    match take_rx(conn, bytes) {
+      Ok(TryRead::Read(len)) => Poll::Ready(Ok(Some(len))),
+      Ok(TryRead::Closed) => Poll::Ready(Ok(None)),
+      Ok(TryRead::Pending | TryRead::Unsupported) => {
+        set_waker(&mut conn.reader, cx);
+        Poll::Pending
       }
-      conn.rx_off += len;
-      if conn.rx_off == conn.rx.len() {
-        conn.rx.clear();
-        conn.rx_off = 0;
-      }
-      return Poll::Ready(Ok(NonZeroUsize::new(len)));
+      Err(err) => Poll::Ready(Err(err)),
     }
-    if conn.rx_err != 0 {
-      return Poll::Ready(Err(io_err(conn.rx_err)));
+  }
+
+  fn poll_readable(
+    &self,
+    idx: u32,
+    generation: u32,
+    cx: &mut Context<'_>,
+  ) -> Poll<crate::Result<()>> {
+    let mut conns = self.conns.borrow_mut();
+    let Some(conn) = conns.get_mut(idx as usize).filter(|el| el.generation == generation) else {
+      return Poll::Ready(Err(io_err(libc::EBADF)));
+    };
+    if conn.rx_off as usize != conn.rx.len() || conn.rx_err != 0 || conn.rx_eof {
+      return Poll::Ready(Ok(()));
     }
-    if conn.rx_eof {
-      return Poll::Ready(Ok(None));
-    }
-    if !conn.reader.as_ref().is_some_and(|el| el.will_wake(cx.waker())) {
-      conn.reader = Some(cx.waker().clone());
-    }
+    set_waker(&mut conn.reader, cx);
     Poll::Pending
+  }
+
+  fn try_read(
+    &self,
+    idx: u32,
+    generation: u32,
+    bytes: &mut MaybeUninitSlice<'_, u8>,
+  ) -> crate::Result<TryRead> {
+    let mut conns = self.conns.borrow_mut();
+    let Some(conn) = conns.get_mut(idx as usize).filter(|el| el.generation == generation) else {
+      return Err(io_err(libc::EBADF));
+    };
+    take_rx(conn, bytes)
   }
 
   fn queue_send(&self, idx: u32, generation: u32, bytes: &[&[u8]]) -> crate::Result<()> {
@@ -1244,7 +1334,7 @@ impl Reactor {
       return Err(io_err(libc::EBADF));
     };
     if conn.tx_err != 0 {
-      return Err(io_err(conn.tx_err));
+      return Err(io_err(conn.tx_err.into()));
     }
     for elem in bytes {
       conn.tx_pending.extend_from_slice(elem);
@@ -1265,7 +1355,7 @@ impl Reactor {
         return Err(io_err(libc::EBADF));
       };
       if conn.tx_err != 0 {
-        return Err(io_err(conn.tx_err));
+        return Err(io_err(conn.tx_err.into()));
       }
       if conn.tx_pending.len() >= self.params.tx_high_water {
         return Ok(false);
@@ -1294,13 +1384,13 @@ impl Reactor {
       return;
     };
     if res < 0 {
-      conn.tx_err = -res;
+      conn.tx_err = errno(res);
       conn.sending = false;
       conn.tx_pending.clear();
     } else {
-      conn.tx_done += res as usize;
-      if conn.tx_done < conn.tx_inflight.len() {
-        let rest = conn.tx_inflight.get(conn.tx_done..).unwrap_or_default();
+      conn.tx_done += res as u32;
+      if (conn.tx_done as usize) < conn.tx_inflight.len() {
+        let rest = conn.tx_inflight.get(conn.tx_done as usize..).unwrap_or_default();
         let sqe = send_sqe(conn, rest).user_data(user_data(KIND_SEND, generation, idx));
         drop(conns);
         self.push_sqe(&sqe);
@@ -1335,7 +1425,7 @@ impl Reactor {
       return Poll::Ready(Err(io_err(libc::EBADF)));
     };
     if conn.tx_err != 0 {
-      return Poll::Ready(Err(io_err(conn.tx_err)));
+      return Poll::Ready(Err(io_err(conn.tx_err.into())));
     }
     if conn.tx_pending.len() < self.params.tx_high_water {
       return Poll::Ready(Ok(()));
