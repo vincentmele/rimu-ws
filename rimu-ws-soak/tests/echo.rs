@@ -23,6 +23,7 @@ pub fn ctx(addr: SocketAddr) -> Ctx {
       idle: Duration::from_millis(300),
       close: Duration::from_millis(300),
       max_payload: 1 << 20,
+      ..Limits::default()
     },
     opts: ConnOpts::default(),
   }

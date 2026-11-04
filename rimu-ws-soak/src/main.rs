@@ -130,6 +130,7 @@ fn ctx(common: &Common) -> Result<(Ctx, Weights), String> {
     idle: common.idle_timeout,
     close: common.close_timeout,
     max_payload: common.max_payload,
+    ..Limits::default()
   };
   let host = authority.to_owned();
   Ok((Ctx { addr, host, path: path.to_owned(), limits, opts: ConnOpts::default() }, weights))

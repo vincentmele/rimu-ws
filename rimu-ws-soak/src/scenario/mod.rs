@@ -1,5 +1,6 @@
 //! What a simulated client does, picked from a weighted mix, and how its run is judged.
 
+mod abuse;
 mod echo;
 
 use crate::{
@@ -87,6 +88,8 @@ pub struct Limits {
   pub idle: Duration,
   pub close: Duration,
   pub max_payload: u64,
+  /// How long `never_read` keeps sending before calling the server unbounded.
+  pub never_read_budget: Duration,
 }
 
 /// `soak-server-uring`'s defaults.
@@ -97,6 +100,7 @@ impl Default for Limits {
       idle: Duration::from_secs(5),
       close: Duration::from_secs(2),
       max_payload: 1 << 20,
+      never_read_budget: Duration::from_secs(10),
     }
   }
 }
@@ -129,12 +133,23 @@ pub enum Outcome {
 }
 
 pub async fn run(scenario: Scenario, ctx: &Ctx, rng: &mut Rng) -> Outcome {
-  match scenario {
-    Scenario::Echo => echo::echo(ctx, rng).await,
-    Scenario::SplitEveryByte => echo::split_every_byte(ctx, rng).await,
-    Scenario::CtrlInFragments => echo::ctrl_in_fragments(ctx, rng).await,
-    other => Outcome::HarnessError(format!("{other:?} is not implemented")),
-  }
+  // Boxed: inline, every scenario's state would size the future of every run.
+  let fut: std::pin::Pin<Box<dyn Future<Output = Outcome> + Send + '_>> = match scenario {
+    Scenario::Echo => Box::pin(echo::echo(ctx, rng)),
+    Scenario::SplitEveryByte => Box::pin(echo::split_every_byte(ctx, rng)),
+    Scenario::CtrlInFragments => Box::pin(echo::ctrl_in_fragments(ctx, rng)),
+    Scenario::NeverRead => Box::pin(abuse::never_read(ctx, rng)),
+    Scenario::Slowloris => Box::pin(abuse::slowloris(ctx, rng)),
+    Scenario::IdlePre => Box::pin(abuse::idle_pre(ctx)),
+    Scenario::IdlePost => Box::pin(abuse::idle_post(ctx, rng)),
+    Scenario::CloseInHandshake => Box::pin(abuse::close_in_handshake(ctx, rng)),
+    Scenario::RstMidframe => Box::pin(abuse::rst_midframe(ctx, rng)),
+    Scenario::HalfClose => Box::pin(abuse::half_close(ctx, rng)),
+    Scenario::PingFlood => Box::pin(abuse::ping_flood(ctx, rng)),
+    Scenario::Garbage => Box::pin(abuse::garbage(ctx, rng)),
+    other => return Outcome::HarnessError(format!("{other:?} is not implemented")),
+  };
+  fut.await
 }
 
 /// The outcome of a failed connection operation.

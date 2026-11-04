@@ -26,6 +26,8 @@ pub struct Faults {
   pub close_code_for_bad_utf8: u16,
   /// Every byte each connection sent, one entry per connection in accept order.
   pub log: Option<Arc<Mutex<Vec<Vec<u8>>>>>,
+  /// After the upgrade, reads everything into memory and never answers.
+  pub unbounded_reads: bool,
 }
 
 impl Default for Faults {
@@ -38,6 +40,7 @@ impl Default for Faults {
       close_code_for_protocol_errors: 1002,
       close_code_for_bad_utf8: 1007,
       log: None,
+      unbounded_reads: false,
     }
   }
 }
@@ -65,7 +68,7 @@ struct Peer {
 impl Peer {
   /// More bytes, or `false` on EOF, error or a timeout.
   async fn fill(&mut self, deadline: Option<Instant>) -> bool {
-    let mut chunk = [0; 16384];
+    let mut chunk = vec![0; 16384];
     let read = self.stream.read(&mut chunk);
     let rslt = match deadline {
       Some(el) => match timeout_at(el, read).await {
@@ -189,6 +192,10 @@ async fn serve(stream: TcpStream, faults: Faults) {
     accept_key(&key)
   );
   if peer.stream.write_all(res.as_bytes()).await.is_err() {
+    return;
+  }
+  if peer.faults.unbounded_reads {
+    while peer.fill(None).await {}
     return;
   }
   echo(&mut peer).await;

@@ -16,23 +16,23 @@ const CLOSE: Duration = Duration::from_secs(2);
 
 /// What the server must send next.
 #[derive(Debug)]
-enum Expect {
+pub(super) enum Expect {
   Message(u8, Vec<u8>),
   Pong(Vec<u8>),
   Close(u16),
 }
 
 /// Checks server frames against the expected sequence, reassembling fragmented messages.
-struct Oracle {
-  expected: VecDeque<Expect>,
-  failure: Option<String>,
+pub(super) struct Oracle {
+  pub(super) expected: VecDeque<Expect>,
+  pub(super) failure: Option<String>,
   messages: usize,
   partial: Option<(u8, Vec<u8>)>,
   received: usize,
 }
 
 impl Oracle {
-  fn new(expected: Vec<Expect>) -> Self {
+  pub(super) fn new(expected: Vec<Expect>) -> Self {
     let messages = expected.iter().filter(|el| matches!(el, Expect::Message(..))).count();
     Self { expected: expected.into(), failure: None, messages, partial: None, received: 0 }
   }
@@ -42,7 +42,7 @@ impl Oracle {
     Flow::Done
   }
 
-  fn closed_early(&self) -> String {
+  pub(super) fn closed_early(&self) -> String {
     format!("server closed during echo ({} of {} echoes)", self.received, self.messages)
   }
 
@@ -102,7 +102,7 @@ impl Oracle {
 }
 
 /// A random message: mostly small, sometimes up to 4 KiB, one in ten 70 to 200 KB.
-fn message(rng: &mut Rng, max_len: Option<usize>) -> (u8, Vec<u8>) {
+pub(super) fn message(rng: &mut Rng, max_len: Option<usize>) -> (u8, Vec<u8>) {
   let len = match max_len {
     Some(max) => rng.random_range(0..max),
     None => match rng.random_range(0..10) {
@@ -119,7 +119,7 @@ fn message(rng: &mut Rng, max_len: Option<usize>) -> (u8, Vec<u8>) {
 }
 
 /// Encodes a message, split into 2 to 4 fragments a quarter of the time.
-fn encode_message(rng: &mut Rng, opcode: u8, data: &[u8], out: &mut Vec<u8>) {
+pub(super) fn encode_message(rng: &mut Rng, opcode: u8, data: &[u8], out: &mut Vec<u8>) {
   let parts = if rng.random_bool(0.25) { rng.random_range(2..=4) } else { 1 };
   if data.is_empty() || parts == 1 {
     client_frame(true, opcode, data, rng.random(), out);
@@ -196,6 +196,26 @@ pub(super) async fn ctrl_in_fragments(ctx: &Ctx, rng: &mut Rng) -> Outcome {
   let expected = vec![Expect::Pong(ping), Expect::Message(1, text), Expect::Close(1000)];
   let chunks = (0..8).map(|_| rng.random_range(1..=64)).collect();
   exchange(ctx, &ctx.opts, rng, data, chunks, expected).await
+}
+
+/// Reads frames into `oracle` until it has everything it expected, fails, or the server closes.
+/// `Ok(true)` if the server closed first.
+pub(super) async fn read_expected(
+  conn: &mut crate::conn::Conn,
+  oracle: &mut Oracle,
+  deadline: Instant,
+) -> Result<bool, crate::conn::ConnError> {
+  while !oracle.expected.is_empty() {
+    match conn.next_frame(deadline).await? {
+      crate::conn::Next::Frame(frame) => {
+        if oracle.on_frame(frame) == Flow::Done {
+          return Ok(false);
+        }
+      }
+      crate::conn::Next::Eof => return Ok(true),
+    }
+  }
+  Ok(false)
 }
 
 /// `count` random messages and a close, with the frames the server must answer them with.
