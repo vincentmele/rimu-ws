@@ -28,6 +28,9 @@ pub struct Faults {
   pub log: Option<Arc<Mutex<Vec<Vec<u8>>>>>,
   /// After the upgrade, reads everything into memory and never answers.
   pub unbounded_reads: bool,
+  /// The largest message, and the code a longer declared length is refused with.
+  pub max_payload: u64,
+  pub huge_len_code: u16,
 }
 
 impl Default for Faults {
@@ -41,6 +44,8 @@ impl Default for Faults {
       close_code_for_bad_utf8: 1007,
       log: None,
       unbounded_reads: false,
+      max_payload: 1 << 20,
+      huge_len_code: 1009,
     }
   }
 }
@@ -216,7 +221,10 @@ async fn echo(peer: &mut Peer) {
   loop {
     let (frame, used) = match parse(&peer.buf) {
       Parsed::Frame(frame, used) => (frame, used),
-      Parsed::Partial { .. } => {
+      Parsed::Partial { declared } => {
+        if declared.is_some_and(|el| el > peer.faults.max_payload) {
+          return peer.close(peer.faults.huge_len_code).await;
+        }
         if !peer.fill(earliest(None, peer.faults.idle_timeout)).await {
           return;
         }
@@ -224,14 +232,24 @@ async fn echo(peer: &mut Peer) {
       }
     };
     let _ = peer.buf.drain(..used);
-    let _ = (frame.rsv, frame.declared);
-    if !frame.masked {
+    if frame.declared > peer.faults.max_payload {
+      return peer.close(peer.faults.huge_len_code).await;
+    }
+    if !frame.masked || frame.rsv != 0 {
+      return peer.close(protocol).await;
+    }
+    if frame.opcode >= 8 && (!frame.fin || frame.payload.len() > 125) {
       return peer.close(protocol).await;
     }
     match frame.opcode {
       8 => {
-        let code = frame.payload.get(..2).map_or(1000, |el| u16::from_be_bytes([el[0], el[1]]));
-        return peer.close(code).await;
+        let code = match frame.payload.len() {
+          0 => 1000,
+          1 => return peer.close(protocol).await,
+          _ => u16::from_be_bytes([frame.payload[0], frame.payload[1]]),
+        };
+        let valid = matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999);
+        return peer.close(if valid { code } else { protocol }).await;
       }
       9 => {
         if !peer.send_frame(10, &frame.payload).await {

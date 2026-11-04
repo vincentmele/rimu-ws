@@ -2,6 +2,7 @@
 
 mod abuse;
 mod echo;
+pub mod invalid;
 
 use crate::{
   conn::{Conn, ConnError, ConnOpts, Failure},
@@ -147,7 +148,8 @@ pub async fn run(scenario: Scenario, ctx: &Ctx, rng: &mut Rng) -> Outcome {
     Scenario::HalfClose => Box::pin(abuse::half_close(ctx, rng)),
     Scenario::PingFlood => Box::pin(abuse::ping_flood(ctx, rng)),
     Scenario::Garbage => Box::pin(abuse::garbage(ctx, rng)),
-    other => return Outcome::HarnessError(format!("{other:?} is not implemented")),
+    Scenario::Invalid => Box::pin(invalid::invalid(ctx, rng)),
+    Scenario::HugeLen => Box::pin(invalid::huge_len(ctx, rng)),
   };
   fut.await
 }
