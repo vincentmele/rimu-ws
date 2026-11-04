@@ -1,0 +1,7 @@
+//! A soak and abuse harness for WebSocket servers: thousands of simulated clients mixing verified
+//! echo traffic with hostile behaviour, and checks that the server stays correct and bounded.
+//!
+//! It speaks raw bytes through its own codec and doesn't depend on rimu-ws, so its clients can
+//! misbehave freely and a bug the two shared couldn't hide.
+
+pub mod codec;
