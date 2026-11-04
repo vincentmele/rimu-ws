@@ -4,15 +4,14 @@
 use clap::Parser as _;
 use rimu_ws_soak::{
   conn::ConnOpts,
-  runner::{Record, RunConfig, parse_replay, replay, run_slots},
+  cycle::{self, CycleConfig},
+  runner::{RunConfig, parse_replay, replay},
   scenario::{Ctx, Limits, Weights, parse_weights, profile},
 };
 use std::{
-  io::Write as _,
   net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs as _},
   path::PathBuf,
   process::ExitCode,
-  sync::{Arc, atomic::AtomicBool},
   time::Duration,
 };
 
@@ -67,8 +66,22 @@ struct RunArgs {
   seed: u64,
   #[arg(long, default_value_t = 100)]
   slots: u32,
+  /// Length of each cycle's mixed load.
   #[arg(long, default_value = "60s", value_parser = parse_duration)]
   duration: Duration,
+  #[arg(long, default_value_t = 1)]
+  cycles: u32,
+  /// Probes only, before each cycle's load: sets its latency and memory baselines.
+  #[arg(long, default_value = "30s", value_parser = parse_duration)]
+  warmup: Duration,
+  /// Idle time after each cycle's load, before the leak check.
+  #[arg(long, default_value = "10s", value_parser = parse_duration)]
+  drain: Duration,
+  /// Latency probe connections, and echoes per second on each.
+  #[arg(long, default_value_t = 8)]
+  probes: u32,
+  #[arg(long, default_value_t = 100)]
+  probe_rate: u32,
   /// JSONL output; defaults to /mnt/nvme1tb/claude-tmp/soak/soak-<seed>.jsonl.
   #[arg(long)]
   out: Option<PathBuf>,
@@ -164,9 +177,6 @@ fn main() -> ExitCode {
 async fn run(args: RunArgs) -> Result<ExitCode, String> {
   let (ctx, weights) = ctx(&args.common)?;
   let source_ips = args.source_ips.as_deref().map(parse_ips).transpose()?.unwrap_or_default();
-  if args.pid.is_none() {
-    eprintln!("warning: no --pid, so the server is not monitored");
-  }
   let out_path = args
     .out
     .unwrap_or_else(|| format!("/mnt/nvme1tb/claude-tmp/soak/soak-{}.jsonl", args.seed).into());
@@ -176,48 +186,38 @@ async fn run(args: RunArgs) -> Result<ExitCode, String> {
   let mut out = std::io::BufWriter::new(
     std::fs::File::create(&out_path).map_err(|err| format!("{}: {err}", out_path.display()))?,
   );
-  let cfg = RunConfig {
-    global_seed: args.seed,
-    slots: args.slots,
-    duration: args.duration,
-    weights,
-    ctx,
-    source_ips,
+  let port = ctx.addr.port();
+  let cfg = CycleConfig {
+    run: RunConfig {
+      global_seed: args.seed,
+      slots: args.slots,
+      duration: args.duration,
+      weights,
+      ctx,
+      source_ips,
+    },
+    pid: args.pid,
+    port,
+    cycles: args.cycles,
+    warmup: args.warmup,
+    drain: args.drain,
+    probes: args.probes,
+    probe_rate: args.probe_rate,
   };
-  let (tx, mut rx) = tokio::sync::mpsc::channel::<Record>(4096);
-  let stop = Arc::new(AtomicBool::new(false));
-  let stopper = stop.clone();
-  let duration = cfg.duration;
-  let _timer = tokio::spawn(async move {
-    tokio::time::sleep(duration).await;
-    stopper.store(true, std::sync::atomic::Ordering::Relaxed);
-  });
-  let runner = tokio::spawn(async move { run_slots(&cfg, stop, tx).await });
-  let (mut total, mut fails, mut harness) = (0u64, 0u64, 0u64);
-  while let Some(record) = rx.recv().await {
-    total += 1;
-    match record.outcome {
-      "fail" => {
-        fails += 1;
-        eprintln!(
-          "FAIL {:?} replay={}: {}",
-          record.scenario,
-          record.replay,
-          record.reason.as_deref().unwrap_or_default()
-        );
-      }
-      "harness_error" => harness += 1,
-      _ => {}
-    }
-    let _ = serde_json::to_writer(&mut out, &record);
-    let _ = out.write_all(b"\n");
-  }
-  let _ = runner.await;
-  let _ = out.flush();
-  eprintln!("records {total}, fails {fails}, harness errors {harness}; {}", out_path.display());
-  Ok(ExitCode::from(if fails > 0 {
+  let summary = cycle::run(cfg, &mut out).await;
+  eprintln!(
+    "cycles {}, records {}, fails {}, harness errors {}, violations {}, saturated cycles {}; {}",
+    summary.cycles,
+    summary.records,
+    summary.fails,
+    summary.harness_errors,
+    summary.violations.len(),
+    summary.client_saturated_cycles,
+    out_path.display()
+  );
+  Ok(ExitCode::from(if summary.fails > 0 || !summary.violations.is_empty() {
     1
-  } else if harness > 0 {
+  } else if summary.harness_errors > 0 {
     2
   } else {
     0

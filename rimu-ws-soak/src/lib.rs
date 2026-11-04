@@ -6,7 +6,9 @@
 
 pub mod codec;
 pub mod conn;
+pub mod cycle;
 pub mod monitor;
+pub mod probe;
 pub mod rng;
 pub mod runner;
 pub mod scenario;
