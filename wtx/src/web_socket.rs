@@ -7,6 +7,9 @@ mod close_code;
 pub mod differential;
 mod frame;
 mod handshake;
+#[cfg(any(test, feature = "_fuzz"))]
+#[doc(hidden)]
+pub mod handshake_check;
 mod is_in_continuation_frame;
 mod mask_op;
 mod misc;

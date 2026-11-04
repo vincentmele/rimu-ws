@@ -35,6 +35,10 @@ name = "web_socket"
 path = "web_socket.rs"
 
 [[bin]]
+name = "web_socket_handshake"
+path = "web_socket_handshake.rs"
+
+[[bin]]
 name = "web_socket_differential"
 path = "web_socket_differential.rs"
 

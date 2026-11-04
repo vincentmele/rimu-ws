@@ -37,7 +37,7 @@ use httparse::{EMPTY_HEADER, Header, Request, Response, Status};
 const MAX_HEADERS: usize = 64;
 /// The largest upgrade request (or response) read: past it, a peer that never ends one would
 /// make the reader hold, and re-parse, as much as it sent.
-const MAX_REQUEST_LEN: usize = 16 * 1024;
+pub(crate) const MAX_REQUEST_LEN: usize = 16 * 1024;
 const READ_INCREMENT: usize = 1024;
 const VERSION: &str = "13";
 

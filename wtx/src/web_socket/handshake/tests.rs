@@ -381,68 +381,24 @@ where
 
 // ---- Upgrade requests a public server gets: what it must refuse, and how much it may read.
 
-/// Feeds `input` to the server `chunk` bytes per read, then reports EOF, and records its answer.
-struct Scripted {
-  chunk: usize,
-  input: std::vec::Vec<u8>,
-  output: std::rc::Rc<core::cell::RefCell<std::vec::Vec<u8>>>,
-  pos: std::rc::Rc<core::cell::Cell<usize>>,
-}
-
-impl crate::net::Stream for Scripted {
-  type BridgeOwned = ();
-  type ReadHalfOwned = ();
-  type WriteHalfOwned = ();
-
-  fn into_split(self) -> crate::Result<((), (), ())> {
-    Ok(((), (), ()))
-  }
-}
-
-impl crate::net::StreamCommon for Scripted {}
-
-impl crate::net::StreamReader for Scripted {
-  async fn read(
-    &mut self,
-    mut bytes: crate::collections::MaybeUninitSlice<'_, u8>,
-  ) -> crate::Result<Option<core::num::NonZeroUsize>> {
-    let init = bytes.initialize_all_bytes();
-    let pos = self.pos.get();
-    let len = init.len().min(self.chunk).min(self.input.len() - pos);
-    init[..len].copy_from_slice(&self.input[pos..pos + len]);
-    self.pos.set(pos + len);
-    Ok(core::num::NonZeroUsize::new(len))
-  }
-}
-
-impl crate::net::StreamWriter for Scripted {
-  async fn write_all(&mut self, bytes: &[u8]) -> crate::Result<()> {
-    self.output.borrow_mut().extend_from_slice(bytes);
-    Ok(())
-  }
-
-  async fn write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<()> {
-    for elem in bytes {
-      self.output.borrow_mut().extend_from_slice(elem);
-    }
-    Ok(())
-  }
-}
-
 /// Whether the server upgraded `input`, what it answered, and how many bytes it read.
 fn serve(input: &[u8], chunk: usize) -> (bool, std::string::String, usize) {
-  let output = std::rc::Rc::new(core::cell::RefCell::new(std::vec::Vec::new()));
-  let pos = std::rc::Rc::new(core::cell::Cell::new(0));
-  let stream = Scripted { chunk, input: input.to_vec(), output: output.clone(), pos: pos.clone() };
-  let tls_config = TlsConfig::plaintext();
-  let upgraded = StdRuntime::new().block_on(async {
-    WebSocketAcceptor::default()
-      .accept(TlsAcceptor::new(&tls_config, ChaCha20::from_std_random().unwrap(), stream))
-      .await
-      .is_ok()
-  });
-  let answer = std::string::String::from_utf8_lossy(&output.borrow()).into_owned();
-  (upgraded, answer, pos.get())
+  let served = crate::web_socket::handshake_check::serve(input, chunk);
+  let answer = std::string::String::from_utf8_lossy(&served.answer).into_owned();
+  (served.upgraded, answer, served.read)
+}
+
+// Each case the fuzzer starts from passes its oracle.
+#[test]
+fn fuzz_oracle_holds_for_the_seed_cases() {
+  let mut endless = std::vec![1];
+  endless.extend_from_slice(b"GET / HTTP/1.1\r\nX: ");
+  endless.resize(64 * 1024, b'a');
+  let mut valid = std::vec![3];
+  valid.extend(request("GET / HTTP/1.1", &refs(&valid_headers())));
+  for case in [std::vec![], std::vec![0], endless, valid, b"\xffGET".to_vec()] {
+    crate::web_socket::handshake_check::check_bytes(&case);
+  }
 }
 
 const KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
