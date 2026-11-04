@@ -40,6 +40,7 @@ fn cfg(addr: SocketAddr, pid: u32) -> CycleConfig {
     drain: Duration::from_secs(1),
     probes: 2,
     probe_rate: 50,
+    fd_flood: None,
   }
 }
 
@@ -96,4 +97,15 @@ fn saturated_probe_lag_skips_latency() {
   assert_eq!(latency_verdict(1000, &slow), Verdict::Violation(6000, 5000));
   let fine = ProbeStats { count: 100, p99_us: 1100, ..ProbeStats::default() };
   assert_eq!(latency_verdict(100, &fine), Verdict::Ok);
+}
+
+#[test]
+fn fd_flood_detects_busy_spin() {
+  use rimu_ws_soak::{fdflood::busy_verdict, monitor::Violation};
+  assert_eq!(
+    busy_verdict(50, Duration::from_secs(1), 100),
+    Some(Violation::Busy { cpu_pct: 50.0 })
+  );
+  assert_eq!(busy_verdict(10, Duration::from_secs(1), 100), None);
+  assert_eq!(busy_verdict(0, Duration::ZERO, 100), None);
 }

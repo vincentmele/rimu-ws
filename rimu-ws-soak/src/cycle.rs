@@ -22,8 +22,11 @@ use std::{
 };
 use tokio::time::{Instant, interval, sleep, timeout};
 
-/// How long a fresh connection may take to upgrade and echo after a drain.
+/// How long a fresh connection may take to upgrade and echo after a drain, and after a flood.
 const RECOVERY: Duration = Duration::from_secs(1);
+const FLOOD_RECOVERY: Duration = Duration::from_secs(2);
+/// How long the flood is held.
+const FLOOD_HOLD: Duration = Duration::from_secs(10);
 
 /// Whether one second of probe results breaks the latency invariant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +59,8 @@ pub struct CycleConfig {
   pub drain: Duration,
   pub probes: u32,
   pub probe_rate: u32,
+  /// Connections the descriptor flood opens after each drain check, if any.
+  pub fd_flood: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -154,8 +159,28 @@ pub async fn run(cfg: CycleConfig, out: &mut dyn Write) -> Summary {
         state.violation(cycle, violation);
       }
     }
-    if let Err(reason) = recovery(&cfg.run.ctx).await {
+    if let Err(reason) = recovery(&cfg.run.ctx, RECOVERY).await {
       state.violation(cycle, Violation::NoRecovery(reason));
+    }
+    if let Some(n) = cfg.fd_flood {
+      let Some(monitor) = state.monitor.as_mut() else {
+        eprintln!("warning: the fd flood needs --pid; skipped");
+        continue;
+      };
+      let found =
+        crate::fdflood::fd_flood(&cfg.run.ctx, &cfg.run.source_ips, monitor, n, FLOOD_HOLD).await;
+      let gone = found.contains(&Violation::PidGone);
+      for violation in found {
+        state.violation(cycle, violation);
+      }
+      if gone {
+        break;
+      }
+      // The flood's connections close as it returns: the server must serve again soon after.
+      sleep(Duration::from_millis(200)).await;
+      if let Err(reason) = recovery(&cfg.run.ctx, FLOOD_RECOVERY).await {
+        state.violation(cycle, Violation::NoRecovery(format!("after the fd flood: {reason}")));
+      }
     }
   }
   if let Some(probes) = probes {
@@ -248,8 +273,8 @@ async fn mix(
   alive
 }
 
-/// A fresh connection upgrades and echoes within `RECOVERY`.
-async fn recovery(ctx: &Ctx) -> Result<(), String> {
+/// A fresh connection upgrades and echoes within `within`.
+async fn recovery(ctx: &Ctx, within: Duration) -> Result<(), String> {
   let attempt = async {
     let mut rng = rng(0);
     let mut conn = Conn::connect(ctx.addr, &ctx.opts).await.map_err(|err| format!("{err:?}"))?;
@@ -257,10 +282,10 @@ async fn recovery(ctx: &Ctx) -> Result<(), String> {
     let mut frame = Vec::new();
     client_frame(true, 1, b"recovery", [1, 2, 3, 4], &mut frame);
     conn.send(&frame).await.map_err(|err| format!("{err:?}"))?;
-    match conn.next_frame(Instant::now() + RECOVERY).await {
+    match conn.next_frame(Instant::now() + within).await {
       Ok(Next::Frame(echo)) if echo.payload == b"recovery" => Ok(()),
       other => Err(format!("no echo: {other:?}")),
     }
   };
-  timeout(RECOVERY, attempt).await.unwrap_or_else(|_| Err(format!("not within {RECOVERY:?}")))
+  timeout(within, attempt).await.unwrap_or_else(|_| Err(format!("not within {within:?}")))
 }

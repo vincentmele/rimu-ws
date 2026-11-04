@@ -7,6 +7,7 @@
 pub mod codec;
 pub mod conn;
 pub mod cycle;
+pub mod fdflood;
 pub mod monitor;
 pub mod probe;
 pub mod rng;

@@ -82,6 +82,9 @@ struct RunArgs {
   probes: u32,
   #[arg(long, default_value_t = 100)]
   probe_rate: u32,
+  /// After each cycle's drain, open this many connections and hold them (needs --pid).
+  #[arg(long)]
+  fd_flood: Option<u32>,
   /// JSONL output; defaults to /mnt/nvme1tb/claude-tmp/soak/soak-<seed>.jsonl.
   #[arg(long)]
   out: Option<PathBuf>,
@@ -203,6 +206,7 @@ async fn run(args: RunArgs) -> Result<ExitCode, String> {
     drain: args.drain,
     probes: args.probes,
     probe_rate: args.probe_rate,
+    fd_flood: args.fd_flood,
   };
   let summary = cycle::run(cfg, &mut out).await;
   eprintln!(
