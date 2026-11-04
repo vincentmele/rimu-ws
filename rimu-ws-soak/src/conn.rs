@@ -41,6 +41,22 @@ pub enum Next {
   Eof,
 }
 
+/// Whether `Conn::exchange` wants more frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flow {
+  More,
+  Done,
+}
+
+/// How `Conn::exchange` ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exchange {
+  /// The frame callback had what it wanted.
+  Done,
+  /// The server closed (or reset) first.
+  Eof,
+}
+
 /// Something the server did wrong.
 #[derive(Debug)]
 pub struct Failure(pub String);
@@ -220,6 +236,87 @@ impl Conn {
         return Ok(Next::Eof);
       }
       self.parser.push(&buf);
+    }
+  }
+
+  /// Writes `data` in pieces of the sizes `chunks` cycles through, while reading the server's
+  /// frames into `on_frame`, until it returns `Flow::Done` or the server closes. Reading while
+  /// writing keeps a large batch from deadlocking against a server that stops reading until its
+  /// replies are read. A failed write (the server closed) stops writing, not reading.
+  pub async fn exchange(
+    &mut self,
+    data: &[u8],
+    chunks: &[usize],
+    deadline: Instant,
+    mut on_frame: impl FnMut(ServerFrame) -> Flow,
+  ) -> Result<Exchange, ConnError> {
+    let Conn { parser, stream, transcript } = self;
+    let transcript = std::sync::Mutex::new(transcript);
+    let record = |dir: Dir, bytes: &[u8]| {
+      if let Ok(mut el) = transcript.lock() {
+        el.record(dir, bytes);
+      }
+    };
+    let (mut rd, mut wr) = stream.split();
+    let writer = async {
+      let mut at = 0;
+      for len in chunks.iter().cycle() {
+        if at >= data.len() {
+          break;
+        }
+        let end = data.len().min(at + len.max(&1));
+        record(Dir::Sent, &data[at..end]);
+        if let Err(err) = wr.write_all(&data[at..end]).await {
+          record(Dir::Note, format!("write failed: {err}").as_bytes());
+          break;
+        }
+        at = end;
+      }
+    };
+    let reader = async {
+      let mut chunk = vec![0; 65536];
+      loop {
+        loop {
+          match parser.next_frame() {
+            Ok(Some(frame)) => {
+              if on_frame(frame) == Flow::Done {
+                return Ok(Exchange::Done);
+              }
+            }
+            Ok(None) => break,
+            Err(err) => return Err(ConnError::server(format!("server frame: {err:?}"))),
+          }
+        }
+        match rd.read(&mut chunk).await {
+          Ok(0) => {
+            record(Dir::Note, b"EOF");
+            return Ok(Exchange::Eof);
+          }
+          Ok(len) => {
+            record(Dir::Received, &chunk[..len]);
+            parser.push(&chunk[..len]);
+          }
+          Err(err) if is_reset(&err) => {
+            record(Dir::Note, b"reset");
+            return Ok(Exchange::Eof);
+          }
+          Err(err) => return Err(classify("read", &err)),
+        }
+      }
+    };
+    let both = async {
+      let (mut writer, mut reader) = (std::pin::pin!(writer), std::pin::pin!(reader));
+      let mut written = false;
+      loop {
+        tokio::select! {
+          () = &mut writer, if !written => written = true,
+          rslt = &mut reader => return rslt,
+        }
+      }
+    };
+    match timeout_at(deadline, both).await {
+      Ok(rslt) => rslt,
+      Err(_) => Err(ConnError::server("timed out")),
     }
   }
 

@@ -4,7 +4,11 @@
 #![allow(dead_code, reason = "each test binary uses part of it")]
 
 use rimu_ws_soak::codec::{FrameSpec, LenForm, accept_key, encode};
-use std::{net::SocketAddr, time::Duration};
+use std::{
+  net::SocketAddr,
+  sync::{Arc, Mutex},
+  time::Duration,
+};
 use tokio::{
   io::{AsyncReadExt, AsyncWriteExt},
   net::{TcpListener, TcpStream},
@@ -20,6 +24,8 @@ pub struct Faults {
   pub handshake_timeout: Option<Duration>,
   pub close_code_for_protocol_errors: u16,
   pub close_code_for_bad_utf8: u16,
+  /// Every byte each connection sent, one entry per connection in accept order.
+  pub log: Option<Arc<Mutex<Vec<Vec<u8>>>>>,
 }
 
 impl Default for Faults {
@@ -31,6 +37,7 @@ impl Default for Faults {
       handshake_timeout: None,
       close_code_for_protocol_errors: 1002,
       close_code_for_bad_utf8: 1007,
+      log: None,
     }
   }
 }
@@ -50,6 +57,8 @@ pub async fn spawn_fake(faults: Faults) -> SocketAddr {
 struct Peer {
   buf: Vec<u8>,
   faults: Faults,
+  // Index of this connection's entry in `faults.log`
+  log_idx: usize,
   stream: TcpStream,
 }
 
@@ -69,6 +78,9 @@ impl Peer {
       Ok(0) | Err(_) => false,
       Ok(len) => {
         self.buf.extend_from_slice(&chunk[..len]);
+        if let Some(log) = &self.faults.log {
+          log.lock().unwrap()[self.log_idx].extend_from_slice(&chunk[..len]);
+        }
         true
       }
     }
@@ -147,7 +159,12 @@ fn parse(buf: &[u8]) -> Parsed {
 }
 
 async fn serve(stream: TcpStream, faults: Faults) {
-  let mut peer = Peer { buf: Vec::new(), faults, stream };
+  let log_idx = faults.log.as_ref().map_or(0, |log| {
+    let mut log = log.lock().unwrap();
+    log.push(Vec::new());
+    log.len() - 1
+  });
+  let mut peer = Peer { buf: Vec::new(), faults, log_idx, stream };
   let handshake_deadline = peer.faults.handshake_timeout.map(|el| Instant::now() + el);
   let end = loop {
     if let Some(end) = peer.buf.windows(4).position(|el| el == b"\r\n\r\n") {
