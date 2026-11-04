@@ -1038,13 +1038,14 @@ impl Reactor {
     if params.direct_files > 0 {
       ring.submitter().register_files_sparse(params.direct_files)?;
     }
-    // A few ticks per timeout keep each within a quarter of its length.
+    // Eight ticks per timeout keep each within a quarter of its length: a deadline can fire up to
+    // two ticks late, and an idle connection up to two sweeps late.
     let timeouts = [params.close_timeout, params.handshake_timeout, params.idle_timeout];
     let period = timeouts
       .iter()
       .flatten()
       .min()
-      .map_or(Duration::from_secs(1), |el| *el / 4)
+      .map_or(Duration::from_secs(1), |el| *el / 8)
       .clamp(Duration::from_millis(1), Duration::from_secs(1));
     let ticks_of = |value: Option<Duration>| value.map_or(0, |el| ticks(el, period));
     let idle_ticks = ticks_of(params.idle_timeout);
@@ -1053,7 +1054,7 @@ impl Reactor {
       close_ticks: ticks_of(params.close_timeout),
       handshakes: Vec::new(),
       handshake_ticks: ticks_of(params.handshake_timeout),
-      idle_every: (idle_ticks / 4).max(1),
+      idle_every: (idle_ticks / 16).max(1),
       idle_ticks,
       lingering: Vec::new(),
       tick: 0,
@@ -2738,6 +2739,90 @@ mod tests {
     assert!(elapsed >= core::time::Duration::from_millis(100), "{elapsed:?}");
     assert!(elapsed < core::time::Duration::from_secs(1), "{elapsed:?}");
     assert_eq!(runtime.open_conns(), 0);
+  }
+
+  // A connection nothing is sent on is cut off within an eighth past the handshake timeout.
+  #[test]
+  fn handshake_timeout_fires_within_an_eighth_of_its_length() {
+    use crate::net::StreamReader;
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let client = std::thread::spawn(move || {
+      let mut stream = connect(&client_addr);
+      let mut rest = Vec::new();
+      let _rslt = stream.read_to_end(&mut rest);
+    });
+    let limit = core::time::Duration::from_secs(1);
+    let params = crate::executor::UringParams::new().set_handshake_timeout(Some(limit));
+    let runtime = UringRuntime::with_params(params).unwrap();
+    let (errno, elapsed) = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+      let begin = std::time::Instant::now();
+      let mut buf = [0; 16];
+      let err = stream.read(buf.as_mut_slice().into()).await.unwrap_err();
+      (os_error(&err), begin.elapsed())
+    });
+    client.join().unwrap();
+    assert_eq!(errno, Some(libc::ETIMEDOUT));
+    assert!(elapsed >= limit * 15 / 16, "{elapsed:?}");
+    assert!(elapsed < limit * 19 / 16, "{elapsed:?}");
+  }
+
+  // Idle connections whose last activity falls anywhere between two sweeps are all cut off within
+  // an eighth past the idle timeout, with a handshake timeout set too (which sets the tick).
+  #[test]
+  fn idle_timeout_fires_within_an_eighth_of_its_length() {
+    use crate::net::{StreamReader, StreamWriter};
+    const CONNS: usize = 8;
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let client = std::thread::spawn(move || {
+      let mut streams = Vec::new();
+      for _ in 0..CONNS {
+        streams.push(connect(&client_addr));
+        std::thread::sleep(core::time::Duration::from_millis(25));
+      }
+      for mut stream in streams {
+        let mut rest = Vec::new();
+        let _rslt = stream.read_to_end(&mut rest);
+      }
+    });
+    let idle = core::time::Duration::from_millis(800);
+    let params = crate::executor::UringParams::new()
+      .set_handshake_timeout(Some(idle * 2 / 5))
+      .set_idle_timeout(Some(idle));
+    let runtime = UringRuntime::with_params(params).unwrap();
+    let results = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let mut handles = Vec::new();
+      for _ in 0..CONNS {
+        let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+        let wait = async move {
+          stream.write_all(b"a").await.unwrap();
+          let begin = std::time::Instant::now();
+          let mut buf = [0; 16];
+          let err = stream.read(buf.as_mut_slice().into()).await.unwrap_err();
+          (os_error(&err), begin.elapsed())
+        };
+        handles.push(crate::executor::Executor::spawn_local(
+          &UringExecutor::default(),
+          wait,
+          &runtime_ref(),
+        ));
+      }
+      let mut results = Vec::new();
+      for handle in handles {
+        results.push(handle.await.unwrap());
+      }
+      results
+    });
+    client.join().unwrap();
+    for (errno, elapsed) in results {
+      assert_eq!(errno, Some(libc::ETIMEDOUT));
+      assert!(elapsed >= idle * 15 / 16, "{elapsed:?}");
+      assert!(elapsed < idle * 9 / 8, "{elapsed:?}");
+    }
   }
 
   // A client that trickles its request a byte at a time keeps the connection active, but never
