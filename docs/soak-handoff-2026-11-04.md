@@ -207,6 +207,46 @@ other scenario passed.
 6. **Report** to the user what was found and fixed; update the memory file
    `~/.claude/projects/-home-vince-xvenue-recorder/memory/wtx-fork-httparena-2026-11-03.md`.
 
+## Recommendations from an independent review (2026-11-04), checked against the code
+
+A review session verified this document against the repository and the smoke-run evidence. Its
+recommendations, corrected where the code says otherwise, amend the plan above:
+
+1. **Fix F-A, F-B and F-C together, then build the handshake fuzz target (item 5) straight
+   away, not last.** The request cap gives the fuzzer its oracle ("101, 400 or an error; never a
+   panic or a hang; bounded bytes"), and the fuzzer keeps the cap from regressing.
+2. **F-A is a vulnerability in the default configuration.**
+   - `UringParams::new()` has `handshake_timeout: None` (`uring_executor.rs:138`); the smoke
+     server sets one only through `WTX_HANDSHAKE_MS`.
+   - The only other backstop is the reader's general 32 MiB `capacity_ub`
+     (`BufStreamReader::manage_capacity`), which errors past it. So it is bounded per connection,
+     but at 32 MiB, with quadratic re-parsing, and unbounded across connections.
+   - Fix: a small request cap (~16 KiB) that is always on.
+3. **Fix F-B as the full RFC 6455 4.2.1 gate**, not just the four cases the smoke run failed:
+   - `Upgrade` containing `websocket` and `Connection` containing `Upgrade` (case-insensitive
+     tokens);
+   - `Host`;
+   - HTTP/1.1 or later;
+   - a key that decodes to 16 bytes;
+   - version 13. The 400 for a wrong version carries `Sec-WebSocket-Version: 13`.
+4. **In the matrix (item 3), run `WTX_LOOP=queue` under `attack` first.** `queue` is the loop
+   that ships and the one HttpArena uses; the smoke run tested `plain` only.
+5. **The test counts were executed, not just counted:**
+   - lib 208/208, after the timer commit; later commits did not touch the lib;
+   - soak 66/66, after the last soak-crate change.
+
+   Re-run both as a baseline anyway before changing anything.
+6. **README:** `--records failures` writes only failing (and harness-error) runs to the output
+   file, while `summary.records` counts every run.
+7. **Compression (item 4): two separate defenses.**
+   - **Bombs:** the decompressed size is bounded by `max_payload_len`, which every `decompress`
+     call already receives (`read_frame.rs:518-553`). `deflate_bomb` must show that going over
+     it closes with 1009, with no truncated message and no memory jump.
+   - **Per-connection deflate memory:** every client can make the server allocate a compressor
+     and a decompressor (zlib defaults are roughly 256 KiB a connection). Bound it by capping
+     `server_max_window_bits` and the memory level. It is worth a test of its own: RSS per
+     connection with compression negotiated.
+
 ## Where further work could go
 
 - **TLS (`wss://`).** Public servers usually terminate TLS. Malformed ClientHellos, slow TLS
