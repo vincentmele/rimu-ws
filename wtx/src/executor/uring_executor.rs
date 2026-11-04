@@ -144,7 +144,7 @@ impl UringParams {
       rx_high_water: 64 * 1024,
       spin: Duration::ZERO,
       sq_entries: 1024,
-      tx_high_water: 4 * 1024 * 1024,
+      tx_high_water: 256 * 1024,
     }
   }
 
@@ -217,7 +217,10 @@ impl UringParams {
   }
 
   /// How many written bytes a connection can have waiting to be sent before a write waits for
-  /// them. Defaults to 4 MiB.
+  /// them. Defaults to 256 KiB.
+  ///
+  /// A peer that stops reading holds about twice this per connection (the bytes being sent and
+  /// those queued behind them), plus the largest single write, until a timeout closes it.
   #[inline]
   #[must_use]
   pub const fn set_tx_high_water(mut self, value: usize) -> Self {
@@ -2838,6 +2841,62 @@ mod tests {
     client.join().unwrap();
     assert!(elapsed >= core::time::Duration::from_millis(50), "{elapsed:?}");
     assert_eq!(runtime.open_conns(), 0);
+  }
+
+  // With the default limits, a peer that never reads pins a bounded amount of send buffer:
+  // writes wait once it is reached. Thousands of such peers must not take gigabytes.
+  #[test]
+  fn peer_that_never_reads_pins_little_send_buffer_by_default() {
+    use crate::net::StreamWriter;
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let client = std::thread::spawn(move || {
+      let stream = connect(&client_addr);
+      set_sock_int(&stream, libc::SOL_SOCKET, libc::SO_RCVBUF, 4096);
+      let _rslt = done_rx.recv();
+      drop(stream);
+    });
+    let params = crate::executor::UringParams::new()
+      .set_close_timeout(Some(core::time::Duration::from_millis(50)));
+    let runtime = UringRuntime::with_params(params).unwrap();
+    let largest = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+      let chunk = alloc::vec![7; 4096];
+      let mut largest = 0;
+      let begin = std::time::Instant::now();
+      {
+        let mut writing = alloc::boxed::Box::pin(async {
+          loop {
+            stream.write_all(&chunk).await.unwrap();
+          }
+        });
+        while begin.elapsed() < core::time::Duration::from_millis(500) {
+          let _pending: Poll<()> = poll_fn(|cx| Poll::Ready(writing.as_mut().poll(cx))).await;
+          largest = largest.max(
+            super::with_reactor(|reactor| {
+              Ok(
+                reactor
+                  .conns
+                  .borrow()
+                  .iter()
+                  .map(|el| el.tx_pending.capacity() + el.tx_inflight.capacity())
+                  .sum::<usize>(),
+              )
+            })
+            .unwrap(),
+          );
+          yield_once().await;
+        }
+      }
+      drop(stream);
+      largest
+    });
+    let _rslt = done_tx.send(());
+    client.join().unwrap();
+    assert!(largest >= 64 * 1024, "the peer never stopped taking bytes ({largest})");
+    assert!(largest <= 1 << 20, "{largest} bytes of send buffer for one peer");
   }
 
   // A connection that moved megabytes each way gives its buffers back when it is closed: its
