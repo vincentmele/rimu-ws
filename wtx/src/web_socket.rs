@@ -213,10 +213,11 @@ where
       )
       .await
     };
-    if rslt.is_err() {
+    if let Err(err) = &rslt {
       // Frames queued before the error still go out, in front of whatever the caller sends next.
       core::hint::cold_path();
       let _rslt = write_frame::flush_write_queue(stream, write_queue).await;
+      misc::write_error_close_frame(err, *no_masking, rng, stream).await;
     }
     rslt
   }

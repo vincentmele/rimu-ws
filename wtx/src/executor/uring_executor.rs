@@ -2538,6 +2538,58 @@ mod tests {
     stress(params, stress_conns(), 3);
   }
 
+  // The owned reader has no writer of its own: a frame that breaks the protocol (here, an
+  // unmasked one) is answered by handing a 1002 close frame to the bridge, which the writer
+  // sends.
+  #[test]
+  fn split_reader_answers_a_protocol_error_with_a_close_frame() {
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let client = std::thread::spawn(move || {
+      let mut stream = connect(&client_addr);
+      stream
+        .write_all(
+          b"GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .unwrap();
+      let mut res = Vec::new();
+      while !res.windows(4).any(|el| el == b"\r\n\r\n") {
+        let mut byte = [0; 1];
+        stream.read_exact(&mut byte).unwrap();
+        res.push(byte[0]);
+      }
+      assert!(res.starts_with(b"HTTP/1.1 101"));
+      stream.write_all(&[0x81, 1, b'a']).unwrap();
+      let mut rest = Vec::new();
+      let _len = stream.read_to_end(&mut rest).unwrap();
+      assert_eq!(rest, [0x88, 2, 3, 234]);
+    });
+    let runtime = UringRuntime::new().unwrap();
+    runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let (stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+      let ws = WebSocketAcceptor::default()
+        .accept(TlsAcceptor::new(
+          &TlsConfig::plaintext(),
+          &mut ChaCha20::from_std_random().unwrap(),
+          stream,
+        ))
+        .await
+        .unwrap();
+      let (bridge, mut reader, mut writer) = ws.into_split().unwrap();
+      let mut buffer = VectorUsize::new();
+      let _err =
+        reader.read_frame(&mut buffer, WebSocketPayloadOrigin::Adaptive).await.unwrap_err();
+      let mut listen = core::pin::pin!(bridge.listen());
+      let data = poll_fn(|cx| Poll::Ready(listen.as_mut().poll(cx))).await;
+      let Poll::Ready(data) = data else {
+        panic!("no close frame was handed to the bridge");
+      };
+      assert!(writer.manage_bridge_data(data).await.unwrap());
+    });
+    client.join().unwrap();
+  }
+
   // ---- robustness
 
   fn test_addr() -> alloc::string::String {

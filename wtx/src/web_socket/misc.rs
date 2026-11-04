@@ -2,8 +2,9 @@ use crate::{
   collections::ArrayVectorCopy,
   futures::FnMutFut,
   misc::from_utf8_basic,
-  net::StreamWriter,
+  net::{ConnectionState, StreamWriter},
   rng::Rng,
+  tls::{TlsCtx, TlsStream},
   web_socket::{
     CloseCode, Frame, MASK_MASK, MAX_CONTROL_PAYLOAD_LEN, MAX_HEADER_LEN, OP_CODE_MASK, OpCode,
     WebSocketError, write_frame::mask_frame,
@@ -120,4 +121,60 @@ where
 {
   stream.write_all_vectored(&[header, payload]).await?;
   Ok(())
+}
+
+/// The close code RFC 6455 has an endpoint send when a frame it received breaks the protocol
+/// (1002), carries invalid UTF-8 (1007) or is too large (1009). `None` for errors that are not
+/// about the peer's frames, such as I/O errors or the end of the stream.
+pub(crate) fn read_error_close_code(err: &crate::Error) -> Option<CloseCode> {
+  match err {
+    crate::Error::InvalidUTF8 => Some(CloseCode::Invalid),
+    // A reserved op code or close code
+    crate::Error::UnexpectedUint { .. } => Some(CloseCode::Protocol),
+    crate::Error::WebSocket(elem) => match elem {
+      WebSocketError::VeryLargePayload => Some(CloseCode::Size),
+      WebSocketError::InvalidCloseFrame
+      | WebSocketError::InvalidCompressionHeaderParameter
+      | WebSocketError::InvalidControlFrame
+      | WebSocketError::InvalidMaskBit
+      | WebSocketError::MissingFrameMask
+      | WebSocketError::UnexpectedFragmentedControlFrame
+      | WebSocketError::UnexpectedFrame
+      | WebSocketError::VeryLargeControlFrame => Some(CloseCode::Protocol),
+      WebSocketError::ClosedConnection
+      | WebSocketError::ClosedHandshake
+      | WebSocketError::DuplicatedHeader
+      | WebSocketError::InvalidCloseFrameParams
+      | WebSocketError::MissingSwitchingProtocols { .. } => None,
+    },
+    _ => None,
+  }
+}
+
+/// Fails the connection after a read returned `err` (RFC 6455, 7.1.7): if a received frame was
+/// at fault and no close frame was sent yet, sends one with the code for it. Best effort, as the
+/// connection is dropped next either way.
+#[cold]
+#[inline(never)]
+pub(crate) async fn write_error_close_frame<RNG, S, TCX, const IS_CLIENT: bool>(
+  err: &crate::Error,
+  no_masking: bool,
+  rng: &mut RNG,
+  stream: &mut TlsStream<S, TCX, IS_CLIENT>,
+) where
+  RNG: Rng,
+  S: StreamWriter,
+  TCX: TlsCtx,
+{
+  if !matches!(stream.connection_state, ConnectionState::Open) {
+    return;
+  }
+  let Some(close_code) = read_error_close_code(err) else {
+    return;
+  };
+  let mut payload = close_code.bytes();
+  let mut frame = Frame::new(true, OpCode::Close, &mut payload[..], 0);
+  mask_frame::<_, _, IS_CLIENT>(&mut frame, no_masking, rng);
+  stream.connection_state = ConnectionState::WriteClosed;
+  let _rslt = stream.write_all_vectored(&[frame.header(), frame.payload()]).await;
 }

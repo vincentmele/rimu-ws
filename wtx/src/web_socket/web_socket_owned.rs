@@ -1,19 +1,20 @@
 use crate::{
-  collections::VectorUsize,
+  collections::{ArrayVectorCopy, VectorUsize},
   misc::LeaseMut,
   net::{BufStreamReader, ConnectionState, StreamReader, StreamWriter},
   rng::Xorshift64,
   tls::{TlsCtx, TlsStreamReader, TlsStreamWriter},
   web_socket::{
-    Frame, FrameMut, WebSocketPayloadOrigin,
+    Frame, FrameMut, OpCode, WebSocketPayloadOrigin,
     is_in_continuation_frame::IsInContinuationFrame,
+    misc::read_error_close_code,
     read_frame::read_frame,
     web_socket_bridge::{WebSocketBridge, WebSocketBridgeData},
     web_socket_compression::{WebSocketCompression, WebSocketDecompression},
     write_frame::write_frame,
   },
 };
-use core::{marker::PhantomData, sync::atomic::Ordering};
+use core::{hint::cold_path, marker::PhantomData, sync::atomic::Ordering};
 
 /// Reader that can be used in concurrent scenarios.
 #[derive(Debug)]
@@ -51,7 +52,7 @@ where
     'buffer: 'frame,
     'this: 'frame,
   {
-    read_frame::<_, _, _, _, _, false, IS_CLIENT>(
+    let rslt = read_frame::<_, _, _, _, _, false, IS_CLIENT>(
       &mut self.is_in_continuation_frame,
       self.max_payload_len,
       &mut self.nc,
@@ -70,7 +71,19 @@ where
       |local_stream| local_stream.0,
       |local_stream| local_stream.1,
     )
-    .await
+    .await;
+    if let Err(err) = &rslt {
+      cold_path();
+      // A frame that broke the protocol is answered with a close frame, which the writer sends.
+      let state = self.stream_reader.common().connection_state.load(Ordering::Relaxed);
+      if ConnectionState::from(state) == ConnectionState::Open
+        && let Some(close_code) = read_error_close_code(err)
+        && let Ok(payload) = ArrayVectorCopy::try_from(&close_code.bytes()[..])
+      {
+        self.stream_bridge.update((OpCode::Close, payload));
+      }
+    }
+    rslt
   }
 }
 

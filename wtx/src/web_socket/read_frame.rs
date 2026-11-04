@@ -239,11 +239,7 @@ where
     )
     .await?;
     if first_rfi.fin {
-      if first_rfi.op_code.is_close() {
-        cold_path();
-        closed_conn_cb(stream);
-      }
-      return manage_first_finished_frame::<_, _, _, HAS_AUTO_REPLY, IS_CLIENT>(
+      let rslt = manage_first_finished_frame::<_, _, _, HAS_AUTO_REPLY, IS_CLIENT>(
         max_payload_len,
         nc,
         nc_rsv1,
@@ -257,6 +253,13 @@ where
         user_buffer,
       )
       .await;
+      // Only a valid close frame closes the connection: an invalid one is a protocol error,
+      // which is answered with a close frame of its own.
+      if first_rfi.op_code.is_close() && rslt.is_ok() {
+        cold_path();
+        closed_conn_cb(stream);
+      }
+      return rslt;
     }
     let buffer = if !D::IS_NOOP && first_rfi.should_decompress {
       reader_buffer.clear();

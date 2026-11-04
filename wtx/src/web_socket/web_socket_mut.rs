@@ -7,6 +7,7 @@ use crate::{
   web_socket::{
     Frame, FrameMut, WebSocketError, WebSocketPayloadOrigin,
     is_in_continuation_frame::IsInContinuationFrame,
+    misc::write_error_close_frame,
     read_frame::{
       BufferedFrame, buffered_data_frame, check_buffered_data_frame, read_frame,
       take_buffered_data_frame, take_checked_data_frame,
@@ -262,10 +263,11 @@ where
       )
       .await
     };
-    if rslt.is_err() {
+    if let Err(err) = &rslt {
       // Frames queued before the error still go out, in front of whatever the caller sends next.
       cold_path();
       let _rslt = flush_write_queue(common.stream, common.write_queue).await;
+      write_error_close_frame(err, self.no_masking, common.rng, common.stream).await;
     }
     rslt
   }

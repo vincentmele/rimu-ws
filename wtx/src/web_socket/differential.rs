@@ -180,7 +180,7 @@ fn reference(input: &[u8]) -> Outcome {
     let fin = b0 & 0x80 != 0;
     let op = b0 & 0x0F;
     if b0 & 0x70 != 0 || !matches!(op, 0 | 1 | 2 | 8 | 9 | 10) {
-      break End::Error;
+      break fail(&mut output, PROTOCOL);
     }
     let ext = match b1 & 0x7F {
       126 => 2,
@@ -191,7 +191,7 @@ fn reference(input: &[u8]) -> Outcome {
       break End::Eof;
     }
     if b1 & 0x80 == 0 {
-      break End::Error;
+      break fail(&mut output, PROTOCOL);
     }
     let header_len = 2 + ext + 4;
     if rest.len() < header_len {
@@ -203,8 +203,11 @@ fn reference(input: &[u8]) -> Outcome {
       _ => u64::from(b1 & 0x7F),
     };
     let control = op >= 8;
-    if (control && (!fin || len > 125)) || len >= MAX_PAYLOAD_LEN as u64 {
-      break End::Error;
+    if control && (!fin || len > 125) {
+      break fail(&mut output, PROTOCOL);
+    }
+    if len >= MAX_PAYLOAD_LEN as u64 {
+      break fail(&mut output, TOO_BIG);
     }
     let len = len as usize;
     if rest.len() < header_len + len {
@@ -224,8 +227,8 @@ fn reference(input: &[u8]) -> Outcome {
       }
       10 => events.push(Event::Pong(payload)),
       8 => {
-        if !close_payload_is_valid(&payload) {
-          break End::Error;
+        if let Some(code) = close_payload_error(&payload) {
+          break fail(&mut output, code);
         }
         encode(&mut output, 0x8, &payload);
         events.push(Event::Close(payload));
@@ -233,31 +236,31 @@ fn reference(input: &[u8]) -> Outcome {
       }
       1 | 2 => {
         if fragment.is_some() {
-          break End::Error;
+          break fail(&mut output, PROTOCOL);
         }
         if fin {
           if op == 1 && core::str::from_utf8(&payload).is_err() {
-            break End::Error;
+            break fail(&mut output, BAD_DATA);
           }
           encode(&mut output, op, &payload);
           events.push(Event::Data(op, payload));
         } else {
           if op == 1 && !is_utf8_prefix(&payload) {
-            break End::Error;
+            break fail(&mut output, BAD_DATA);
           }
           fragment = Some((op, payload));
         }
       }
       _ => {
         let Some((first, mut message)) = fragment.take() else {
-          break End::Error;
+          break fail(&mut output, PROTOCOL);
         };
         message.extend_from_slice(&payload);
         if first == 1 {
           let valid =
             if fin { core::str::from_utf8(&message).is_ok() } else { is_utf8_prefix(&message) };
           if !valid {
-            break End::Error;
+            break fail(&mut output, BAD_DATA);
           }
         }
         if fin {
@@ -276,14 +279,16 @@ fn reference(input: &[u8]) -> Outcome {
   clippy::disallowed_methods,
   reason = "the model checks UTF-8 with the standard validator on purpose, independently of wtx's"
 )]
-fn close_payload_is_valid(payload: &[u8]) -> bool {
+fn close_payload_error(payload: &[u8]) -> Option<u16> {
   match payload {
-    [] => true,
-    [_] => false,
+    [] => None,
+    [_] => Some(PROTOCOL),
     [b0, b1, reason @ ..] => {
+      if core::str::from_utf8(reason).is_err() {
+        return Some(BAD_DATA);
+      }
       let code = u16::from_be_bytes([*b0, *b1]);
-      matches!(code, 1000..=1003 | 1007..=1013 | 3000..=4999)
-        && core::str::from_utf8(reason).is_ok()
+      (!matches!(code, 1000..=1003 | 1007..=1013 | 3000..=4999)).then_some(PROTOCOL)
     }
   }
 }
@@ -297,6 +302,16 @@ fn is_utf8_prefix(bytes: &[u8]) -> bool {
     Ok(_) => true,
     Err(err) => err.error_len().is_none(),
   }
+}
+
+// The close codes RFC 6455 has the server send before it closes a connection that broke it.
+const PROTOCOL: u16 = 1002;
+const BAD_DATA: u16 = 1007;
+const TOO_BIG: u16 = 1009;
+
+fn fail(out: &mut Vec<u8>, code: u16) -> End {
+  encode(out, 0x8, &code.to_be_bytes());
+  End::Error
 }
 
 fn encode(out: &mut Vec<u8>, op: u8, payload: &[u8]) {
