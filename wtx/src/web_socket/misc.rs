@@ -145,7 +145,9 @@ pub(crate) fn read_error_close_code(err: &crate::Error) -> Option<CloseCode> {
       | WebSocketError::ClosedHandshake
       | WebSocketError::DuplicatedHeader
       | WebSocketError::InvalidCloseFrameParams
-      | WebSocketError::MissingSwitchingProtocols { .. } => None,
+      | WebSocketError::InvalidHandshakeRequest
+      | WebSocketError::MissingSwitchingProtocols { .. }
+      | WebSocketError::VeryLargeHandshake => None,
     },
     _ => None,
   }

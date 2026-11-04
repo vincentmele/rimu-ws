@@ -11,8 +11,8 @@ macro_rules! check_headers {
       ],
       $headers
     );
-    drop(check_header_value(rslt[0]));
-    drop(check_header_value(rslt[1]));
+    let _ = check_header_value(rslt[0])?;
+    let _ = check_header_value(rslt[1])?;
     rslt
   }};
 }
@@ -33,7 +33,11 @@ use crate::{
 };
 use httparse::{EMPTY_HEADER, Header, Request, Response, Status};
 
-const MAX_HEADERS: usize = 16;
+/// Proxies and CDNs add their own headers to a browser's dozen or so.
+const MAX_HEADERS: usize = 64;
+/// The largest upgrade request (or response) read: past it, a peer that never ends one would
+/// make the reader hold, and re-parse, as much as it sent.
+const MAX_REQUEST_LEN: usize = 16 * 1024;
 const READ_INCREMENT: usize = 1024;
 const VERSION: &str = "13";
 
@@ -58,61 +62,117 @@ where
     self.wsb.clear();
     let mut tls_stream = tls_acceptor.accept().await?.tls_stream;
     let nb = &mut self.wsb.network_buffer;
+    let mut scanned = 0;
     loop {
-      let _ = nb
-        .read_arbitrary(READ_INCREMENT, &mut tls_stream)
-        .await?
-        .ok_or(WebSocketError::ClosedConnection)
-        .map_err(crate::Error::from)?;
+      // Into `following`, which `BufStreamReader` keeps across reads: a request that arrives in
+      // several reads is parsed whole.
+      // The reserve counts from the start of `following`, which holds the request so far.
+      let reserve = nb.following().len().wrapping_add(READ_INCREMENT);
+      if !nb.read_following(reserve, &mut tls_stream).await? {
+        return Err(crate::Error::from(WebSocketError::ClosedConnection).into());
+      }
+      let buffer = nb.following();
+      // Parsed only once the blank line may have arrived, so a request sent a byte at a time
+      // costs linear time, not quadratic.
+      let ended = has_blank_line(buffer, scanned);
+      scanned = buffer.len();
+      if !ended {
+        if buffer.len() > MAX_REQUEST_LEN {
+          build_and_send_res431(&mut tls_stream).await?;
+          return Err(crate::Error::from(WebSocketError::VeryLargeHandshake).into());
+        }
+        continue;
+      }
       let mut req_buffer = [EMPTY_HEADER; MAX_HEADERS];
       let mut req = Request::new(&mut req_buffer);
-      let buffer = nb.current();
-      match req.parse(buffer).map_err(From::from)? {
-        Status::Complete(len) => {
-          if !(self.req)(&req)? {
-            build_and_send_res400(&mut tls_stream).await?;
-            return Err(crate::Error::from(WebSocketError::ClosedHandshake).into());
+      let len = match req.parse(buffer) {
+        Ok(Status::Complete(len)) => len,
+        Ok(Status::Partial) => {
+          if buffer.len() > MAX_REQUEST_LEN {
+            build_and_send_res431(&mut tls_stream).await?;
+            return Err(crate::Error::from(WebSocketError::VeryLargeHandshake).into());
           }
-          if !req.method().trim_ascii().eq_ignore_ascii_case(b"get") {
-            build_and_send_res400(&mut tls_stream).await?;
-            return Err(
-              crate::Error::from(HttpError::UnexpectedHttpMethod { expected: Some(Method::Get) })
-                .into(),
-            );
-          }
-          let mut key_buffer = [0; 30];
-          let swa = match Self::check_req_headers(&mut self.no_masking, &req, &mut key_buffer) {
-            Ok(el) => el,
-            Err(err) => {
-              build_and_send_res400(&mut tls_stream).await?;
-              return Err(err.into());
-            }
-          };
-          let nc = self.compression.negotiate(req.headers.iter())?;
-          build_and_send_res101(swa, &nc, self.no_masking, &mut tls_stream).await?;
-          self.wsb.network_buffer.set_indices(len, len);
-          let rng = Xorshift64::from_simple_seed()?;
-          return Ok(WebSocket::new(nc, self.no_masking, rng, tls_stream, self.wsb));
+          continue;
         }
-        Status::Partial => {}
+        Err(err) => {
+          if err == httparse::Error::TooManyHeaders {
+            build_and_send_res431(&mut tls_stream).await?;
+          } else {
+            build_and_send_res400(&mut tls_stream, false).await?;
+          }
+          return Err(crate::Error::from(err).into());
+        }
+      };
+      if !(self.req)(&req)? {
+        build_and_send_res400(&mut tls_stream, false).await?;
+        return Err(crate::Error::from(WebSocketError::ClosedHandshake).into());
       }
+      if !req.method().trim_ascii().eq_ignore_ascii_case(b"get") {
+        build_and_send_res400(&mut tls_stream, false).await?;
+        return Err(
+          crate::Error::from(HttpError::UnexpectedHttpMethod { expected: Some(Method::Get) })
+            .into(),
+        );
+      }
+      let mut key_buffer = [0; 30];
+      let swa = match Self::check_req_headers(&mut self.no_masking, &req, &mut key_buffer) {
+        Ok(el) => el,
+        Err(bad_version) => {
+          build_and_send_res400(&mut tls_stream, bad_version).await?;
+          return Err(crate::Error::from(WebSocketError::InvalidHandshakeRequest).into());
+        }
+      };
+      let nc = self.compression.negotiate(req.headers.iter())?;
+      build_and_send_res101(swa, &nc, self.no_masking, &mut tls_stream).await?;
+      self.wsb.network_buffer.set_indices(len, len);
+      let rng = Xorshift64::from_simple_seed()?;
+      return Ok(WebSocket::new(nc, self.no_masking, rng, tls_stream, self.wsb));
     }
   }
 
+  /// The `Sec-WebSocket-Accept` of a request RFC 6455 (4.2.1) lets the server upgrade: HTTP/1.1,
+  /// with `Host`, `Upgrade: websocket`, `Connection: Upgrade` (tokens in any case, in lists), one
+  /// key of 16 bytes in base64 and version 13. `Err(true)` when only the version is wrong, which
+  /// the 400 then names.
   fn check_req_headers<'kb>(
     no_masking: &mut bool,
     req: &Request<'_, '_>,
     key_buffer: &'kb mut [u8; 30],
-  ) -> crate::Result<&'kb [u8]> {
-    let [_, _, b2, b3, b4] = check_headers!(
-      req.headers,
-      (KnownHeaderName::SecWebsocketExtensions, None),
-      (KnownHeaderName::SecWebsocketKey, None),
-      (KnownHeaderName::SecWebsocketVersion, Some(VERSION.as_bytes()))
-    );
-    *no_masking &= check_header_value(b2).is_ok_and(has_no_masking);
-    let key = check_header_value(b3)?;
-    let _ = check_header_value(b4)?;
+  ) -> Result<&'kb [u8], bool> {
+    let (mut host, mut upgrade, mut connection, mut key, mut version) =
+      (false, false, false, None, None);
+    // Off unless the client asks for it.
+    let mut asks_no_masking = false;
+    for header in req.headers.iter() {
+      let name = header.name.as_bytes().trim_ascii();
+      let value = header.value.trim_ascii();
+      let has_token =
+        |token: &[u8]| bytes_split1(value, b',').any(|el| el.trim_ascii().eq_ignore_ascii_case(token));
+      if name.eq_ignore_ascii_case(b"host") {
+        host = true;
+      } else if name.eq_ignore_ascii_case(b"upgrade") {
+        upgrade |= has_token(b"websocket");
+      } else if name.eq_ignore_ascii_case(b"connection") {
+        connection |= has_token(b"upgrade");
+      } else if name.eq_ignore_ascii_case(b"sec-websocket-key") {
+        if key.is_some() {
+          return Err(false);
+        }
+        key = Some(value);
+      } else if name.eq_ignore_ascii_case(b"sec-websocket-version") {
+        version = Some(value);
+      } else if name.eq_ignore_ascii_case(b"sec-websocket-extensions") {
+        asks_no_masking |= has_no_masking(value);
+      }
+    }
+    let Some(key) = key.filter(|el| is_valid_key(el)) else { return Err(false) };
+    if req.version != Some(1) || !host || !upgrade || !connection {
+      return Err(false);
+    }
+    if version != Some(VERSION.as_bytes()) {
+      return Err(true);
+    }
+    *no_masking &= asks_no_masking;
     Ok(derived_key(key_buffer, key))
   }
 }
@@ -155,18 +215,29 @@ where
       out.tls_stream.write_all(sw.curr()).await?;
       key
     };
+    let mut scanned = 0;
     let (nc, len) = loop {
       let nb = &mut self.wsb.network_buffer;
-      let _ = nb
-        .read_arbitrary(READ_INCREMENT, &mut out.tls_stream)
-        .await?
-        .ok_or(WebSocketError::ClosedConnection)
-        .map_err(crate::Error::from)?;
+      let reserve = nb.following().len().wrapping_add(READ_INCREMENT);
+      if !nb.read_following(reserve, &mut out.tls_stream).await? {
+        return Err(crate::Error::from(WebSocketError::ClosedConnection).into());
+      }
+      let buffer = nb.following();
+      let ended = has_blank_line(buffer, scanned);
+      scanned = buffer.len();
+      if buffer.len() > MAX_REQUEST_LEN && !ended {
+        return Err(crate::Error::from(WebSocketError::VeryLargeHandshake).into());
+      }
+      if !ended {
+        continue;
+      }
       let mut httparse_headers = [EMPTY_HEADER; MAX_HEADERS];
       let mut res = Response::new(&mut httparse_headers);
-      let buffer = nb.current();
       let len = match res.parse(buffer).map_err(From::from)? {
         Status::Complete(len) => len,
+        Status::Partial if buffer.len() > MAX_REQUEST_LEN => {
+          return Err(crate::Error::from(WebSocketError::VeryLargeHandshake).into());
+        }
         Status::Partial => continue,
       };
       if res.code != Some(101) {
@@ -180,7 +251,8 @@ where
         (KnownHeaderName::SecWebsocketAccept, Some(derived_key(&mut [0; 30], key))),
         (KnownHeaderName::SecWebsocketExtensions, None)
       );
-      drop(check_header_value(b2));
+      // RFC 6455 4.1: a client that gets the wrong key fails the connection.
+      let _ = check_header_value(b2)?;
       self.no_masking &= check_header_value(b3).is_ok_and(has_no_masking);
       break (self.compression.negotiate(res.headers.iter())?, len);
     };
@@ -249,12 +321,40 @@ where
   Ok(key)
 }
 
-async fn build_and_send_res400<S>(stream: &mut S) -> crate::Result<()>
+/// With `bad_version`, names the version the server speaks (RFC 6455 4.4).
+async fn build_and_send_res400<S>(stream: &mut S, bad_version: bool) -> crate::Result<()>
 where
   S: Stream,
 {
-  stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await?;
+  if bad_version {
+    stream.write_all(b"HTTP/1.1 400 Bad Request\r\nSec-WebSocket-Version: 13\r\n\r\n").await?;
+  } else {
+    stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await?;
+  }
   Ok(())
+}
+
+async fn build_and_send_res431<S>(stream: &mut S) -> crate::Result<()>
+where
+  S: Stream,
+{
+  stream.write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n").await?;
+  Ok(())
+}
+
+/// Whether `buffer` holds the blank line that ends an HTTP head (CRLF or bare LF), looking only
+/// at what arrived after its first `scanned` bytes and the 2 before them.
+fn has_blank_line(buffer: &[u8], scanned: usize) -> bool {
+  let from = scanned.saturating_sub(2).min(buffer.len());
+  buffer.get(from..).unwrap_or_default().windows(2).any(|el| el == b"\n\n")
+    || buffer.get(from..).unwrap_or_default().windows(3).any(|el| el == b"\n\r\n")
+}
+
+/// 16 bytes in base64: 22 characters, the last carrying 2 bits, then `==`.
+fn is_valid_key(key: &[u8]) -> bool {
+  let [body @ .., last, b'=', b'='] = key else { return false };
+  let is_b64 = |el: &u8| el.is_ascii_alphanumeric() || *el == b'+' || *el == b'/';
+  body.len() == 21 && body.iter().all(is_b64) && matches!(last, b'A' | b'Q' | b'g' | b'w')
 }
 
 /// Server response

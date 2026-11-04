@@ -13,6 +13,8 @@ pub enum WebSocketError {
   InvalidCloseFrameParams,
   /// Control frames can not exceed 125 bytes.
   InvalidControlFrame,
+  /// An upgrade request RFC 6455 has the server refuse; it was answered 400.
+  InvalidHandshakeRequest,
   /// Received an invalid header compression parameter.
   InvalidCompressionHeaderParameter,
   /// The client sent an invalid mask bit.
@@ -30,6 +32,8 @@ pub enum WebSocketError {
   UnexpectedFrame,
   /// Control frames have a maximum allowed size.
   VeryLargeControlFrame,
+  /// An upgrade request or response grew past 16 KiB without ending.
+  VeryLargeHandshake,
   /// Frame payload exceeds the defined threshold.
   VeryLargePayload,
 }

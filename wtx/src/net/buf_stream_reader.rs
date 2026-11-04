@@ -262,34 +262,6 @@ impl BufStreamReader {
     *forbid_clear = false;
   }
 
-  /// Useful when the actual amount of required buffer is unknown. Always increases current by the
-  /// number of filled elements.
-  ///
-  /// `reserve_len` is only used to create a buffer to allow external reads.
-  #[cfg(feature = "web-socket")]
-  pub(crate) async fn read_arbitrary<SR>(
-    &mut self,
-    reserve_len: usize,
-    stream_reader: &mut SR,
-  ) -> crate::Result<Option<core::num::NonZeroUsize>>
-  where
-    SR: StreamReader,
-  {
-    self.manage_capacity(reserve_len)?;
-    let (init, uninit) = self.buffer.split_at_spare_mut();
-    let Some(len) = stream_reader.read(uninit.into()).await? else {
-      cold_path();
-      return Ok(None);
-    };
-    let new_len = init.len().wrapping_add(len.get());
-    // SAFETY: `stream_reader.read` just initialized `len` buffer
-    unsafe {
-      self.buffer.set_len(new_len);
-    }
-    self.current_end_idx = new_len;
-    Ok(Some(len))
-  }
-
   /// Marks the first `len` bytes of [`Self::following`] as consumed, like [`Self::read_header`]
   /// does with the bytes it returns. `len` is capped to the following length.
   #[cfg(feature = "web-socket")]

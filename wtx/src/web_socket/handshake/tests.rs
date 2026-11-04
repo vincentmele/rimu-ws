@@ -378,3 +378,280 @@ where
     assert_eq!((OpCode::Text, "2".as_bytes()), (two.op_code(), &**two.payload()));
   }
 }
+
+// ---- Upgrade requests a public server gets: what it must refuse, and how much it may read.
+
+/// Feeds `input` to the server `chunk` bytes per read, then reports EOF, and records its answer.
+struct Scripted {
+  chunk: usize,
+  input: std::vec::Vec<u8>,
+  output: std::rc::Rc<core::cell::RefCell<std::vec::Vec<u8>>>,
+  pos: std::rc::Rc<core::cell::Cell<usize>>,
+}
+
+impl crate::net::Stream for Scripted {
+  type BridgeOwned = ();
+  type ReadHalfOwned = ();
+  type WriteHalfOwned = ();
+
+  fn into_split(self) -> crate::Result<((), (), ())> {
+    Ok(((), (), ()))
+  }
+}
+
+impl crate::net::StreamCommon for Scripted {}
+
+impl crate::net::StreamReader for Scripted {
+  async fn read(
+    &mut self,
+    mut bytes: crate::collections::MaybeUninitSlice<'_, u8>,
+  ) -> crate::Result<Option<core::num::NonZeroUsize>> {
+    let init = bytes.initialize_all_bytes();
+    let pos = self.pos.get();
+    let len = init.len().min(self.chunk).min(self.input.len() - pos);
+    init[..len].copy_from_slice(&self.input[pos..pos + len]);
+    self.pos.set(pos + len);
+    Ok(core::num::NonZeroUsize::new(len))
+  }
+}
+
+impl crate::net::StreamWriter for Scripted {
+  async fn write_all(&mut self, bytes: &[u8]) -> crate::Result<()> {
+    self.output.borrow_mut().extend_from_slice(bytes);
+    Ok(())
+  }
+
+  async fn write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<()> {
+    for elem in bytes {
+      self.output.borrow_mut().extend_from_slice(elem);
+    }
+    Ok(())
+  }
+}
+
+/// Whether the server upgraded `input`, what it answered, and how many bytes it read.
+fn serve(input: &[u8], chunk: usize) -> (bool, std::string::String, usize) {
+  let output = std::rc::Rc::new(core::cell::RefCell::new(std::vec::Vec::new()));
+  let pos = std::rc::Rc::new(core::cell::Cell::new(0));
+  let stream = Scripted { chunk, input: input.to_vec(), output: output.clone(), pos: pos.clone() };
+  let tls_config = TlsConfig::plaintext();
+  let upgraded = StdRuntime::new().block_on(async {
+    WebSocketAcceptor::default()
+      .accept(TlsAcceptor::new(&tls_config, ChaCha20::from_std_random().unwrap(), stream))
+      .await
+      .is_ok()
+  });
+  let answer = std::string::String::from_utf8_lossy(&output.borrow()).into_owned();
+  (upgraded, answer, pos.get())
+}
+
+const KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
+const ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+
+fn request(request_line: &str, headers: &[&str]) -> std::vec::Vec<u8> {
+  let mut out = std::format!("{request_line}\r\n");
+  for header in headers {
+    out.push_str(header);
+    out.push_str("\r\n");
+  }
+  out.push_str("\r\n");
+  out.into_bytes()
+}
+
+fn valid_headers() -> std::vec::Vec<std::string::String> {
+  std::vec![
+    "Host: example.com".into(),
+    "Upgrade: websocket".into(),
+    "Connection: Upgrade".into(),
+    std::format!("Sec-WebSocket-Key: {KEY}"),
+    "Sec-WebSocket-Version: 13".into(),
+  ]
+}
+
+fn without(name: &str) -> std::vec::Vec<std::string::String> {
+  valid_headers().into_iter().filter(|el| !el.starts_with(name)).collect()
+}
+
+fn refs(headers: &[std::string::String]) -> std::vec::Vec<&str> {
+  headers.iter().map(std::string::String::as_str).collect()
+}
+
+#[test]
+fn a_valid_request_is_upgraded() {
+  let headers = valid_headers();
+  let (upgraded, answer, _) = serve(&request("GET / HTTP/1.1", &refs(&headers)), 1024);
+  assert!(upgraded, "{answer}");
+  assert!(answer.starts_with("HTTP/1.1 101"), "{answer}");
+  assert!(answer.contains(ACCEPT), "{answer}");
+}
+
+// Firefox sends `Connection: keep-alive, Upgrade`; header names and tokens are case-insensitive.
+#[test]
+fn tokens_in_lists_and_any_case_are_upgraded() {
+  let mut headers = without("Connection");
+  headers.retain(|el| !el.starts_with("Upgrade"));
+  headers.push("connection: keep-alive, Upgrade".into());
+  headers.push("UPGRADE: WebSocket".into());
+  let (upgraded, answer, _) = serve(&request("GET /chat HTTP/1.1", &refs(&headers)), 7);
+  assert!(upgraded, "{answer}");
+  assert!(answer.contains(ACCEPT), "{answer}");
+}
+
+// RFC 6455 4.2.1: each of these gets a 400, not a 101.
+#[test]
+fn requests_rfc_6455_refuses_get_a_400() {
+  let short_key = {
+    let mut headers = without("Sec-WebSocket-Key");
+    headers.push("Sec-WebSocket-Key: AAAAAAAAAAA=".into());
+    headers
+  };
+  let not_base64 = {
+    let mut headers = without("Sec-WebSocket-Key");
+    headers.push("Sec-WebSocket-Key: !!!!!!!!!!!!!!!!!!!!!!==".into());
+    headers
+  };
+  let cases: [(&str, &str, std::vec::Vec<std::string::String>); 8] = [
+    ("no Upgrade", "GET / HTTP/1.1", without("Upgrade")),
+    ("no Connection", "GET / HTTP/1.1", without("Connection")),
+    ("no Host", "GET / HTTP/1.1", without("Host")),
+    ("no key", "GET / HTTP/1.1", without("Sec-WebSocket-Key")),
+    ("short key", "GET / HTTP/1.1", short_key),
+    ("key not base64", "GET / HTTP/1.1", not_base64),
+    ("HTTP/1.0", "GET / HTTP/1.0", valid_headers()),
+    ("POST", "POST / HTTP/1.1", valid_headers()),
+  ];
+  for (name, request_line, headers) in cases {
+    let (upgraded, answer, _) = serve(&request(request_line, &refs(&headers)), 1024);
+    assert!(!upgraded, "{name}: {answer}");
+    assert!(answer.starts_with("HTTP/1.1 400"), "{name}: {answer}");
+  }
+}
+
+// RFC 6455 4.4: the 400 for another version names the one the server speaks.
+#[test]
+fn another_version_gets_a_400_naming_13() {
+  let mut headers = without("Sec-WebSocket-Version");
+  headers.push("Sec-WebSocket-Version: 8".into());
+  let (upgraded, answer, _) = serve(&request("GET / HTTP/1.1", &refs(&headers)), 1024);
+  assert!(!upgraded, "{answer}");
+  assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+  assert!(answer.contains("Sec-WebSocket-Version: 13"), "{answer}");
+  let (upgraded, answer, _) = serve(&request("GET / HTTP/1.1", &refs(&without("Sec-WebSocket-Version"))), 1024);
+  assert!(!upgraded && answer.contains("Sec-WebSocket-Version: 13"), "{answer}");
+}
+
+// A request that never ends is refused once it passes the cap, not read to the end: a server
+// that kept reading would hold, and re-parse, as much as the client sent.
+#[test]
+fn an_endless_request_is_refused_at_the_cap() {
+  let mut input = b"GET / HTTP/1.1\r\nHost: x\r\nX-Pad: ".to_vec();
+  input.resize(input.len() + (1 << 20), b'a');
+  let (upgraded, answer, read) = serve(&input, 1024);
+  assert!(!upgraded);
+  assert!(answer.starts_with("HTTP/1.1 431"), "{answer}");
+  assert!(read <= 2 * super::MAX_REQUEST_LEN, "read {read} bytes");
+}
+
+// Proxies and CDNs add headers: a few dozen are upgraded, hundreds get a 431.
+#[test]
+fn header_count_is_generous_but_bounded() {
+  let mut headers = valid_headers();
+  headers.extend((0..40).map(|idx| std::format!("X-Forwarded-{idx}: 10.0.0.{idx}")));
+  let (upgraded, answer, _) = serve(&request("GET / HTTP/1.1", &refs(&headers)), 1024);
+  assert!(upgraded, "{answer}");
+  headers.extend((0..200).map(|idx| std::format!("X-Many-{idx}: v")));
+  let (upgraded, answer, _) = serve(&request("GET / HTTP/1.1", &refs(&headers)), 1024);
+  assert!(!upgraded);
+  assert!(answer.starts_with("HTTP/1.1 431"), "{answer}");
+}
+
+// Malformed HTTP gets a 400, not a silent close.
+#[test]
+fn malformed_http_gets_a_400() {
+  let mut input = request("GET / HTTP/1.1", &refs(&valid_headers()));
+  input.splice(16..16, b"a header without a colon\r\n".iter().copied());
+  let (upgraded, answer, _) = serve(&input, 1024);
+  assert!(!upgraded);
+  assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+}
+
+// Requests arrive in pieces over a real network: every split upgrades.
+#[test]
+fn a_request_split_across_reads_is_upgraded() {
+  let input = request("GET / HTTP/1.1", &refs(&valid_headers()));
+  for chunk in [1, 2, 3, 7, 100, 1024] {
+    let (upgraded, answer, _) = serve(&input, chunk);
+    assert!(upgraded, "chunk {chunk}: {answer}");
+    assert!(answer.contains(ACCEPT), "chunk {chunk}: {answer}");
+  }
+}
+
+/// Connects a client to a server thread that answers the upgrade with `respond(key)`, written a
+/// byte at a time when `trickle`.
+fn connect_to(respond: fn(&str) -> std::string::String, trickle: bool) -> bool {
+  use std::io::{Read, Write};
+  let uri = _uri();
+  let listener = TcpListener::bind(uri.hostname_with_implied_port()).unwrap();
+  let server = std::thread::spawn(move || {
+    let (mut stream, _) = listener.accept().unwrap();
+    stream.set_nodelay(true).unwrap();
+    let mut head = std::vec::Vec::new();
+    let mut byte = [0; 1];
+    while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap() == 1 {
+      head.push(byte[0]);
+    }
+    let head = std::string::String::from_utf8(head).unwrap();
+    let key = std::string::String::from(
+      head.lines().find_map(|el| el.strip_prefix("Sec-WebSocket-Key: ")).unwrap().trim(),
+    );
+    let res = respond(&key);
+    if trickle {
+      for byte in res.as_bytes() {
+        stream.write_all(&[*byte]).unwrap();
+        std::thread::sleep(Duration::from_micros(200));
+      }
+    } else {
+      stream.write_all(res.as_bytes()).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(100));
+  });
+  let connected = StdRuntime::new().block_on(async {
+    WebSocketConnector::default()
+      .connect(
+        TlsConnectorBuilder::std(uri)
+          .build(&TlsConfig::plaintext(), &mut ChaCha20::from_std_random().unwrap())
+          .await
+          .unwrap(),
+      )
+      .await
+      .is_ok()
+  });
+  server.join().unwrap();
+  connected
+}
+
+fn res101(accept: &str) -> std::string::String {
+  std::format!(
+    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+  )
+}
+
+// RFC 6455 4.1: the client checks the server's answer to its key, and its Upgrade and Connection.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn client_checks_the_servers_answer() {
+  let right = |key: &str| {
+    let mut buffer = [0; 30];
+    res101(crate::misc::from_utf8_basic(super::derived_key(&mut buffer, key.as_bytes())).unwrap())
+  };
+  assert!(connect_to(right, false));
+  // Responses arrive in pieces too.
+  assert!(connect_to(right, true));
+  assert!(!connect_to(|_| res101("c29tZXRoaW5nIGVsc2UgZW50aXJlbHk="), false));
+  let no_upgrade = |key: &str| {
+    let mut buffer = [0; 30];
+    let accept = crate::misc::from_utf8_basic(super::derived_key(&mut buffer, key.as_bytes())).unwrap();
+    std::format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n")
+  };
+  assert!(!connect_to(no_upgrade, false));
+}
