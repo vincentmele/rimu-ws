@@ -404,14 +404,19 @@ where
 {
   let ConnParams { compression, error_cb, rng, router, stream, tls_config, web_socket_router } =
     conn_params;
+  let handshake_router = router.clone();
   let handshake = Box::pin(async move {
     let mut path = String::new();
     let web_socket = WebSocketAcceptor::default()
       .set_compression(compression)
       .set_req(|req| {
-        if let Some(elem) = req.path {
-          path.push_str(elem);
+        // Routed on the path without its query, and before the 101: a path no route has is
+        // answered 400, not upgraded and dropped.
+        let route = req.path.map_or("", |el| el.split_once('?').map_or(el, |parts| parts.0));
+        if handshake_router.find(route).is_err() {
+          return crate::Result::Ok(false);
         }
+        path.push_str(route);
         crate::Result::Ok(true)
       })
       .accept(TlsAcceptor::new(&*tls_config, rng, stream))
@@ -456,4 +461,90 @@ where
     tls_config: tls_config.clone(),
     web_socket_router: web_socket_router.clone(),
   })
+}
+
+#[cfg(all(test, feature = "io-uring"))]
+mod tests {
+  use crate::{
+    collections::VectorUsize,
+    executor::{UringExecutor, UringRuntime, UringTcpStream},
+    http::WebSocketServerFramework,
+    rng::{ChaCha20, CryptoSeedableRng},
+    tests::_uri,
+    tls::{PlaintextCtx, TlsConfig},
+    web_socket::{OpCode, WebSocket, WebSocketPayloadOrigin},
+  };
+  use std::io::{Read, Write};
+
+  async fn echo(
+    mut buffer: VectorUsize<u8>,
+    mut ws: WebSocket<(), UringTcpStream, PlaintextCtx, false>,
+  ) -> crate::Result<()> {
+    let (mut common, mut reader, mut writer) = ws.split_mut();
+    loop {
+      let mut frame =
+        reader.read_frame(&mut buffer, &mut common, WebSocketPayloadOrigin::Adaptive).await?;
+      match frame.op_code() {
+        OpCode::Text | OpCode::Binary => writer.write_frame(&mut common, &mut frame).await?,
+        OpCode::Close => return Ok(()),
+        _ => {}
+      }
+    }
+  }
+
+  /// The status of the server's answer to an upgrade of `target`, and whether a text sent after
+  /// a 101 came back.
+  fn upgrade(addr: &str, target: &str) -> (std::string::String, bool) {
+    let mut stream = loop {
+      if let Ok(elem) = std::net::TcpStream::connect(addr) {
+        break elem;
+      }
+      std::thread::sleep(core::time::Duration::from_millis(5));
+    };
+    stream.set_read_timeout(Some(core::time::Duration::from_secs(2))).unwrap();
+    let req = std::format!(
+      "GET {target} HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut head = std::vec::Vec::new();
+    let mut byte = [0; 1];
+    while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+      head.push(byte[0]);
+    }
+    let status = std::string::String::from_utf8_lossy(head.get(9..12).unwrap_or_default()).into_owned();
+    if status != "101" {
+      return (status, false);
+    }
+    // A masked "hi".
+    stream.write_all(&[0x81, 0x82, 1, 2, 3, 4, b'h' ^ 1, b'i' ^ 2]).unwrap();
+    let mut echo = [0; 4];
+    let echoed = stream.read_exact(&mut echo).is_ok() && echo == [0x81, 2, b'h', b'i'];
+    (status, echoed)
+  }
+
+  // Queries and long paths reach the handler of their route; a path no route has gets a 400, not
+  // a 101 and a dropped connection.
+  #[test]
+  fn routes_are_matched_before_the_upgrade() {
+    let uri = _uri();
+    let (host, port) = uri.hostname_with_implied_port();
+    let addr = std::format!("{host}:{port}");
+    let server_addr = addr.clone();
+    let _server = std::thread::spawn(move || {
+      WebSocketServerFramework::<(), fn(crate::Error), UringExecutor, _, ChaCha20, PlaintextCtx>::new(
+        UringExecutor::default(),
+        ChaCha20::from_std_random().unwrap(),
+        TlsConfig::plaintext(),
+      )
+      .unwrap()
+      .set_local_runtime_cb(|| UringRuntime::with_params(crate::executor::UringParams::new()))
+      .set_local_runtimes(core::num::NonZeroUsize::new(1))
+      .run_in_threads(&server_addr, (("/chat", echo),))
+    });
+    assert_eq!(upgrade(&addr, "/chat"), ("101".into(), true));
+    assert_eq!(upgrade(&addr, "/chat?room=1&user=2"), ("101".into(), true));
+    let long = std::format!("/chat?pad={}", "a".repeat(4000));
+    assert_eq!(upgrade(&addr, &long), ("101".into(), true));
+    assert_eq!(upgrade(&addr, "/nowhere").0, "400");
+  }
 }
