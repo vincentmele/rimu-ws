@@ -5,3 +5,5 @@
 //! misbehave freely and a bug the two shared couldn't hide.
 
 pub mod codec;
+pub mod conn;
+pub mod rng;
