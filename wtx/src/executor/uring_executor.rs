@@ -52,6 +52,8 @@ const ONE_SHOT: u32 = 1;
 // `Conn::activity` bits: something was received, something was sent.
 const ACTIVE_RX: u8 = 1;
 const ACTIVE_TX: u8 = 2;
+// A free slot keeps a buffer up to this capacity for the next connection, and drops a larger one.
+const SLOT_BUFFER_KEEP: usize = 64 * 1024;
 
 std::thread_local! {
   static CURRENT: Cell<*const Reactor> = const { Cell::new(core::ptr::null()) };
@@ -1840,6 +1842,13 @@ impl Reactor {
     let direct = conn.direct;
     conn.in_use = false;
     conn.generation = conn.generation.wrapping_add(1) & 0x0FFF_FFFF;
+    // Slots are reused, so a buffer that grew for one connection would stay allocated for as
+    // long as the runtime runs: memory a burst of large or unread transfers never gives back.
+    for buffer in [&mut conn.rx, &mut conn.tx_inflight, &mut conn.tx_pending] {
+      if buffer.capacity() > SLOT_BUFFER_KEEP {
+        *buffer = Vec::new();
+      }
+    }
     drop(conns);
     if direct {
       let sqe = opcode::Close::new(types::Fixed(fd as u32))
@@ -2777,6 +2786,50 @@ mod tests {
     client.join().unwrap();
     assert!(elapsed >= core::time::Duration::from_millis(50), "{elapsed:?}");
     assert_eq!(runtime.open_conns(), 0);
+  }
+
+  // A connection that moved megabytes each way gives its buffers back when it is closed: its
+  // slot is reused, and one that kept them would hold the most any connection ever needed.
+  #[test]
+  fn closed_connection_keeps_no_large_buffers() {
+    use crate::net::{StreamReader, StreamWriter};
+    const TOTAL: usize = 2 << 20;
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let client = std::thread::spawn(move || {
+      let mut stream = connect(&client_addr);
+      Write::write_all(&mut stream, &alloc::vec![3; TOTAL]).unwrap();
+      let mut got = Vec::new();
+      let _len = stream.read_to_end(&mut got).unwrap();
+      assert_eq!(got.len(), TOTAL);
+    });
+    let runtime = UringRuntime::new().unwrap();
+    let largest = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+      // Let the client's bytes pile up in the receive buffer before reading them.
+      std::thread::sleep(core::time::Duration::from_millis(100));
+      let mut buf = alloc::vec![0; 64 * 1024];
+      let mut read = 0;
+      while read < TOTAL {
+        read += stream.read(buf.as_mut_slice().into()).await.unwrap().unwrap().get();
+      }
+      stream.write_all(&alloc::vec![5; TOTAL]).await.unwrap();
+      drop(stream);
+      while super::with_reactor(|reactor| Ok(reactor.conns.borrow().iter().any(|el| el.in_use)))
+        .unwrap()
+      {
+        yield_once().await;
+      }
+      super::with_reactor(|reactor| {
+        Ok(reactor.conns.borrow().iter().fold(0, |acc, el| {
+          acc.max(el.rx.capacity()).max(el.tx_inflight.capacity()).max(el.tx_pending.capacity())
+        }))
+      })
+      .unwrap()
+    });
+    client.join().unwrap();
+    assert!(largest <= 64 * 1024, "a free slot holds a {largest}-byte buffer");
   }
 
   // With two direct descriptors, the third and fourth connections wait in the backlog until one
