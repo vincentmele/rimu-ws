@@ -22,6 +22,7 @@ fn ctx(addr: SocketAddr) -> Ctx {
       close: LIMIT,
       max_payload: 1 << 20,
       never_read_budget: Duration::from_secs(5),
+      server_sndbuf: None,
     },
     opts: ConnOpts::default(),
   }

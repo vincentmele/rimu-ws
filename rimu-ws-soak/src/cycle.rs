@@ -343,7 +343,8 @@ pub async fn run(cfg: CycleConfig, out: &mut dyn Write) -> Summary {
       run.weights = weights.clone();
       state.profile = Some(name.clone());
     }
-    let end = deadline.map_or(Instant::now() + run.duration, |el| el.min(Instant::now() + run.duration));
+    let end =
+      deadline.map_or(Instant::now() + run.duration, |el| el.min(Instant::now() + run.duration));
     if !mix(&cfg, run, end, cycle, &mut state, probes.as_ref(), base, &warm).await {
       break;
     }
@@ -409,7 +410,6 @@ fn finish(mut state: State<'_>) -> Summary {
 }
 
 /// The mixed load, sampled once a second. `false` if the server is gone.
-#[expect(clippy::too_many_arguments, reason = "the cycle's parts")]
 async fn mix(
   cfg: &CycleConfig,
   mut run: RunConfig,
@@ -429,7 +429,11 @@ async fn mix(
   };
   let mut tick = interval(Duration::from_secs(1));
   let _ = tick.tick().await;
-  let budgets = Budgets { slots: cfg.run.slots };
+  let mut budgets = Budgets {
+    slots: cfg.run.slots,
+    large_inflight: 0,
+    max_payload: cfg.run.ctx.limits.max_payload,
+  };
   let (mut streak, mut saturated, mut alive) = (0, false, true);
   // Whether the last second's probes showed the harness saturated.
   let mut saturated_now = false;
@@ -471,14 +475,14 @@ async fn mix(
           continue;
         };
         let stats = probes.map(Probes::snapshot).unwrap_or_default();
-        if let Some(every) = cfg.ext.heartbeat {
-          if state.last_beat.elapsed() >= every {
-            state.heartbeat(cycle, probes);
-          }
+        if let Some(every) = cfg.ext.heartbeat && state.last_beat.elapsed() >= every {
+          state.heartbeat(cycle, probes);
         }
         line(state.out, "sample", serde_json::json!({ "cycle": cycle, "sample": sample, "probes": stats }));
         if let (Some(sample), Some(base)) = (sample, base) {
           let live = cfg.run.slots + cfg.probes;
+          budgets.large_inflight =
+            crate::scenario::LARGE_INFLIGHT.load(std::sync::atomic::Ordering::Relaxed);
           for violation in check_running(&base, &sample, live, &budgets, &mut streak) {
             state.violation(cycle, violation);
           }

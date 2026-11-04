@@ -46,7 +46,7 @@ impl Oracle {
     format!("server closed during echo ({} of {} echoes)", self.received, self.messages)
   }
 
-  fn on_frame(&mut self, frame: ServerFrame) -> Flow {
+  pub(super) fn on_frame(&mut self, frame: ServerFrame) -> Flow {
     match frame.opcode {
       0 => match &mut self.partial {
         Some((_, data)) => data.extend_from_slice(&frame.payload),
@@ -136,7 +136,7 @@ pub(super) fn encode_message(rng: &mut Rng, opcode: u8, data: &[u8], out: &mut V
 }
 
 /// Sends `data` while checking the server's frames against `expected`, then waits for its close.
-async fn exchange(
+pub(super) async fn exchange(
   ctx: &Ctx,
   opts: &crate::conn::ConnOpts,
   rng: &mut Rng,

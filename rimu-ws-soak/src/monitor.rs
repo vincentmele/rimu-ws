@@ -139,9 +139,12 @@ pub struct Baseline {
   pub fds: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Budgets {
   pub slots: u32,
+  /// Connections holding a message of up to `max_payload` on the server.
+  pub large_inflight: u32,
+  pub max_payload: u64,
 }
 
 /// A broken invariant.
@@ -200,7 +203,9 @@ pub fn check_running(
   if s.fds > fd_limit {
     found.push(Violation::Fds { fds: s.fds, limit: fd_limit });
   }
-  let rss_limit = base.rss_kib + 256 * u64::from(budgets.slots) + 65536;
+  // A large message costs the server the message, its buffer's doubling, and the echo.
+  let large_kib = u64::from(budgets.large_inflight) * 3 * budgets.max_payload.div_ceil(1024);
+  let rss_limit = base.rss_kib + 256 * u64::from(budgets.slots) + 65536 + large_kib;
   if s.rss_kib > rss_limit {
     found.push(Violation::Rss { rss_kib: s.rss_kib, limit_kib: rss_limit });
   }

@@ -2,7 +2,10 @@
 //! the server with.
 
 use crate::{
-  codec::{Parser, ServerFrame, accept_key, close_code, parse_upgrade_response, upgrade_request},
+  codec::{
+    Parser, ServerFrame, UpgradeResponse, accept_key, close_code, parse_upgrade_response,
+    upgrade_request,
+  },
   rng::Rng,
 };
 use std::{
@@ -188,17 +191,8 @@ impl Conn {
     use base64::Engine as _;
     let key = base64::engine::general_purpose::STANDARD.encode(rand::Rng::random::<[u8; 16]>(rng));
     self.send(&upgrade_request(host, path, &key)).await?;
-    let deadline = Instant::now() + UPGRADE_TIMEOUT;
-    let mut head = Vec::new();
-    let res = loop {
-      match parse_upgrade_response(&head) {
-        Ok(Some(res)) => break res,
-        Ok(None) => {}
-        Err(err) => return Err(ConnError::server(format!("upgrade response: {err:?}"))),
-      }
-      if self.read_some(&mut head, deadline).await? == 0 {
-        return Err(ConnError::server("EOF during the upgrade"));
-      }
+    let Some(res) = self.read_response(Instant::now() + UPGRADE_TIMEOUT).await? else {
+      return Err(ConnError::server("EOF during the upgrade"));
     };
     if res.status != 101 {
       return Err(ConnError::server(format!("upgrade answered {}", res.status)));
@@ -206,8 +200,29 @@ impl Conn {
     if res.accept.as_deref() != Some(accept_key(&key).as_str()) {
       return Err(ConnError::server(format!("bad Sec-WebSocket-Accept {:?}", res.accept)));
     }
-    self.parser.push(&head[res.header_len..]);
     Ok(())
+  }
+
+  /// The head of the server's answer to an upgrade request, or `None` if it closed first. Bytes
+  /// after the head go to the frame parser.
+  pub async fn read_response(
+    &mut self,
+    deadline: Instant,
+  ) -> Result<Option<UpgradeResponse>, ConnError> {
+    let mut head = Vec::new();
+    loop {
+      match parse_upgrade_response(&head) {
+        Ok(Some(res)) => {
+          self.parser.push(&head[res.header_len..]);
+          return Ok(Some(res));
+        }
+        Ok(None) => {}
+        Err(err) => return Err(ConnError::server(format!("upgrade response: {err:?}"))),
+      }
+      if self.read_some(&mut head, deadline).await? == 0 {
+        return Ok(None);
+      }
+    }
   }
 
   /// Appends what one read returns to `buf`; 0 on EOF or reset.
@@ -256,6 +271,18 @@ impl Conn {
     data: &[u8],
     chunks: &[usize],
     deadline: Instant,
+    on_frame: impl FnMut(ServerFrame) -> Flow,
+  ) -> Result<Exchange, ConnError> {
+    self.exchange_paced(data, chunks, None, deadline, on_frame).await
+  }
+
+  /// `exchange`, reading at most `pace.0` bytes per `pace.1` when `pace` is set: a slow reader.
+  pub async fn exchange_paced(
+    &mut self,
+    data: &[u8],
+    chunks: &[usize],
+    pace: Option<(usize, Duration)>,
+    deadline: Instant,
     mut on_frame: impl FnMut(ServerFrame) -> Flow,
   ) -> Result<Exchange, ConnError> {
     let Conn { parser, stream, transcript } = self;
@@ -282,7 +309,7 @@ impl Conn {
       }
     };
     let reader = async {
-      let mut chunk = vec![0; 65536];
+      let mut chunk = vec![0; pace.map_or(65536, |el| el.0.max(1))];
       loop {
         loop {
           match parser.next_frame() {
@@ -303,6 +330,9 @@ impl Conn {
           Ok(len) => {
             record(Dir::Received, &chunk[..len]);
             parser.push(&chunk[..len]);
+            if let Some((_, pause)) = pace {
+              tokio::time::sleep(pause).await;
+            }
           }
           Err(err) if is_reset(&err) => {
             record(Dir::Note, b"reset");

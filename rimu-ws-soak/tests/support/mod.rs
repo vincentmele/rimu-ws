@@ -33,6 +33,10 @@ pub struct Faults {
   pub huge_len_code: u16,
   /// How long each echo of a data message is held back.
   pub echo_delay: Option<Duration>,
+  /// Upgrade request bytes read before refusing it with 431; `None` reads without bound.
+  pub header_cap: Option<usize>,
+  /// Upgrades any request with a key, as RFC 6455 says not to.
+  pub lax_upgrade: bool,
 }
 
 impl Default for Faults {
@@ -49,6 +53,8 @@ impl Default for Faults {
       max_payload: 1 << 20,
       huge_len_code: 1009,
       echo_delay: None,
+      header_cap: Some(16 * 1024),
+      lax_upgrade: false,
     }
   }
 }
@@ -67,6 +73,8 @@ pub async fn spawn_fake(faults: Faults) -> SocketAddr {
 
 struct Peer {
   buf: Vec<u8>,
+  // Where the unparsed bytes of `buf` start
+  pos: usize,
   faults: Faults,
   // Index of this connection's entry in `faults.log`
   log_idx: usize,
@@ -88,6 +96,10 @@ impl Peer {
     match rslt {
       Ok(0) | Err(_) => false,
       Ok(len) => {
+        if self.pos > 0 {
+          let _ = self.buf.drain(..self.pos);
+          self.pos = 0;
+        }
         self.buf.extend_from_slice(&chunk[..len]);
         if let Some(log) = &self.faults.log {
           log.lock().unwrap()[self.log_idx].extend_from_slice(&chunk[..len]);
@@ -175,11 +187,17 @@ async fn serve(stream: TcpStream, faults: Faults) {
     log.push(Vec::new());
     log.len() - 1
   });
-  let mut peer = Peer { buf: Vec::new(), faults, log_idx, stream };
+  let mut peer = Peer { buf: Vec::new(), pos: 0, faults, log_idx, stream };
   let handshake_deadline = peer.faults.handshake_timeout.map(|el| Instant::now() + el);
   let end = loop {
-    if let Some(end) = peer.buf.windows(4).position(|el| el == b"\r\n\r\n") {
-      break end + 4;
+    let crlf = peer.buf.windows(4).position(|el| el == b"\r\n\r\n").map(|el| el + 4);
+    let lf = peer.buf.windows(2).position(|el| el == b"\n\n").map(|el| el + 2);
+    if let Some(end) = crlf.into_iter().chain(lf).min() {
+      break end;
+    }
+    if peer.faults.header_cap.is_some_and(|el| peer.buf.len() > el) {
+      let _ = peer.stream.write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n").await;
+      return;
     }
     let deadline = earliest(handshake_deadline, peer.faults.idle_timeout);
     if !peer.fill(deadline).await {
@@ -188,10 +206,7 @@ async fn serve(stream: TcpStream, faults: Faults) {
   };
   let head = String::from_utf8_lossy(&peer.buf[..end]).into_owned();
   let _ = peer.buf.drain(..end);
-  let Some(key) = head.split("\r\n").find_map(|line| {
-    let (name, value) = line.split_once(':')?;
-    name.trim().eq_ignore_ascii_case("sec-websocket-key").then(|| value.trim().to_owned())
-  }) else {
+  let Some(key) = upgrade_key(&head, peer.faults.lax_upgrade) else {
     let _ = peer.stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
     return;
   };
@@ -209,6 +224,42 @@ async fn serve(stream: TcpStream, faults: Faults) {
   echo(&mut peer).await;
 }
 
+/// The key of a request RFC 6455 lets a server upgrade; with `lax`, of any request with a key.
+fn upgrade_key(head: &str, lax: bool) -> Option<String> {
+  let mut lines = head.split('\n').map(|el| el.strip_suffix('\r').unwrap_or(el));
+  let request_line = lines.next()?;
+  let mut headers = Vec::new();
+  for line in lines.filter(|el| !el.is_empty()) {
+    if line.starts_with([' ', '\t']) {
+      return None;
+    }
+    let (name, value) = line.split_once(':')?;
+    headers.push((name.trim().to_ascii_lowercase(), value.trim().to_owned()));
+  }
+  let values = |name: &str| -> Vec<String> {
+    headers.iter().filter(|el| el.0 == name).map(|el| el.1.clone()).collect()
+  };
+  let keys = values("sec-websocket-key");
+  if lax {
+    return keys.first().cloned();
+  }
+  let has_token = |name: &str, token: &str| {
+    values(name).iter().any(|el| el.split(',').any(|el| el.trim().eq_ignore_ascii_case(token)))
+  };
+  let decoded_len = |key: &str| {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.decode(key).map(|el| el.len()).ok()
+  };
+  let valid = request_line.starts_with("GET ")
+    && request_line.ends_with(" HTTP/1.1")
+    && has_token("upgrade", "websocket")
+    && has_token("connection", "upgrade")
+    && values("sec-websocket-version") == ["13"]
+    && keys.len() == 1
+    && decoded_len(&keys[0]) == Some(16);
+  valid.then(|| keys[0].clone())
+}
+
 fn earliest(deadline: Option<Instant>, idle: Option<Duration>) -> Option<Instant> {
   let idle = idle.map(|el| Instant::now() + el);
   match (deadline, idle) {
@@ -222,7 +273,7 @@ async fn echo(peer: &mut Peer) {
   let mut message: Option<(u8, Vec<u8>)> = None;
   let mut echoed = 0;
   loop {
-    let (frame, used) = match parse(&peer.buf) {
+    let (frame, used) = match parse(&peer.buf[peer.pos..]) {
       Parsed::Frame(frame, used) => (frame, used),
       Parsed::Partial { declared } => {
         if declared.is_some_and(|el| el > peer.faults.max_payload) {
@@ -234,7 +285,7 @@ async fn echo(peer: &mut Peer) {
         continue;
       }
     };
-    let _ = peer.buf.drain(..used);
+    peer.pos += used;
     if frame.declared > peer.faults.max_payload {
       return peer.close(peer.faults.huge_len_code).await;
     }
@@ -262,7 +313,12 @@ async fn echo(peer: &mut Peer) {
       }
       10 => continue,
       0 => match &mut message {
-        Some((_, data)) => data.extend_from_slice(&frame.payload),
+        Some((_, data)) => {
+          data.extend_from_slice(&frame.payload);
+          if data.len() as u64 > peer.faults.max_payload {
+            return peer.close(peer.faults.huge_len_code).await;
+          }
+        }
         None => return peer.close(protocol).await,
       },
       1 | 2 => {

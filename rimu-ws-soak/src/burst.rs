@@ -13,7 +13,12 @@ use tokio::time::{Instant, timeout};
 
 /// Opens `n` connections at once, spread over `source_ips`. Each must connect, upgrade and echo a
 /// text within `within`; `Burst` counts the ones that didn't.
-pub async fn burst(ctx: &Ctx, source_ips: &[IpAddr], n: u32, within: Duration) -> Option<Violation> {
+pub async fn burst(
+  ctx: &Ctx,
+  source_ips: &[IpAddr],
+  n: u32,
+  within: Duration,
+) -> Option<Violation> {
   let deadline = Instant::now() + within;
   let mut opens = tokio::task::JoinSet::new();
   for idx in 0..n {

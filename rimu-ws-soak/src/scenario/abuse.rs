@@ -44,16 +44,22 @@ async fn eof_by(mut conn: Conn, deadline: Instant) -> Outcome {
 /// Sends 64-byte texts with a 4 KiB receive buffer and never reads: a bounded server stops
 /// reading, so a send soon blocks, or it closes.
 pub(super) async fn never_read(ctx: &Ctx, rng: &mut Rng) -> Outcome {
-  let opts = ConnOpts { rcvbuf: Some(4096), ..ctx.opts.clone() };
-  let mut conn = match upgraded(ctx, &opts, rng).await {
-    Ok(conn) => conn,
-    Err(outcome) => return outcome,
-  };
   let text: Vec<u8> = (0..64).map(|_| rng.random_range(b'a'..=b'z')).collect();
   let mut batch = Vec::new();
   for _ in 0..64 {
     client_frame(true, 1, &text, rng.random(), &mut batch);
   }
+  unread_flood(ctx, rng, &batch).await
+}
+
+/// Sends `batch` over and over with a 4 KiB receive buffer and never reads: a bounded server stops
+/// reading, so a send soon blocks, or it closes.
+pub(super) async fn unread_flood(ctx: &Ctx, rng: &mut Rng, batch: &[u8]) -> Outcome {
+  let opts = ConnOpts { rcvbuf: Some(4096), ..ctx.opts.clone() };
+  let mut conn = match upgraded(ctx, &opts, rng).await {
+    Ok(conn) => conn,
+    Err(outcome) => return outcome,
+  };
   let begin = Instant::now();
   let mut sent = 0usize;
   loop {
@@ -64,7 +70,7 @@ pub(super) async fn never_read(ctx: &Ctx, rng: &mut Rng) -> Outcome {
       );
       return fail(reason, &conn);
     }
-    match timeout(BLOCKED, conn.send(&batch)).await {
+    match timeout(BLOCKED, conn.send(batch)).await {
       Err(_) | Ok(Err(ConnError::Server(_))) => break,
       Ok(Err(err @ ConnError::Harness(_))) => return from_err(err, Some(&conn)),
       Ok(Ok(())) => sent += batch.len(),

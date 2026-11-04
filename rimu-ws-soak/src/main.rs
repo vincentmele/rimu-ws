@@ -54,6 +54,10 @@ struct Common {
   /// The server's largest message.
   #[arg(long, default_value_t = 1 << 20)]
   max_payload: u64,
+  /// The server's SO_SNDBUF (at most 32 KiB), which `close_linger` needs; without it, that
+  /// scenario is left out.
+  #[arg(long)]
+  server_sndbuf: Option<u32>,
 }
 
 #[derive(clap::Args)]
@@ -186,10 +190,23 @@ fn ctx(common: &Common) -> Result<(Ctx, Weights, Vec<(String, Weights)>), String
     idle: common.idle_timeout,
     close: common.close_timeout,
     max_payload: common.max_payload,
+    server_sndbuf: common.server_sndbuf,
     ..Limits::default()
   };
+  if common.server_sndbuf.is_some_and(|el| el > 32 * 1024) {
+    return Err("--server-sndbuf must be at most 32 KiB".into());
+  }
+  let weights = weights.for_limits(&limits)?;
+  let rotation = rotation
+    .into_iter()
+    .map(|(name, weights)| Ok((name, weights.for_limits(&limits)?)))
+    .collect::<Result<Vec<_>, String>>()?;
   let host = authority.to_owned();
-  Ok((Ctx { addr, host, path: path.to_owned(), limits, opts: ConnOpts::default() }, weights, rotation))
+  Ok((
+    Ctx { addr, host, path: path.to_owned(), limits, opts: ConnOpts::default() },
+    weights,
+    rotation,
+  ))
 }
 
 /// Raises the descriptor limit to its hard limit: every slot holds a socket or two.

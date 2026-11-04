@@ -1,15 +1,21 @@
 //! What a simulated client does, picked from a weighted mix, and how its run is judged.
 
 mod abuse;
+pub mod attack;
 mod echo;
 pub mod invalid;
+pub mod resource;
 
 use crate::{
   conn::{Conn, ConnError, ConnOpts, Failure},
   rng::Rng,
 };
 use rand::Rng as _;
-use std::{net::SocketAddr, time::Duration};
+use std::{
+  net::SocketAddr,
+  sync::atomic::{AtomicU32, Ordering},
+  time::Duration,
+};
 
 /// A client behaviour, with the oracle that judges the server's answer to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, clap::ValueEnum)]
@@ -30,6 +36,34 @@ pub enum Scenario {
   Garbage,
   Invalid,
   HugeLen,
+  BadUpgrade,
+  HeaderFlood,
+  FragFlood,
+  ZeroFlood,
+  FragDrip,
+  CloseLinger,
+  PingNoRead,
+  SlowReader,
+}
+
+/// Scenario runs holding a message of up to `max_payload` on the server, which the memory budget
+/// allows for.
+pub static LARGE_INFLIGHT: AtomicU32 = AtomicU32::new(0);
+
+/// Counts a run in `LARGE_INFLIGHT` while it lives.
+pub(crate) struct LargeInflight;
+
+impl LargeInflight {
+  pub(crate) fn new() -> Self {
+    let _ = LARGE_INFLIGHT.fetch_add(1, Ordering::Relaxed);
+    Self
+  }
+}
+
+impl Drop for LargeInflight {
+  fn drop(&mut self) {
+    let _ = LARGE_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+  }
 }
 
 /// Relative weights of the scenarios a client picks from.
@@ -48,18 +82,56 @@ impl Weights {
     }
     self.0.first().map_or(Scenario::Echo, |el| el.0)
   }
+
+  /// Without the scenarios `limits` can't judge: `close_linger` needs the server's send buffer.
+  /// Errs if nothing is left.
+  pub fn for_limits(&self, limits: &Limits) -> Result<Weights, String> {
+    let kept: Vec<_> = self
+      .0
+      .iter()
+      .copied()
+      .filter(|(scenario, weight)| {
+        let judged = *scenario != Scenario::CloseLinger || limits.server_sndbuf.is_some();
+        if !judged && *weight > 0 {
+          eprintln!("warning: {scenario:?} needs --server-sndbuf; left out");
+        }
+        judged
+      })
+      .collect();
+    if kept.iter().all(|el| el.1 == 0) {
+      return Err("no scenario left to run".into());
+    }
+    Ok(Weights(kept))
+  }
 }
 
-/// `baseline`, `hostile` or `storm`.
+/// - `baseline`: well-behaved clients only.
+/// - `hostile`: mostly well-behaved, with a bit of everything else.
+/// - `attack`: a public server under attack, with few well-behaved clients.
+/// - `storm`: connection churn.
+/// - `untimed`: `hostile` without the scenarios that need server timeouts.
+/// - `drip`: large messages trickled in fragments, for the memory budget.
 pub fn profile(name: &str) -> Option<Weights> {
   let spec = match name {
     "baseline" => "echo=100",
     "hostile" => {
       "echo=40,split_every_byte=5,ctrl_in_fragments=5,never_read=5,slowloris=5,idle_pre=3,\
        idle_post=3,close_in_handshake=4,rst_midframe=6,half_close=4,ping_flood=4,garbage=4,\
-       invalid=10,huge_len=2"
+       invalid=10,huge_len=2,bad_upgrade=4,header_flood=1,frag_flood=1,zero_flood=1,frag_drip=2,\
+       close_linger=2,ping_no_read=2,slow_reader=3"
+    }
+    "attack" => {
+      "echo=5,invalid=15,huge_len=5,bad_upgrade=15,header_flood=5,slowloris=8,garbage=8,\
+       frag_flood=5,zero_flood=4,ping_flood=4,ping_no_read=5,never_read=5,frag_drip=5,\
+       rst_midframe=4,close_in_handshake=4,close_linger=3"
     }
     "storm" => "rst_midframe=30,close_in_handshake=30,slowloris=20,never_read=20",
+    "untimed" => {
+      "echo=40,split_every_byte=5,ctrl_in_fragments=5,never_read=5,close_in_handshake=4,\
+       rst_midframe=6,half_close=4,ping_flood=4,invalid=10,huge_len=2,bad_upgrade=4,frag_flood=1,\
+       zero_flood=1,frag_drip=2,ping_no_read=2,slow_reader=3"
+    }
+    "drip" => "frag_drip=100",
     _ => return None,
   };
   parse_weights(spec).ok()
@@ -91,6 +163,9 @@ pub struct Limits {
   pub max_payload: u64,
   /// How long `never_read` keeps sending before calling the server unbounded.
   pub never_read_budget: Duration,
+  /// The server's `SO_SNDBUF`, which `close_linger` needs; at most 32 KiB, so a reply under the
+  /// server's send queue limit still outgrows it.
+  pub server_sndbuf: Option<u32>,
 }
 
 /// `soak-server-uring`'s defaults.
@@ -102,6 +177,7 @@ impl Default for Limits {
       close: Duration::from_secs(2),
       max_payload: 1 << 20,
       never_read_budget: Duration::from_secs(10),
+      server_sndbuf: None,
     }
   }
 }
@@ -150,6 +226,14 @@ pub async fn run(scenario: Scenario, ctx: &Ctx, rng: &mut Rng) -> Outcome {
     Scenario::Garbage => Box::pin(abuse::garbage(ctx, rng)),
     Scenario::Invalid => Box::pin(invalid::invalid(ctx, rng)),
     Scenario::HugeLen => Box::pin(invalid::huge_len(ctx, rng)),
+    Scenario::BadUpgrade => Box::pin(attack::bad_upgrade(ctx, rng)),
+    Scenario::HeaderFlood => Box::pin(attack::header_flood(ctx, rng)),
+    Scenario::FragFlood => Box::pin(attack::frag_flood(ctx, rng)),
+    Scenario::ZeroFlood => Box::pin(attack::zero_flood(ctx, rng)),
+    Scenario::FragDrip => Box::pin(resource::frag_drip(ctx, rng)),
+    Scenario::CloseLinger => Box::pin(resource::close_linger(ctx, rng)),
+    Scenario::PingNoRead => Box::pin(resource::ping_no_read(ctx, rng)),
+    Scenario::SlowReader => Box::pin(resource::slow_reader(ctx, rng)),
   };
   fut.await
 }

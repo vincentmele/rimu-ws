@@ -52,7 +52,7 @@ fn sample(fds: u32, rss_kib: u64, close_wait: u32) -> Sample {
 #[test]
 fn close_wait_needs_three_samples() {
   let base = Baseline { rss_kib: 1000, fds: 10 };
-  let budgets = Budgets { slots: 10 };
+  let budgets = Budgets { slots: 10, ..Budgets::default() };
   let mut streak = 0;
   let mut found = Vec::new();
   for _ in 0..4 {
@@ -66,7 +66,7 @@ fn close_wait_needs_three_samples() {
 #[test]
 fn running_limits_on_fds_and_rss() {
   let base = Baseline { rss_kib: 1000, fds: 10 };
-  let budgets = Budgets { slots: 100 };
+  let budgets = Budgets { slots: 100, ..Budgets::default() };
   let mut streak = 0;
   assert!(
     check_running(&base, &sample(10 + 50 + 64, 1000, 0), 50, &budgets, &mut streak).is_empty()
@@ -89,4 +89,19 @@ fn drained_leak_detected() {
   let found = check_drained(&base, &sample(27, 1000, 0));
   assert_eq!(found.len(), 1);
   assert!(matches!(found[0], Violation::Leak(_)));
+}
+
+// A connection may hold a message up to the size limit: each one in flight raises the RSS limit
+// by three times the limit (the message, its buffer's doubling, and the echo).
+#[test]
+fn large_messages_in_flight_raise_the_rss_limit() {
+  let base = Baseline { rss_kib: 1000, fds: 10 };
+  let budgets = Budgets { slots: 100, large_inflight: 10, max_payload: 1 << 20 };
+  let limit_kib = 1000 + 256 * 100 + 65536 + 10 * 3 * 1024;
+  let mut streak = 0;
+  assert!(check_running(&base, &sample(10, limit_kib, 0), 0, &budgets, &mut streak).is_empty());
+  assert_eq!(
+    check_running(&base, &sample(10, limit_kib + 1, 0), 0, &budgets, &mut streak),
+    [Violation::Rss { rss_kib: limit_kib + 1, limit_kib }]
+  );
 }
