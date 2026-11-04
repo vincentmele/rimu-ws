@@ -315,6 +315,69 @@ tokio-tungstenite findings:
 - item 4 (compression);
 - the open questions above.
 
+## Other Rust WebSocket servers under the soak (2026-11-05)
+
+**Setup:**
+
+- Echo servers live in `/mnt/nvme1tb/claude-tmp/{tt-echo,sk-echo,fw-echo}` (not in the repo):
+  - tokio-tungstenite 0.30;
+  - sockudo-ws 3.1.0 at commit 35933d7, through `WebSocketServer::accept`, with `idle_timeout`
+    5 s;
+  - fastwebsockets 0.10.0, as its own `echo_server` example (hyper upgrade,
+    `FragmentCollector`), on a multi-thread runtime.
+- All have 1 MiB message and frame limits.
+- Runner: `/mnt/nvme1tb/claude-tmp/soak/run-other.sh BIN NAME ARGS` (same CPU pinning as
+  `soak.sh`).
+- Runs: 100 slots, 30 s, `--rss-ceiling 2048`, `MALLOC_MMAP_THRESHOLD_=262144`. Single 30 s runs
+  on a shared box, so the latencies are indicative.
+
+**Profile `untimed`** (the fair comparison: no server timeouts needed):
+
+| Server | Runs | Fails | Probe p50/p99/p99.9 (idle p50/p99) |
+|---|---|---|---|
+| rimu-ws, tokio, queue loop | 24,247 | **0** | 40/298/1150 us (36/65) |
+| tokio-tungstenite, defaults | died | | RSS climbed about 4 GB/s to 23 GB on `ping_no_read`, then the process was gone |
+| tokio-tungstenite, defaults, without `ping_no_read` | 27,829 | 3,475 | 43/371/2049 us (39/63) |
+| tokio-tungstenite, `max_write_buffer_size` 1 MiB | 9,786 | 1,375 | 2025/10487/16343 us |
+| sockudo-ws | 14,594 | 2,657 | 2153/16767/24175 us (35/54) |
+| fastwebsockets | 20,902 | 2,786 | 43/719/2517 us (37/109) |
+
+**Profile `attack`** (a public server under attack; tokio-tungstenite with the 1 MiB write
+buffer):
+
+| Server | Runs | Fails | Notes |
+|---|---|---|---|
+| rimu-ws, uring, queue loop | 7,977 | **0** | drain-baseline violation (question 3 above) |
+| sockudo-ws | 4,191 | 1,364 | slowloris 376, `ping_no_read` about 80, protocol errors |
+| fastwebsockets | 6,455 | 2,212 | slowloris 528, upgrades it must refuse 361, protocol errors |
+| tokio-tungstenite | 3,085 | 1,104 | slowloris 294, `ping_no_read` about 130, protocol errors |
+
+**What the others get wrong** (rimu-ws passes every item):
+
+- **No close frame on protocol errors (all three).** Every invalid-frame case, oversized lengths,
+  bad UTF-8 and an over-limit fragmented message end in a bare TCP close, not the close code RFC
+  6455 7.1.7 asks for. The exception is fastwebsockets, which sends 1002 for a bad close code.
+- **Slowloris (all three).** None has a handshake deadline: an upgrade request trickled a byte
+  every 100 ms holds a connection indefinitely.
+- **tokio-tungstenite:**
+  - With the default config, pongs to a peer that never reads are queued without bound (23 GB).
+  - With a write-buffer limit it stays bounded, but keeps reading pings without pushing back.
+  - It refuses frames sent right behind the upgrade request (RFC 6455 4.1 allows that; see
+    question 1 above).
+- **sockudo-ws:**
+  - Keeps reading pings without pushing back (memory stayed bounded).
+  - Sometimes sends a pong after the echo of the message the ping was in the middle of (about
+    20 of some 700 `ctrl_in_fragments` runs).
+  - Latency degrades sharply under load: p50 2.1 ms against about 40 us for the others, and the
+    fewest runs per 30 s.
+- **fastwebsockets:**
+  - **Accepts unmasked client frames** and echoes them; RFC 6455 5.1 says the server must close.
+  - Its example upgrade (`upgrade::upgrade` without `is_upgrade_request`) upgrades POST, a short
+    key, and requests with no Upgrade or no Connection header.
+  - An HTTP/1.0 upgrade gets no answer.
+  - Pushes back on `ping_no_read` (it awaits each pong write) and stays bounded.
+- **All three cap the upgrade header** (`header_flood` passes).
+
 ## Where further work could go
 
 - **TLS (`wss://`).** Public servers usually terminate TLS. Malformed ClientHellos, slow TLS
