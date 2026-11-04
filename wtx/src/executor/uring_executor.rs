@@ -32,7 +32,7 @@ use core::{
   task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
   time::Duration,
 };
-use io_uring::{IoUring, cqueue, opcode, squeue, types};
+use io_uring::{IoUring, cqueue, opcode, opcode::AcceptMulti, squeue, types};
 use std::os::fd::{IntoRawFd, RawFd};
 
 const BUF_GROUP: u16 = 0;
@@ -41,7 +41,17 @@ const KIND_RECV: u64 = 1;
 const KIND_SEND: u64 = 2;
 const KIND_ACCEPT: u64 = 3;
 const KIND_CANCEL: u64 = 4;
+const KIND_TIMER: u64 = 5;
+const KIND_ACCEPT_RETRY: u64 = 6;
 const MAIN_TASK: usize = usize::MAX;
+// One-shot accepts kept armed per listener with direct descriptors close to running out
+const ACCEPT_DEPTH: u32 = 16;
+// The `generation` of a one-shot accept's `user_data`; a multishot accept's is 0.
+const ONE_SHOT: u32 = 1;
+
+// `Conn::activity` bits: something was received, something was sent.
+const ACTIVE_RX: u8 = 1;
+const ACTIVE_TX: u8 = 2;
 
 std::thread_local! {
   static CURRENT: Cell<*const Reactor> = const { Cell::new(core::ptr::null()) };
@@ -102,11 +112,15 @@ impl UringRuntime {
 /// Settings of a [`UringRuntime`].
 #[derive(Clone, Copy, Debug)]
 pub struct UringParams {
+  close_timeout: Option<Duration>,
   cq_entries: u32,
   direct_files: u32,
+  handshake_timeout: Option<Duration>,
+  idle_timeout: Option<Duration>,
   peer_addrs: bool,
   recv_buffer_len: u32,
   recv_buffers: u16,
+  rx_high_water: usize,
   spin: Duration,
   sq_entries: u32,
   tx_high_water: usize,
@@ -117,15 +131,62 @@ impl UringParams {
   #[inline]
   pub const fn new() -> Self {
     Self {
+      close_timeout: Some(Duration::from_secs(10)),
       cq_entries: 4096,
       direct_files: 0,
+      handshake_timeout: None,
+      idle_timeout: None,
       peer_addrs: true,
       recv_buffer_len: 4096,
       recv_buffers: 512,
+      rx_high_water: 64 * 1024,
       spin: Duration::ZERO,
       sq_entries: 1024,
       tx_high_water: 4 * 1024 * 1024,
     }
+  }
+
+  /// How long a connection whose last handle was dropped may go without sending anything while
+  /// it still has written bytes to send. Past that its sends are cancelled and it is closed, so
+  /// a peer that stops reading cannot hold the connection, or the end of
+  /// [`Runtime::block_on`], forever. `None` waits for as long as it takes. Defaults to 10 s.
+  #[inline]
+  #[must_use]
+  pub const fn set_close_timeout(mut self, value: Option<Duration>) -> Self {
+    self.close_timeout = value;
+    self
+  }
+
+  /// How long an accepted connection may go before anything is sent on it. Past that, its reads
+  /// and writes fail with `ETIMEDOUT`. A server writes once it has a whole request or handshake,
+  /// so this bounds how long a client may take to send one, even one byte at a time. Defaults to
+  /// `None`.
+  #[inline]
+  #[must_use]
+  pub const fn set_handshake_timeout(mut self, value: Option<Duration>) -> Self {
+    self.handshake_timeout = value;
+    self
+  }
+
+  /// How long a connection may go without receiving or sending anything. Past that, its reads
+  /// and writes fail with `ETIMEDOUT`. A peer that only listens should be pinged: the pongs keep
+  /// it alive. Connections are checked a few times per timeout, from one timer per runtime.
+  /// Defaults to `None`.
+  #[inline]
+  #[must_use]
+  pub const fn set_idle_timeout(mut self, value: Option<Duration>) -> Self {
+    self.idle_timeout = value;
+    self
+  }
+
+  /// How many received bytes a connection can hold that nobody has read before it stops
+  /// receiving, which leaves the rest in the socket and lets TCP slow the peer down. It receives
+  /// again once reads take it under half of that. Defaults to 64 KiB.
+  #[inline]
+  #[must_use]
+  pub const fn set_rx_high_water(mut self, value: usize) -> Self {
+    self.rx_high_water = value;
+    self
   }
 
   /// The ring of buffers that receives are made into: `count` buffers (rounded up to a power of
@@ -386,7 +447,7 @@ impl TcpListener for UringTcpListener {
     } else {
       SocketAddr::V4(core::net::SocketAddrV4::new(core::net::Ipv4Addr::UNSPECIFIED, 0))
     };
-    let (idx, generation) = with_reactor(|reactor| reactor.add_conn(fd, 1, direct))?;
+    let (idx, generation) = with_reactor(|reactor| reactor.add_conn(fd, 1, direct, true))?;
     Ok((UringTcpStream { generation, idx }, peer_addr))
   }
 }
@@ -472,7 +533,7 @@ impl TcpStream for UringTcpStream {
     .await?;
     stream.set_nodelay(tcp_params.tcp_nodelay())?;
     let fd = stream.into_raw_fd();
-    let (idx, generation) = with_reactor(|reactor| reactor.add_conn(fd, 1, false))?;
+    let (idx, generation) = with_reactor(|reactor| reactor.add_conn(fd, 1, false, false))?;
     Ok(Self { generation, idx })
   }
 
@@ -701,8 +762,12 @@ struct Conn {
   fd: RawFd,
   rx: Vec<u8>,
   rx_off: u32,
-  rx_err: i16,
-  tx_err: i16,
+  rx_err: u8,
+  tx_err: u8,
+  // The receive was cancelled because `rx` holds more than `rx_high_water` unread bytes
+  rx_paused: bool,
+  // `ACTIVE_RX` and `ACTIVE_TX`, set by completions and cleared by the timer
+  activity: u8,
   reader: Option<Waker>,
   tx_inflight: Vec<u8>,
   tx_pending: Vec<u8>,
@@ -713,21 +778,26 @@ struct Conn {
   rx_eof: bool,
   sending: bool,
   writer: Option<Waker>,
-  // Setup and teardown only
+  // Setup, teardown and the timer only
   cancel_sent: bool,
   in_use: bool,
+  // In `Timers::lingering`
+  lingering: bool,
   recv_armed: bool,
   refs: u8,
+  // The tick `activity` was last seen set
+  last_active: u32,
 }
 
 const _: () = {
   assert!(size_of::<Conn>() == 192);
+  assert!(core::mem::offset_of!(Conn, activity) < 64);
   assert!(core::mem::offset_of!(Conn, writer) + size_of::<Option<Waker>>() == 128);
 };
 
-/// An errno from a negative completion result. Linux errnos fit an `i16`.
-fn errno(res: i32) -> i16 {
-  i16::try_from(res.unsigned_abs()).unwrap_or(i16::MAX)
+/// An errno from a negative completion result. Linux errnos fit a `u8` (the largest is 133).
+fn errno(res: i32) -> u8 {
+  u8::try_from(res.unsigned_abs()).unwrap_or(u8::MAX)
 }
 
 // The queue views are read through `ManuallyDrop`: dropping one stores its index back to the
@@ -759,7 +829,13 @@ fn set_waker(slot: &mut Option<Waker>, cx: &Context<'_>) {
 fn take_rx(conn: &mut Conn, bytes: &mut MaybeUninitSlice<'_, u8>) -> crate::Result<TryRead> {
   let available = conn.rx.get(conn.rx_off as usize..).unwrap_or_default();
   if !available.is_empty() {
-    let dst = bytes.uninitialized_mut();
+    // The whole slice, as other streams read: an initialized one has no uninitialized part.
+    // SAFETY: only initialized bytes are written into it
+    let dst = unsafe { bytes.all_mut() };
+    // Reading nothing would report the end of the stream, with bytes still to read.
+    if dst.is_empty() {
+      return Err(io_err(libc::EINVAL));
+    }
     let len = available.len().min(dst.len());
     // SAFETY: `dst` has room for `len` bytes, and the regions don't overlap
     unsafe {
@@ -771,8 +847,7 @@ fn take_rx(conn: &mut Conn, bytes: &mut MaybeUninitSlice<'_, u8>) -> crate::Resu
       conn.rx.clear();
       conn.rx_off = 0;
     }
-    // An empty `bytes` reads nothing, which `read` reports as the end of the stream
-    return Ok(NonZeroUsize::new(len).map_or(TryRead::Closed, TryRead::Read));
+    return Ok(NonZeroUsize::new(len).map_or(TryRead::Pending, TryRead::Read));
   }
   if conn.rx_err != 0 {
     return Err(io_err(conn.rx_err.into()));
@@ -780,13 +855,50 @@ fn take_rx(conn: &mut Conn, bytes: &mut MaybeUninitSlice<'_, u8>) -> crate::Resu
   if conn.rx_eof {
     return Ok(TryRead::Closed);
   }
+  if bytes.all().is_empty() {
+    return Err(io_err(libc::EINVAL));
+  }
   Ok(TryRead::Pending)
 }
 
-struct ListenerState {
+fn cancel_sqe(target: u64) -> squeue::Entry {
+  opcode::AsyncCancel::new(target).build().flags(squeue::Flags::SKIP_SUCCESS).user_data(user_data(
+    KIND_CANCEL,
+    0,
+    0,
+  ))
+}
+
+fn ticks(value: Duration, period: Duration) -> u32 {
+  u32::try_from(value.as_nanos().div_ceil(period.as_nanos().max(1))).unwrap_or(u32::MAX).max(1)
+}
+
+/// Deadlines, counted in ticks of one timer per runtime that runs while something needs it.
+struct Timers {
   armed: bool,
+  close_ticks: u32,
+  // Accepted connections nothing was sent on yet: index, generation, deadline
+  handshakes: Vec<(u32, u32, u32)>,
+  handshake_ticks: u32,
+  // How often the idle sweep runs, in ticks
+  idle_every: u32,
+  idle_ticks: u32,
+  // Dropped connections still sending: index, generation, the tick they last sent by
+  lingering: Vec<(u32, u32, u32)>,
+  tick: u32,
+}
+
+struct ListenerState {
+  // A multishot accept is armed
+  armed: bool,
+  // Waiting out a resource error before accepting again
+  backoff: bool,
   closed: bool,
   fd: RawFd,
+  // Fewer than `ACCEPT_DEPTH` accepts are armed for lack of direct descriptor slots
+  gated: bool,
+  // One-shot accepts armed
+  pending: u32,
   queue: VecDeque<RawFd>,
   waker: Option<Waker>,
 }
@@ -832,9 +944,18 @@ struct Reactor {
   // First, so that it is dropped first: the kernel may still use the buffers below until the ring
   // is closed.
   ring: RefCell<IoUring>,
+  #[cfg(test)]
+  accept_arms: Cell<usize>,
+  // Read by the kernel when it takes a timeout entry off the queue
+  backoff_ts: types::Timespec,
+  tick_ts: types::Timespec,
   bufs: RefCell<BufRing>,
   cqes: RefCell<Vec<(u64, i32, u32)>>,
   conns: RefCell<Vec<Conn>>,
+  // Slots of the direct descriptor table that connections, accept queues and armed accepts hold.
+  // Accepting into a full table drops the connection, so accepts stop at `direct_files` and the
+  // connections wait in the backlog instead.
+  direct_open: Cell<u32>,
   free_conns: RefCell<Vec<u32>>,
   free_tasks: RefCell<Vec<u32>>,
   listeners: RefCell<Vec<ListenerState>>,
@@ -844,11 +965,17 @@ struct Reactor {
   polling: Cell<usize>,
   ready: RefCell<VecDeque<usize>>,
   tasks: RefCell<Vec<TaskSlot>>,
+  timers: RefCell<Timers>,
 }
 
 impl Drop for Reactor {
   fn drop(&mut self) {
-    // Listeners whose handles outlive the runtime can no longer reach it to close themselves.
+    // Handles that outlive the runtime can no longer reach it to close themselves. Direct
+    // descriptors go with the ring.
+    for conn in self.conns.get_mut().iter().filter(|el| el.in_use && !el.direct) {
+      // SAFETY: closed once, here; the ring that could still use it is dropped right after
+      let _rslt = unsafe { libc::close(conn.fd) };
+    }
     let direct = self.params.direct_files > 0;
     for listener in self.listeners.get_mut().iter_mut().filter(|el| !el.closed) {
       listener.closed = true;
@@ -906,11 +1033,36 @@ impl Reactor {
     if params.direct_files > 0 {
       ring.submitter().register_files_sparse(params.direct_files)?;
     }
+    // A few ticks per timeout keep each within a quarter of its length.
+    let timeouts = [params.close_timeout, params.handshake_timeout, params.idle_timeout];
+    let period = timeouts
+      .iter()
+      .flatten()
+      .min()
+      .map_or(Duration::from_secs(1), |el| *el / 4)
+      .clamp(Duration::from_millis(1), Duration::from_secs(1));
+    let ticks_of = |value: Option<Duration>| value.map_or(0, |el| ticks(el, period));
+    let idle_ticks = ticks_of(params.idle_timeout);
+    let timers = Timers {
+      armed: false,
+      close_ticks: ticks_of(params.close_timeout),
+      handshakes: Vec::new(),
+      handshake_ticks: ticks_of(params.handshake_timeout),
+      idle_every: (idle_ticks / 4).max(1),
+      idle_ticks,
+      lingering: Vec::new(),
+      tick: 0,
+    };
     Ok(Self {
       ring: RefCell::new(ring),
+      #[cfg(test)]
+      accept_arms: Cell::new(0),
+      backoff_ts: types::Timespec::new().nsec(100_000_000),
+      tick_ts: types::Timespec::from(period),
       bufs: RefCell::new(bufs),
       cqes: RefCell::new(Vec::with_capacity(cq_entries as usize)),
       conns: RefCell::new(Vec::new()),
+      direct_open: Cell::new(0),
       free_conns: RefCell::new(Vec::new()),
       free_tasks: RefCell::new(Vec::new()),
       listeners: RefCell::new(Vec::new()),
@@ -919,6 +1071,7 @@ impl Reactor {
       polling: Cell::new(usize::MAX),
       ready: RefCell::new(VecDeque::new()),
       tasks: RefCell::new(Vec::new()),
+      timers: RefCell::new(timers),
     })
   }
 
@@ -1076,7 +1229,9 @@ impl Reactor {
       match kind {
         KIND_RECV => recycled |= self.on_recv(idx, generation, res, flags),
         KIND_SEND => self.on_send(idx, generation, res),
-        KIND_ACCEPT => self.on_accept(idx as usize, res, flags),
+        KIND_ACCEPT => self.on_accept(idx as usize, generation == ONE_SHOT, res, flags),
+        KIND_ACCEPT_RETRY => self.on_accept_retry(idx as usize),
+        KIND_TIMER => self.on_tick(),
         _ => {}
       }
     }
@@ -1091,8 +1246,11 @@ impl Reactor {
     let mut listeners = self.listeners.borrow_mut();
     listeners.push(ListenerState {
       armed: false,
+      backoff: false,
       closed: false,
       fd,
+      gated: false,
+      pending: 0,
       queue: VecDeque::new(),
       waker: None,
     });
@@ -1102,52 +1260,140 @@ impl Reactor {
     Ok(idx)
   }
 
+  /// Arms a multishot accept, or with direct descriptors close to running out, tops the listener
+  /// up to `ACCEPT_DEPTH` one-shot accepts that each hold a slot of the table. A multishot accept
+  /// takes whatever the backlog holds, and the connections it takes into a full table are dropped;
+  /// one-shot accepts cost a submission per connection, so they are kept for the last
+  /// `accept_margin` slots.
   fn arm_accept(&self, idx: usize) {
-    let fd = {
+    let direct = self.params.direct_files > 0;
+    let (fd, count) = {
       let mut listeners = self.listeners.borrow_mut();
       let listener = &mut listeners[idx];
-      listener.armed = true;
-      listener.fd
+      if listener.closed || listener.backoff || listener.armed {
+        return;
+      }
+      let free = self.params.direct_files.saturating_sub(self.direct_open.get());
+      if direct && free <= self.accept_margin() {
+        let count = ACCEPT_DEPTH.saturating_sub(listener.pending).min(free);
+        listener.gated = listener.pending + count < ACCEPT_DEPTH;
+        if count == 0 {
+          return;
+        }
+        listener.pending += count;
+        self.direct_open.set(self.direct_open.get() + count);
+        (listener.fd, count)
+      } else {
+        listener.armed = true;
+        (listener.fd, 0)
+      }
     };
-    let sqe = opcode::AcceptMulti::new(types::Fd(fd))
-      .allocate_file_index(self.params.direct_files > 0)
-      .build()
-      .user_data(user_data(KIND_ACCEPT, 0, idx as u32));
-    self.push_sqe(&sqe);
+    #[cfg(test)]
+    self.accept_arms.set(self.accept_arms.get() + 1);
+    if count > 0 {
+      let sqe = opcode::Accept::new(types::Fd(fd), core::ptr::null_mut(), core::ptr::null_mut())
+        .file_index(Some(types::DestinationSlot::auto_target()))
+        .build()
+        .user_data(user_data(KIND_ACCEPT, ONE_SHOT, idx as u32));
+      for _ in 0..count {
+        self.push_sqe(&sqe);
+      }
+    } else {
+      let sqe = AcceptMulti::new(types::Fd(fd))
+        .allocate_file_index(direct)
+        .build()
+        .user_data(user_data(KIND_ACCEPT, 0, idx as u32));
+      self.push_sqe(&sqe);
+    }
   }
 
-  fn on_accept(&self, idx: usize, res: i32, flags: u32) {
-    let rearm = {
-      let mut listeners = self.listeners.borrow_mut();
-      let Some(listener) = listeners.get_mut(idx) else {
-        return;
-      };
-      if listener.closed {
-        listener.armed = false;
-        drop(listeners);
-        if res >= 0 {
-          self.close_accepted(res);
-        }
-        return;
-      }
-      if res >= 0 {
-        listener.queue.push_back(res);
-        if let Some(elem) = listener.waker.take() {
-          elem.wake();
-        }
-      }
-      if !cqueue::more(flags) {
-        listener.armed = false;
-      }
-      !listener.armed
+  fn accept_margin(&self) -> u32 {
+    (self.params.direct_files / 8).max(2 * ACCEPT_DEPTH)
+  }
+
+  fn on_accept(&self, idx: usize, one_shot: bool, res: i32, flags: u32) {
+    let direct = self.params.direct_files > 0;
+    let mut listeners = self.listeners.borrow_mut();
+    let Some(listener) = listeners.get_mut(idx) else {
+      return;
     };
-    if rearm {
+    let more = !one_shot && cqueue::more(flags);
+    if one_shot {
+      listener.pending = listener.pending.saturating_sub(1);
+    } else {
+      if !more {
+        listener.armed = false;
+      }
+      if direct && res >= 0 {
+        self.direct_open.set(self.direct_open.get() + 1);
+      }
+    }
+    if listener.closed {
+      drop(listeners);
+      if res >= 0 {
+        self.close_accepted(res);
+      } else if one_shot {
+        self.release_direct();
+      }
+      return;
+    }
+    if res >= 0 {
+      listener.queue.push_back(res);
+      if let Some(elem) = listener.waker.take() {
+        elem.wake();
+      }
+    }
+    // Out of descriptors or memory: retrying at once would fail again.
+    let backoff = res < 0
+      && matches!(-res, libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+      && !listener.backoff;
+    if backoff {
+      listener.backoff = true;
+    }
+    drop(listeners);
+    if res < 0 && one_shot {
+      // The slot the accept held
+      self.release_direct();
+    }
+    let free = self.params.direct_files.saturating_sub(self.direct_open.get());
+    if backoff {
+      let sqe = opcode::Timeout::new(&raw const self.backoff_ts).build().user_data(user_data(
+        KIND_ACCEPT_RETRY,
+        0,
+        idx as u32,
+      ));
+      self.push_sqe(&sqe);
+    } else if more && direct && free <= self.accept_margin() {
+      // Close to running out: its last completion re-arms the listener with one-shot accepts.
+      self.push_sqe(&cancel_sqe(user_data(KIND_ACCEPT, 0, idx as u32)));
+    } else if !more {
       self.arm_accept(idx);
     }
   }
 
-  /// Stops listening: the armed accept is cancelled, and the connections it took that nobody
-  /// claimed are closed, along with any it still completes.
+  fn on_accept_retry(&self, idx: usize) {
+    if let Some(listener) = self.listeners.borrow_mut().get_mut(idx) {
+      listener.backoff = false;
+    }
+    self.arm_accept(idx);
+  }
+
+  /// A slot of the direct descriptor table was freed: accepts that waited for one start again.
+  fn release_direct(&self) {
+    self.direct_open.set(self.direct_open.get().saturating_sub(1));
+    let gated = self.listeners.borrow().iter().position(|el| el.gated && !el.closed);
+    if let Some(first) = gated {
+      let count = self.listeners.borrow().len();
+      for idx in first..count {
+        if self.listeners.borrow()[idx].gated {
+          self.arm_accept(idx);
+        }
+      }
+    }
+  }
+
+  /// Stops listening: the armed accepts are cancelled, and the connections they took that nobody
+  /// claimed are closed, along with any they still complete.
   fn drop_listener(&self, idx: usize) {
     let (armed, fd, queue) = {
       let mut listeners = self.listeners.borrow_mut();
@@ -1156,20 +1402,22 @@ impl Reactor {
       };
       listener.closed = true;
       listener.waker = None;
-      (listener.armed, listener.fd, core::mem::take(&mut listener.queue))
+      (listener.armed || listener.pending > 0, listener.fd, core::mem::take(&mut listener.queue))
     };
     for accepted in queue {
       self.close_accepted(accepted);
     }
     if armed {
-      let target = user_data(KIND_ACCEPT, 0, idx as u32);
-      let sqe = opcode::AsyncCancel::new(target)
+      self.push_sqe(&cancel_sqe(user_data(KIND_ACCEPT, 0, idx as u32)));
+      let target =
+        types::CancelBuilder::user_data(user_data(KIND_ACCEPT, ONE_SHOT, idx as u32)).all();
+      let sqe = opcode::AsyncCancel2::new(target)
         .build()
         .flags(squeue::Flags::SKIP_SUCCESS)
         .user_data(user_data(KIND_CANCEL, 0, 0));
       self.push_sqe(&sqe);
     }
-    // SAFETY: closed once, here; the accept still armed keeps its own reference until cancelled
+    // SAFETY: closed once, here; the accepts still armed keep their own reference until cancelled
     let _rslt = unsafe { libc::close(fd) };
   }
 
@@ -1180,6 +1428,7 @@ impl Reactor {
         .flags(squeue::Flags::SKIP_SUCCESS)
         .user_data(user_data(KIND_CANCEL, 0, 0));
       self.push_sqe(&sqe);
+      self.release_direct();
     } else {
       // SAFETY: an accepted socket that no handle owns
       let _rslt = unsafe { libc::close(fd) };
@@ -1200,7 +1449,14 @@ impl Reactor {
 
   // ---- connections
 
-  fn add_conn(&self, fd: RawFd, refs: u8, direct: bool) -> crate::Result<(u32, u32)> {
+  fn add_conn(
+    &self,
+    fd: RawFd,
+    refs: u8,
+    direct: bool,
+    accepted: bool,
+  ) -> crate::Result<(u32, u32)> {
+    let tick = self.timers.borrow().tick;
     let (idx, generation) = {
       let mut conns = self.conns.borrow_mut();
       let idx = if let Some(idx) = self.free_conns.borrow_mut().pop() {
@@ -1210,17 +1466,21 @@ impl Reactor {
         (conns.len() - 1) as u32
       };
       let conn = &mut conns[idx as usize];
+      conn.activity = 0;
       conn.cancel_sent = false;
       conn.closing = false;
       conn.direct = direct;
       conn.fd = fd;
       conn.in_use = true;
+      conn.last_active = tick;
+      conn.lingering = false;
       conn.reader = None;
       conn.refs = refs;
       conn.rx.clear();
       conn.rx_eof = false;
       conn.rx_err = 0;
       conn.rx_off = 0;
+      conn.rx_paused = false;
       conn.sending = false;
       conn.tx_done = 0;
       conn.tx_err = 0;
@@ -1230,6 +1490,17 @@ impl Reactor {
       (idx, conn.generation)
     };
     self.arm_recv(idx, generation, fd);
+    let watch = {
+      let mut timers = self.timers.borrow_mut();
+      if accepted && timers.handshake_ticks > 0 {
+        let deadline = tick.wrapping_add(timers.handshake_ticks).wrapping_add(1);
+        timers.handshakes.push((idx, generation, deadline));
+      }
+      !timers.handshakes.is_empty() || timers.idle_ticks > 0
+    };
+    if watch {
+      self.arm_timer();
+    }
     Ok((idx, generation))
   }
 
@@ -1277,6 +1548,7 @@ impl Reactor {
       return recycled;
     };
     if res > 0 {
+      conn.activity |= ACTIVE_RX;
       if let Some(bid) = cqueue::buffer_select(flags) {
         let bufs_len = self.bufs.borrow().len;
         let begin = usize::from(bid) * bufs_len;
@@ -1290,6 +1562,9 @@ impl Reactor {
         drop(bufs);
         self.bufs.borrow_mut().push(bid);
         recycled = true;
+        if conn.rx.len() - conn.rx_off as usize > self.params.rx_high_water && !conn.rx_paused {
+          self.pause_recv(conn, idx, generation);
+        }
       }
     } else if res == 0 {
       conn.rx_eof = true;
@@ -1310,13 +1585,43 @@ impl Reactor {
         self.maybe_close(idx, fd);
         return recycled;
       }
-      if !conn.rx_eof && conn.rx_err == 0 {
+      if !conn.rx_eof && conn.rx_err == 0 && !conn.rx_paused {
         let fd = conn.fd;
         drop(conns);
         self.arm_recv(idx, generation, fd);
       }
     }
     recycled
+  }
+
+  /// Stops receiving into a connection that holds `rx_high_water` unread bytes: the rest waits in
+  /// the socket. Completions already in flight still land in `rx`.
+  #[cold]
+  #[inline(never)]
+  fn pause_recv(&self, conn: &mut Conn, idx: u32, generation: u32) {
+    conn.rx_paused = true;
+    if conn.recv_armed {
+      self.push_sqe(&cancel_sqe(user_data(KIND_RECV, generation, idx)));
+    }
+  }
+
+  /// Receives again into a paused connection once reads have taken it under half of
+  /// `rx_high_water`.
+  #[cold]
+  #[inline(never)]
+  fn maybe_resume_recv(&self, mut conns: core::cell::RefMut<'_, Vec<Conn>>, idx: u32) {
+    let conn = &mut conns[idx as usize];
+    if conn.rx.len() - conn.rx_off as usize > self.params.rx_high_water / 2 {
+      return;
+    }
+    conn.rx_paused = false;
+    // An armed receive is the one the pause is cancelling: its last completion re-arms it.
+    if conn.recv_armed || conn.rx_eof || conn.rx_err != 0 || conn.closing {
+      return;
+    }
+    let (fd, generation) = (conn.fd, conn.generation);
+    drop(conns);
+    self.arm_recv(idx, generation, fd);
   }
 
   fn poll_read(
@@ -1330,13 +1635,17 @@ impl Reactor {
     let Some(conn) = conns.get_mut(idx as usize).filter(|el| el.generation == generation) else {
       return Poll::Ready(Err(io_err(libc::EBADF)));
     };
-    match take_rx(conn, bytes) {
+    let rslt = take_rx(conn, bytes);
+    if let Ok(TryRead::Pending | TryRead::Unsupported) = rslt {
+      set_waker(&mut conn.reader, cx);
+    }
+    if conn.rx_paused {
+      self.maybe_resume_recv(conns, idx);
+    }
+    match rslt {
       Ok(TryRead::Read(len)) => Poll::Ready(Ok(Some(len))),
       Ok(TryRead::Closed) => Poll::Ready(Ok(None)),
-      Ok(TryRead::Pending | TryRead::Unsupported) => {
-        set_waker(&mut conn.reader, cx);
-        Poll::Pending
-      }
+      Ok(TryRead::Pending | TryRead::Unsupported) => Poll::Pending,
       Err(err) => Poll::Ready(Err(err)),
     }
   }
@@ -1368,7 +1677,11 @@ impl Reactor {
     let Some(conn) = conns.get_mut(idx as usize).filter(|el| el.generation == generation) else {
       return Err(io_err(libc::EBADF));
     };
-    take_rx(conn, bytes)
+    let rslt = take_rx(conn, bytes);
+    if conn.rx_paused {
+      self.maybe_resume_recv(conns, idx);
+    }
+    rslt
   }
 
   fn queue_send(&self, idx: u32, generation: u32, bytes: &[&[u8]]) -> crate::Result<()> {
@@ -1427,12 +1740,17 @@ impl Reactor {
       return;
     };
     if res < 0 {
-      conn.tx_err = errno(res);
+      // A timeout cancels the send: keep its `ETIMEDOUT`.
+      if conn.tx_err == 0 {
+        conn.tx_err = errno(res);
+      }
       conn.sending = false;
       conn.tx_pending.clear();
     } else {
+      conn.activity |= ACTIVE_TX;
       conn.tx_done += res as u32;
-      if (conn.tx_done as usize) < conn.tx_inflight.len() {
+      // A timed-out connection sends nothing more, even if the cancel found the send half done.
+      if (conn.tx_done as usize) < conn.tx_inflight.len() && conn.tx_err == 0 {
         let rest = conn.tx_inflight.get(conn.tx_done as usize..).unwrap_or_default();
         let sqe = send_sqe(conn, rest).user_data(user_data(KIND_SEND, generation, idx));
         drop(conns);
@@ -1501,6 +1819,12 @@ impl Reactor {
     let mut conns = self.conns.borrow_mut();
     let conn = &mut conns[idx as usize];
     if conn.sending || !conn.tx_pending.is_empty() {
+      if !conn.lingering {
+        conn.lingering = true;
+        let generation = conn.generation;
+        drop(conns);
+        self.linger(idx, generation);
+      }
       return;
     }
     if conn.recv_armed {
@@ -1510,11 +1834,7 @@ impl Reactor {
       conn.cancel_sent = true;
       let target = user_data(KIND_RECV, conn.generation, idx);
       drop(conns);
-      let sqe = opcode::AsyncCancel::new(target)
-        .build()
-        .flags(squeue::Flags::SKIP_SUCCESS)
-        .user_data(user_data(KIND_CANCEL, 0, 0));
-      self.push_sqe(&sqe);
+      self.push_sqe(&cancel_sqe(target));
       return;
     }
     let direct = conn.direct;
@@ -1532,6 +1852,137 @@ impl Reactor {
       let _rslt = unsafe { libc::close(fd) };
     }
     self.free_conns.borrow_mut().push(idx);
+    if direct {
+      self.release_direct();
+    }
+  }
+
+  // ---- timeouts
+
+  /// Watches a dropped connection that still has bytes to send, for the close timeout.
+  #[cold]
+  #[inline(never)]
+  fn linger(&self, idx: u32, generation: u32) {
+    {
+      let mut timers = self.timers.borrow_mut();
+      if timers.close_ticks == 0 {
+        return;
+      }
+      let tick = timers.tick;
+      timers.lingering.push((idx, generation, tick));
+    }
+    self.arm_timer();
+  }
+
+  fn arm_timer(&self) {
+    {
+      let mut timers = self.timers.borrow_mut();
+      if timers.armed {
+        return;
+      }
+      timers.armed = true;
+    }
+    let sqe =
+      opcode::Timeout::new(&raw const self.tick_ts).build().user_data(user_data(KIND_TIMER, 0, 0));
+    self.push_sqe(&sqe);
+  }
+
+  /// One tick: times out the connections past a deadline, then re-arms the timer if anything is
+  /// still watched. The handshake and close checks read the activity bits before the idle sweep
+  /// clears them.
+  fn on_tick(&self) {
+    let mut timers = self.timers.borrow_mut();
+    timers.armed = false;
+    timers.tick = timers.tick.wrapping_add(1);
+    let Timers { close_ticks, handshakes, idle_every, idle_ticks, lingering, tick, .. } =
+      &mut *timers;
+    let tick = *tick;
+    let past = |deadline: u32| tick.wrapping_sub(deadline) as i32 >= 0;
+    let mut conns = self.conns.borrow_mut();
+    let live = |conns: &[Conn], idx: u32, generation: u32| {
+      conns.get(idx as usize).is_some_and(|el| el.in_use && el.generation == generation)
+    };
+    handshakes.retain(|&(idx, generation, deadline)| {
+      if !live(&conns, idx, generation) {
+        return false;
+      }
+      let conn = &mut conns[idx as usize];
+      if conn.activity & ACTIVE_TX != 0 || conn.closing {
+        return false;
+      }
+      if past(deadline) {
+        self.time_out(conn, idx);
+        return false;
+      }
+      true
+    });
+    lingering.retain_mut(|(idx, generation, since)| {
+      if !live(&conns, *idx, *generation) {
+        return false;
+      }
+      let conn = &mut conns[*idx as usize];
+      if conn.activity & ACTIVE_TX != 0 {
+        conn.activity &= !ACTIVE_TX;
+        *since = tick;
+        return true;
+      }
+      if tick.wrapping_sub(*since) >= *close_ticks {
+        self.time_out(conn, *idx);
+        return false;
+      }
+      true
+    });
+    let mut open = false;
+    if *idle_ticks > 0 && tick % *idle_every == 0 {
+      for (idx, conn) in conns.iter_mut().enumerate() {
+        if !conn.in_use {
+          continue;
+        }
+        open = true;
+        if conn.activity != 0 {
+          conn.activity = 0;
+          conn.last_active = tick;
+        } else if tick.wrapping_sub(conn.last_active) >= *idle_ticks {
+          self.time_out(conn, idx as u32);
+        }
+      }
+    } else if *idle_ticks > 0 {
+      open = conns.len() > self.free_conns.borrow().len();
+    }
+    drop(conns);
+    let watch = open || !handshakes.is_empty() || !lingering.is_empty();
+    drop(timers);
+    if watch {
+      self.arm_timer();
+    }
+  }
+
+  /// Fails a connection's reads and writes with `ETIMEDOUT` and cancels what it has in flight,
+  /// which also lets a dropped connection close.
+  #[cold]
+  #[inline(never)]
+  fn time_out(&self, conn: &mut Conn, idx: u32) {
+    let timed_out = libc::ETIMEDOUT as u8;
+    if conn.rx_err == 0 {
+      conn.rx_err = timed_out;
+    }
+    if conn.tx_err == 0 {
+      conn.tx_err = timed_out;
+    }
+    conn.tx_pending.clear();
+    if conn.recv_armed && !conn.cancel_sent {
+      conn.cancel_sent = true;
+      self.push_sqe(&cancel_sqe(user_data(KIND_RECV, conn.generation, idx)));
+    }
+    if conn.sending {
+      self.push_sqe(&cancel_sqe(user_data(KIND_SEND, conn.generation, idx)));
+    }
+    if let Some(elem) = conn.reader.take() {
+      elem.wake();
+    }
+    if let Some(elem) = conn.writer.take() {
+      elem.wake();
+    }
   }
 }
 
@@ -2076,5 +2527,437 @@ mod tests {
   fn stress_direct_files() {
     let params = crate::executor::UringParams::new().set_direct_files(1024).set_peer_addrs(false);
     stress(params, stress_conns(), 3);
+  }
+
+  // ---- robustness
+
+  fn test_addr() -> alloc::string::String {
+    let uri = _uri();
+    let (host, port) = uri.hostname_with_implied_port();
+    alloc::format!("{host}:{port}")
+  }
+
+  fn connect(addr: &str) -> std::net::TcpStream {
+    loop {
+      if let Ok(elem) = std::net::TcpStream::connect(addr) {
+        break elem;
+      }
+      std::thread::sleep(core::time::Duration::from_millis(5));
+    }
+  }
+
+  fn set_sock_int(stream: &std::net::TcpStream, level: i32, name: i32, value: libc::c_int) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: valid socket and option buffer
+    unsafe {
+      libc::setsockopt(
+        stream.as_raw_fd(),
+        level,
+        name,
+        (&raw const value).cast(),
+        size_of::<libc::c_int>() as libc::socklen_t,
+      );
+    }
+  }
+
+  async fn bind(addr: &str) -> UringTcpListener {
+    UringTcpListener::bind(addr, TcpParams::default().set_reuse_port(Some(false))).await.unwrap()
+  }
+
+  fn os_error(err: &crate::Error) -> Option<i32> {
+    match err {
+      crate::Error::Io(elem) => elem.raw_os_error(),
+      _ => None,
+    }
+  }
+
+  /// The most unread bytes any connection holds.
+  fn max_unread() -> usize {
+    super::with_reactor(|reactor| {
+      Ok(
+        reactor
+          .conns
+          .borrow()
+          .iter()
+          .filter(|el| el.in_use)
+          .map(|el| el.rx.len() - el.rx_off as usize)
+          .max()
+          .unwrap_or(0),
+      )
+    })
+    .unwrap()
+  }
+
+  // A peer that sends 8 MiB but reads nothing for a while: the echo stalls on writing, and the
+  // connection stops receiving at its high-water mark instead of buffering everything. Once the
+  // peer reads, every byte comes back in order.
+  #[test]
+  fn peer_that_stops_reading_is_held_at_the_high_water_mark() {
+    use crate::net::{StreamReader, StreamWriter};
+    const TOTAL: usize = 8 << 20;
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let client = std::thread::spawn(move || {
+      let mut stream = connect(&client_addr);
+      let mut writer = stream.try_clone().unwrap();
+      let sending = std::thread::spawn(move || {
+        let data: Vec<u8> = (0..TOTAL).map(|idx| (idx * 7 % 251) as u8).collect();
+        Write::write_all(&mut writer, &data).unwrap();
+        writer.shutdown(std::net::Shutdown::Write).unwrap();
+      });
+      std::thread::sleep(core::time::Duration::from_millis(500));
+      let mut got = Vec::new();
+      let _len = stream.read_to_end(&mut got).unwrap();
+      sending.join().unwrap();
+      assert_eq!(got.len(), TOTAL);
+      assert!(got.iter().enumerate().all(|(idx, el)| *el == (idx * 7 % 251) as u8));
+    });
+    let params = crate::executor::UringParams::new()
+      .set_recv_buffers(64, 4096)
+      .set_rx_high_water(16 * 1024)
+      .set_tx_high_water(16 * 1024);
+    let runtime = UringRuntime::with_params(params).unwrap();
+    let peak = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+      let echo = async move {
+        let mut buf = alloc::vec![0; 4096];
+        while let Some(len) = stream.read(buf.as_mut_slice().into()).await.unwrap() {
+          stream.write_all(&buf[..len.get()]).await.unwrap();
+        }
+      };
+      let handle =
+        crate::executor::Executor::spawn_local(&UringExecutor::default(), echo, &runtime_ref());
+      let mut peak = 0;
+      while !client.is_finished() {
+        peak = peak.max(max_unread());
+        yield_once().await;
+      }
+      handle.await.unwrap();
+      peak
+    });
+    // The receives that complete in the turn that crosses the mark still land: at most a ring
+    // of buffers beyond it.
+    assert!(peak <= 16 * 1024 + 64 * 4096, "{peak} unread bytes held");
+    assert!(peak >= 16 * 1024, "the mark was never reached ({peak}), so nothing was tested");
+    assert_eq!(runtime.open_conns(), 0);
+  }
+
+  fn runtime_ref() -> UringRuntime {
+    UringRuntime::new().unwrap()
+  }
+
+  // A connection that receives and sends nothing fails its read with `ETIMEDOUT`.
+  #[test]
+  fn idle_connection_times_out() {
+    use crate::net::StreamReader;
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let client = std::thread::spawn(move || {
+      let mut stream = connect(&client_addr);
+      let mut rest = Vec::new();
+      let _rslt = stream.read_to_end(&mut rest);
+    });
+    let params = crate::executor::UringParams::new()
+      .set_idle_timeout(Some(core::time::Duration::from_millis(100)));
+    let runtime = UringRuntime::with_params(params).unwrap();
+    let (errno, elapsed) = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+      let begin = std::time::Instant::now();
+      let mut buf = [0; 16];
+      let err = stream.read(buf.as_mut_slice().into()).await.unwrap_err();
+      (os_error(&err), begin.elapsed())
+    });
+    client.join().unwrap();
+    assert_eq!(errno, Some(libc::ETIMEDOUT));
+    assert!(elapsed >= core::time::Duration::from_millis(100), "{elapsed:?}");
+    assert!(elapsed < core::time::Duration::from_secs(1), "{elapsed:?}");
+    assert_eq!(runtime.open_conns(), 0);
+  }
+
+  // A client that trickles its request a byte at a time keeps the connection active, but never
+  // gets an answer: the handshake timeout cuts it off. A connection that was answered is left
+  // alone however long it then waits.
+  #[test]
+  fn handshake_timeout_cuts_off_a_trickling_client() {
+    use crate::net::{StreamReader, StreamWriter};
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let client = std::thread::spawn(move || {
+      let mut trickle = connect(&client_addr);
+      let trickling = std::thread::spawn(move || {
+        for _ in 0..50 {
+          if Write::write_all(&mut trickle, b"x").is_err() {
+            break;
+          }
+          std::thread::sleep(core::time::Duration::from_millis(20));
+        }
+      });
+      let mut answered = connect(&client_addr);
+      Write::write_all(&mut answered, b"q").unwrap();
+      let mut byte = [0; 1];
+      answered.read_exact(&mut byte).unwrap();
+      trickling.join().unwrap();
+      Write::write_all(&mut answered, b"r").unwrap();
+      let mut rest = Vec::new();
+      let _rslt = answered.read_to_end(&mut rest);
+    });
+    let params = crate::executor::UringParams::new()
+      .set_handshake_timeout(Some(core::time::Duration::from_millis(200)));
+    let runtime = UringRuntime::with_params(params).unwrap();
+    let (errno, elapsed) = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let mut streams = Vec::new();
+      for _ in 0..2 {
+        streams.push(listener.accept(TcpParams::default()).await.unwrap().0);
+      }
+      let begin = std::time::Instant::now();
+      let mut buf = [0; 16];
+      // Tell the two apart: the answered one sends `q` first and waits.
+      let (mut first, second) = (streams.remove(0), streams.remove(0));
+      let len = first.read(buf.as_mut_slice().into()).await.unwrap().unwrap();
+      let (mut trickle, mut answered) =
+        if buf[..len.get()].contains(&b'q') { (second, first) } else { (first, second) };
+      answered.write_all(b"a").await.unwrap();
+      let err = loop {
+        match trickle.read(buf.as_mut_slice().into()).await {
+          Ok(Some(_)) => {}
+          Ok(None) => panic!("closed before the timeout"),
+          Err(err) => break err,
+        }
+      };
+      let elapsed = begin.elapsed();
+      // Past the timeout, the answered connection still reads.
+      let mut got = Vec::new();
+      while !got.contains(&b'r') {
+        let len = answered.read(buf.as_mut_slice().into()).await.unwrap().unwrap();
+        got.extend_from_slice(&buf[..len.get()]);
+      }
+      (os_error(&err), elapsed)
+    });
+    client.join().unwrap();
+    assert_eq!(errno, Some(libc::ETIMEDOUT));
+    assert!(elapsed >= core::time::Duration::from_millis(150), "{elapsed:?}");
+    assert!(elapsed < core::time::Duration::from_secs(1), "{elapsed:?}");
+  }
+
+  // A connection dropped with 32 MiB still to send to a peer that never reads is closed once the
+  // close timeout passes without progress, and `block_on` returns.
+  #[test]
+  fn dropped_connection_to_a_peer_that_never_reads_is_closed() {
+    use crate::net::StreamWriter;
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let client = std::thread::spawn(move || {
+      let stream = connect(&client_addr);
+      set_sock_int(&stream, libc::SOL_SOCKET, libc::SO_RCVBUF, 4096);
+      let _rslt = done_rx.recv();
+      drop(stream);
+    });
+    let params = crate::executor::UringParams::new()
+      .set_close_timeout(Some(core::time::Duration::from_millis(100)));
+    let runtime = UringRuntime::with_params(params).unwrap();
+    let elapsed = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+      stream.write_all(&alloc::vec![7; 32 << 20]).await.unwrap();
+      drop(stream);
+      let begin = std::time::Instant::now();
+      while super::with_reactor(|reactor| Ok(reactor.conns.borrow().iter().any(|el| el.in_use)))
+        .unwrap()
+      {
+        assert!(begin.elapsed() < core::time::Duration::from_secs(5), "never closed");
+        yield_once().await;
+      }
+      begin.elapsed()
+    });
+    let _rslt = done_tx.send(());
+    client.join().unwrap();
+    assert!(elapsed >= core::time::Duration::from_millis(50), "{elapsed:?}");
+    assert_eq!(runtime.open_conns(), 0);
+  }
+
+  // With two direct descriptors, the third and fourth connections wait in the backlog until one
+  // is closed, instead of being accepted into a full table and dropped, and the accept isn't
+  // re-armed in a loop meanwhile.
+  #[test]
+  fn accepts_wait_for_a_free_direct_descriptor() {
+    use crate::net::StreamReader;
+    let accept_arms = || super::with_reactor(|reactor| Ok(reactor.accept_arms.get())).unwrap();
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let clients = std::thread::spawn(move || {
+      let handles: Vec<_> = (0..4u8)
+        .map(|id| {
+          let local = client_addr.clone();
+          std::thread::spawn(move || {
+            let mut stream = connect(&local);
+            stream.write_all(&[id]).unwrap();
+            stream.set_read_timeout(Some(core::time::Duration::from_secs(10))).unwrap();
+            let mut rest = Vec::new();
+            // Served, then closed by the server: a clean end of stream, not a reset.
+            let _len = stream.read_to_end(&mut rest).unwrap();
+          })
+        })
+        .collect();
+      for handle in handles {
+        handle.join().unwrap();
+      }
+    });
+    let params = crate::executor::UringParams::new().set_direct_files(2).set_peer_addrs(false);
+    let runtime = UringRuntime::with_params(params).unwrap();
+    let (ids, arms) = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let mut held = Vec::new();
+      let mut ids = Vec::new();
+      let mut buf = [0; 1];
+      for _ in 0..2 {
+        let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+        let _len = stream.read(buf.as_mut_slice().into()).await.unwrap();
+        ids.push(buf[0]);
+        held.push(stream);
+      }
+      let arms_before = accept_arms();
+      let begin = std::time::Instant::now();
+      while begin.elapsed() < core::time::Duration::from_millis(300) {
+        yield_once().await;
+      }
+      let arms = accept_arms() - arms_before;
+      for _ in 0..2 {
+        drop(held.remove(0));
+        let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+        let _len = stream.read(buf.as_mut_slice().into()).await.unwrap();
+        ids.push(buf[0]);
+        held.push(stream);
+      }
+      drop(held);
+      (ids, arms)
+    });
+    clients.join().unwrap();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, [0, 1, 2, 3]);
+    assert_eq!(arms, 0, "accepts were armed while the table was full");
+    assert_eq!(runtime.open_conns(), 0);
+  }
+
+  // With 40 slots the accept starts multishot; the second wave takes the table within the margin,
+  // so the listener switches to one-shot accepts that each hold a slot, and the last four
+  // connections wait in the backlog instead of being dropped.
+  #[test]
+  fn accept_switches_to_reserved_one_shots_near_capacity() {
+    use crate::net::StreamReader;
+    use std::sync::mpsc;
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let (wave_tx, wave_rx) = mpsc::channel::<()>();
+    let clients = std::thread::spawn(move || {
+      let spawn = |ids: core::ops::Range<u8>| -> Vec<_> {
+        ids
+          .map(|id| {
+            let local = client_addr.clone();
+            std::thread::spawn(move || {
+              let mut stream = connect(&local);
+              stream.write_all(&[id]).unwrap();
+              stream.set_read_timeout(Some(core::time::Duration::from_secs(10))).unwrap();
+              let mut rest = Vec::new();
+              let _len = stream.read_to_end(&mut rest).unwrap();
+            })
+          })
+          .collect()
+      };
+      let mut handles = spawn(0..10);
+      wave_rx.recv().unwrap();
+      handles.extend(spawn(10..44));
+      for handle in handles {
+        handle.join().unwrap();
+      }
+    });
+    let params = crate::executor::UringParams::new().set_direct_files(40).set_peer_addrs(false);
+    let runtime = UringRuntime::with_params(params).unwrap();
+    let ids = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let mut held = Vec::new();
+      let mut ids = Vec::new();
+      let mut buf = [0; 1];
+      for idx in 0..40 {
+        if idx == 10 {
+          wave_tx.send(()).unwrap();
+        }
+        let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+        let _len = stream.read(buf.as_mut_slice().into()).await.unwrap();
+        ids.push(buf[0]);
+        held.push(stream);
+      }
+      let begin = std::time::Instant::now();
+      while begin.elapsed() < core::time::Duration::from_millis(300) {
+        yield_once().await;
+      }
+      for _ in 0..4 {
+        drop(held.remove(0));
+        let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+        let _len = stream.read(buf.as_mut_slice().into()).await.unwrap();
+        ids.push(buf[0]);
+        held.push(stream);
+      }
+      drop(held);
+      ids
+    });
+    clients.join().unwrap();
+    let mut sorted = ids;
+    sorted.sort_unstable();
+    assert_eq!(sorted, (0..44).collect::<Vec<u8>>());
+    assert_eq!(runtime.open_conns(), 0);
+  }
+
+  // Reading into an empty buffer would report the end of the stream: it fails instead, and the
+  // bytes stay readable.
+  #[test]
+  fn reading_into_an_empty_buffer_is_an_error() {
+    use crate::net::StreamReader;
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let client = std::thread::spawn(move || {
+      let mut stream = connect(&client_addr);
+      stream.write_all(b"ab").unwrap();
+      let mut rest = Vec::new();
+      let _rslt = stream.read_to_end(&mut rest);
+    });
+    let runtime = UringRuntime::new().unwrap();
+    runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+      let mut buf = [0; 4];
+      let len = stream.read(buf.get_mut(..1).unwrap().into()).await.unwrap().unwrap();
+      assert_eq!(len.get(), 1);
+      let err = stream.read((&mut buf[..0]).into()).await.unwrap_err();
+      assert_eq!(os_error(&err), Some(libc::EINVAL));
+      let len = stream.read(buf.as_mut_slice().into()).await.unwrap().unwrap();
+      assert_eq!(&buf[..len.get()], b"b");
+    });
+    client.join().unwrap();
+  }
+
+  // A connection whose handle outlives the runtime is closed when the runtime is dropped.
+  #[test]
+  fn dropping_the_runtime_closes_connections_still_open() {
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let client = std::thread::spawn(move || {
+      let mut stream = connect(&client_addr);
+      stream.set_read_timeout(Some(core::time::Duration::from_secs(5))).unwrap();
+      let mut rest = Vec::new();
+      stream.read_to_end(&mut rest).unwrap();
+    });
+    let runtime = UringRuntime::new().unwrap();
+    let stream = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      listener.accept(TcpParams::default()).await.unwrap().0
+    });
+    drop(runtime);
+    client.join().unwrap();
+    drop(stream);
   }
 }
