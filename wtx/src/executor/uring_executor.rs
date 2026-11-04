@@ -1163,7 +1163,10 @@ impl Reactor {
     }
     if armed {
       let target = user_data(KIND_ACCEPT, 0, idx as u32);
-      let sqe = opcode::AsyncCancel::new(target).build().user_data(user_data(KIND_CANCEL, 0, 0));
+      let sqe = opcode::AsyncCancel::new(target)
+        .build()
+        .flags(squeue::Flags::SKIP_SUCCESS)
+        .user_data(user_data(KIND_CANCEL, 0, 0));
       self.push_sqe(&sqe);
     }
     // SAFETY: closed once, here; the accept still armed keeps its own reference until cancelled
@@ -1172,8 +1175,10 @@ impl Reactor {
 
   fn close_accepted(&self, fd: RawFd) {
     if self.params.direct_files > 0 {
-      let sqe =
-        opcode::Close::new(types::Fixed(fd as u32)).build().user_data(user_data(KIND_CANCEL, 0, 0));
+      let sqe = opcode::Close::new(types::Fixed(fd as u32))
+        .build()
+        .flags(squeue::Flags::SKIP_SUCCESS)
+        .user_data(user_data(KIND_CANCEL, 0, 0));
       self.push_sqe(&sqe);
     } else {
       // SAFETY: an accepted socket that no handle owns
@@ -1505,7 +1510,10 @@ impl Reactor {
       conn.cancel_sent = true;
       let target = user_data(KIND_RECV, conn.generation, idx);
       drop(conns);
-      let sqe = opcode::AsyncCancel::new(target).build().user_data(user_data(KIND_CANCEL, 0, 0));
+      let sqe = opcode::AsyncCancel::new(target)
+        .build()
+        .flags(squeue::Flags::SKIP_SUCCESS)
+        .user_data(user_data(KIND_CANCEL, 0, 0));
       self.push_sqe(&sqe);
       return;
     }
@@ -1514,8 +1522,10 @@ impl Reactor {
     conn.generation = conn.generation.wrapping_add(1) & 0x0FFF_FFFF;
     drop(conns);
     if direct {
-      let sqe =
-        opcode::Close::new(types::Fixed(fd as u32)).build().user_data(user_data(KIND_CANCEL, 0, 0));
+      let sqe = opcode::Close::new(types::Fixed(fd as u32))
+        .build()
+        .flags(squeue::Flags::SKIP_SUCCESS)
+        .user_data(user_data(KIND_CANCEL, 0, 0));
       self.push_sqe(&sqe);
     } else {
       // SAFETY: no operation on `fd` is in flight any more

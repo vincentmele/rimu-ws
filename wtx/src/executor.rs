@@ -125,6 +125,24 @@ where
           socket.set_reuse_port(elem)?;
         }
         socket.set_tcp_nodelay(_tcp_params.tcp_nodelay())?;
+        #[cfg(all(feature = "libc", target_os = "linux"))]
+        if let Some(elem) = _tcp_params.tcp_defer_accept() {
+          use std::os::fd::AsRawFd;
+          let secs = libc::c_int::try_from(elem).unwrap_or(libc::c_int::MAX);
+          // SAFETY: a valid socket, and an option value of the size passed
+          let rslt = unsafe {
+            libc::setsockopt(
+              socket.as_raw_fd(),
+              libc::IPPROTO_TCP,
+              libc::TCP_DEFER_ACCEPT,
+              (&raw const secs).cast(),
+              size_of::<libc::c_int>() as libc::socklen_t,
+            )
+          };
+          if rslt != 0 {
+            return Err(std::io::Error::last_os_error().into());
+          }
+        }
 
         // ***** THE ORDER IS IMPORTANT *****
         socket.bind(&socket_addr.into())?;

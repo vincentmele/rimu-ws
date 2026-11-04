@@ -6,6 +6,7 @@ pub struct TcpParams {
   reuse_address: Option<bool>,
   reuse_port: Option<bool>,
   send_buffer_size: Option<u32>,
+  tcp_defer_accept: Option<u32>,
   tcp_nodelay: bool,
 }
 
@@ -90,6 +91,24 @@ impl TcpParams {
     self
   }
 
+  /// Sets the `TCP_DEFER_ACCEPT` socket option of a listener, in seconds: a connection is only
+  /// handed to `accept` once its first bytes have arrived, which saves the server a wakeup and a
+  /// turn per connection when clients speak first, as HTTP and WebSocket clients do.
+  ///
+  /// Linux only, and only with the `libc` feature; ignored elsewhere and by clients.
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub const fn set_tcp_defer_accept(mut self, value: Option<u32>) -> Self {
+    self.tcp_defer_accept = value;
+    self
+  }
+
+  /// Returns the `TCP_DEFER_ACCEPT` socket option.
+  #[inline]
+  pub const fn tcp_defer_accept(&self) -> Option<u32> {
+    self.tcp_defer_accept
+  }
+
   /// Returns the `TCP_NODELAY` socket option.
   #[inline]
   pub const fn tcp_nodelay(&self) -> bool {
@@ -106,6 +125,7 @@ impl Default for TcpParams {
       reuse_address: Some(true),
       reuse_port: Some(true),
       send_buffer_size: None,
+      tcp_defer_accept: None,
       tcp_nodelay: true,
     }
   }
