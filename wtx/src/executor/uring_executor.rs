@@ -44,6 +44,7 @@ const KIND_CANCEL: u64 = 4;
 const KIND_TIMER: u64 = 5;
 const KIND_ACCEPT_RETRY: u64 = 6;
 const KIND_DOORBELL: u64 = 7;
+const KIND_SLEEP: u64 = 8;
 // One-shot accepts kept armed per listener with direct descriptors close to running out
 const ACCEPT_DEPTH: u32 = 16;
 // The `generation` of a one-shot accept's `user_data`; a multishot accept's is 0.
@@ -668,6 +669,75 @@ impl StreamWriter for UringWriteHalf {
   }
 }
 
+/// A timer of the runtime running on this thread: one timeout on its ring. Created by
+/// `futures::Sleep` when that runtime is current.
+#[derive(Debug)]
+pub(crate) struct UringSleep {
+  duration: Duration,
+  // Slot, generation and runtime, once the first poll armed it
+  armed: Option<(u32, u32, u32)>,
+}
+
+impl UringSleep {
+  /// `None` if no `UringRuntime` runs on this thread.
+  pub(crate) fn new(duration: Duration) -> Option<Self> {
+    (!CURRENT.with(Cell::get).is_null()).then_some(Self { duration, armed: None })
+  }
+}
+
+impl Future for UringSleep {
+  type Output = crate::Result<()>;
+
+  #[inline]
+  fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    let Some((idx, generation, runtime)) = self.armed else {
+      let duration = self.duration;
+      let armed = with_reactor(|reactor| {
+        let (idx, generation) = reactor.add_sleep(duration, cx);
+        Ok((idx, generation, reactor.id))
+      });
+      return match armed {
+        Ok(elem) => {
+          self.armed = Some(elem);
+          Poll::Pending
+        }
+        Err(err) => Poll::Ready(Err(err)),
+      };
+    };
+    // Polled on another runtime, it can't reach its timeout: it reports itself done.
+    poll_own_reactor(runtime, |reactor| reactor.poll_sleep(idx, generation, cx))
+      .map(|el| el.or(Ok(())))
+  }
+}
+
+impl Drop for UringSleep {
+  #[inline]
+  fn drop(&mut self) {
+    if let Some((idx, generation, runtime)) = self.armed
+      && let Some(reactor) = own_reactor(runtime)
+    {
+      reactor.drop_sleep(idx, generation);
+    }
+  }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SleepState {
+  Armed,
+  // Its handle was dropped before it fired; the slot waits for the kernel's completion.
+  Dropped,
+  Fired,
+  Free,
+}
+
+struct SleepSlot {
+  generation: u32,
+  state: SleepState,
+  // Boxed, so that it stays put until the kernel copies it at submission, however `sleeps` grows
+  ts: Box<types::Timespec>,
+  waker: Option<Waker>,
+}
+
 /// A connection of one runtime: its slot, the slot's generation and the runtime's id. Every use
 /// checks the runtime, so a handle moved to another runtime fails instead of reaching that
 /// runtime's connection in the same slot.
@@ -1232,6 +1302,8 @@ struct Reactor {
   polling: Cell<usize>,
   // The task `run_ready` is polling
   current: Cell<Option<Rc<dyn RunTask>>>,
+  // `UringSleep`s, by slot
+  sleeps: RefCell<Vec<SleepSlot>>,
   ready: RefCell<VecDeque<usize>>,
   tasks: RefCell<Vec<TaskSlot>>,
   timers: RefCell<Timers>,
@@ -1352,6 +1424,7 @@ impl Reactor {
       params,
       polling: Cell::new(usize::MAX),
       current: Cell::new(None),
+      sleeps: RefCell::new(Vec::new()),
       ready: RefCell::new(VecDeque::new()),
       tasks: RefCell::new(Vec::new()),
       timers: RefCell::new(timers),
@@ -1361,6 +1434,89 @@ impl Reactor {
   /// This runtime's slot in `RUNTIMES`.
   fn slot(&self) -> usize {
     self.id as usize & (RUNTIME_SLOTS - 1)
+  }
+
+  // ---- sleeps
+
+  fn add_sleep(&self, duration: Duration, cx: &Context<'_>) -> (u32, u32) {
+    let mut sleeps = self.sleeps.borrow_mut();
+    let idx = match sleeps.iter().position(|el| el.state == SleepState::Free) {
+      Some(idx) => idx,
+      None => {
+        sleeps.push(SleepSlot {
+          generation: 0,
+          state: SleepState::Free,
+          ts: Box::new(types::Timespec::new()),
+          waker: None,
+        });
+        sleeps.len() - 1
+      }
+    };
+    let slot = &mut sleeps[idx];
+    slot.generation = slot.generation.wrapping_add(1) & 0x0FFF_FFFF;
+    slot.state = SleepState::Armed;
+    *slot.ts = types::Timespec::from(duration);
+    slot.waker = Some(cx.waker().clone());
+    let generation = slot.generation;
+    let sqe = opcode::Timeout::new(&raw const *slot.ts)
+      .build()
+      .user_data(user_data(KIND_SLEEP, generation, idx as u32));
+    drop(sleeps);
+    self.push_sqe(&sqe);
+    (idx as u32, generation)
+  }
+
+  fn poll_sleep(&self, idx: u32, generation: u32, cx: &Context<'_>) -> Poll<crate::Result<()>> {
+    let mut sleeps = self.sleeps.borrow_mut();
+    let Some(slot) = sleeps.get_mut(idx as usize).filter(|el| el.generation == generation) else {
+      return Poll::Ready(Ok(()));
+    };
+    if slot.state == SleepState::Armed {
+      set_waker(&mut slot.waker, cx);
+      return Poll::Pending;
+    }
+    Poll::Ready(Ok(()))
+  }
+
+  fn drop_sleep(&self, idx: u32, generation: u32) {
+    let mut sleeps = self.sleeps.borrow_mut();
+    let Some(slot) = sleeps.get_mut(idx as usize).filter(|el| el.generation == generation) else {
+      return;
+    };
+    slot.waker = None;
+    match slot.state {
+      SleepState::Armed => {
+        slot.state = SleepState::Dropped;
+        drop(sleeps);
+        let sqe = opcode::TimeoutRemove::new(user_data(KIND_SLEEP, generation, idx))
+          .build()
+          .flags(squeue::Flags::SKIP_SUCCESS)
+          .user_data(user_data(KIND_CANCEL, 0, 0));
+        self.push_sqe(&sqe);
+      }
+      SleepState::Fired => slot.state = SleepState::Free,
+      SleepState::Dropped | SleepState::Free => {}
+    }
+  }
+
+  /// A timeout completed, by firing or by being removed.
+  fn on_sleep(&self, idx: u32, generation: u32) {
+    let mut sleeps = self.sleeps.borrow_mut();
+    let Some(slot) = sleeps.get_mut(idx as usize).filter(|el| el.generation == generation) else {
+      return;
+    };
+    match slot.state {
+      SleepState::Armed => {
+        slot.state = SleepState::Fired;
+        let waker = slot.waker.take();
+        drop(sleeps);
+        if let Some(elem) = waker {
+          elem.wake();
+        }
+      }
+      SleepState::Dropped => slot.state = SleepState::Free,
+      SleepState::Fired | SleepState::Free => {}
+    }
   }
 
   // ---- messages from other threads
@@ -1576,6 +1732,7 @@ impl Reactor {
         KIND_ACCEPT_RETRY => self.on_accept_retry(idx as usize),
         KIND_TIMER => self.on_tick(),
         KIND_DOORBELL => self.on_doorbell(res),
+        KIND_SLEEP => self.on_sleep(idx, generation),
         _ => {}
       }
     }
@@ -3883,6 +4040,54 @@ mod tests {
       }
     });
     client.join().unwrap();
+  }
+
+  /// CPU time this thread has used.
+  fn thread_cpu() -> core::time::Duration {
+    // SAFETY: `usage` is a plain C struct the call fills
+    let usage = unsafe {
+      let mut usage = core::mem::zeroed::<libc::rusage>();
+      let _rslt = libc::getrusage(libc::RUSAGE_THREAD, &mut usage);
+      usage
+    };
+    let tv =
+      |el: libc::timeval| core::time::Duration::new(el.tv_sec as u64, (el.tv_usec * 1000) as u32);
+    tv(usage.ru_utime) + tv(usage.ru_stime)
+  }
+
+  // `Sleep` on a uring runtime is one of its timeouts: it waits its time without the busy poll
+  // the default `Sleep` falls back to (or tokio's, which panics outside a tokio runtime).
+  #[test]
+  fn sleep_waits_on_the_ring_without_spinning() {
+    let (elapsed, cpu) = UringRuntime::new().unwrap().block_on(async {
+      let (begin, cpu) = (std::time::Instant::now(), thread_cpu());
+      crate::futures::Sleep::new(core::time::Duration::from_millis(100)).unwrap().await.unwrap();
+      (begin.elapsed(), thread_cpu() - cpu)
+    });
+    assert!(elapsed >= core::time::Duration::from_millis(100), "{elapsed:?}");
+    assert!(elapsed < core::time::Duration::from_millis(400), "{elapsed:?}");
+    assert!(cpu < core::time::Duration::from_millis(20), "spent {cpu:?} of CPU sleeping");
+  }
+
+  // A sleep dropped before it fires is cancelled: nothing wakes for it later, and its slot is
+  // free once the kernel confirms.
+  #[test]
+  fn a_dropped_sleep_is_cancelled() {
+    let free = UringRuntime::new().unwrap().block_on(async {
+      let mut sleep = alloc::boxed::Box::pin(
+        crate::futures::Sleep::new(core::time::Duration::from_secs(30)).unwrap(),
+      );
+      assert!(crate::futures::PollOnce::new(sleep.as_mut()).await.is_none());
+      drop(sleep);
+      for _ in 0..8 {
+        yield_once().await;
+      }
+      super::with_reactor(|reactor| {
+        Ok(reactor.sleeps.borrow().iter().all(|el| el.state == super::SleepState::Free))
+      })
+      .unwrap()
+    });
+    assert!(free, "the dropped sleep's slot was not freed");
   }
 
   // Reading into an empty buffer would report the end of the stream: it fails instead, and the
