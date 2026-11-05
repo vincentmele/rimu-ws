@@ -54,6 +54,9 @@ const ACTIVE_RX: u8 = 1;
 const ACTIVE_TX: u8 = 2;
 // A free slot keeps a buffer up to this capacity for the next connection, and drops a larger one.
 const SLOT_BUFFER_KEEP: usize = 64 * 1024;
+// Free slots that keep their buffers however few connections are open; more stay warm while more
+// are open.
+const WARM_FREE_MIN: usize = 64;
 
 std::thread_local! {
   static CURRENT: Cell<*const Reactor> = const { Cell::new(core::ptr::null()) };
@@ -956,6 +959,8 @@ struct Reactor {
   tick_ts: types::Timespec,
   bufs: RefCell<BufRing>,
   cqes: RefCell<Vec<(u64, i32, u32)>>,
+  // How many slots at the bottom of `free_conns` hold no buffers
+  cold_free: Cell<usize>,
   conns: RefCell<Vec<Conn>>,
   // Slots of the direct descriptor table that connections, accept queues and armed accepts hold.
   // Accepting into a full table drops the connection, so accepts stop at `direct_files` and the
@@ -1067,6 +1072,7 @@ impl Reactor {
       tick_ts: types::Timespec::from(period),
       bufs: RefCell::new(bufs),
       cqes: RefCell::new(Vec::with_capacity(cq_entries as usize)),
+      cold_free: Cell::new(0),
       conns: RefCell::new(Vec::new()),
       direct_open: Cell::new(0),
       free_conns: RefCell::new(Vec::new()),
@@ -1465,12 +1471,15 @@ impl Reactor {
     let tick = self.timers.borrow().tick;
     let (idx, generation) = {
       let mut conns = self.conns.borrow_mut();
-      let idx = if let Some(idx) = self.free_conns.borrow_mut().pop() {
+      let mut free = self.free_conns.borrow_mut();
+      let idx = if let Some(idx) = free.pop() {
+        self.cold_free.set(self.cold_free.get().min(free.len()));
         idx
       } else {
         conns.push(Conn::default());
         (conns.len() - 1) as u32
       };
+      drop(free);
       let conn = &mut conns[idx as usize];
       conn.activity = 0;
       conn.cancel_sent = false;
@@ -1865,9 +1874,31 @@ impl Reactor {
       let _rslt = unsafe { libc::close(fd) };
     }
     self.free_conns.borrow_mut().push(idx);
+    self.trim_free_slots();
     if direct {
       self.release_direct();
     }
+  }
+
+  /// Strips the buffers of the free slots the next connections are unlikely to reuse soon: all but
+  /// as many as are open, and at least `WARM_FREE_MIN`. After a burst closes, memory then follows
+  /// the connections open rather than the most ever open. The free list is a stack, so the
+  /// stripped slots are a prefix at its bottom, which `cold_free` counts: each slot is stripped
+  /// at most once per time it is freed.
+  fn trim_free_slots(&self) {
+    let free = self.free_conns.borrow();
+    let mut conns = self.conns.borrow_mut();
+    let keep = conns.len().wrapping_sub(free.len()).max(WARM_FREE_MIN);
+    let mut cold = self.cold_free.get().min(free.len());
+    while free.len().wrapping_sub(cold) > keep {
+      if let Some(conn) = free.get(cold).and_then(|&idx| conns.get_mut(idx as usize)) {
+        conn.rx = Vec::new();
+        conn.tx_inflight = Vec::new();
+        conn.tx_pending = Vec::new();
+      }
+      cold = cold.wrapping_add(1);
+    }
+    self.cold_free.set(cold);
   }
 
   // ---- timeouts
@@ -3026,6 +3057,69 @@ mod tests {
     });
     client.join().unwrap();
     assert!(largest <= 64 * 1024, "a free slot holds a {largest}-byte buffer");
+  }
+
+  // After a burst of connections closes, at most `WARM_FREE_MIN` free slots keep buffers: the rest
+  // give them back, so memory follows the connections open, not the most ever open.
+  #[test]
+  fn a_closed_burst_leaves_few_slots_with_buffers() {
+    use crate::net::{StreamReader, StreamWriter};
+    const CONNS: usize = 200;
+    const LEN: usize = 8 * 1024;
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let client = std::thread::spawn(move || {
+      let mut streams: Vec<_> = (0..CONNS).map(|_| connect(&client_addr)).collect();
+      for stream in &mut streams {
+        Write::write_all(stream, &alloc::vec![7; LEN]).unwrap();
+      }
+      for stream in &mut streams {
+        let mut got = alloc::vec![0; LEN];
+        stream.read_exact(&mut got).unwrap();
+      }
+    });
+    let runtime = UringRuntime::new().unwrap();
+    let (warm, slots) = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let mut handles = Vec::new();
+      for _ in 0..CONNS {
+        let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+        let echo = async move {
+          let mut buf = alloc::vec![0; LEN];
+          let mut read = 0;
+          while read < LEN {
+            read += stream.read(buf[read..].as_mut().into()).await.unwrap().unwrap().get();
+          }
+          stream.write_all(&buf).await.unwrap();
+        };
+        handles.push(crate::executor::Executor::spawn_local(
+          &UringExecutor::default(),
+          echo,
+          &runtime_ref(),
+        ));
+      }
+      for handle in handles {
+        handle.await.unwrap();
+      }
+      while super::with_reactor(|reactor| Ok(reactor.conns.borrow().iter().any(|el| el.in_use)))
+        .unwrap()
+      {
+        yield_once().await;
+      }
+      super::with_reactor(|reactor| {
+        let conns = reactor.conns.borrow();
+        let warm = conns
+          .iter()
+          .filter(|el| el.rx.capacity() + el.tx_inflight.capacity() + el.tx_pending.capacity() > 0)
+          .count();
+        Ok((warm, conns.len()))
+      })
+      .unwrap()
+    });
+    client.join().unwrap();
+    assert_eq!(slots, CONNS);
+    assert!(warm <= super::WARM_FREE_MIN, "{warm} of {slots} free slots hold buffers");
+    assert!(warm > 0, "no free slot kept its buffers for the next connection");
   }
 
   // With two direct descriptors, the third and fourth connections wait in the backlog until one
