@@ -1,3 +1,20 @@
+# rimu-ws
+
+rimu-ws is a fork of [wtx](https://github.com/c410-f3r/wtx), by Caio Fernandes and the wtx
+contributors, taken at upstream commit `d22e17e0` (1 November 2026). It adds a thread-per-core
+io_uring executor, synchronous and queued WebSocket read/write paths, differential and soak testing,
+and handshake hardening. rimu-ws is not affiliated with or endorsed by the wtx project.
+
+Like wtx, rimu-ws is licensed under the [Mozilla Public License 2.0](LICENSE), except
+[`rimu-ws-soak`](rimu-ws-soak), which is licensed under [Apache-2.0](rimu-ws-soak/LICENSE). See
+[NOTICE](NOTICE) for the details.
+
+The rest of this README is upstream's and describes wtx. Its badges, benchmarks and links refer to
+the upstream project. Its description of wtx as human-written applies to upstream: this fork's
+changes were developed with AI assistance.
+
+---
+
 # WTX
 
 [![crates.io](https://img.shields.io/crates/v/wtx?color=blue)](https://crates.io/crates/wtx)

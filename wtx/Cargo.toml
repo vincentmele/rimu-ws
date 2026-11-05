@@ -184,12 +184,10 @@ _tracing-tree = ["tracing", "tracing-subscriber", "tracing-tree"]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(wtx_msan)'] }
 
 [package]
-authors = ["Caio Fernandes <c410.f3r@gmail.com>"]
+authors = ["Caio Fernandes <c410.f3r@gmail.com>", "Vincent Mele <vince@mele.law>"]
 categories = ["asynchronous", "database", "network-programming", "no-std", "web-programming"]
 description = "A collection of different transport implementations and related tools focused primarily on web technologies."
-documentation = "https://docs.rs/wtx"
 edition = "2024"
-homepage = "https://c410-f3r.github.io/wtx"
 keywords = ["api", "database", "http", "tls", "websocket"]
 license = "MPL-2.0"
 name = "rimu-ws"

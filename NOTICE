@@ -1,0 +1,33 @@
+rimu-ws
+=======
+
+rimu-ws is a fork of wtx, by Caio Fernandes and the wtx contributors.
+
+  Upstream:    https://github.com/c410-f3r/wtx
+  Fork point:  d22e17e0316f632e33eea62581d283ee6b6c2640 (1 November 2026)
+  Fork:        https://github.com/vincentmele/rimu-ws
+
+rimu-ws is not affiliated with or endorsed by the wtx project. "wtx" names the
+upstream project only; the crates in this repository are published as rimu-ws.
+
+Licensing
+---------
+
+Everything in this repository is licensed under the Mozilla Public License,
+version 2.0 (see LICENSE), except the rimu-ws-soak directory.
+
+  - The files inherited from wtx, with the changes made to them in this fork,
+    are Covered Software under MPL-2.0.
+  - The files added by this fork outside rimu-ws-soak are also licensed under
+    MPL-2.0.
+  - rimu-ws-soak/ is licensed under the Apache License, version 2.0 (see
+    rimu-ws-soak/LICENSE). It contains no wtx code and does not depend on
+    rimu-ws.
+
+The changes this fork made to the wtx files are recorded in the git history
+since the fork point (git log d22e17e0..HEAD). The wtx source is available
+from the upstream repository above, and the source of this fork from the fork
+repository.
+
+Copyright of the wtx code remains with its authors. Copyright of the changes
+and additions made in this fork is held by Vincent Mele.
