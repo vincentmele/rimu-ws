@@ -43,7 +43,7 @@ const KIND_ACCEPT: u64 = 3;
 const KIND_CANCEL: u64 = 4;
 const KIND_TIMER: u64 = 5;
 const KIND_ACCEPT_RETRY: u64 = 6;
-const MAIN_TASK: usize = usize::MAX;
+const KIND_DOORBELL: u64 = 7;
 // One-shot accepts kept armed per listener with direct descriptors close to running out
 const ACCEPT_DEPTH: u32 = 16;
 // The `generation` of a one-shot accept's `user_data`; a multishot accept's is 0.
@@ -110,7 +110,10 @@ impl UringRuntime {
   /// A runtime with the given settings.
   #[inline]
   pub fn with_params(params: UringParams) -> crate::Result<Self> {
-    Ok(Self { reactor: Box::new(Reactor::new(params)?) })
+    let reactor = Box::new(Reactor::new(params)?);
+    // Once boxed: the read points into the reactor
+    reactor.arm_doorbell();
+    Ok(Self { reactor })
   }
 }
 
@@ -278,7 +281,7 @@ impl Default for UringParams {
 impl Runtime for UringRuntime {
   #[inline]
   fn new() -> crate::Result<Self> {
-    Ok(Self { reactor: Box::new(Reactor::new(UringParams::new())?) })
+    Self::with_params(UringParams::new())
   }
 
   #[inline]
@@ -290,7 +293,7 @@ impl Runtime for UringRuntime {
     let prev = CURRENT.with(|el| el.replace(reactor));
     let _guard = RestoreCurrent(prev);
     let mut future = pin!(future);
-    let main_waker = waker(MAIN_TASK);
+    let main_waker = waker(waker_data(reactor.slot(), 0, MAIN_TASK));
     reactor.main_woken.set(true);
     loop {
       if reactor.main_woken.replace(false)
@@ -422,17 +425,16 @@ pub struct UringTcpListener {
   idx: usize,
   // Accepted sockets inherit it from the listening one.
   nodelay: bool,
+  runtime: u32,
 }
 
 impl Drop for UringTcpListener {
   #[inline]
   fn drop(&mut self) {
-    let reactor = CURRENT.with(Cell::get);
-    if reactor.is_null() {
-      return;
+    match own_reactor(self.runtime) {
+      Some(reactor) => reactor.drop_listener(self.idx),
+      None => send_to_runtime(self.runtime, Message::DropListener(self.idx)),
     }
-    // SAFETY: set by `block_on`, which outlives everything it polls
-    unsafe { &*reactor }.drop_listener(self.idx);
   }
 }
 
@@ -446,8 +448,8 @@ impl TcpListener for UringTcpListener {
   {
     let listener = tcp_listener_std(addr, &UringExecutor::default(), tcp_params).await?;
     let fd = listener.into_raw_fd();
-    let idx = with_reactor(|reactor| reactor.add_listener(fd))?;
-    Ok(Self { idx, nodelay: tcp_params.tcp_nodelay() })
+    let (idx, runtime) = with_reactor(|reactor| Ok((reactor.add_listener(fd)?, reactor.id)))?;
+    Ok(Self { idx, nodelay: tcp_params.tcp_nodelay(), runtime })
   }
 
   /// A connection its peer already reset or closed is closed and skipped, as are the ones whose
@@ -455,7 +457,9 @@ impl TcpListener for UringTcpListener {
   #[inline]
   async fn accept(&self, tcp_params: TcpParams) -> crate::Result<(Self::TcpStream, SocketAddr)> {
     loop {
-      let fd = poll_fn(|cx| poll_reactor(|reactor| reactor.poll_accept(self.idx, cx))).await?;
+      let runtime = self.runtime;
+      let fd = poll_fn(|cx| poll_own_reactor(runtime, |reactor| reactor.poll_accept(self.idx, cx)))
+        .await?;
       let params = with_reactor(|reactor| Ok(reactor.params))?;
       let direct = params.direct_files > 0;
       let setup = (|| {
@@ -470,8 +474,8 @@ impl TcpListener for UringTcpListener {
       })();
       match setup {
         Ok(peer_addr) => {
-          let (idx, generation) = with_reactor(|reactor| reactor.add_conn(fd, 1, direct, true))?;
-          return Ok((UringTcpStream { generation, idx }, peer_addr));
+          let conn = with_reactor(|reactor| reactor.add_conn(fd, 1, direct, true))?;
+          return Ok((UringTcpStream { conn }, peer_addr));
         }
         Err(err) => {
           with_reactor(|reactor| {
@@ -492,14 +496,13 @@ impl TcpListener for UringTcpListener {
 /// A connected socket. See the [module documentation](self).
 #[derive(Debug)]
 pub struct UringTcpStream {
-  generation: u32,
-  idx: u32,
+  conn: ConnRef,
 }
 
 impl Drop for UringTcpStream {
   #[inline]
   fn drop(&mut self) {
-    drop_conn_ref(self.idx, self.generation);
+    drop_conn_ref(self.conn);
   }
 }
 
@@ -512,10 +515,10 @@ impl Stream for UringTcpStream {
   fn into_split(
     self,
   ) -> crate::Result<(Self::BridgeOwned, Self::ReadHalfOwned, Self::WriteHalfOwned)> {
-    let (generation, idx) = (self.generation, self.idx);
+    let conn = self.conn;
     core::mem::forget(self);
-    with_reactor(|reactor| reactor.add_conn_ref(idx, generation))?;
-    Ok(((), UringReadHalf { generation, idx }, UringWriteHalf { generation, idx }))
+    with_own_reactor(conn.runtime, |reactor| reactor.add_conn_ref(conn.idx, conn.generation))?;
+    Ok(((), UringReadHalf { conn }, UringWriteHalf { conn }))
   }
 }
 
@@ -524,34 +527,34 @@ impl StreamCommon for UringTcpStream {}
 impl StreamReader for UringTcpStream {
   #[inline]
   async fn read(&mut self, bytes: MaybeUninitSlice<'_, u8>) -> crate::Result<Option<NonZeroUsize>> {
-    read(self.idx, self.generation, bytes).await
+    read(self.conn, bytes).await
   }
 
   #[inline]
-  fn try_read(&mut self, mut bytes: MaybeUninitSlice<'_, u8>) -> crate::Result<TryRead> {
-    with_reactor(|reactor| reactor.try_read(self.idx, self.generation, &mut bytes))
+  fn try_read(&mut self, bytes: MaybeUninitSlice<'_, u8>) -> crate::Result<TryRead> {
+    try_read(self.conn, bytes)
   }
 
   #[inline]
   fn readable(&mut self) -> impl Future<Output = crate::Result<()>> {
-    readable(self.idx, self.generation)
+    readable(self.conn)
   }
 }
 
 impl StreamWriter for UringTcpStream {
   #[inline]
   async fn write_all(&mut self, bytes: &[u8]) -> crate::Result<()> {
-    write_all_vectored(self.idx, self.generation, &[bytes]).await
+    write_all_vectored(self.conn, &[bytes]).await
   }
 
   #[inline]
   async fn write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<()> {
-    write_all_vectored(self.idx, self.generation, bytes).await
+    write_all_vectored(self.conn, bytes).await
   }
 
   #[inline]
   fn try_write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<bool> {
-    try_write_all_vectored(self.idx, self.generation, bytes)
+    try_write_all_vectored(self.conn, bytes)
   }
 }
 
@@ -570,13 +573,15 @@ impl TcpStream for UringTcpStream {
     .await?;
     stream.set_nodelay(tcp_params.tcp_nodelay())?;
     let fd = stream.into_raw_fd();
-    let (idx, generation) = with_reactor(|reactor| reactor.add_conn(fd, 1, false, false))?;
-    Ok(Self { generation, idx })
+    let conn = with_reactor(|reactor| reactor.add_conn(fd, 1, false, false))?;
+    Ok(Self { conn })
   }
 
   #[inline]
   fn peer_addr(&self) -> crate::Result<SocketAddr> {
-    let (fd, direct) = with_reactor(|reactor| reactor.conn_fd(self.idx, self.generation))?;
+    let conn = self.conn;
+    let (fd, direct) =
+      with_own_reactor(conn.runtime, |reactor| reactor.conn_fd(conn.idx, conn.generation))?;
     if direct {
       return Err(io_err(libc::EOPNOTSUPP));
     }
@@ -587,14 +592,13 @@ impl TcpStream for UringTcpStream {
 /// Reading part of a split [`UringTcpStream`].
 #[derive(Debug)]
 pub struct UringReadHalf {
-  generation: u32,
-  idx: u32,
+  conn: ConnRef,
 }
 
 impl Drop for UringReadHalf {
   #[inline]
   fn drop(&mut self) {
-    drop_conn_ref(self.idx, self.generation);
+    drop_conn_ref(self.conn);
   }
 }
 
@@ -603,31 +607,30 @@ impl StreamCommon for UringReadHalf {}
 impl StreamReader for UringReadHalf {
   #[inline]
   async fn read(&mut self, bytes: MaybeUninitSlice<'_, u8>) -> crate::Result<Option<NonZeroUsize>> {
-    read(self.idx, self.generation, bytes).await
+    read(self.conn, bytes).await
   }
 
   #[inline]
-  fn try_read(&mut self, mut bytes: MaybeUninitSlice<'_, u8>) -> crate::Result<TryRead> {
-    with_reactor(|reactor| reactor.try_read(self.idx, self.generation, &mut bytes))
+  fn try_read(&mut self, bytes: MaybeUninitSlice<'_, u8>) -> crate::Result<TryRead> {
+    try_read(self.conn, bytes)
   }
 
   #[inline]
   fn readable(&mut self) -> impl Future<Output = crate::Result<()>> {
-    readable(self.idx, self.generation)
+    readable(self.conn)
   }
 }
 
 /// Writing part of a split [`UringTcpStream`].
 #[derive(Debug)]
 pub struct UringWriteHalf {
-  generation: u32,
-  idx: u32,
+  conn: ConnRef,
 }
 
 impl Drop for UringWriteHalf {
   #[inline]
   fn drop(&mut self) {
-    drop_conn_ref(self.idx, self.generation);
+    drop_conn_ref(self.conn);
   }
 }
 
@@ -636,49 +639,94 @@ impl StreamCommon for UringWriteHalf {}
 impl StreamWriter for UringWriteHalf {
   #[inline]
   async fn write_all(&mut self, bytes: &[u8]) -> crate::Result<()> {
-    write_all_vectored(self.idx, self.generation, &[bytes]).await
+    write_all_vectored(self.conn, &[bytes]).await
   }
 
   #[inline]
   async fn write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<()> {
-    write_all_vectored(self.idx, self.generation, bytes).await
+    write_all_vectored(self.conn, bytes).await
   }
 
   #[inline]
   fn try_write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<bool> {
-    try_write_all_vectored(self.idx, self.generation, bytes)
+    try_write_all_vectored(self.conn, bytes)
   }
+}
+
+/// A connection of one runtime: its slot, the slot's generation and the runtime's id. Every use
+/// checks the runtime, so a handle moved to another runtime fails instead of reaching that
+/// runtime's connection in the same slot.
+#[derive(Clone, Copy, Debug)]
+struct ConnRef {
+  generation: u32,
+  idx: u32,
+  runtime: u32,
 }
 
 async fn read(
-  idx: u32,
-  generation: u32,
+  conn: ConnRef,
   mut bytes: MaybeUninitSlice<'_, u8>,
 ) -> crate::Result<Option<NonZeroUsize>> {
-  poll_fn(|cx| poll_reactor(|reactor| reactor.poll_read(idx, generation, &mut bytes, cx))).await
+  poll_fn(|cx| {
+    poll_own_reactor(conn.runtime, |reactor| {
+      reactor.poll_read(conn.idx, conn.generation, &mut bytes, cx)
+    })
+  })
+  .await
 }
 
-// A plain `fn`: the future holds the two ids and nothing else.
-fn readable(idx: u32, generation: u32) -> impl Future<Output = crate::Result<()>> {
-  poll_fn(move |cx| poll_reactor(|reactor| reactor.poll_readable(idx, generation, cx)))
+fn try_read(conn: ConnRef, mut bytes: MaybeUninitSlice<'_, u8>) -> crate::Result<TryRead> {
+  with_own_reactor(conn.runtime, |reactor| reactor.try_read(conn.idx, conn.generation, &mut bytes))
 }
 
-async fn write_all_vectored(idx: u32, generation: u32, bytes: &[&[u8]]) -> crate::Result<()> {
-  with_reactor(|reactor| reactor.queue_send(idx, generation, bytes))?;
-  poll_fn(|cx| poll_reactor(|reactor| reactor.poll_send_room(idx, generation, cx))).await
+// A plain `fn`: the future holds the ids and nothing else.
+fn readable(conn: ConnRef) -> impl Future<Output = crate::Result<()>> {
+  poll_fn(move |cx| {
+    poll_own_reactor(conn.runtime, |reactor| reactor.poll_readable(conn.idx, conn.generation, cx))
+  })
 }
 
-fn try_write_all_vectored(idx: u32, generation: u32, bytes: &[&[u8]]) -> crate::Result<bool> {
-  with_reactor(|reactor| reactor.try_queue_send(idx, generation, bytes))
+async fn write_all_vectored(conn: ConnRef, bytes: &[&[u8]]) -> crate::Result<()> {
+  with_own_reactor(conn.runtime, |reactor| reactor.queue_send(conn.idx, conn.generation, bytes))?;
+  poll_fn(|cx| {
+    poll_own_reactor(conn.runtime, |reactor| reactor.poll_send_room(conn.idx, conn.generation, cx))
+  })
+  .await
 }
 
-fn drop_conn_ref(idx: u32, generation: u32) {
-  let reactor = CURRENT.with(Cell::get);
-  if reactor.is_null() {
-    return;
+fn try_write_all_vectored(conn: ConnRef, bytes: &[&[u8]]) -> crate::Result<bool> {
+  with_own_reactor(conn.runtime, |reactor| reactor.try_queue_send(conn.idx, conn.generation, bytes))
+}
+
+/// Drops a handle's reference on its own runtime, or, from anywhere else, asks that runtime to.
+fn drop_conn_ref(conn: ConnRef) {
+  match own_reactor(conn.runtime) {
+    Some(reactor) => reactor.drop_conn_ref(conn.idx, conn.generation),
+    None => send_to_runtime(conn.runtime, Message::DropConn(conn.idx, conn.generation)),
   }
+}
+
+/// The runtime running on this thread, if it is the one with this id.
+fn own_reactor<'any>(runtime: u32) -> Option<&'any Reactor> {
+  let reactor = CURRENT.with(Cell::get);
   // SAFETY: set by `block_on`, which outlives everything it polls
-  unsafe { &*reactor }.drop_conn_ref(idx, generation);
+  unsafe { reactor.as_ref() }.filter(|el| el.id == runtime)
+}
+
+fn with_own_reactor<T>(
+  runtime: u32,
+  cb: impl FnOnce(&Reactor) -> crate::Result<T>,
+) -> crate::Result<T> {
+  with_reactor(|reactor| if reactor.id == runtime { cb(reactor) } else { Err(io_err(libc::EBADF)) })
+}
+
+fn poll_own_reactor<T>(
+  runtime: u32,
+  cb: impl FnOnce(&Reactor) -> Poll<crate::Result<T>>,
+) -> Poll<crate::Result<T>> {
+  poll_reactor(|reactor| {
+    if reactor.id == runtime { cb(reactor) } else { Poll::Ready(Err(io_err(libc::EBADF))) }
+  })
 }
 
 fn spawn_on_current<F>(future: F) -> UringJoinHandle<F::Output>
@@ -761,7 +809,24 @@ const fn split_user_data(user_data: u64) -> (u64, u32, u32) {
   ((user_data >> 60), ((user_data >> 32) & 0x0FFF_FFFF) as u32, user_data as u32)
 }
 
-// ---- wakers: the data is a task index and generation, or `MAIN_TASK`
+// ---- wakers
+//
+// A waker's data is plain bits, so cloning and dropping one costs nothing: the runtime's slot in
+// `RUNTIMES` (12 bits), the task's generation (24 bits) and its index (28 bits; `MAIN_TASK` for
+// the future `block_on` runs). Woken on the thread of its runtime, a waker schedules its task
+// directly. Woken anywhere else, it queues the wake in that runtime's inbox and rings the
+// runtime's eventfd.
+
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("UringExecutor packs runtime, generation and task index into a 64-bit waker");
+
+const IDX_BITS: u32 = 28;
+const GEN_BITS: u32 = 24;
+const IDX_MASK: usize = (1 << IDX_BITS) - 1;
+const GEN_MASK: u32 = (1 << GEN_BITS) - 1;
+const MAIN_TASK: usize = IDX_MASK;
+// At most this many runtimes at once, one slot each
+const RUNTIME_SLOTS: usize = 4096;
 
 static VTABLE: RawWakerVTable =
   RawWakerVTable::new(waker_clone, waker_wake, waker_wake, waker_drop);
@@ -771,20 +836,149 @@ fn waker(data: usize) -> Waker {
   unsafe { Waker::from_raw(RawWaker::new(data as *const (), &VTABLE)) }
 }
 
+const fn waker_data(slot: usize, generation: u32, idx: usize) -> usize {
+  (slot << (IDX_BITS + GEN_BITS)) | (((generation & GEN_MASK) as usize) << IDX_BITS) | idx
+}
+
+const fn split_waker_data(data: usize) -> (usize, u32, usize) {
+  (data >> (IDX_BITS + GEN_BITS), ((data >> IDX_BITS) as u32) & GEN_MASK, data & IDX_MASK)
+}
+
 fn waker_clone(data: *const ()) -> RawWaker {
   RawWaker::new(data, &VTABLE)
 }
 
 fn waker_wake(data: *const ()) {
+  let data = data as usize;
   let reactor = CURRENT.with(Cell::get);
-  if reactor.is_null() {
+  // SAFETY: set by `block_on`, which outlives everything it polls
+  if let Some(reactor) = unsafe { reactor.as_ref() }
+    && reactor.slot() == split_waker_data(data).0
+  {
+    reactor.schedule(data);
     return;
   }
-  // SAFETY: set by `block_on`, which outlives everything it polls
-  unsafe { &*reactor }.schedule(data as usize);
+  wake_remote(data);
 }
 
 fn waker_drop(_: *const ()) {}
+
+// ---- runtimes reached from other threads
+
+/// What another thread asks a runtime to do.
+enum Message {
+  DropConn(u32, u32),
+  DropListener(usize),
+  Wake(usize),
+}
+
+/// A runtime's queue of messages from other threads, and the eventfd that tells it there are
+/// some.
+struct Inbox {
+  eventfd: RawFd,
+  messages: std::sync::Mutex<Vec<Message>>,
+}
+
+impl Inbox {
+  fn push(&self, message: Message) {
+    let was_empty = {
+      let mut messages = self.messages.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+      let was_empty = messages.is_empty();
+      messages.push(message);
+      was_empty
+    };
+    // The runtime drains the whole queue on each ring, so only the first message rings.
+    if was_empty {
+      let one: u64 = 1;
+      // SAFETY: `one` outlives the call and its size is passed; the eventfd lives as long as
+      // `self`
+      let _rslt = unsafe { libc::write(self.eventfd, (&raw const one).cast(), 8) };
+    }
+  }
+
+  fn take(&self) -> Vec<Message> {
+    core::mem::take(&mut *self.messages.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+  }
+}
+
+impl Drop for Inbox {
+  fn drop(&mut self) {
+    // SAFETY: closed once, here, when the last reference to the inbox goes
+    let _rslt = unsafe { libc::close(self.eventfd) };
+  }
+}
+
+/// A slot of `RUNTIMES`: the inbox of the runtime in it, and how many runtimes it has had, which
+/// makes runtime ids unique over time.
+#[derive(Default)]
+struct RuntimeSlot {
+  epoch: u32,
+  inbox: Option<crate::sync::Arc<Inbox>>,
+}
+
+static RUNTIMES: std::sync::Mutex<Vec<RuntimeSlot>> = std::sync::Mutex::new(Vec::new());
+
+fn runtimes() -> std::sync::MutexGuard<'static, Vec<RuntimeSlot>> {
+  RUNTIMES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A slot for a new runtime: its id (the slot in the low 12 bits, the slot's epoch above) and its
+/// inbox.
+fn register_runtime() -> crate::Result<(u32, crate::sync::Arc<Inbox>)> {
+  // SAFETY: plain syscall
+  let eventfd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+  if eventfd < 0 {
+    return Err(std::io::Error::last_os_error().into());
+  }
+  let inbox = crate::sync::Arc::new(Inbox { eventfd, messages: std::sync::Mutex::new(Vec::new()) });
+  let mut slots = runtimes();
+  let idx = if let Some(idx) = slots.iter().position(|el| el.inbox.is_none()) {
+    idx
+  } else if slots.len() < RUNTIME_SLOTS {
+    slots.push(RuntimeSlot::default());
+    slots.len() - 1
+  } else {
+    return Err(io_err(libc::EMFILE));
+  };
+  let slot = &mut slots[idx];
+  slot.epoch = slot.epoch.wrapping_add(1) & 0x000F_FFFF;
+  slot.inbox = Some(inbox.clone());
+  Ok(((slot.epoch << 12) | idx as u32, inbox))
+}
+
+fn unregister_runtime(id: u32) {
+  if let Some(slot) = runtimes().get_mut(id as usize & (RUNTIME_SLOTS - 1)) {
+    slot.inbox = None;
+  }
+}
+
+/// The inbox of the runtime in `slot`, if `epoch` is `None` or still that runtime's.
+fn inbox_of(slot: usize, epoch: Option<u32>) -> Option<crate::sync::Arc<Inbox>> {
+  let slots = runtimes();
+  let elem = slots.get(slot)?;
+  if epoch.is_some_and(|el| el != elem.epoch) {
+    return None;
+  }
+  elem.inbox.clone()
+}
+
+/// A wake from outside its runtime's thread. A runtime that is gone has nothing left to wake;
+/// a wake that reaches a newer runtime in the same slot can only be spurious, which futures
+/// allow, as the task index and generation must match.
+#[cold]
+fn wake_remote(data: usize) {
+  if let Some(inbox) = inbox_of(split_waker_data(data).0, None) {
+    inbox.push(Message::Wake(data));
+  }
+}
+
+/// A message for the runtime with this exact id; dropped if that runtime is gone.
+#[cold]
+fn send_to_runtime(runtime: u32, message: Message) {
+  if let Some(inbox) = inbox_of(runtime as usize & (RUNTIME_SLOTS - 1), Some(runtime >> 12)) {
+    inbox.push(message);
+  }
+}
 
 // ---- the reactor
 
@@ -992,6 +1186,11 @@ struct Reactor {
   // First, so that it is dropped first: the kernel may still use the buffers below until the ring
   // is closed.
   ring: RefCell<IoUring>,
+  // Unique among the runtimes alive or ever made: see `register_runtime`
+  id: u32,
+  inbox: crate::sync::Arc<Inbox>,
+  // Where the doorbell read puts the eventfd's count
+  doorbell: core::cell::UnsafeCell<u64>,
   #[cfg(test)]
   accept_arms: Cell<usize>,
   // Accepted sockets closed because setting them up failed
@@ -1023,6 +1222,9 @@ struct Reactor {
 
 impl Drop for Reactor {
   fn drop(&mut self) {
+    // Wakes and drops from other threads now find nothing to reach. The eventfd closes with the
+    // last reference to the inbox.
+    unregister_runtime(self.id);
     // Handles that outlive the runtime can no longer reach it to close themselves. Direct
     // descriptors go with the ring.
     for conn in self.conns.get_mut().iter().filter(|el| el.in_use && !el.direct) {
@@ -1109,8 +1311,12 @@ impl Reactor {
       lingering: Vec::new(),
       tick: 0,
     };
+    let (id, inbox) = register_runtime()?;
     Ok(Self {
       ring: RefCell::new(ring),
+      id,
+      inbox,
+      doorbell: core::cell::UnsafeCell::new(0),
       #[cfg(test)]
       accept_arms: Cell::new(0),
       #[cfg(test)]
@@ -1134,6 +1340,34 @@ impl Reactor {
     })
   }
 
+  /// This runtime's slot in `RUNTIMES`.
+  fn slot(&self) -> usize {
+    self.id as usize & (RUNTIME_SLOTS - 1)
+  }
+
+  // ---- messages from other threads
+
+  fn arm_doorbell(&self) {
+    let sqe = opcode::Read::new(types::Fd(self.inbox.eventfd), self.doorbell.get().cast(), 8)
+      .build()
+      .user_data(user_data(KIND_DOORBELL, 0, 0));
+    self.push_sqe(&sqe);
+  }
+
+  /// The eventfd rang: runs what other threads asked for, then listens again.
+  fn on_doorbell(&self, res: i32) {
+    for message in self.inbox.take() {
+      match message {
+        Message::DropConn(idx, generation) => self.drop_conn_ref(idx, generation),
+        Message::DropListener(idx) => self.drop_listener(idx),
+        Message::Wake(data) => self.schedule(data),
+      }
+    }
+    if res != -libc::ECANCELED {
+      self.arm_doorbell();
+    }
+  }
+
   // ---- tasks
 
   fn spawn(&self, future: Rc<dyn RunTask>) {
@@ -1151,16 +1385,16 @@ impl Reactor {
   }
 
   fn schedule(&self, data: usize) {
-    if data == MAIN_TASK {
+    let (_, generation, idx) = split_waker_data(data);
+    if idx == MAIN_TASK {
       self.main_woken.set(true);
       return;
     }
-    let (idx, generation) = (data as u32, (data >> 32) as u32);
     let mut tasks = self.tasks.borrow_mut();
     // A task being polled has its future taken out of the slot, and can still wake itself.
-    if let Some(slot) = tasks.get_mut(idx as usize)
-      && slot.generation == generation
-      && (slot.future.is_some() || self.polling.get() == idx as usize)
+    if let Some(slot) = tasks.get_mut(idx)
+      && slot.generation & GEN_MASK == generation
+      && (slot.future.is_some() || self.polling.get() == idx)
       && !slot.scheduled
     {
       slot.scheduled = true;
@@ -1183,7 +1417,7 @@ impl Reactor {
       let Some(future) = future else {
         continue;
       };
-      let waker = waker(((generation as usize) << 32) | idx);
+      let waker = waker(waker_data(self.slot(), generation, idx));
       self.polling.set(idx);
       let poll = future.poll_task(&mut Context::from_waker(&waker));
       self.polling.set(usize::MAX);
@@ -1291,6 +1525,7 @@ impl Reactor {
         KIND_ACCEPT => self.on_accept(idx as usize, generation == ONE_SHOT, res, flags),
         KIND_ACCEPT_RETRY => self.on_accept_retry(idx as usize),
         KIND_TIMER => self.on_tick(),
+        KIND_DOORBELL => self.on_doorbell(res),
         _ => {}
       }
     }
@@ -1508,13 +1743,7 @@ impl Reactor {
 
   // ---- connections
 
-  fn add_conn(
-    &self,
-    fd: RawFd,
-    refs: u8,
-    direct: bool,
-    accepted: bool,
-  ) -> crate::Result<(u32, u32)> {
+  fn add_conn(&self, fd: RawFd, refs: u8, direct: bool, accepted: bool) -> crate::Result<ConnRef> {
     let tick = self.timers.borrow().tick;
     let (idx, generation) = {
       let mut conns = self.conns.borrow_mut();
@@ -1564,7 +1793,7 @@ impl Reactor {
     if watch {
       self.arm_timer();
     }
-    Ok((idx, generation))
+    Ok(ConnRef { generation, idx, runtime: self.id })
   }
 
   fn add_conn_ref(&self, idx: u32, generation: u32) -> crate::Result<()> {
@@ -3436,6 +3665,174 @@ mod tests {
     let params = crate::executor::UringParams::new();
     assert_eq!(params.handshake_timeout, Some(core::time::Duration::from_secs(10)));
     assert_eq!(params.idle_timeout, Some(core::time::Duration::from_secs(300)));
+  }
+
+  /// Pending until `flag` is set, with its waker handed to `slot` for another thread to wake.
+  async fn woken_by_another_thread(
+    flag: std::sync::Arc<core::sync::atomic::AtomicBool>,
+    slot: std::sync::Arc<std::sync::Mutex<Option<core::task::Waker>>>,
+  ) {
+    poll_fn(|cx| {
+      if flag.load(core::sync::atomic::Ordering::Acquire) {
+        return Poll::Ready(());
+      }
+      *slot.lock().unwrap() = Some(cx.waker().clone());
+      Poll::Pending
+    })
+    .await;
+  }
+
+  /// Sets `flag` and wakes the waker in `slot` from a new thread, once one is there.
+  fn wake_from_another_thread(
+    flag: std::sync::Arc<core::sync::atomic::AtomicBool>,
+    slot: std::sync::Arc<std::sync::Mutex<Option<core::task::Waker>>>,
+  ) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+      let waker = loop {
+        if let Some(elem) = slot.lock().unwrap().take() {
+          break elem;
+        }
+        std::thread::sleep(core::time::Duration::from_millis(5));
+      };
+      std::thread::sleep(core::time::Duration::from_millis(20));
+      flag.store(true, core::sync::atomic::Ordering::Release);
+      waker.wake();
+    })
+  }
+
+  /// Runs `cb` on a new thread and fails if it hasn't finished within 5 s.
+  fn within_5s<T: Send + 'static>(cb: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _thread = std::thread::spawn(move || {
+      let _rslt = tx.send(cb());
+    });
+    rx.recv_timeout(core::time::Duration::from_secs(5)).expect("did not finish within 5 s")
+  }
+
+  // A waker is `Send`: a task woken from another thread is polled again. The wake used to be
+  // dropped, as no runtime runs on the waking thread.
+  #[test]
+  fn a_task_woken_from_another_thread_is_polled() {
+    let out = within_5s(|| {
+      let flag = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+      let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+      let waking = wake_from_another_thread(flag.clone(), slot.clone());
+      let out = UringRuntime::new().unwrap().block_on(async {
+        let task = async move {
+          woken_by_another_thread(flag, slot).await;
+          9u8
+        };
+        crate::executor::Executor::spawn_local(
+          &UringExecutor::default(),
+          task,
+          &UringRuntime::new().unwrap(),
+        )
+        .await
+        .unwrap()
+      });
+      waking.join().unwrap();
+      out
+    });
+    assert_eq!(out, 9);
+  }
+
+  // The same for the future `block_on` runs.
+  #[test]
+  fn a_main_future_woken_from_another_thread_completes() {
+    within_5s(|| {
+      let flag = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+      let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+      let waking = wake_from_another_thread(flag.clone(), slot.clone());
+      UringRuntime::new().unwrap().block_on(woken_by_another_thread(flag, slot));
+      waking.join().unwrap();
+    });
+  }
+
+  // A stream belongs to the runtime that made it. Used on another runtime it fails with EBADF:
+  // its slot index and generation used to be looked up in that runtime's table, so it read
+  // another client's bytes. Dropped there, it doesn't touch that runtime's connections, and its
+  // own runtime closes it when it next runs.
+  #[test]
+  fn a_stream_used_on_another_runtime_is_refused() {
+    use crate::net::StreamReader;
+    let (addr_a, addr_b) = (test_addr(), test_addr());
+    let clients = {
+      let (addr_a, addr_b) = (addr_a.clone(), addr_b.clone());
+      std::thread::spawn(move || {
+        let mut a = connect(&addr_a);
+        a.write_all(b"A").unwrap();
+        let mut b = connect(&addr_b);
+        b.write_all(b"B").unwrap();
+        let mut rest = Vec::new();
+        let _rslt = a.read_to_end(&mut rest);
+        let _rslt = b.read_to_end(&mut rest);
+      })
+    };
+    let runtime_a = UringRuntime::new().unwrap();
+    let (listener_a, mut stream_a) = runtime_a.block_on(async {
+      let listener = bind(&addr_a).await;
+      let stream = listener.accept(TcpParams::default()).await.unwrap().0;
+      (listener, stream)
+    });
+    let runtime_b = UringRuntime::new().unwrap();
+    let (wrong, right) = runtime_b.block_on(async {
+      let listener = bind(&addr_b).await;
+      let (mut stream_b, _) = listener.accept(TcpParams::default()).await.unwrap();
+      let mut buf = [0; 4];
+      let wrong = stream_a
+        .read(buf.as_mut_slice().into())
+        .await
+        .map(|el| el.map(|len| buf[..len.get()].to_vec()));
+      drop(stream_a);
+      let len = stream_b.read(buf.as_mut_slice().into()).await.unwrap().unwrap();
+      (wrong.map_err(|err| os_error(&err)), buf[..len.get()].to_vec())
+    });
+    assert_eq!(wrong, Err(Some(libc::EBADF)));
+    assert_eq!(right, b"B");
+    let open = runtime_a.block_on(async {
+      for _ in 0..16 {
+        yield_once().await;
+      }
+      drop(listener_a);
+      super::with_reactor(|reactor| {
+        Ok(reactor.conns.borrow().iter().filter(|el| el.in_use).count())
+      })
+      .unwrap()
+    });
+    assert_eq!(open, 0, "the stream dropped on the other runtime was not closed by its own");
+    drop(runtime_b);
+    drop(runtime_a);
+    clients.join().unwrap();
+  }
+
+  // A stream dropped on a thread with no runtime is closed by its own runtime when that next
+  // runs, instead of holding its slot and socket forever.
+  #[test]
+  fn a_stream_dropped_on_another_thread_is_closed() {
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let client = std::thread::spawn(move || {
+      let mut stream = connect(&client_addr);
+      stream.set_read_timeout(Some(core::time::Duration::from_secs(5))).unwrap();
+      let mut rest = Vec::new();
+      stream.read_to_end(&mut rest).unwrap();
+    });
+    let runtime = UringRuntime::new().unwrap();
+    let stream = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      listener.accept(TcpParams::default()).await.unwrap().0
+    });
+    std::thread::spawn(move || drop(stream)).join().unwrap();
+    runtime.block_on(async {
+      let begin = std::time::Instant::now();
+      while super::with_reactor(|reactor| Ok(reactor.conns.borrow().iter().any(|el| el.in_use)))
+        .unwrap()
+      {
+        assert!(begin.elapsed() < core::time::Duration::from_secs(2), "never closed");
+        yield_once().await;
+      }
+    });
+    client.join().unwrap();
   }
 
   // Reading into an empty buffer would report the end of the stream: it fails instead, and the
