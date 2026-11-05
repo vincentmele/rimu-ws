@@ -76,7 +76,7 @@ Anti-goals (a failure even if the numbers win):
 
 ## 4. Constraints
 
-- Licence: the fork is MPL-2.0; new files carry the fork's MPL-2.0 header (see `NOTICE`).
+- Licence: the fork is MPL-2.0 (see `NOTICE`; no per-file headers).
 - Upstream merges get harder: the user accepted that by choosing an in-place rewrite. Keep HPACK,
   Huffman and frame types where they are, so merges in those files stay easy.
 - Toolchain: nightly, as the crate is today. Tests without the `tokio` feature (upstream's tokio tests
