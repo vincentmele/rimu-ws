@@ -1,7 +1,7 @@
 use crate::{
   executor::{Executor, Runtime as _},
   futures::Sleep,
-  http::{Router, ShutdownSignal},
+  http::{Router, ShutdownSignal, misc::on_accept_error},
   net::{StreamReader, StreamWriter, TcpListener as _, TcpParams, Uri},
   rng::{CryptoRng, CryptoSeedableRng},
   sync::{Arc, AtomicUsize},
@@ -668,33 +668,6 @@ async fn drain_connections(active: &AtomicUsize, drain: Duration) {
     let Ok(sleep) = Sleep::new(Duration::from_millis(10)) else {
       break;
     };
-    let _rslt = sleep.await;
-  }
-}
-
-/// Reports a failed accept to the error callback. Unless the connection only went away before it
-/// was taken, the next accept would most likely fail the same way at once (out of descriptors,
-/// say), so the loop waits a moment first instead of spinning.
-async fn on_accept_error<EC, ER>(error_cb: &EC, err: crate::Error)
-where
-  EC: Fn(ER),
-  ER: From<crate::Error>,
-{
-  let transient = cfg_select! {
-    feature = "std" => matches!(
-      &err,
-      crate::Error::Io(elem) if matches!(
-        elem.kind(),
-        std::io::ErrorKind::ConnectionAborted
-          | std::io::ErrorKind::ConnectionReset
-          | std::io::ErrorKind::Interrupted
-          | std::io::ErrorKind::WouldBlock
-      )
-    ),
-    _ => false,
-  };
-  error_cb(err.into());
-  if !transient && let Ok(sleep) = Sleep::new(Duration::from_millis(100)) {
     let _rslt = sleep.await;
   }
 }

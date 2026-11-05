@@ -31,7 +31,7 @@ use crate::{
   executor::{Executor, Runtime as _},
   http::{
     AutoStream, HttpRecvParams, ManualStream, MsgBufferString, OperationMode, Request, Response,
-    push_h2_alpn,
+    misc::on_accept_error, push_h2_alpn,
   },
   http2::{Http2, Http2Buffer, Http2ErrorCode, Http2RecvStatus, ServerStream},
   net::{Stream, StreamReader, StreamWriter, TcpListener as _, TcpParams, TcpStream as _, Uri},
@@ -281,14 +281,18 @@ where
     let listener = EX::TcpListener::bind(uri.hostname_with_implied_port(), self.tcp_params).await?;
     let xorshift = &mut Xorshift64::from_simple_seed()?;
     loop {
-      let Ok(cp) = conn_params(
+      let cp = match conn_params(
         (&self.data, &self.error_cb, &self.executor, self.hrc),
         (&mut self.rng, self.tcp_params, &self.tls_config),
         (&http_router, &listener, xorshift),
       )
       .await
-      else {
-        continue;
+      {
+        Ok(elem) => elem,
+        Err(err) => {
+          on_accept_error(&self.error_cb, err).await;
+          continue;
+        }
       };
       let conn_fut = async move {
         let fut = http2::<EX, _, _>(cp.hrc, cp.rng, cp.stream, cp.tls_config, cp.xorshift);
@@ -384,14 +388,18 @@ where
           let listener = EX::TcpListener::bind(hostname, thread_tcp_params).await?;
           let xorshift = &mut Xorshift64::from_simple_seed()?;
           loop {
-            let Ok(cp) = conn_params(
+            let cp = match conn_params(
               (&thread_data, &thread_error_cb, &thread_executor, thread_hrc),
               (&mut thread_rng, thread_tcp_params, &thread_tls_config),
               (&thread_http_router, &listener, xorshift),
             )
             .await
-            else {
-              continue;
+            {
+              Ok(elem) => elem,
+              Err(err) => {
+                on_accept_error(&thread_error_cb, err).await;
+                continue;
+              }
             };
             let conn_runtime = lc.clone();
             let _conn_jh = thread_executor.spawn_local(
@@ -467,14 +475,18 @@ where
     let listener = EX::TcpListener::bind(uri.hostname_with_implied_port(), self.tcp_params).await?;
     let xorshift = &mut Xorshift64::from_simple_seed()?;
     loop {
-      let Ok(cp) = conn_params(
+      let cp = match conn_params(
         (&self.data, &self.error_cb, &self.executor, self.hrc),
         (&mut self.rng, self.tcp_params, &self.tls_config),
         (&http_router, &listener, xorshift),
       )
       .await
-      else {
-        continue;
+      {
+        Ok(elem) => elem,
+        Err(err) => {
+          on_accept_error(&self.error_cb, err).await;
+          continue;
+        }
       };
       let conn_lc = lc.clone();
       let _conn_jh = self.executor.spawn_local(
