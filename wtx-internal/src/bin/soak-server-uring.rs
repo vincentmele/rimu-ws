@@ -40,17 +40,23 @@ fn main() -> rimu_ws::Result<()> {
     .set_rx_high_water(usize::try_from(env("WTX_RX_HIGH_WATER", 65536)).unwrap_or(65536));
   let error_cb: fn(rimu_ws::Error) =
     if settings.log_errors { |error| eprintln!("{error}") } else { |_| {} };
-  let framework =
-    WebSocketServerFramework::<(), fn(rimu_ws::Error), UringExecutor, _, ChaCha20, PlaintextCtx>::new(
-      UringExecutor::default(),
-      ChaCha20::from_std_random()?,
-      TlsConfig::plaintext(),
-    )?
-    .set_error_cb(error_cb)
-    .set_local_runtime_cb(move || UringRuntime::with_params(params))
-    .set_tcp_params(tcp_params());
+  let framework = WebSocketServerFramework::<
+    (),
+    fn(rimu_ws::Error),
+    UringExecutor,
+    _,
+    ChaCha20,
+    PlaintextCtx,
+  >::new(
+    UringExecutor::default(), ChaCha20::from_std_random()?, TlsConfig::plaintext()
+  )?
+  .set_error_cb(error_cb)
+  .set_local_runtime_cb(move || UringRuntime::with_params(params))
+  .set_tcp_params(tcp_params());
   if settings.deflate {
-    framework.set_compression(ZlibRs::default()).run_in_threads("127.0.0.1:9080", (("/", echo_deflate),))
+    framework
+      .set_compression(ZlibRs::default())
+      .run_in_threads("127.0.0.1:9080", (("/", echo_deflate),))
   } else {
     framework.run_in_threads("127.0.0.1:9080", (("/", echo),))
   }

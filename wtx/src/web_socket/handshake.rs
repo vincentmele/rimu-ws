@@ -146,8 +146,9 @@ where
     for header in req.headers.iter() {
       let name = header.name.as_bytes().trim_ascii();
       let value = header.value.trim_ascii();
-      let has_token =
-        |token: &[u8]| bytes_split1(value, b',').any(|el| el.trim_ascii().eq_ignore_ascii_case(token));
+      let has_token = |token: &[u8]| {
+        bytes_split1(value, b',').any(|el| el.trim_ascii().eq_ignore_ascii_case(token))
+      };
       if name.eq_ignore_ascii_case(b"host") {
         host = true;
       } else if name.eq_ignore_ascii_case(b"upgrade") {

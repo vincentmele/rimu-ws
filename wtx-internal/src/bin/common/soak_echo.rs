@@ -13,7 +13,8 @@ use rimu_ws::{
   net::{Stream, TcpParams},
   tls::PlaintextCtx,
   web_socket::{
-    Fill, OpCode, WebSocket, WebSocketPayloadOrigin, web_socket_compression::NegotiatedWsCompression,
+    Fill, OpCode, WebSocket, WebSocketPayloadOrigin,
+    web_socket_compression::NegotiatedWsCompression,
   },
 };
 use std::sync::OnceLock;

@@ -511,7 +511,8 @@ mod tests {
     while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
       head.push(byte[0]);
     }
-    let status = std::string::String::from_utf8_lossy(head.get(9..12).unwrap_or_default()).into_owned();
+    let status =
+      std::string::String::from_utf8_lossy(head.get(9..12).unwrap_or_default()).into_owned();
     if status != "101" {
       return (status, false);
     }

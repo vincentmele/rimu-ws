@@ -49,7 +49,10 @@ impl Stream for Scripted {
 impl StreamCommon for Scripted {}
 
 impl StreamReader for Scripted {
-  async fn read(&mut self, mut bytes: MaybeUninitSlice<'_, u8>) -> crate::Result<Option<NonZeroUsize>> {
+  async fn read(
+    &mut self,
+    mut bytes: MaybeUninitSlice<'_, u8>,
+  ) -> crate::Result<Option<NonZeroUsize>> {
     let init = bytes.initialize_all_bytes();
     let pos = self.pos.get();
     let rest = self.input.get(pos..).unwrap_or_default();
@@ -78,10 +81,16 @@ impl StreamWriter for Scripted {
 pub fn serve(input: &[u8], chunk: usize) -> Served {
   let output = Rc::new(RefCell::new(Vec::new()));
   let pos = Rc::new(Cell::new(0));
-  let stream =
-    Scripted { chunk: chunk.max(1), input: input.to_vec(), output: output.clone(), pos: pos.clone() };
+  let stream = Scripted {
+    chunk: chunk.max(1),
+    input: input.to_vec(),
+    output: output.clone(),
+    pos: pos.clone(),
+  };
   let tls_config = TlsConfig::plaintext();
-  let Ok(rng) = ChaCha20::from_seed([7; 32]) else { return Served { answer: Vec::new(), read: 0, upgraded: false } };
+  let Ok(rng) = ChaCha20::from_seed([7; 32]) else {
+    return Served { answer: Vec::new(), read: 0, upgraded: false };
+  };
   let mut fut = pin!(async {
     WebSocketAcceptor::default().accept(TlsAcceptor::new(&tls_config, rng, stream)).await.is_ok()
   });
@@ -113,11 +122,14 @@ pub fn check_bytes(data: &[u8]) {
     assert!(answer.starts_with(b"HTTP/1.1 101 "), "upgraded with {answer:?}");
     let accept = b"Sec-WebSocket-Accept: ";
     let at = answer.windows(accept.len()).position(|el| el == accept);
-    let key = at.and_then(|el| answer.get(el.wrapping_add(accept.len())..).and_then(|rest| rest.get(..28)));
+    let key =
+      at.and_then(|el| answer.get(el.wrapping_add(accept.len())..).and_then(|rest| rest.get(..28)));
     assert!(key.is_some_and(|el| el.ends_with(b"=")), "upgraded with {answer:?}");
   } else {
     assert!(
-      answer.is_empty() || answer.starts_with(b"HTTP/1.1 400 ") || answer.starts_with(b"HTTP/1.1 431 "),
+      answer.is_empty()
+        || answer.starts_with(b"HTTP/1.1 400 ")
+        || answer.starts_with(b"HTTP/1.1 431 "),
       "refused with {answer:?}"
     );
   }

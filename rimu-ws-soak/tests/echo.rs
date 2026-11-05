@@ -36,7 +36,8 @@ fn weights_pick_matches_profile() {
   let echo = (0..100_000).filter(|_| weights.pick(&mut rng) == Scenario::Echo).count();
   let share = echo as f64 / 100_000.0;
   let total: u32 = weights.0.iter().map(|el| el.1).sum();
-  let want = f64::from(weights.0.iter().find(|el| el.0 == Scenario::Echo).unwrap().1) / f64::from(total);
+  let want =
+    f64::from(weights.0.iter().find(|el| el.0 == Scenario::Echo).unwrap().1) / f64::from(total);
   assert!((share - want).abs() < 0.01, "{share} vs {want}");
   assert!(profile("baseline").is_some() && profile("storm").is_some() && profile("x").is_none());
 }

@@ -492,7 +492,8 @@ fn another_version_gets_a_400_naming_13() {
   assert!(!upgraded, "{answer}");
   assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
   assert!(answer.contains("Sec-WebSocket-Version: 13"), "{answer}");
-  let (upgraded, answer, _) = serve(&request("GET / HTTP/1.1", &refs(&without("Sec-WebSocket-Version"))), 1024);
+  let (upgraded, answer, _) =
+    serve(&request("GET / HTTP/1.1", &refs(&without("Sec-WebSocket-Version"))), 1024);
   assert!(!upgraded && answer.contains("Sec-WebSocket-Version: 13"), "{answer}");
 }
 
@@ -606,8 +607,11 @@ fn client_checks_the_servers_answer() {
   assert!(!connect_to(|_| res101("c29tZXRoaW5nIGVsc2UgZW50aXJlbHk="), false));
   let no_upgrade = |key: &str| {
     let mut buffer = [0; 30];
-    let accept = crate::misc::from_utf8_basic(super::derived_key(&mut buffer, key.as_bytes())).unwrap();
-    std::format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n")
+    let accept =
+      crate::misc::from_utf8_basic(super::derived_key(&mut buffer, key.as_bytes())).unwrap();
+    std::format!(
+      "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+    )
   };
   assert!(!connect_to(no_upgrade, false));
 }
