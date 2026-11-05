@@ -1,5 +1,6 @@
 use crate::{
   executor::{Executor, Runtime as _},
+  futures::Sleep,
   http::{Router, ShutdownSignal},
   net::{StreamReader, StreamWriter, TcpListener as _, TcpParams, Uri},
   rng::{CryptoRng, CryptoSeedableRng},
@@ -25,8 +26,10 @@ pub struct WebSocketServerFramework<CO, EC, EX, RC, RNG, TCX> {
   compression: CO,
   error_cb: EC,
   executor: EX,
+  handshake_timeout: Option<Duration>,
   local_runtime_cb: RC,
   local_runtimes: Option<NonZeroUsize>,
+  max_connections: Option<NonZeroUsize>,
   rng: RNG,
   shutdown: Option<(ShutdownSignal, Duration)>,
   tcp_params: TcpParams,
@@ -55,8 +58,10 @@ where
       compression: (),
       error_cb,
       executor,
+      handshake_timeout: Some(Duration::from_secs(10)),
       local_runtime_cb,
       local_runtimes: None,
+      max_connections: None,
       rng,
       shutdown: None,
       tcp_params: TcpParams::default(),
@@ -100,8 +105,10 @@ impl<CO, EC, EX, RC, RNG, TCX> WebSocketServerFramework<CO, EC, EX, RC, RNG, TCX
       compression: value,
       error_cb: self.error_cb,
       executor: self.executor,
+      handshake_timeout: self.handshake_timeout,
       local_runtime_cb: self.local_runtime_cb,
       local_runtimes: self.local_runtimes,
+      max_connections: self.max_connections,
       rng: self.rng,
       shutdown: self.shutdown,
       tcp_params: self.tcp_params,
@@ -119,13 +126,29 @@ impl<CO, EC, EX, RC, RNG, TCX> WebSocketServerFramework<CO, EC, EX, RC, RNG, TCX
       compression: self.compression,
       error_cb: value,
       executor: self.executor,
+      handshake_timeout: self.handshake_timeout,
       local_runtime_cb: self.local_runtime_cb,
       local_runtimes: self.local_runtimes,
+      max_connections: self.max_connections,
       rng: self.rng,
       shutdown: self.shutdown,
       tcp_params: self.tcp_params,
       tls_config: self.tls_config,
     }
+  }
+
+  /// How long a client has to complete its upgrade (and, with TLS, its TLS handshake) once
+  /// accepted. Past that, the connection is closed and the error callback receives
+  /// [`crate::Error::ExpiredFuture`]. Defaults to 10 s; `None` waits for as long as it takes.
+  ///
+  /// [`crate::executor::UringRuntime`] also bounds handshakes on its own (see
+  /// [`crate::executor::UringParams::set_handshake_timeout`]), more cheaply than this timer per
+  /// connection, so a server on it can set this to `None`.
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub const fn set_handshake_timeout(mut self, value: Option<Duration>) -> Self {
+    self.handshake_timeout = value;
+    self
   }
 
   /// Allows the tweaking of the chosen runtime.
@@ -140,8 +163,10 @@ impl<CO, EC, EX, RC, RNG, TCX> WebSocketServerFramework<CO, EC, EX, RC, RNG, TCX
       compression: self.compression,
       error_cb: self.error_cb,
       executor: self.executor,
+      handshake_timeout: self.handshake_timeout,
       local_runtime_cb: value,
       local_runtimes: self.local_runtimes,
+      max_connections: self.max_connections,
       rng: self.rng,
       shutdown: self.shutdown,
       tcp_params: self.tcp_params,
@@ -156,6 +181,17 @@ impl<CO, EC, EX, RC, RNG, TCX> WebSocketServerFramework<CO, EC, EX, RC, RNG, TCX
   #[must_use = must_use_itself_doc!()]
   pub const fn set_local_runtimes(mut self, value: Option<NonZeroUsize>) -> Self {
     self.local_runtimes = value;
+    self
+  }
+
+  /// How many connections the server serves at once, across all of its runtimes. A connection
+  /// accepted past that is closed at once, and the error callback receives
+  /// [`crate::Error::TooManyConnections`]. Defaults to `None`: no limit beyond the process's
+  /// descriptors.
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub const fn set_max_connections(mut self, value: Option<NonZeroUsize>) -> Self {
+    self.max_connections = value;
     self
   }
 
@@ -188,8 +224,10 @@ impl<CO, EC, EX, RC, RNG, TCX> WebSocketServerFramework<CO, EC, EX, RC, RNG, TCX
       compression: self.compression,
       error_cb: self.error_cb,
       executor: self.executor,
+      handshake_timeout: self.handshake_timeout,
       local_runtime_cb: self.local_runtime_cb,
       local_runtimes: self.local_runtimes,
+      max_connections: self.max_connections,
       rng: self.rng,
       shutdown: self.shutdown,
       tcp_params: self.tcp_params,
@@ -235,11 +273,11 @@ where
     let listener = EX::TcpListener::bind(uri.hostname_with_implied_port(), self.tcp_params).await?;
     let router = build_matcher(&*web_socket_router)?;
     let shutdown = self.shutdown.clone();
-    let active = shutdown.as_ref().map(|_| Arc::new(AtomicUsize::new(0)));
+    let active = counter(shutdown.as_ref(), self.max_connections);
     loop {
       let accept = conn_params::<CO, EC, EX, RNG, TCX, WSR>(
         (&self.compression, &self.error_cb),
-        (&mut self.rng, self.tcp_params, &self.tls_config),
+        (&mut self.rng, self.tcp_params, &self.tls_config, self.handshake_timeout),
         &listener,
         &router,
         &web_socket_router,
@@ -255,7 +293,11 @@ where
         }
       };
       if let Some(active) = &active {
-        let _prev = active.fetch_add(1, Ordering::AcqRel);
+        if !admit(active, self.max_connections) {
+          drop(cp);
+          (self.error_cb)(crate::Error::TooManyConnections.into());
+          continue;
+        }
         let _jh = self.executor.spawn(tracked(conn_fut(cp), active.clone()));
       } else {
         let _jh = self.executor.spawn(conn_fut(cp));
@@ -298,7 +340,11 @@ where
     let web_socket_router = Arc::new(wsr);
     let router = build_matcher(&*web_socket_router)?;
     let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(), ER>>();
+    // One count for every runtime, so that the limit is the server's
+    let active = counter(self.shutdown.as_ref(), self.max_connections);
     for _ in 0..runtimes {
+      let thread_active = active.clone();
+      let thread_max_connections = self.max_connections;
       let thread_done = done_tx.clone();
       let thread_comp = self.compression.clone();
       let thread_error_cb = self.error_cb.clone();
@@ -311,17 +357,18 @@ where
       let thread_uri = Uri::new(String::from(addr));
       let thread_web_socket_router = web_socket_router.clone();
       let thread_shutdown = self.shutdown.clone();
+      let thread_handshake_timeout = self.handshake_timeout;
       let thread_body = move || -> Result<(), ER> {
         let lc = thread_local_runtime_cb()?;
         lc.block_on(async {
           let hostname = thread_uri.hostname_with_implied_port();
           let listener = EX::TcpListener::bind(hostname, thread_tcp_params).await?;
           let shutdown = thread_shutdown;
-          let active = shutdown.as_ref().map(|_| Arc::new(AtomicUsize::new(0)));
+          let active = thread_active;
           loop {
             let accept = conn_params::<CO, EC, EX, RNG, TCX, WSR>(
               (&thread_comp, &thread_error_cb),
-              (&mut thread_rng, thread_tcp_params, &thread_tls_config),
+              (&mut thread_rng, thread_tcp_params, &thread_tls_config, thread_handshake_timeout),
               &listener,
               &thread_router,
               &thread_web_socket_router,
@@ -338,7 +385,11 @@ where
               }
             };
             if let Some(active) = &active {
-              let _prev = active.fetch_add(1, Ordering::AcqRel);
+              if !admit(active, thread_max_connections) {
+                drop(cp);
+                (thread_error_cb)(crate::Error::TooManyConnections.into());
+                continue;
+              }
               let _jh = thread_executor.spawn_local(tracked(conn_fut(cp), active.clone()), &lc);
             } else {
               let _jh = thread_executor.spawn_local(conn_fut(cp), &lc);
@@ -389,11 +440,11 @@ where
     let uri = Uri::new(addr);
     let listener = EX::TcpListener::bind(uri.hostname_with_implied_port(), self.tcp_params).await?;
     let shutdown = self.shutdown.clone();
-    let active = shutdown.as_ref().map(|_| Arc::new(AtomicUsize::new(0)));
+    let active = counter(shutdown.as_ref(), self.max_connections);
     loop {
       let accept = conn_params::<CO, EC, EX, RNG, TCX, WSR>(
         (&self.compression, &self.error_cb),
-        (&mut self.rng, self.tcp_params, &self.tls_config),
+        (&mut self.rng, self.tcp_params, &self.tls_config, self.handshake_timeout),
         &listener,
         &router,
         &web_socket_router,
@@ -409,7 +460,11 @@ where
         }
       };
       if let Some(active) = &active {
-        let _prev = active.fetch_add(1, Ordering::AcqRel);
+        if !admit(active, self.max_connections) {
+          drop(cp);
+          (self.error_cb)(crate::Error::TooManyConnections.into());
+          continue;
+        }
         let _jh = self.executor.spawn_local(tracked(conn_fut(cp), active.clone()), lc);
       } else {
         let _jh = self.executor.spawn_local(conn_fut(cp), lc);
@@ -447,6 +502,7 @@ where
 {
   compression: CO,
   error_cb: EC,
+  handshake_timeout: Option<Duration>,
   rng: RNG,
   router: Arc<Router<u8>>,
   stream: EX::TcpStream,
@@ -490,12 +546,20 @@ where
   TCX: TlsCtxSk,
   WSR: WebSocketRouter<CO, ER, EX, TCX>,
 {
-  let ConnParams { compression, error_cb, rng, router, stream, tls_config, web_socket_router } =
-    conn_params;
+  let ConnParams {
+    compression,
+    error_cb,
+    handshake_timeout,
+    rng,
+    router,
+    stream,
+    tls_config,
+    web_socket_router,
+  } = conn_params;
   let handshake_router = router.clone();
   let handshake = Box::pin(async move {
     let mut path = String::new();
-    let web_socket = WebSocketAcceptor::default()
+    let accept = WebSocketAcceptor::default()
       .set_compression(compression)
       .set_req(|req| {
         // Routed on the path without its query, and before the 101: a path no route has is
@@ -507,8 +571,8 @@ where
         path.push_str(route);
         crate::Result::Ok(true)
       })
-      .accept(TlsAcceptor::new(&*tls_config, rng, stream))
-      .await?;
+      .accept(TlsAcceptor::new(&*tls_config, rng, stream));
+    let web_socket = within(accept, handshake_timeout).await?;
     crate::Result::Ok((path, web_socket))
   });
   // Errors handled inline rather than through an inner `async` block: each nested future is
@@ -545,6 +609,44 @@ async fn accept_or_shutdown<T>(
   .await
 }
 
+/// `fut`'s output, or [`crate::Error::ExpiredFuture`] if `timeout` passes first.
+async fn within<T>(
+  fut: impl Future<Output = crate::Result<T>>,
+  timeout: Option<Duration>,
+) -> crate::Result<T> {
+  let Some(duration) = timeout else {
+    return fut.await;
+  };
+  let mut fut = pin!(fut);
+  let mut sleep = pin!(Sleep::new(duration)?);
+  poll_fn(|cx| {
+    if let Poll::Ready(elem) = fut.as_mut().poll(cx) {
+      return Poll::Ready(elem);
+    }
+    sleep.as_mut().poll(cx).map(|elem| elem.and(Err(crate::Error::ExpiredFuture)))
+  })
+  .await
+}
+
+/// The count of open connections, when a shutdown has to wait for them or a limit caps them.
+fn counter(
+  shutdown: Option<&(ShutdownSignal, Duration)>,
+  max_connections: Option<NonZeroUsize>,
+) -> Option<Arc<AtomicUsize>> {
+  (shutdown.is_some() || max_connections.is_some()).then(|| Arc::new(AtomicUsize::new(0)))
+}
+
+/// Counts a new connection in `active`, unless that would take it past `max`. Counted first and
+/// then checked, so that runtimes accepting at the same time can't together pass the limit.
+fn admit(active: &AtomicUsize, max: Option<NonZeroUsize>) -> bool {
+  let prev = active.fetch_add(1, Ordering::AcqRel);
+  if max.is_some_and(|el| prev >= el.get()) {
+    let _prev = active.fetch_sub(1, Ordering::AcqRel);
+    return false;
+  }
+  true
+}
+
 /// A connection's task, counted in `active` while it runs.
 async fn tracked(fut: impl Future<Output = ()>, active: Arc<AtomicUsize>) {
   struct Guard(Arc<AtomicUsize>);
@@ -563,7 +665,7 @@ async fn tracked(fut: impl Future<Output = ()>, active: Arc<AtomicUsize>) {
 async fn drain_connections(active: &AtomicUsize, drain: Duration) {
   let begin = crate::calendar::Instant::new();
   while active.load(Ordering::Acquire) > 0 && begin.elapsed().is_ok_and(|el| el < drain) {
-    let Ok(sleep) = crate::futures::Sleep::new(Duration::from_millis(10)) else {
+    let Ok(sleep) = Sleep::new(Duration::from_millis(10)) else {
       break;
     };
     let _rslt = sleep.await;
@@ -592,16 +694,19 @@ where
     _ => false,
   };
   error_cb(err.into());
-  if !transient
-    && let Ok(sleep) = crate::futures::Sleep::new(core::time::Duration::from_millis(100))
-  {
+  if !transient && let Ok(sleep) = Sleep::new(Duration::from_millis(100)) {
     let _rslt = sleep.await;
   }
 }
 
 async fn conn_params<CO, EC, EX, RNG, TCX, WSR>(
   (compression, error_cb): (&CO, &EC),
-  (rng, tcp_params, tls_config): (&mut RNG, TcpParams, &Arc<TlsConfig<TCX>>),
+  (rng, tcp_params, tls_config, handshake_timeout): (
+    &mut RNG,
+    TcpParams,
+    &Arc<TlsConfig<TCX>>,
+    Option<Duration>,
+  ),
   listener: &EX::TcpListener,
   router: &Arc<Router<u8>>,
   web_socket_router: &Arc<WSR>,
@@ -615,6 +720,7 @@ where
   Ok(ConnParams {
     compression: compression.clone(),
     error_cb: error_cb.clone(),
+    handshake_timeout,
     rng: RNG::from_crypto_rng(rng)?,
     router: router.clone(),
     stream: listener.accept(tcp_params).await?.0,
@@ -758,6 +864,125 @@ mod tests {
     let mut rest = std::vec::Vec::new();
     let _rslt = open.read_to_end(&mut rest);
     assert!(rest.starts_with(b"HTTP/1.1 101"), "the open connection was not served then closed");
+  }
+
+  // A one-runtime server on `addr`, its handshake timeout and connection limit as given.
+  fn server(
+    addr: &str,
+    params: crate::executor::UringParams,
+    handshake_timeout: Option<core::time::Duration>,
+    max_connections: Option<core::num::NonZeroUsize>,
+    error_cb: fn(crate::Error),
+  ) {
+    let server_addr = std::string::String::from(addr);
+    let _server = std::thread::spawn(move || {
+      WebSocketServerFramework::<(), fn(crate::Error), UringExecutor, _, ChaCha20, PlaintextCtx>::new(
+        UringExecutor::default(),
+        ChaCha20::from_std_random().unwrap(),
+        TlsConfig::plaintext(),
+      )
+      .unwrap()
+      .set_error_cb(error_cb)
+      .set_handshake_timeout(handshake_timeout)
+      .set_local_runtime_cb(move || UringRuntime::with_params(params))
+      .set_local_runtimes(core::num::NonZeroUsize::new(1))
+      .set_max_connections(max_connections)
+      .run_in_threads(&server_addr, (("/", echo),))
+    });
+  }
+
+  fn connect(addr: &str) -> std::net::TcpStream {
+    loop {
+      if let Ok(elem) = std::net::TcpStream::connect(addr) {
+        elem.set_read_timeout(Some(core::time::Duration::from_secs(2))).unwrap();
+        return elem;
+      }
+      std::thread::sleep(core::time::Duration::from_millis(5));
+    }
+  }
+
+  // What a connection reads before the server closes it, or `None` if it is still open after the
+  // read timeout.
+  fn read_until_closed(stream: &mut std::net::TcpStream) -> Option<std::vec::Vec<u8>> {
+    let mut rest = std::vec::Vec::new();
+    match stream.read_to_end(&mut rest) {
+      Ok(_) => Some(rest),
+      Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => Some(rest),
+      Err(_) => None,
+    }
+  }
+
+  // A client that connects and sends nothing is closed once the handshake timeout passes, also
+  // on a runtime that has no handshake timeout of its own (as with tokio).
+  #[test]
+  fn a_silent_client_is_closed_after_the_handshake_timeout() {
+    let uri = _uri();
+    let (host, port) = uri.hostname_with_implied_port();
+    let addr = std::format!("{host}:{port}");
+    server(
+      &addr,
+      crate::executor::UringParams::new().set_handshake_timeout(None),
+      Some(core::time::Duration::from_millis(200)),
+      None,
+      |_| {},
+    );
+    let mut silent = connect(&addr);
+    let begin = std::time::Instant::now();
+    assert_eq!(read_until_closed(&mut silent), Some(std::vec::Vec::new()));
+    let elapsed = begin.elapsed();
+    assert!(elapsed >= core::time::Duration::from_millis(150), "{elapsed:?}");
+    // A client that upgrades in time is served past the timeout.
+    let (status, echoed) = upgrade(&addr, "/");
+    assert_eq!((status.as_str(), echoed), ("101", true));
+  }
+
+  // Past the connection limit, a new connection is closed at once instead of served, and the
+  // error callback hears of it; once one closes, the next is served again.
+  #[test]
+  fn connections_past_the_limit_are_refused() {
+    use crate::sync::AtomicUsize;
+    use core::sync::atomic::Ordering;
+    static REFUSED: AtomicUsize = AtomicUsize::new(0);
+    let uri = _uri();
+    let (host, port) = uri.hostname_with_implied_port();
+    let addr = std::format!("{host}:{port}");
+    server(
+      &addr,
+      crate::executor::UringParams::new(),
+      None,
+      core::num::NonZeroUsize::new(2),
+      |err| {
+        if matches!(err, crate::Error::TooManyConnections) {
+          let _prev = REFUSED.fetch_add(1, Ordering::Relaxed);
+        }
+      },
+    );
+    let req = b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    let mut first = connect(&addr);
+    first.write_all(req).unwrap();
+    let mut second = connect(&addr);
+    second.write_all(req).unwrap();
+    let mut head = [0; 12];
+    first.read_exact(&mut head).unwrap();
+    assert_eq!(&head, b"HTTP/1.1 101");
+    second.read_exact(&mut head).unwrap();
+    assert_eq!(&head, b"HTTP/1.1 101");
+    let mut third = connect(&addr);
+    let _rslt = third.write_all(req);
+    assert_eq!(read_until_closed(&mut third), Some(std::vec::Vec::new()));
+    assert_eq!(REFUSED.load(Ordering::Relaxed), 1);
+    drop(first);
+    // The server sees the close and ends the first connection's task.
+    let begin = std::time::Instant::now();
+    loop {
+      let (status, echoed) = upgrade(&addr, "/");
+      if status == "101" {
+        assert!(echoed);
+        break;
+      }
+      assert!(begin.elapsed() < core::time::Duration::from_secs(2), "no room after a close");
+      std::thread::sleep(core::time::Duration::from_millis(10));
+    }
   }
 
   // When one thread of `run_in_threads` fails, the call returns its error at once, whichever

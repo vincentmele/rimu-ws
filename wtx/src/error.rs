@@ -226,6 +226,8 @@ pub enum Error {
   RngHostError,
   /// `WTX` can not fetch entropy from a host. To fix the issue, use `getrandom` or `std::random`.
   RngUnsupportedHost,
+  /// A server already serves as many connections as it was configured to, so it closed a new one.
+  TooManyConnections,
   /// Unexpected Unsigned integer
   UnboundedNumber {
     /// Expected bounds
