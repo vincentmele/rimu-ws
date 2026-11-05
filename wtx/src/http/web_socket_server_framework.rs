@@ -218,16 +218,20 @@ where
     let listener = EX::TcpListener::bind(uri.hostname_with_implied_port(), self.tcp_params).await?;
     let router = build_matcher(&*web_socket_router)?;
     loop {
-      let Ok(cp) = conn_params::<CO, EC, EX, RNG, TCX, WSR>(
+      let rslt = conn_params::<CO, EC, EX, RNG, TCX, WSR>(
         (&self.compression, &self.error_cb),
         (&mut self.rng, self.tcp_params, &self.tls_config),
         &listener,
         &router,
         &web_socket_router,
       )
-      .await
-      else {
-        continue;
+      .await;
+      let cp = match rslt {
+        Ok(elem) => elem,
+        Err(err) => {
+          on_accept_error(&self.error_cb, err).await;
+          continue;
+        }
       };
       let _jh = self.executor.spawn(conn_fut(cp));
     }
@@ -280,16 +284,20 @@ where
           let hostname = thread_uri.hostname_with_implied_port();
           let listener = EX::TcpListener::bind(hostname, thread_tcp_params).await?;
           loop {
-            let Ok(cp) = conn_params::<CO, EC, EX, RNG, TCX, WSR>(
+            let rslt = conn_params::<CO, EC, EX, RNG, TCX, WSR>(
               (&thread_comp, &thread_error_cb),
               (&mut thread_rng, thread_tcp_params, &thread_tls_config),
               &listener,
               &thread_router,
               &thread_web_socket_router,
             )
-            .await
-            else {
-              continue;
+            .await;
+            let cp = match rslt {
+              Ok(elem) => elem,
+              Err(err) => {
+                on_accept_error(&thread_error_cb, err).await;
+                continue;
+              }
             };
             let _jh = thread_executor.spawn_local(conn_fut(cp), &lc);
           }
@@ -323,16 +331,20 @@ where
     let uri = Uri::new(addr);
     let listener = EX::TcpListener::bind(uri.hostname_with_implied_port(), self.tcp_params).await?;
     loop {
-      let Ok(cp) = conn_params::<CO, EC, EX, RNG, TCX, WSR>(
+      let rslt = conn_params::<CO, EC, EX, RNG, TCX, WSR>(
         (&self.compression, &self.error_cb),
         (&mut self.rng, self.tcp_params, &self.tls_config),
         &listener,
         &router,
         &web_socket_router,
       )
-      .await
-      else {
-        continue;
+      .await;
+      let cp = match rslt {
+        Ok(elem) => elem,
+        Err(err) => {
+          on_accept_error(&self.error_cb, err).await;
+          continue;
+        }
       };
       let _jh = self.executor.spawn_local(conn_fut(cp), lc);
     }
@@ -440,6 +452,35 @@ where
     if let Err(err) = web_socket_router.call(&router, path, web_socket).await {
       error_cb(err);
     }
+  }
+}
+
+/// Reports a failed accept to the error callback. Unless the connection only went away before it
+/// was taken, the next accept would most likely fail the same way at once (out of descriptors,
+/// say), so the loop waits a moment first instead of spinning.
+async fn on_accept_error<EC, ER>(error_cb: &EC, err: crate::Error)
+where
+  EC: Fn(ER),
+  ER: From<crate::Error>,
+{
+  let transient = cfg_select! {
+    feature = "std" => matches!(
+      &err,
+      crate::Error::Io(elem) if matches!(
+        elem.kind(),
+        std::io::ErrorKind::ConnectionAborted
+          | std::io::ErrorKind::ConnectionReset
+          | std::io::ErrorKind::Interrupted
+          | std::io::ErrorKind::WouldBlock
+      )
+    ),
+    _ => false,
+  };
+  error_cb(err.into());
+  if !transient
+    && let Ok(sleep) = crate::futures::Sleep::new(core::time::Duration::from_millis(100))
+  {
+    let _rslt = sleep.await;
   }
 }
 

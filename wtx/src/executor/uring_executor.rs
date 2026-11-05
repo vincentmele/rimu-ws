@@ -1224,6 +1224,8 @@ struct ListenerState {
   fd: RawFd,
   // Fewer than `ACCEPT_DEPTH` accepts are armed for lack of direct descriptor slots
   gated: bool,
+  // The last accept error, for `accept` to report once
+  error: Option<i32>,
   // One-shot accepts armed
   pending: u32,
   queue: VecDeque<RawFd>,
@@ -1750,6 +1752,7 @@ impl Reactor {
       backoff: false,
       closed: false,
       fd,
+      error: None,
       gated: false,
       pending: 0,
       queue: VecDeque::new(),
@@ -1844,12 +1847,22 @@ impl Reactor {
         elem.wake();
       }
     }
-    // Out of descriptors or memory: retrying at once would fail again.
-    let backoff = res < 0
-      && matches!(-res, libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
-      && !listener.backoff;
+    // Anything but a connection that went away before it was taken, or a cancel of our own,
+    // would fail again at once: wait before retrying, and tell `accept`.
+    let failed = res < 0
+      && !matches!(
+        -res,
+        libc::ECONNABORTED | libc::EINTR | libc::EAGAIN | libc::EPERM | libc::ECANCELED
+      );
+    let backoff = failed && !listener.backoff;
     if backoff {
       listener.backoff = true;
+    }
+    if failed {
+      listener.error = Some(-res);
+      if let Some(elem) = listener.waker.take() {
+        elem.wake();
+      }
     }
     drop(listeners);
     if res < 0 && one_shot {
@@ -1943,6 +1956,9 @@ impl Reactor {
     };
     if let Some(fd) = listener.queue.pop_front() {
       return Poll::Ready(Ok(fd));
+    }
+    if let Some(errno) = listener.error.take() {
+      return Poll::Ready(Err(io_err(errno)));
     }
     listener.waker = Some(cx.waker().clone());
     Poll::Pending
@@ -4088,6 +4104,47 @@ mod tests {
       .unwrap()
     });
     assert!(free, "the dropped sleep's slot was not freed");
+  }
+
+  // A listener whose accepts keep failing (here a socket shut down underneath it, which fails
+  // every accept with EINVAL) backs off instead of re-arming in a loop, and `accept` reports the
+  // error instead of waiting forever.
+  #[test]
+  fn a_failing_listener_backs_off_and_reports_its_error() {
+    let addr = test_addr();
+    let (arms, err) = UringRuntime::new().unwrap().block_on(async {
+      let listener = bind(&addr).await;
+      let fd =
+        super::with_reactor(|reactor| Ok(reactor.listeners.borrow()[listener.idx].fd)).unwrap();
+      // SAFETY: the listener's own socket, still open
+      let _rslt = unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+      let before = super::with_reactor(|reactor| Ok(reactor.accept_arms.get())).unwrap();
+      let begin = std::time::Instant::now();
+      while begin.elapsed() < core::time::Duration::from_millis(300) {
+        yield_once().await;
+      }
+      let arms = super::with_reactor(|reactor| Ok(reactor.accept_arms.get())).unwrap() - before;
+      let err = within_accept(&listener).await;
+      (arms, err)
+    });
+    assert!(arms <= 8, "the failing accept was re-armed {arms} times in 300 ms");
+    assert_eq!(err, Some(libc::EINVAL));
+  }
+
+  /// The error `accept` returns, waiting at most 2 s for one.
+  async fn within_accept(listener: &UringTcpListener) -> Option<i32> {
+    let accept = core::pin::pin!(listener.accept(TcpParams::default()));
+    let mut accept = accept;
+    let begin = std::time::Instant::now();
+    loop {
+      if let Some(rslt) = crate::futures::PollOnce::new(accept.as_mut()).await {
+        return rslt.err().and_then(|err| os_error(&err));
+      }
+      if begin.elapsed() > core::time::Duration::from_secs(2) {
+        return None;
+      }
+      yield_once().await;
+    }
   }
 
   // Reading into an empty buffer would report the end of the stream: it fails instead, and the
