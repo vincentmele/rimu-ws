@@ -378,6 +378,42 @@ buffer):
   - Pushes back on `ping_no_read` (it awaits each pong write) and stays bounded.
 - **All three cap the upgrade header** (`header_flood` passes).
 
+## Memory after drains: what it was, and the fix (2026-11-05)
+
+**The extended run** (`soak.sh long`, 1000 slots, 10-minute cycles rotating hostile, attack and
+storm, a 2000-connection burst per cycle):
+
+- 13,257,490 runs over 1 h 59 m: 0 fails and 0 harness errors. The run was killed by the
+  2-hour cap on background jobs, so it wrote no summary; next time detach it from the session.
+- RSS after the drain climbed from 198 MB to 301 MB.
+
+**Allocation snapshots** (`/mnt/nvme1tb/claude-tmp/allocshim`, 37-minute runs of the same mix,
+data in `/mnt/nvme1tb/claude-tmp/soak/alloc-run*`) showed it was not a leak, but two kinds of
+retention:
+
+1. **Per-slot buffers:** each reused slot kept up to three buffers of 64 KiB, so after a burst
+   memory followed the most connections ever open. Live heap after a drain was 54–121 MB.
+2. **glibc keeping freed memory:** RSS was about 2.6 times the live heap.
+
+**Fix, 0c899291:** only `max(open connections, 64)` free slots keep buffers; the rest are
+stripped, oldest first. Test: `a_closed_burst_leaves_few_slots_with_buffers`. Same benchmark,
+glibc:
+
+| | Before | After |
+|---|---|---|
+| Live heap after a drain | 54–121 MB | 29–33 MB (flat) |
+| Live heap when idle at the end | 121 MB | 37 MB |
+| RSS after a drain | 256 → 316 MB | about 268 MB (flat; no trend violation) |
+| Runs / fails | 3,671,421 / 0 | 3,665,570 / 0 |
+
+- The remaining ~235 MB of RSS is glibc's own retention.
+- jemalloc (`LD_PRELOAD`, `background_thread:true`) cut drained RSS to 86–162 MB before the fix,
+  but raised the peaks under load 20–45% and its tail latency was worse. The user chose glibc.
+- The typical per-second p99 is unchanged by the fix (cycles 0–3 within 3%). The after run's
+  tail was worse in cycles 4–5, where harness lag rose with box load (load average 25 at the
+  end), so it is not attributed to the fix. Re-run on a quiet box to confirm.
+- Throughput (HttpArena A/B) has not been re-measured since the fix.
+
 ## Where further work could go
 
 - **TLS (`wss://`).** Public servers usually terminate TLS. Malformed ClientHellos, slow TLS
