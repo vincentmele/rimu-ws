@@ -35,8 +35,8 @@ pub struct Record {
   pub scenario: Scenario,
   /// `"pass"`, `"fail"`, `"mark"` or `"harness_error"`.
   pub outcome: String,
-  /// A failure's kind.
-  #[serde(default, skip_serializing_if = "Option::is_none")]
+  /// A failure's kind. Written as `severity`: every JSONL line's `kind` is its line type.
+  #[serde(default, rename = "severity", skip_serializing_if = "Option::is_none")]
   pub kind: Option<Kind>,
   pub reason: Option<String>,
   pub transcript: Option<String>,

@@ -202,6 +202,8 @@ async fn summary_counts_kinds_and_marks_per_scenario() {
   let mut cfg = cfg(addr, child.id());
   cfg.run.ctx.mode = Mode::Common;
   cfg.run.weights = parse_weights("invalid=1").unwrap();
+  // Judges no latency: no probes, which would load the other tests' fakes.
+  cfg.probes = 0;
   let summary = run(cfg, &mut Vec::new()).await;
   let _ = child.kill();
   let _ = child.wait();
@@ -211,4 +213,27 @@ async fn summary_counts_kinds_and_marks_per_scenario() {
   assert_eq!(summary.rules_version, "1");
   assert_eq!(summary.mode, Mode::Common);
   assert_eq!(summary.should_fails, invalid.should);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn record_lines_keep_their_severity() {
+  let addr = spawn_fake(Faults { no_close_frame: true, ..Faults::default() }).await;
+  let mut child = stand_in();
+  let mut cfg = cfg(addr, child.id());
+  cfg.run.ctx.mode = Mode::Common;
+  cfg.run.weights = parse_weights("invalid=1").unwrap();
+  // Judges no latency: no probes, which would load the other tests' fakes.
+  cfg.probes = 0;
+  let mut out = Vec::new();
+  let _ = run(cfg, &mut out).await;
+  let _ = child.kill();
+  let _ = child.wait();
+  let fails: Vec<serde_json::Value> = String::from_utf8(out)
+    .unwrap()
+    .lines()
+    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+    .filter(|el| el["kind"] == "record" && el["outcome"] == "fail")
+    .collect();
+  assert!(!fails.is_empty());
+  assert!(fails.iter().all(|el| el["severity"] == "should"), "{:?}", fails.first());
 }
