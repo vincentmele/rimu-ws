@@ -1,16 +1,16 @@
-#![expect(clippy::infinite_loop, reason = "expected behavior of a server")]
-
 use crate::{
   executor::{Executor, Runtime as _},
-  http::Router,
+  http::{Router, ShutdownSignal},
   net::{StreamReader, StreamWriter, TcpListener as _, TcpParams, Uri},
   rng::{CryptoRng, CryptoSeedableRng},
-  sync::Arc,
+  sync::{Arc, AtomicUsize},
   tls::{TlsAcceptor, TlsConfig, TlsCtxSk},
   web_socket::{WebSocket, WebSocketAcceptor, WsCompression},
 };
 use alloc::{boxed::Box, string::String};
-use core::num::NonZeroUsize;
+use core::{
+  future::poll_fn, num::NonZeroUsize, pin::pin, sync::atomic::Ordering, task::Poll, time::Duration,
+};
 
 type LocalWebSocket<CO, EX, TCX> = WebSocket<
   <CO as WsCompression<false>>::NegotiatedCompression,
@@ -28,6 +28,7 @@ pub struct WebSocketServerFramework<CO, EC, EX, RC, RNG, TCX> {
   local_runtime_cb: RC,
   local_runtimes: Option<NonZeroUsize>,
   rng: RNG,
+  shutdown: Option<(ShutdownSignal, Duration)>,
   tcp_params: TcpParams,
   tls_config: Arc<TlsConfig<TCX>>,
 }
@@ -57,6 +58,7 @@ where
       local_runtime_cb,
       local_runtimes: None,
       rng,
+      shutdown: None,
       tcp_params: TcpParams::default(),
       tls_config: tls_config.into(),
     })
@@ -101,6 +103,7 @@ impl<CO, EC, EX, RC, RNG, TCX> WebSocketServerFramework<CO, EC, EX, RC, RNG, TCX
       local_runtime_cb: self.local_runtime_cb,
       local_runtimes: self.local_runtimes,
       rng: self.rng,
+      shutdown: self.shutdown,
       tcp_params: self.tcp_params,
       tls_config: self.tls_config,
     }
@@ -119,6 +122,7 @@ impl<CO, EC, EX, RC, RNG, TCX> WebSocketServerFramework<CO, EC, EX, RC, RNG, TCX
       local_runtime_cb: self.local_runtime_cb,
       local_runtimes: self.local_runtimes,
       rng: self.rng,
+      shutdown: self.shutdown,
       tcp_params: self.tcp_params,
       tls_config: self.tls_config,
     }
@@ -139,6 +143,7 @@ impl<CO, EC, EX, RC, RNG, TCX> WebSocketServerFramework<CO, EC, EX, RC, RNG, TCX
       local_runtime_cb: value,
       local_runtimes: self.local_runtimes,
       rng: self.rng,
+      shutdown: self.shutdown,
       tcp_params: self.tcp_params,
       tls_config: self.tls_config,
     }
@@ -151,6 +156,17 @@ impl<CO, EC, EX, RC, RNG, TCX> WebSocketServerFramework<CO, EC, EX, RC, RNG, TCX
   #[must_use = must_use_itself_doc!()]
   pub const fn set_local_runtimes(mut self, value: Option<NonZeroUsize>) -> Self {
     self.local_runtimes = value;
+    self
+  }
+
+  /// Stops the server when `signal` is triggered: it stops accepting, gives the open connections
+  /// up to `drain` to finish, and then returns `Ok`. Connections still open after `drain` are
+  /// closed with their runtime. A handler that should close before then (with close code 1001,
+  /// say) can wait on a clone of `signal`.
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub fn set_shutdown(mut self, signal: ShutdownSignal, drain: Duration) -> Self {
+    self.shutdown = Some((signal, drain));
     self
   }
 
@@ -175,6 +191,7 @@ impl<CO, EC, EX, RC, RNG, TCX> WebSocketServerFramework<CO, EC, EX, RC, RNG, TCX
       local_runtime_cb: self.local_runtime_cb,
       local_runtimes: self.local_runtimes,
       rng: self.rng,
+      shutdown: self.shutdown,
       tcp_params: self.tcp_params,
       tls_config: Arc::new(value),
     }
@@ -217,15 +234,19 @@ where
     let web_socket_router = Arc::new(wsr);
     let listener = EX::TcpListener::bind(uri.hostname_with_implied_port(), self.tcp_params).await?;
     let router = build_matcher(&*web_socket_router)?;
+    let shutdown = self.shutdown.clone();
+    let active = shutdown.as_ref().map(|_| Arc::new(AtomicUsize::new(0)));
     loop {
-      let rslt = conn_params::<CO, EC, EX, RNG, TCX, WSR>(
+      let accept = conn_params::<CO, EC, EX, RNG, TCX, WSR>(
         (&self.compression, &self.error_cb),
         (&mut self.rng, self.tcp_params, &self.tls_config),
         &listener,
         &router,
         &web_socket_router,
-      )
-      .await;
+      );
+      let Some(rslt) = accept_or_shutdown(accept, shutdown.as_ref().map(|el| &el.0)).await else {
+        break;
+      };
       let cp = match rslt {
         Ok(elem) => elem,
         Err(err) => {
@@ -233,8 +254,18 @@ where
           continue;
         }
       };
-      let _jh = self.executor.spawn(conn_fut(cp));
+      if let Some(active) = &active {
+        let _prev = active.fetch_add(1, Ordering::AcqRel);
+        let _jh = self.executor.spawn(tracked(conn_fut(cp), active.clone()));
+      } else {
+        let _jh = self.executor.spawn(conn_fut(cp));
+      }
     }
+    drop(listener);
+    if let (Some((_, drain)), Some(active)) = (&shutdown, &active) {
+      drain_connections(active, *drain).await;
+    }
+    Ok(())
   }
 
   /// Starts the server using a runtime-per-thread architecture.
@@ -242,9 +273,10 @@ where
   /// Contrary to the other methods, this method internally creates a runtime according to the
   /// specified `local_runtimes` value.
   ///
-  /// Returns when the first thread ends, with its error, or with its panic as an error. The
+  /// Returns the first thread's error, or its panic as an error, as soon as one happens. The
   /// other threads are left running, so call this from the main thread: returning from `main`
-  /// then ends the process instead of leaving a server short of a core.
+  /// then ends the process instead of leaving a server short of a core. After a shutdown (see
+  /// [`Self::set_shutdown`]), returns `Ok` once every thread has drained.
   #[cfg(feature = "std")]
   #[inline]
   pub fn run_in_threads<WSR>(mut self, addr: &str, wsr: WSR) -> Result<(), ER>
@@ -278,20 +310,26 @@ where
       let thread_tls_config = self.tls_config.clone();
       let thread_uri = Uri::new(String::from(addr));
       let thread_web_socket_router = web_socket_router.clone();
+      let thread_shutdown = self.shutdown.clone();
       let thread_body = move || -> Result<(), ER> {
         let lc = thread_local_runtime_cb()?;
         lc.block_on(async {
           let hostname = thread_uri.hostname_with_implied_port();
           let listener = EX::TcpListener::bind(hostname, thread_tcp_params).await?;
+          let shutdown = thread_shutdown;
+          let active = shutdown.as_ref().map(|_| Arc::new(AtomicUsize::new(0)));
           loop {
-            let rslt = conn_params::<CO, EC, EX, RNG, TCX, WSR>(
+            let accept = conn_params::<CO, EC, EX, RNG, TCX, WSR>(
               (&thread_comp, &thread_error_cb),
               (&mut thread_rng, thread_tcp_params, &thread_tls_config),
               &listener,
               &thread_router,
               &thread_web_socket_router,
-            )
-            .await;
+            );
+            let Some(rslt) = accept_or_shutdown(accept, shutdown.as_ref().map(|el| &el.0)).await
+            else {
+              break;
+            };
             let cp = match rslt {
               Ok(elem) => elem,
               Err(err) => {
@@ -299,8 +337,18 @@ where
                 continue;
               }
             };
-            let _jh = thread_executor.spawn_local(conn_fut(cp), &lc);
+            if let Some(active) = &active {
+              let _prev = active.fetch_add(1, Ordering::AcqRel);
+              let _jh = thread_executor.spawn_local(tracked(conn_fut(cp), active.clone()), &lc);
+            } else {
+              let _jh = thread_executor.spawn_local(conn_fut(cp), &lc);
+            }
           }
+          drop(listener);
+          if let (Some((_, drain)), Some(active)) = (&shutdown, &active) {
+            drain_connections(active, *drain).await;
+          }
+          Ok(())
         })
       };
       let _jh = std::thread::spawn(move || {
@@ -310,7 +358,17 @@ where
       });
     }
     drop(done_tx);
-    done_rx.recv().unwrap_or(Ok(()))
+    // A thread ends only on an error, a panic or a shutdown. The first error is returned at once;
+    // after a shutdown, every thread drains before this returns.
+    let mut ended = 0;
+    while let Ok(rslt) = done_rx.recv() {
+      rslt?;
+      ended += 1;
+      if ended == runtimes {
+        break;
+      }
+    }
+    Ok(())
   }
 
   /// Starts the server handling all connections on the current thread.
@@ -330,15 +388,19 @@ where
     let router = build_matcher(&*web_socket_router)?;
     let uri = Uri::new(addr);
     let listener = EX::TcpListener::bind(uri.hostname_with_implied_port(), self.tcp_params).await?;
+    let shutdown = self.shutdown.clone();
+    let active = shutdown.as_ref().map(|_| Arc::new(AtomicUsize::new(0)));
     loop {
-      let rslt = conn_params::<CO, EC, EX, RNG, TCX, WSR>(
+      let accept = conn_params::<CO, EC, EX, RNG, TCX, WSR>(
         (&self.compression, &self.error_cb),
         (&mut self.rng, self.tcp_params, &self.tls_config),
         &listener,
         &router,
         &web_socket_router,
-      )
-      .await;
+      );
+      let Some(rslt) = accept_or_shutdown(accept, shutdown.as_ref().map(|el| &el.0)).await else {
+        break;
+      };
       let cp = match rslt {
         Ok(elem) => elem,
         Err(err) => {
@@ -346,8 +408,18 @@ where
           continue;
         }
       };
-      let _jh = self.executor.spawn_local(conn_fut(cp), lc);
+      if let Some(active) = &active {
+        let _prev = active.fetch_add(1, Ordering::AcqRel);
+        let _jh = self.executor.spawn_local(tracked(conn_fut(cp), active.clone()), lc);
+      } else {
+        let _jh = self.executor.spawn_local(conn_fut(cp), lc);
+      }
     }
+    drop(listener);
+    if let (Some((_, drain)), Some(active)) = (&shutdown, &active) {
+      drain_connections(active, *drain).await;
+    }
+    Ok(())
   }
 }
 
@@ -452,6 +524,49 @@ where
     if let Err(err) = web_socket_router.call(&router, path, web_socket).await {
       error_cb(err);
     }
+  }
+}
+
+/// The next accepted connection, or `None` once `shutdown` is triggered.
+async fn accept_or_shutdown<T>(
+  accept: impl Future<Output = T>,
+  shutdown: Option<&ShutdownSignal>,
+) -> Option<T> {
+  let Some(signal) = shutdown else {
+    return Some(accept.await);
+  };
+  let mut accept = pin!(accept);
+  poll_fn(|cx| {
+    if signal.poll_triggered(cx).is_ready() {
+      return Poll::Ready(None);
+    }
+    accept.as_mut().poll(cx).map(Some)
+  })
+  .await
+}
+
+/// A connection's task, counted in `active` while it runs.
+async fn tracked(fut: impl Future<Output = ()>, active: Arc<AtomicUsize>) {
+  struct Guard(Arc<AtomicUsize>);
+
+  impl Drop for Guard {
+    fn drop(&mut self) {
+      let _prev = self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+  }
+
+  let _guard = Guard(active);
+  fut.await;
+}
+
+/// Waits until no connection is left, or `drain` has passed.
+async fn drain_connections(active: &AtomicUsize, drain: Duration) {
+  let begin = crate::calendar::Instant::new();
+  while active.load(Ordering::Acquire) > 0 && begin.elapsed().is_ok_and(|el| el < drain) {
+    let Ok(sleep) = crate::futures::Sleep::new(Duration::from_millis(10)) else {
+      break;
+    };
+    let _rslt = sleep.await;
   }
 }
 
@@ -592,6 +707,57 @@ mod tests {
     let long = std::format!("/chat?pad={}", "a".repeat(4000));
     assert_eq!(upgrade(&addr, &long), ("101".into(), true));
     assert_eq!(upgrade(&addr, "/nowhere").0, "400");
+  }
+
+  // A triggered shutdown stops the accept loops, gives the open connections the drain time to
+  // finish, and then returns from `run_in_threads`, which waits for every thread.
+  #[test]
+  fn shutdown_stops_accepting_and_drains() {
+    let uri = _uri();
+    let (host, port) = uri.hostname_with_implied_port();
+    let addr = std::format!("{host}:{port}");
+    let server_addr = addr.clone();
+    let signal = crate::http::ShutdownSignal::new();
+    let server_signal = signal.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let _server = std::thread::spawn(move || {
+      let rslt = WebSocketServerFramework::<
+        (),
+        fn(crate::Error),
+        UringExecutor,
+        _,
+        ChaCha20,
+        PlaintextCtx,
+      >::new(
+        UringExecutor::default(),
+        ChaCha20::from_std_random().unwrap(),
+        TlsConfig::plaintext(),
+      )
+      .unwrap()
+      .set_local_runtime_cb(|| UringRuntime::with_params(crate::executor::UringParams::new()))
+      .set_local_runtimes(core::num::NonZeroUsize::new(2))
+      .set_shutdown(server_signal, core::time::Duration::from_millis(300))
+      .run_in_threads(&server_addr, (("/", echo),));
+      let _rslt = done_tx.send(rslt.is_ok());
+    });
+    // A client that stays connected through the shutdown
+    let (status, _) = upgrade(&addr, "/");
+    assert_eq!(status, "101");
+    let mut open = std::net::TcpStream::connect(&addr).unwrap();
+    open
+      .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+      .unwrap();
+    std::thread::sleep(core::time::Duration::from_millis(100));
+    let begin = std::time::Instant::now();
+    signal.trigger();
+    let rslt = done_rx.recv_timeout(core::time::Duration::from_secs(3));
+    assert_eq!(rslt, Ok(true), "run_in_threads did not return after the shutdown");
+    assert!(begin.elapsed() >= core::time::Duration::from_millis(300), "{:?}", begin.elapsed());
+    assert!(std::net::TcpStream::connect(&addr).is_err(), "still accepting after the shutdown");
+    open.set_read_timeout(Some(core::time::Duration::from_secs(2))).unwrap();
+    let mut rest = std::vec::Vec::new();
+    let _rslt = open.read_to_end(&mut rest);
+    assert!(rest.starts_with(b"HTTP/1.1 101"), "the open connection was not served then closed");
   }
 
   // When one thread of `run_in_threads` fails, the call returns its error at once, whichever
