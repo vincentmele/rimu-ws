@@ -1,0 +1,13 @@
+diff -ruN a/main.cpp b/main.cpp
+--- a/main.cpp	2026-11-04 18:40:26.000000000 +0100
++++ b/main.cpp	2026-11-05 23:21:12.265569771 +0100
+@@ -331,6 +331,9 @@
+         server.buffer_pool_entries(512);
+     }
+     server.tcp_nodelay(true);
++    // Production: 1 MiB WebSocket messages and frames (the defaults are 16 MiB).
++    server.ws_max_message_size(1 << 20);
++    server.ws_max_frame_size(1 << 20);
+     server.h2_max_concurrent_streams(2000);
+     server.h2_initial_window_size(1048576);
+     register_routes(server.router());

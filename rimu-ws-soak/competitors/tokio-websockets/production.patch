@@ -1,0 +1,27 @@
+diff -ruN a/src/main.rs b/src/main.rs
+--- a/src/main.rs	2026-11-04 18:40:26.000000000 +0100
++++ b/src/main.rs	2026-11-05 22:55:08.779300319 +0100
+@@ -52,8 +52,9 @@
+ 
+ async fn handle(stream: TcpStream) {
+     let rslt = ServerBuilder::new()
+-        .config(Config::default().frame_size(usize::MAX))
+-        .limits(Limits::unlimited())
++        // Production: the default config, and 1 MiB messages (the default limit is 64 MiB).
++        .config(Config::default())
++        .limits(Limits::default().max_payload_len(Some(1 << 20)))
+         .accept(stream)
+         .await;
+     let Ok((_request, mut ws_stream)) = rslt else {
+@@ -61,7 +62,10 @@
+     };
+     while let Some(Ok(msg)) = ws_stream.next().await {
+         if msg.is_text() || msg.is_binary() {
+-            ws_stream.send(msg).await.unwrap();
++            // As the library's echo example: a failed send ends this connection, not the server.
++            if ws_stream.send(msg).await.is_err() {
++                return;
++            }
+         }
+     }
+ }
