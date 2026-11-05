@@ -1,7 +1,6 @@
 #![expect(clippy::infinite_loop, reason = "expected behavior of a server")]
 
 use crate::{
-  collections::VectorUsize,
   executor::{Executor, Runtime as _},
   http::Router,
   net::{StreamReader, StreamWriter, TcpListener as _, TcpParams, Uri},
@@ -239,8 +238,9 @@ where
   /// Contrary to the other methods, this method internally creates a runtime according to the
   /// specified `local_runtimes` value.
   ///
-  /// You must call this method inside the main thread to allow the interruption of the remaining
-  /// threads once an error arises.
+  /// Returns when the first thread ends, with its error, or with its panic as an error. The
+  /// other threads are left running, so call this from the main thread: returning from `main`
+  /// then ends the process instead of leaving a server short of a core.
   #[cfg(feature = "std")]
   #[inline]
   pub fn run_in_threads<WSR>(mut self, addr: &str, wsr: WSR) -> Result<(), ER>
@@ -261,8 +261,9 @@ where
     };
     let web_socket_router = Arc::new(wsr);
     let router = build_matcher(&*web_socket_router)?;
-    let mut join_handles = VectorUsize::<std::thread::JoinHandle<Result<(), ER>>>::new();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(), ER>>();
     for _ in 0..runtimes {
+      let thread_done = done_tx.clone();
       let thread_comp = self.compression.clone();
       let thread_error_cb = self.error_cb.clone();
       let thread_executor = self.executor.clone();
@@ -273,7 +274,7 @@ where
       let thread_tls_config = self.tls_config.clone();
       let thread_uri = Uri::new(String::from(addr));
       let thread_web_socket_router = web_socket_router.clone();
-      join_handles.push(std::thread::spawn(move || {
+      let thread_body = move || -> Result<(), ER> {
         let lc = thread_local_runtime_cb()?;
         lc.block_on(async {
           let hostname = thread_uri.hostname_with_implied_port();
@@ -293,12 +294,15 @@ where
             let _jh = thread_executor.spawn_local(conn_fut(cp), &lc);
           }
         })
-      }))?;
+      };
+      let _jh = std::thread::spawn(move || {
+        let rslt = std::panic::catch_unwind(core::panic::AssertUnwindSafe(thread_body))
+          .unwrap_or_else(|payload| Err(crate::Error::from(payload).into()));
+        let _rslt = thread_done.send(rslt);
+      });
     }
-    for join_handle in join_handles {
-      join_handle.join().map_err(crate::Error::from)??;
-    }
-    Ok(())
+    drop(done_tx);
+    done_rx.recv().unwrap_or(Ok(()))
   }
 
   /// Starts the server handling all connections on the current thread.
@@ -547,5 +551,46 @@ mod tests {
     let long = std::format!("/chat?pad={}", "a".repeat(4000));
     assert_eq!(upgrade(&addr, &long), ("101".into(), true));
     assert_eq!(upgrade(&addr, "/nowhere").0, "400");
+  }
+
+  // When one thread of `run_in_threads` fails, the call returns its error at once, whichever
+  // thread it was: it used to join the threads in order and wait on the first forever.
+  #[test]
+  fn a_failed_thread_ends_run_in_threads() {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static RUNTIMES: AtomicUsize = AtomicUsize::new(0);
+    let uri = _uri();
+    let (host, port) = uri.hostname_with_implied_port();
+    let addr = std::format!("{host}:{port}");
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let _server = std::thread::spawn(move || {
+      let rslt = WebSocketServerFramework::<
+        (),
+        fn(crate::Error),
+        UringExecutor,
+        _,
+        ChaCha20,
+        PlaintextCtx,
+      >::new(
+        UringExecutor::default(),
+        ChaCha20::from_std_random().unwrap(),
+        TlsConfig::plaintext(),
+      )
+      .unwrap()
+      .set_local_runtime_cb(|| {
+        // The second runtime fails to start; give the first time to be serving.
+        if RUNTIMES.fetch_add(1, Ordering::Relaxed) == 0 {
+          UringRuntime::with_params(crate::executor::UringParams::new())
+        } else {
+          std::thread::sleep(core::time::Duration::from_millis(100));
+          Err(std::io::Error::from_raw_os_error(libc::ENOMEM).into())
+        }
+      })
+      .set_local_runtimes(core::num::NonZeroUsize::new(2))
+      .run_in_threads(&addr, (("/", echo),));
+      let _rslt = done_tx.send(rslt.is_err());
+    });
+    let failed = done_rx.recv_timeout(core::time::Duration::from_secs(5));
+    assert_eq!(failed, Ok(true), "run_in_threads did not return the failed thread's error");
   }
 }
