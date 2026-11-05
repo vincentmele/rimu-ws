@@ -139,8 +139,8 @@ impl UringParams {
       close_timeout: Some(Duration::from_secs(10)),
       cq_entries: 4096,
       direct_files: 0,
-      handshake_timeout: None,
-      idle_timeout: None,
+      handshake_timeout: Some(Duration::from_secs(10)),
+      idle_timeout: Some(Duration::from_secs(300)),
       peer_addrs: true,
       recv_buffer_len: 4096,
       recv_buffers: 512,
@@ -165,7 +165,7 @@ impl UringParams {
   /// How long an accepted connection may go before anything is sent on it. Past that, its reads
   /// and writes fail with `ETIMEDOUT`. A server writes once it has a whole request or handshake,
   /// so this bounds how long a client may take to send one, even one byte at a time. Defaults to
-  /// `None`.
+  /// 10 s.
   #[inline]
   #[must_use]
   pub const fn set_handshake_timeout(mut self, value: Option<Duration>) -> Self {
@@ -173,10 +173,10 @@ impl UringParams {
     self
   }
 
-  /// How long a connection may go without receiving or sending anything. Past that, its reads
-  /// and writes fail with `ETIMEDOUT`. A peer that only listens should be pinged: the pongs keep
-  /// it alive. Connections are checked a few times per timeout, from one timer per runtime.
-  /// Defaults to `None`.
+  /// How long an accepted connection may go without receiving or sending anything. Past that, its
+  /// reads and writes fail with `ETIMEDOUT`. A peer that only listens should be pinged: the pongs
+  /// keep it alive. Connections this runtime opened with `connect` are not watched. Connections
+  /// are checked many times per timeout, from one timer per runtime. Defaults to 300 s.
   #[inline]
   #[must_use]
   pub const fn set_idle_timeout(mut self, value: Option<Duration>) -> Self {
@@ -195,7 +195,7 @@ impl UringParams {
   }
 
   /// The ring of buffers that receives are made into: `count` buffers (rounded up to a power of
-  /// two) of `len` bytes each, shared by the connections of a runtime. Received bytes are copied
+  /// two, at most 32768, the kernel's limit) of `len` bytes each, shared by the connections of a runtime. Received bytes are copied
   /// out as soon as they complete, so the ring only has to cover one turn. Defaults to 512 of
   /// 4096 bytes.
   #[inline]
@@ -337,7 +337,7 @@ impl<T> Future for UringJoinHandle<T> {
     let Some(task) = &self.task else {
       return Poll::Ready(Err(ExecutorError::MissingRuntime.into()));
     };
-    task.poll_join(cx).map(Ok)
+    task.poll_join(cx)
   }
 }
 
@@ -355,6 +355,7 @@ where
   F: Future,
 {
   Done(Option<F::Output>),
+  Panicked,
   Running(F),
 }
 
@@ -363,7 +364,7 @@ trait RunTask {
 }
 
 trait JoinTask<T> {
-  fn poll_join(&self, cx: &mut Context<'_>) -> Poll<T>;
+  fn poll_join(&self, cx: &mut Context<'_>) -> Poll<crate::Result<T>>;
 }
 
 impl<F> RunTask for TaskCell<F>
@@ -378,10 +379,13 @@ where
     };
     // SAFETY: the future lives in the `Rc` allocation and is only dropped in place, never moved
     let future = unsafe { Pin::new_unchecked(future) };
-    let Poll::Ready(value) = future.poll(cx) else {
-      return Poll::Pending;
+    // A panic ends this task alone: the other tasks and connections of the runtime carry on, and
+    // the join handle gets `TaskPanicked`. With `panic = "abort"` the process aborts as usual.
+    inner.0 = match std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| future.poll(cx))) {
+      Ok(Poll::Pending) => return Poll::Pending,
+      Ok(Poll::Ready(value)) => TaskState::Done(Some(value)),
+      Err(_payload) => TaskState::Panicked,
     };
-    inner.0 = TaskState::Done(Some(value));
     let waker = inner.1.take();
     drop(inner);
     if let Some(elem) = waker {
@@ -396,12 +400,16 @@ where
   F: Future,
 {
   #[inline]
-  fn poll_join(&self, cx: &mut Context<'_>) -> Poll<F::Output> {
+  fn poll_join(&self, cx: &mut Context<'_>) -> Poll<crate::Result<F::Output>> {
     let mut inner = self.inner.borrow_mut();
-    if let TaskState::Done(value) = &mut inner.0
-      && let Some(elem) = value.take()
-    {
-      return Poll::Ready(elem);
+    match &mut inner.0 {
+      TaskState::Done(value) => {
+        if let Some(elem) = value.take() {
+          return Poll::Ready(Ok(elem));
+        }
+      }
+      TaskState::Panicked => return Poll::Ready(Err(ExecutorError::TaskPanicked.into())),
+      TaskState::Running(_) => {}
     }
     inner.1 = Some(cx.waker().clone());
     Poll::Pending
@@ -442,21 +450,42 @@ impl TcpListener for UringTcpListener {
     Ok(Self { idx, nodelay: tcp_params.tcp_nodelay() })
   }
 
+  /// A connection its peer already reset or closed is closed and skipped, as are the ones whose
+  /// setup fails: their sockets are never left open.
   #[inline]
   async fn accept(&self, tcp_params: TcpParams) -> crate::Result<(Self::TcpStream, SocketAddr)> {
-    let fd = poll_fn(|cx| poll_reactor(|reactor| reactor.poll_accept(self.idx, cx))).await?;
-    let params = with_reactor(|reactor| Ok(reactor.params))?;
-    let direct = params.direct_files > 0;
-    if !direct && tcp_params.tcp_nodelay() != self.nodelay {
-      set_nodelay(fd, tcp_params.tcp_nodelay())?;
+    loop {
+      let fd = poll_fn(|cx| poll_reactor(|reactor| reactor.poll_accept(self.idx, cx))).await?;
+      let params = with_reactor(|reactor| Ok(reactor.params))?;
+      let direct = params.direct_files > 0;
+      let setup = (|| {
+        if !direct && tcp_params.tcp_nodelay() != self.nodelay {
+          set_nodelay(fd, tcp_params.tcp_nodelay())?;
+        }
+        if params.peer_addrs && !direct {
+          peer_addr(fd)
+        } else {
+          Ok(SocketAddr::V4(core::net::SocketAddrV4::new(core::net::Ipv4Addr::UNSPECIFIED, 0)))
+        }
+      })();
+      match setup {
+        Ok(peer_addr) => {
+          let (idx, generation) = with_reactor(|reactor| reactor.add_conn(fd, 1, direct, true))?;
+          return Ok((UringTcpStream { generation, idx }, peer_addr));
+        }
+        Err(err) => {
+          with_reactor(|reactor| {
+            reactor.close_accepted(fd);
+            #[cfg(test)]
+            reactor.accept_setup_failures.set(reactor.accept_setup_failures.get() + 1);
+            Ok(())
+          })?;
+          if !peer_gone(&err) {
+            return Err(err);
+          }
+        }
+      }
     }
-    let peer_addr = if params.peer_addrs && !direct {
-      peer_addr(fd)?
-    } else {
-      SocketAddr::V4(core::net::SocketAddrV4::new(core::net::Ipv4Addr::UNSPECIFIED, 0))
-    };
-    let (idx, generation) = with_reactor(|reactor| reactor.add_conn(fd, 1, direct, true))?;
-    Ok((UringTcpStream { generation, idx }, peer_addr))
   }
 }
 
@@ -697,6 +726,15 @@ fn peer_addr(fd: RawFd) -> crate::Result<SocketAddr> {
   Ok(stream.peer_addr()?)
 }
 
+/// Whether an error setting up an accepted socket only says its peer is already gone.
+fn peer_gone(err: &crate::Error) -> bool {
+  matches!(
+    err,
+    crate::Error::Io(elem)
+      if matches!(elem.raw_os_error(), Some(libc::ENOTCONN | libc::ECONNRESET | libc::ECONNABORTED))
+  )
+}
+
 fn set_nodelay(fd: RawFd, value: bool) -> crate::Result<()> {
   let flag = libc::c_int::from(value);
   // SAFETY: `flag` outlives the call and its size is passed
@@ -791,6 +829,8 @@ struct Conn {
   in_use: bool,
   // In `Timers::lingering`
   lingering: bool,
+  // Came from a listener, so the idle timeout applies
+  accepted: bool,
   recv_armed: bool,
   refs: u8,
   // The tick `activity` was last seen set
@@ -954,6 +994,9 @@ struct Reactor {
   ring: RefCell<IoUring>,
   #[cfg(test)]
   accept_arms: Cell<usize>,
+  // Accepted sockets closed because setting them up failed
+  #[cfg(test)]
+  accept_setup_failures: Cell<usize>,
   // Read by the kernel when it takes a timeout entry off the queue
   backoff_ts: types::Timespec,
   tick_ts: types::Timespec,
@@ -1015,7 +1058,9 @@ impl Reactor {
       .setup_submit_all()
       .setup_cqsize(cq_entries)
       .build(sq_entries)?;
-    let count = params.recv_buffers.max(1).next_power_of_two();
+    // The kernel takes at most 32768 buffers in a ring, and the next power of two above that
+    // overflows a `u16`.
+    let count = params.recv_buffers.clamp(1, 32768).next_power_of_two();
     let len = params.recv_buffer_len.max(1) as usize;
     let layout = Layout::from_size_align(usize::from(count) * 16, 4096)
       .map_err(|_err| io_err(libc::EINVAL))?;
@@ -1068,6 +1113,8 @@ impl Reactor {
       ring: RefCell::new(ring),
       #[cfg(test)]
       accept_arms: Cell::new(0),
+      #[cfg(test)]
+      accept_setup_failures: Cell::new(0),
       backoff_ts: types::Timespec::new().nsec(100_000_000),
       tick_ts: types::Timespec::from(period),
       bufs: RefCell::new(bufs),
@@ -1481,6 +1528,7 @@ impl Reactor {
       };
       drop(free);
       let conn = &mut conns[idx as usize];
+      conn.accepted = accepted;
       conn.activity = 0;
       conn.cancel_sent = false;
       conn.closing = false;
@@ -1979,7 +2027,7 @@ impl Reactor {
     let mut open = false;
     if *idle_ticks > 0 && tick % *idle_every == 0 {
       for (idx, conn) in conns.iter_mut().enumerate() {
-        if !conn.in_use {
+        if !conn.in_use || !conn.accepted {
           continue;
         }
         open = true;
@@ -2656,6 +2704,20 @@ mod tests {
     }
   }
 
+  fn set_sock_opt<T>(stream: &std::net::TcpStream, level: i32, name: i32, value: &T) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: valid socket, and the option buffer is a live `T` of the size passed
+    unsafe {
+      libc::setsockopt(
+        stream.as_raw_fd(),
+        level,
+        name,
+        core::ptr::from_ref(value).cast(),
+        size_of::<T>() as libc::socklen_t,
+      );
+    }
+  }
+
   async fn bind(addr: &str) -> UringTcpListener {
     UringTcpListener::bind(addr, TcpParams::default().set_reuse_port(Some(false))).await.unwrap()
   }
@@ -3253,6 +3315,127 @@ mod tests {
     sorted.sort_unstable();
     assert_eq!(sorted, (0..44).collect::<Vec<u8>>());
     assert_eq!(runtime.open_conns(), 0);
+  }
+
+  // ---- hardening
+
+  // A connection reset before `accept` looks up its peer fails that lookup (ENOTCONN). The
+  // accepted socket is closed, not leaked, and `accept` goes on to the next connection.
+  #[test]
+  fn a_connection_reset_before_accept_is_closed_and_skipped() {
+    use crate::net::StreamReader;
+    use std::sync::mpsc;
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let (reset_tx, reset_rx) = mpsc::channel::<()>();
+    let client = std::thread::spawn(move || {
+      for _ in 0..8 {
+        let stream = connect(&client_addr);
+        let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+        set_sock_opt(&stream, libc::SOL_SOCKET, libc::SO_LINGER, &linger);
+        drop(stream);
+      }
+      reset_tx.send(()).unwrap();
+      let mut good = connect(&client_addr);
+      good.write_all(b"g").unwrap();
+      let mut rest = Vec::new();
+      let _rslt = good.read_to_end(&mut rest);
+    });
+    let runtime = UringRuntime::new().unwrap();
+    let (byte, failures) = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      // Let the resets land before `accept` looks at the connections.
+      while reset_rx.try_recv().is_err() {
+        yield_once().await;
+      }
+      let begin = std::time::Instant::now();
+      while begin.elapsed() < core::time::Duration::from_millis(100) {
+        yield_once().await;
+      }
+      let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+      let mut buf = [0; 1];
+      let _len = stream.read(buf.as_mut_slice().into()).await.unwrap();
+      let failures =
+        super::with_reactor(|reactor| Ok(reactor.accept_setup_failures.get())).unwrap();
+      (buf[0], failures)
+    });
+    client.join().unwrap();
+    assert_eq!(byte, b'g');
+    assert_eq!(failures, 8, "every reset connection is closed when its setup fails");
+    assert_eq!(runtime.open_conns(), 0);
+  }
+
+  // The kernel takes at most 32768 provided buffers; more must not overflow the ring size.
+  #[test]
+  fn recv_buffers_beyond_the_kernel_limit_are_clamped() {
+    let params = crate::executor::UringParams::new().set_recv_buffers(40_000, 64);
+    let runtime = UringRuntime::with_params(params).unwrap();
+    assert_eq!(runtime.block_on(async { 1 }), 1);
+  }
+
+  // A task that panics ends with an error at its join handle; the runtime and its other tasks
+  // carry on, and the task's slot is freed.
+  #[test]
+  fn a_panicking_task_does_not_take_down_the_runtime() {
+    let out = UringRuntime::new().unwrap().block_on(async {
+      let exec = UringExecutor::default();
+      let runtime = UringRuntime::new().unwrap();
+      let bad = crate::executor::Executor::spawn_local(
+        &exec,
+        async {
+          yield_once().await;
+          panic!("a task panicked on purpose");
+        },
+        &runtime,
+      );
+      let good = crate::executor::Executor::spawn_local(
+        &exec,
+        async {
+          yield_once().await;
+          yield_once().await;
+          5u8
+        },
+        &runtime,
+      );
+      let bad = bad.await;
+      let good = good.await.unwrap();
+      let free = super::with_reactor(|reactor| Ok(reactor.free_tasks.borrow().len())).unwrap();
+      (bad.is_err(), good, free)
+    });
+    assert_eq!(out, (true, 5, 2));
+  }
+
+  // The idle timeout is for accepted connections: an outbound one waiting on a quiet server is
+  // left alone.
+  #[test]
+  fn idle_timeout_leaves_outbound_connections_alone() {
+    use crate::net::{StreamReader, TcpStream};
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = std_listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+      let (mut stream, _) = std_listener.accept().unwrap();
+      std::thread::sleep(core::time::Duration::from_millis(400));
+      stream.write_all(b"late").unwrap();
+    });
+    let params = crate::executor::UringParams::new()
+      .set_idle_timeout(Some(core::time::Duration::from_millis(100)));
+    let runtime = UringRuntime::with_params(params).unwrap();
+    let got = runtime.block_on(async {
+      let mut stream = super::UringTcpStream::connect(addr, TcpParams::default()).await.unwrap();
+      let mut buf = [0; 8];
+      let len = stream.read(buf.as_mut_slice().into()).await.unwrap().unwrap();
+      buf[..len.get()].to_vec()
+    });
+    server.join().unwrap();
+    assert_eq!(got, b"late");
+  }
+
+  // Safe for a public server out of the box: a handshake and an idle deadline.
+  #[test]
+  fn defaults_bound_handshakes_and_idle_connections() {
+    let params = crate::executor::UringParams::new();
+    assert_eq!(params.handshake_timeout, Some(core::time::Duration::from_secs(10)));
+    assert_eq!(params.idle_timeout, Some(core::time::Duration::from_secs(300)));
   }
 
   // Reading into an empty buffer would report the end of the stream: it fails instead, and the
