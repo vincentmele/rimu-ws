@@ -1,0 +1,31 @@
+diff -ruN a/src/main.zig b/src/main.zig
+--- a/src/main.zig	2026-11-04 18:40:26.000000000 +0100
++++ b/src/main.zig	2026-11-05 23:25:18.827539791 +0100
+@@ -17,7 +17,8 @@
+     _ = try app.get("/baseline2", baseline);
+     _ = try app.get("/pipeline", pipeline);
+     _ = try app.get("/json/:count", json);
+-    _ = try app.ws("/ws", .{ .message = wsMessage });
++    // Production: 1 MiB messages and frames (the defaults are 16 KiB).
++    _ = try app.ws("/ws", .{ .message = wsMessage, .max_frame_size = 1 << 20, .max_message_size = 1 << 20 });
+ }
+ 
+ fn baseline(req: *uz.Request, res: *uz.Response) void {
+@@ -211,11 +212,15 @@
+ 
+ fn clusterConfig(comptime connections: usize) uz.ServerConfig {
+     var config = uz.ServerConfig{};
+-    config.max_connections = connections;
++    // Production: each connection's slab holds a whole 1 MiB message and a 256 KiB write queue, so
++    // the per-worker connection count is capped to keep the slabs within the container's memory.
++    config.max_connections = @min(connections, 192);
++    config.max_ws_message_size = 1 << 20;
++    config.idle_timeout_ms = 300_000;
+     config.max_request_line_size = 1024;
+     config.max_header_size = 4096;
+     config.max_body_size = 2048;
+-    config.write_queue_size = 16 * 1024;
++    config.write_queue_size = 256 * 1024;
+     config.max_h2_header_block_size = 2048;
+     config.max_h2_body_size = 512;
+     config.max_h2_response_header_size = 1024;

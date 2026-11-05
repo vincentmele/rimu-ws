@@ -1,0 +1,23 @@
+diff -ruN a/app.goose b/app.goose
+--- a/app.goose	2026-11-04 18:40:26.000000000 +0100
++++ b/app.goose	2026-11-05 23:27:16.975753168 +0100
+@@ -51,7 +51,8 @@
+ struct St {
+     use: Use = Use.None,
+     file: http::FileBody = http::FileBody { .. },
+-    ws: http::WebSocket = http::WebSocket { .. },
++    // Production: 1 MiB messages (the default is 64 KiB).
++    ws: http::WebSocket = http::WebSocket { limit: 1 << 20, .. },
+     ticket: pg::Ticket = pg::Ticket { .. },
+ }
+ 
+@@ -579,7 +580,8 @@
+ 
+ // 8080, h2c on 8082, and a wait per connection for /delay and /async-db.
+ fn config() -> http::Config {
+-    var cfg = http::Config { port: 8080, mail_slots: 256, .. };
++    // Production: a 300 s idle timeout (the default is 60 s); request_ms keeps its 10 s.
++    var cfg = http::Config { port: 8080, mail_slots: 256, idle_ms: 300000, .. };
+     cfg.max_waiting = cfg.max_conns;
+     cfg.listeners.push(http::Listener { port: 8082, h2c: true });
+     return cfg;

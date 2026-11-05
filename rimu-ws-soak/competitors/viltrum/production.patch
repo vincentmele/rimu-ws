@@ -1,0 +1,33 @@
+diff -ruN a/main.v b/main.v
+--- a/main.v	2026-11-04 18:40:26.000000000 +0100
++++ b/main.v	2026-11-05 23:26:11.671338317 +0100
+@@ -2,6 +2,7 @@
+ 
+ import json
+ import os
++import time
+ import viltrum
+ 
+ struct Rating {
+@@ -36,6 +37,11 @@
+ fn main() {
+ 	dataset := json.decode([]Item, os.read_file('/data/dataset.json') or { '[]' }) or { []Item{} }
+ 	mut app := viltrum.new()
++	// Production: 10 s to send a whole request (the upgrade), 256 KiB of output pending.
++	app.server_options(viltrum.Options{
++		read_timeout: 10 * time.second
++		max_pending:  256 * 1024
++	})
+ 	// One copy of the dataset per worker: totals are written per request, and a
+ 	// worker only touches its own copy.
+ 	mut copies := [][]Item{}
+@@ -86,6 +92,9 @@
+ 	// echo-ws: each message comes back as it came, text or binary, from the worker
+ 	// that owns the connection.
+ 	app.ws('/ws', viltrum.WsHandler{
++		// Production: 1 MiB messages (the default) and a 300 s idle timeout (default 120 s).
++		max_message:  1024 * 1024
++		idle_timeout: 300 * time.second
+ 		on_message: fn (mut s viltrum.Ws, m viltrum.WsMessage) {
+ 			if m.binary {
+ 				s.send_binary(m.data)

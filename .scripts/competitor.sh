@@ -9,7 +9,9 @@
 #
 # Every container runs with the same flags (rimu-ws-soak/RULES.md, docs/superpowers/plans/
 # 2026-11-05-soak-tier1.md): host network, seccomp unconfined, memlock unlimited, the server CPUs,
-# a 3 GiB memory cap, this user's uid, and MALLOC_MMAP_THRESHOLD_=262144. The harness runs on the
+# a 3 GiB memory cap, this user's uid, MALLOC_MMAP_THRESHOLD_=262144, and HttpArena's dataset.json
+# and static/ mounted read-only at /data as HttpArena mounts them (not its certs: TLS isn't tested,
+# and they would only open more listeners). The harness runs on the
 # other CPUs with --cgroup, --label NAME and --rss-ceiling 2048.
 #
 # Environment:
@@ -89,10 +91,13 @@ check_idle() {
 		echo "a soak container is running: $(docker ps --format '{{.Names}}' --filter name='^soak-')" >&2
 		exit 1
 	fi
-	if ss -ltn | grep -q ':8080 '; then
-		echo "port 8080 is busy" >&2
-		exit 1
-	fi
+	# The last container's listener can take a moment to go after its removal.
+	for _ in $(seq 50); do
+		ss -ltn | grep -q ':8080 ' || return 0
+		sleep 0.2
+	done
+	echo "port 8080 is busy" >&2
+	exit 1
 }
 
 cleanup() {
@@ -106,6 +111,7 @@ start() {
 	docker run -d --name "$container" --network host --security-opt seccomp=unconfined \
 		--ulimit memlock=-1:-1 --ulimit "nofile=$nofile:$nofile" --cpuset-cpus 0-5,12-17 \
 		--memory 3g --user "$(id -u):$(id -g)" -e MALLOC_MMAP_THRESHOLD_=262144 \
+		-v "$httparena/data/dataset.json:/data/dataset.json:ro" -v "$httparena/data/static:/data/static:ro" \
 		"$container" >/dev/null
 	for _ in $(seq 300); do
 		ss -ltn | grep -q ':8080 ' && return 0
