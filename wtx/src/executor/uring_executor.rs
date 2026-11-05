@@ -1425,8 +1425,9 @@ struct Reactor {
   polling: Cell<usize>,
   // The task `run_ready` is polling
   current: Cell<Option<Rc<dyn RunTask>>>,
-  // `UringSleep`s, by slot
+  // `UringSleep`s, by slot, and the free slots
   sleeps: RefCell<Vec<SleepSlot>>,
+  free_sleeps: RefCell<Vec<u32>>,
   counters: Counters,
   ready: RefCell<VecDeque<usize>>,
   tasks: RefCell<Vec<TaskSlot>>,
@@ -1549,6 +1550,7 @@ impl Reactor {
       polling: Cell::new(usize::MAX),
       current: Cell::new(None),
       sleeps: RefCell::new(Vec::new()),
+      free_sleeps: RefCell::new(Vec::new()),
       counters: Counters::default(),
       ready: RefCell::new(VecDeque::new()),
       tasks: RefCell::new(Vec::new()),
@@ -1584,8 +1586,10 @@ impl Reactor {
 
   fn add_sleep(&self, duration: Duration, cx: &Context<'_>) -> (u32, u32) {
     let mut sleeps = self.sleeps.borrow_mut();
-    let idx = match sleeps.iter().position(|el| el.state == SleepState::Free) {
-      Some(idx) => idx,
+    // A free list, not a scan: every closing TLS stream (plaintext too) starts an after-close
+    // timer, so with many connections closing the table is large.
+    let idx = match self.free_sleeps.borrow_mut().pop() {
+      Some(idx) => idx as usize,
       None => {
         sleeps.push(SleepSlot {
           generation: 0,
@@ -1638,7 +1642,10 @@ impl Reactor {
           .user_data(user_data(KIND_CANCEL, 0, 0));
         self.push_sqe(&sqe);
       }
-      SleepState::Fired => slot.state = SleepState::Free,
+      SleepState::Fired => {
+        slot.state = SleepState::Free;
+        self.free_sleeps.borrow_mut().push(idx);
+      }
       SleepState::Dropped | SleepState::Free => {}
     }
   }
@@ -1658,7 +1665,10 @@ impl Reactor {
           elem.wake();
         }
       }
-      SleepState::Dropped => slot.state = SleepState::Free,
+      SleepState::Dropped => {
+        slot.state = SleepState::Free;
+        self.free_sleeps.borrow_mut().push(idx);
+      }
       SleepState::Fired | SleepState::Free => {}
     }
   }
