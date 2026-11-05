@@ -27,6 +27,7 @@ mod udp_stream;
 mod uri;
 
 pub use buf_stream_reader::BufStreamReader;
+pub(crate) use buf_stream_reader::release_if_oversized;
 pub use bytes_stream::BytesStream;
 pub use connection_state::ConnectionState;
 pub use net_error::NetError;

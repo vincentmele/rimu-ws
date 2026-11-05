@@ -210,7 +210,9 @@ where
   let is_in_continuation_frame = if let Some(elem) = is_in_continuation_frame_opt {
     elem
   } else {
+    let used = user_buffer.len();
     user_buffer.clear();
+    crate::net::release_if_oversized(user_buffer, used);
     if let Some((rfi, header_len)) = fetch_buffered_data_frame::<D, _, IS_CLIENT>(
       max_payload_len,
       nc_rsv1,
@@ -325,7 +327,9 @@ where
     let _ = payload_origin;
     (op_code, network_buffer.current_mut())
   } else {
+    let used = reader_buffer.len();
     reader_buffer.clear();
+    crate::net::release_if_oversized(reader_buffer, used);
     let op_code = is_in_continuation_frame.op_code;
     *is_in_continuation_frame_opt = None;
     (op_code, user_buffer.as_slice_mut())

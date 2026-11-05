@@ -411,7 +411,9 @@ impl BufStreamReader {
       return Err(NetError::CapacityOverflow.into());
     }
     if following_len == 0 && !self.forbid_clear {
+      let used = self.buffer.len();
       self.clear();
+      release_if_oversized(&mut self.buffer, used.max(additional));
       if self.buffer.capacity() < additional {
         self.buffer.reserve(additional)?;
       }
@@ -477,6 +479,22 @@ impl Default for BufStreamReader {
   }
 }
 
+/// Buffers past this size are released once a use takes under a quarter of them.
+pub(crate) const RETAINED_BUFFER_LEN: usize = 1 << 20;
+
+/// Releases an empty buffer that one large message grew, if its last use (`used` bytes) took
+/// under a quarter of it. Without this a buffer keeps its peak size for the connection's life,
+/// so a single large (or inflated) message held its memory until the connection closed. A run of
+/// large messages keeps its buffer, so each doesn't pay for a new allocation.
+#[inline]
+pub(crate) fn release_if_oversized(buffer: &mut VectorUsize<u8>, used: usize) {
+  let capacity = buffer.capacity();
+  if capacity > RETAINED_BUFFER_LEN && used < capacity / 4 {
+    cold_path();
+    *buffer = VectorUsize::new();
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use crate::net::{BufStreamReader, BytesStream, StreamWriter};
@@ -534,6 +552,31 @@ mod tests {
     }
     let capacity = nrb.buffer.capacity();
     assert!(capacity <= 64 * 1024, "{capacity} bytes for 64-byte frames");
+  }
+
+  // One large message must not hold its memory for the rest of the connection: once a small
+  // message follows it, the buffer is released. A run of large messages keeps it, so that each doesn't pay
+  // for a new allocation.
+  #[rimu_ws::test]
+  async fn a_large_read_does_not_keep_its_buffer() {
+    let mut stream = BytesStream::default();
+    let large = alloc::vec![7; 4 << 20];
+    let mut nrb = BufStreamReader::default();
+    for _ in 0..2 {
+      stream.write_all(&large).await.unwrap();
+      nrb.read_payload(large.len(), &mut stream).await.unwrap();
+      assert!(nrb.buffer.capacity() >= 4 << 20);
+    }
+    let kept = nrb.buffer.capacity();
+    // The drain after the large message still counts it; the one after a small message releases.
+    for _ in 0..2 {
+      stream.write_all(&[0, 2, 1, 2]).await.unwrap();
+      let header = nrb.read_header::<_, 2>(&mut stream).await.unwrap().unwrap();
+      nrb.read_payload(u16::from_be_bytes(header).into(), &mut stream).await.unwrap();
+      assert_eq!(nrb.current(), &[1, 2][..]);
+    }
+    let capacity = nrb.buffer.capacity();
+    assert!(capacity <= 1 << 20, "{capacity} bytes kept after a small read (was {kept})");
   }
 
   #[rimu_ws::test]
