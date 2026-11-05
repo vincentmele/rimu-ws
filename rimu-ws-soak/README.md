@@ -94,3 +94,10 @@ rimu-ws-soak replay SEED:SLOT:GEN --url ws://127.0.0.1:9080/
 
 This reruns that one scenario with the same bytes and prints its outcome and transcript. Give it
 the same `--profile` or `--weights` as the run, because they decide which scenario the id picks.
+
+## License
+
+Copyright 2026 Vincent Mele. Licensed under the [Apache License, version 2.0](LICENSE).
+
+The rest of this repository is a fork of [wtx](https://github.com/c410-f3r/wtx) and is licensed
+under the Mozilla Public License 2.0; see [NOTICE](../NOTICE). This crate contains no wtx code.

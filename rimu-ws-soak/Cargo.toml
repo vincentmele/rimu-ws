@@ -1,9 +1,11 @@
 [package]
+authors = ["Vincent Mele <vince@mele.law>"]
 description = "Soak and abuse harness for rimu-ws WebSocket servers"
 edition = "2024"
 license = "Apache-2.0"
 name = "rimu-ws-soak"
 publish = false
+repository = "https://github.com/vincentmele/rimu-ws"
 version = "0.1.0"
 
 [dependencies]

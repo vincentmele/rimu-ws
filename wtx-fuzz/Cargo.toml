@@ -52,6 +52,7 @@ rimu-ws = { default-features = false, features = ["_fuzz", "arbitrary", "asn1", 
 
 [package]
 edition = "2024"
+license = "MPL-2.0"
 name = "rimu-ws-fuzz"
 publish = false
 version = "0.0.0"

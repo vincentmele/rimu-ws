@@ -98,6 +98,7 @@ x509-limbo = ["rimu-ws/serde", "serde/derive", "serde_json/std", "rimu-ws/x509"]
 
 [package]
 edition = "2024"
+license = "MPL-2.0"
 name = "rimu-ws-internal"
 publish = false
 version = "0.0.0"
