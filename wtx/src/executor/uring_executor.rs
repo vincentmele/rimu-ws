@@ -364,6 +364,10 @@ where
 
 trait RunTask {
   fn poll_task(&self, cx: &mut Context<'_>) -> Poll<()>;
+
+  /// Ends a task whose poll panicked: its future is dropped and its join handle gets
+  /// `TaskPanicked`.
+  fn end_panicked(&self);
 }
 
 trait JoinTask<T> {
@@ -382,19 +386,30 @@ where
     };
     // SAFETY: the future lives in the `Rc` allocation and is only dropped in place, never moved
     let future = unsafe { Pin::new_unchecked(future) };
-    // A panic ends this task alone: the other tasks and connections of the runtime carry on, and
-    // the join handle gets `TaskPanicked`. With `panic = "abort"` the process aborts as usual.
-    inner.0 = match std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| future.poll(cx))) {
-      Ok(Poll::Pending) => return Poll::Pending,
-      Ok(Poll::Ready(value)) => TaskState::Done(Some(value)),
-      Err(_payload) => TaskState::Panicked,
+    let Poll::Ready(value) = future.poll(cx) else {
+      return Poll::Pending;
     };
+    inner.0 = TaskState::Done(Some(value));
     let waker = inner.1.take();
     drop(inner);
     if let Some(elem) = waker {
       elem.wake();
     }
     Poll::Ready(())
+  }
+
+  #[cold]
+  fn end_panicked(&self) {
+    // The unwind released the poll's borrow.
+    let Ok(mut inner) = self.inner.try_borrow_mut() else {
+      return;
+    };
+    inner.0 = TaskState::Panicked;
+    let waker = inner.1.take();
+    drop(inner);
+    if let Some(elem) = waker {
+      elem.wake();
+    }
   }
 }
 
@@ -1215,6 +1230,8 @@ struct Reactor {
   params: UringParams,
   // The task `run_ready` is polling, or `usize::MAX`
   polling: Cell<usize>,
+  // The task `run_ready` is polling
+  current: Cell<Option<Rc<dyn RunTask>>>,
   ready: RefCell<VecDeque<usize>>,
   tasks: RefCell<Vec<TaskSlot>>,
   timers: RefCell<Timers>,
@@ -1334,6 +1351,7 @@ impl Reactor {
       main_woken: Cell::new(false),
       params,
       polling: Cell::new(usize::MAX),
+      current: Cell::new(None),
       ready: RefCell::new(VecDeque::new()),
       tasks: RefCell::new(Vec::new()),
       timers: RefCell::new(timers),
@@ -1402,9 +1420,38 @@ impl Reactor {
     }
   }
 
+  /// Polls the tasks woken so far. A task that panics ends alone: the others, and the runtime's
+  /// connections, carry on. With `panic = "abort"` the process aborts as usual.
   fn run_ready(&self) {
-    let count = self.ready.borrow().len();
-    for _ in 0..count {
+    let mut count = self.ready.borrow().len();
+    // One unwind guard per turn: one per poll would keep each task's poll from being inlined.
+    while std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| self.poll_ready(&mut count)))
+      .is_err()
+    {
+      self.end_panicked_task();
+    }
+  }
+
+  #[cold]
+  #[inline(never)]
+  fn end_panicked_task(&self) {
+    let idx = self.polling.replace(usize::MAX);
+    if let Some(task) = self.current.take() {
+      // Dropping its future may panic too; the task is over either way.
+      let _rslt = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| task.end_panicked()));
+    }
+    let mut tasks = self.tasks.borrow_mut();
+    if let Some(slot) = tasks.get_mut(idx) {
+      slot.future = None;
+      slot.generation = slot.generation.wrapping_add(1);
+      slot.scheduled = false;
+      self.free_tasks.borrow_mut().push(idx as u32);
+    }
+  }
+
+  fn poll_ready(&self, count: &mut usize) {
+    while *count > 0 {
+      *count -= 1;
       let Some(idx) = self.ready.borrow_mut().pop_front() else {
         break;
       };
@@ -1419,7 +1466,10 @@ impl Reactor {
       };
       let waker = waker(waker_data(self.slot(), generation, idx));
       self.polling.set(idx);
+      // Kept here as well, for `end_panicked_task` to reach the task if its poll unwinds
+      self.current.set(Some(future.clone()));
       let poll = future.poll_task(&mut Context::from_waker(&waker));
+      self.current.set(None);
       self.polling.set(usize::MAX);
       if poll.is_ready() {
         drop(future);
