@@ -71,6 +71,9 @@ const MAX_SEND: usize = 1 << 30;
 const MAX_RX_HIGH_WATER: usize = 512 << 20;
 const MAX_RECV_RING: usize = 512 << 20;
 const RX_COMPACT: usize = 32 * 1024;
+// Refused submissions in a row, with the queue full or waiting for completions, after which the
+// ring is taken to be broken.
+const SUBMIT_TRIES: u32 = 1024;
 
 std::thread_local! {
   static CURRENT: Cell<*const Reactor> = const { Cell::new(core::ptr::null()) };
@@ -377,10 +380,12 @@ impl Runtime for UringRuntime {
       if reactor.main_woken.replace(false)
         && let Poll::Ready(elem) = future.as_mut().poll(&mut Context::from_waker(&main_waker))
       {
+        reactor.check_ring();
         reactor.finish_closing();
         return elem;
       }
       reactor.run_ready();
+      reactor.check_ring();
       let idle = !reactor.main_woken.get() && reactor.ready.borrow().is_empty();
       reactor.enter(idle);
       reactor.reap();
@@ -1439,6 +1444,10 @@ struct Reactor {
   sleeps: RefCell<Vec<SleepSlot>>,
   free_sleeps: RefCell<Vec<u32>>,
   counters: Counters,
+  // Waits for completions that failed in a row
+  enter_failures: Cell<u32>,
+  // The errno the ring kept refusing submissions with, if it did: `block_on` panics with it
+  ring_failed: Cell<i32>,
   ready: RefCell<VecDeque<usize>>,
   tasks: RefCell<Vec<TaskSlot>>,
   timers: RefCell<Timers>,
@@ -1562,6 +1571,8 @@ impl Reactor {
       sleeps: RefCell::new(Vec::new()),
       free_sleeps: RefCell::new(Vec::new()),
       counters: Counters::default(),
+      enter_failures: Cell::new(0),
+      ring_failed: Cell::new(0),
       ready: RefCell::new(VecDeque::new()),
       tasks: RefCell::new(Vec::new()),
       timers: RefCell::new(timers),
@@ -1835,12 +1846,43 @@ impl Reactor {
   #[cold]
   #[inline(never)]
   fn push_sqe_full(&self, sqe: &squeue::Entry) {
+    if self.ring_failed.get() != 0 {
+      return;
+    }
     let mut ring = self.ring.borrow_mut();
+    let mut tries: u32 = 0;
     // SAFETY: as in `push_sqe`
     while unsafe { ring.submission().push(sqe) }.is_err() {
-      if ring.submit().is_err() {
-        bump(&self.counters.submit_errors);
+      #[cfg(test)]
+      let rslt = if tests::FAIL_SUBMIT.with(core::cell::Cell::get) {
+        Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
+      } else {
+        ring.submit()
+      };
+      #[cfg(not(test))]
+      let rslt = ring.submit();
+      // A submit that succeeds empties the queue, so a second try means refusals.
+      let Err(err) = rslt else {
+        continue;
+      };
+      bump(&self.counters.submit_errors);
+      tries += 1;
+      if tries >= SUBMIT_TRIES {
+        // The entry is lost and the runtime can't go on: `block_on` ends with the error.
+        self.ring_failed.set(err.raw_os_error().unwrap_or(libc::EIO));
+        return;
       }
+      // Most likely a transient shortage (`EAGAIN`, `ENOMEM`): give the kernel a moment.
+      std::thread::yield_now();
+    }
+  }
+
+  /// Panics if the ring kept refusing submissions: entries were lost, so tasks would wait for
+  /// completions that never come.
+  fn check_ring(&self) {
+    let errno = self.ring_failed.get();
+    if errno != 0 {
+      ring_failed(errno);
     }
   }
 
@@ -1883,10 +1925,17 @@ impl Reactor {
       }
     }
     // EINTR from a signal is not a refusal: the next turn waits again.
-    if let Err(err) = ring.submit_and_wait(1)
-      && err.kind() != std::io::ErrorKind::Interrupted
-    {
-      bump(&self.counters.submit_errors);
+    match ring.submit_and_wait(1) {
+      Err(err) if err.kind() != std::io::ErrorKind::Interrupted => {
+        bump(&self.counters.submit_errors);
+        let failures = self.enter_failures.get() + 1;
+        self.enter_failures.set(failures);
+        // Failing at once every time, the loop would spin instead of waiting.
+        if failures >= SUBMIT_TRIES {
+          self.ring_failed.set(err.raw_os_error().unwrap_or(libc::EIO));
+        }
+      }
+      _ => self.enter_failures.set(0),
     }
   }
 
@@ -2799,6 +2848,15 @@ fn send_pending_tls_alert(conn: &mut Conn) {
   }
 }
 
+#[cold]
+#[inline(never)]
+fn ring_failed(errno: i32) -> ! {
+  panic!(
+    "io_uring refused submissions {SUBMIT_TRIES} times in a row: {}",
+    std::io::Error::from_raw_os_error(errno)
+  );
+}
+
 /// Drops the read bytes from the front of a connection's received ones, which a reader that never
 /// takes everything there is would otherwise keep for as long as the connection lives.
 #[cold]
@@ -3343,6 +3401,11 @@ mod tests {
 
   pub(super) static ENOBUFS: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+
+  std::thread_local! {
+    // Every submission on this thread fails with `EAGAIN`
+    pub(super) static FAIL_SUBMIT: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+  }
 
   #[test]
   fn stress_starved_buffers_and_small_queue() {
@@ -4744,5 +4807,40 @@ mod tests {
     });
     let rslt = done_rx.recv_timeout(core::time::Duration::from_secs(120));
     assert_eq!(rslt, Ok((LEN, None)));
+  }
+
+  // A ring that refuses every submission once its queue is full ends `block_on` with a panic
+  // that names the error, instead of spinning on the full queue forever.
+  #[test]
+  fn a_ring_that_refuses_submissions_ends_the_runtime() {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let _thread = std::thread::spawn(move || {
+      let rslt = std::panic::catch_unwind(|| {
+        let params = crate::executor::UringParams::new().set_ring_entries(4, 8);
+        UringRuntime::with_params(params).unwrap().block_on(async {
+          super::tests::FAIL_SUBMIT.with(|el| el.set(true));
+          let mut sleeps: Vec<_> = (0..8)
+            .map(|_| crate::futures::Sleep::new(core::time::Duration::from_secs(60)).unwrap())
+            .collect();
+          poll_fn(|cx| {
+            for sleep in &mut sleeps {
+              let _poll = core::pin::Pin::new(sleep).poll(cx);
+            }
+            Poll::Ready(())
+          })
+          .await;
+          crate::futures::Sleep::new(core::time::Duration::from_secs(60)).unwrap().await.unwrap();
+        });
+      });
+      let msg = rslt.err().and_then(|el| {
+        el.downcast_ref::<alloc::string::String>()
+          .cloned()
+          .or_else(|| el.downcast_ref::<&str>().map(|msg| alloc::string::String::from(*msg)))
+      });
+      let _rslt = done_tx.send(msg);
+    });
+    let msg = done_rx.recv_timeout(core::time::Duration::from_secs(5));
+    let msg = msg.expect("the runtime spun on a full submission queue").unwrap_or_default();
+    assert!(msg.contains("submission"), "{msg}");
   }
 }
