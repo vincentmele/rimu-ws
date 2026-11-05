@@ -1,0 +1,19 @@
+[package]
+authors = ["Vincent Mele <vince@mele.law>"]
+description = "rimu-ws in the soak's comparison: an echo server on its documented production settings"
+edition = "2024"
+license = "Apache-2.0"
+name = "soak-competitor-rimu-ws"
+publish = false
+version = "0.1.0"
+
+# Its own workspace: built on its own, as a user's project would be.
+[workspace]
+
+[dependencies]
+rimu-ws = { default-features = false, features = ["crypto-ring", "io-uring", "optimizations-std", "web-socket-server-framework"], path = "../../../wtx" }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"

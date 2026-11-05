@@ -9,6 +9,9 @@ Like wtx, rimu-ws is licensed under the [Mozilla Public License 2.0](LICENSE), e
 [`rimu-ws-soak`](rimu-ws-soak), which is licensed under [Apache-2.0](rimu-ws-soak/LICENSE). See
 [NOTICE](NOTICE) for the details.
 
+For a server on the public internet, see [docs/production-settings.md](docs/production-settings.md)
+for the settings rimu-ws recommends.
+
 The rest of this README is upstream's and describes wtx. Its badges, benchmarks and links refer to
 the upstream project. Its description of wtx as human-written applies to upstream: this fork's
 changes were developed with AI assistance.
