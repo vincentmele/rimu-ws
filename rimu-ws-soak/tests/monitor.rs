@@ -105,3 +105,76 @@ fn large_messages_in_flight_raise_the_rss_limit() {
     [Violation::Rss { rss_kib: limit_kib + 1, limit_kib }]
   );
 }
+
+/// A fresh directory standing in for a container's cgroup.
+fn fake_cgroup(name: &str, pids: &[u32]) -> std::path::PathBuf {
+  let dir = std::path::PathBuf::from(format!(
+    "/mnt/nvme1tb/claude-tmp/soak-test/{name}-{}",
+    std::process::id()
+  ));
+  std::fs::create_dir_all(&dir).unwrap();
+  let procs: String = pids.iter().map(|el| format!("{el}\n")).collect();
+  std::fs::write(dir.join("cgroup.procs"), procs).unwrap();
+  dir
+}
+
+#[test]
+fn cgroup_monitor_sums_every_process() {
+  let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+  let own_fds = std::fs::read_dir("/proc/self/fd").unwrap().count() as u32;
+  let dir = fake_cgroup("sums", &[std::process::id(), child.id()]);
+  let mut monitor = Monitor::cgroup(dir.clone(), 9).unwrap();
+  let sample = monitor.sample().unwrap();
+  let _ = child.kill();
+  let _ = child.wait();
+  let _ = std::fs::remove_dir_all(dir);
+  assert_eq!(sample.procs, 2, "{sample:?}");
+  assert!(sample.fds >= own_fds + 3 - 2, "{sample:?}, own {own_fds}");
+  assert!(sample.rss_kib > 0, "{sample:?}");
+}
+
+#[test]
+fn empty_cgroup_is_pid_gone() {
+  let dir = fake_cgroup("empty", &[]);
+  let rslt = Monitor::cgroup(dir.clone(), 9).and_then(|mut el| el.sample());
+  let _ = std::fs::remove_dir_all(dir);
+  assert!(matches!(rslt, Err(MonitorError::PidGone)), "{rslt:?}");
+}
+
+#[test]
+fn unreadable_fd_dir_is_an_error() {
+  // SAFETY: no arguments
+  if unsafe { libc::geteuid() } == 0 {
+    eprintln!("skipped: running as root, which can read every process's descriptors");
+    return;
+  }
+  let dir = fake_cgroup("unreadable", &[1]);
+  let rslt = Monitor::cgroup(dir.clone(), 9).and_then(|mut el| el.sample());
+  let _ = std::fs::remove_dir_all(dir);
+  assert!(matches!(rslt, Err(MonitorError::Unreadable(_))), "{rslt:?}");
+}
+
+#[test]
+fn io_uring_expected_but_absent_is_invalid() {
+  use rimu_ws_soak::cycle::io_uring_verdict;
+  assert!(io_uring_verdict(true, 0).is_some());
+  assert_eq!(io_uring_verdict(true, 2), None);
+  assert_eq!(io_uring_verdict(false, 0), None);
+}
+
+#[test]
+fn counts_io_uring_descriptors() {
+  // struct io_uring_params is 120 bytes; zeroed asks for the defaults.
+  let mut params = [0u64; 15];
+  // SAFETY: a valid, writable params struct
+  let fd = unsafe { libc::syscall(libc::SYS_io_uring_setup, 4, params.as_mut_ptr()) };
+  if fd < 0 {
+    eprintln!("skipped: io_uring_setup is not allowed here");
+    return;
+  }
+  let sample = Monitor::new(std::process::id(), 9).unwrap().sample();
+  // SAFETY: the ring's descriptor, closed once
+  let _ = unsafe { libc::close(fd as i32) };
+  let sample = sample.unwrap();
+  assert!(sample.io_uring_fds >= 1, "{sample:?}");
+}

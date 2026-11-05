@@ -1,5 +1,8 @@
 //! The server seen from outside, once a second: memory, descriptors, CPU and its sockets' states,
-//! and the invariants a bounded server keeps.
+//! and the invariants a bounded server keeps. The server is one process (`--pid`), or every
+//! process of a container's cgroup (`--cgroup`), summed.
+
+use std::path::PathBuf;
 
 /// Socket states on the server's port (sockets whose local port it is).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -20,6 +23,16 @@ pub struct Sample {
   pub fds: u32,
   pub cpu_ticks: u64,
   pub tcp: TcpStates,
+  /// Processes summed.
+  #[serde(default)]
+  pub procs: u32,
+  /// Descriptors that are io_uring instances.
+  #[serde(default)]
+  pub io_uring_fds: u32,
+  /// The cgroup's `memory.current`, recorded only: it adds socket buffers and page cache to what
+  /// the processes hold, so judging it would be another rule.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub cgroup_mem_kib: Option<u64>,
 }
 
 /// `VmRSS` and `VmHWM` in KiB.
@@ -76,46 +89,128 @@ fn read(path: &str) -> Result<String, MonitorError> {
 
 #[derive(Debug)]
 pub enum MonitorError {
-  /// The process is gone, or another one has its pid.
+  /// The process is gone, or another one has its pid; or the cgroup has no process left.
   PidGone,
+  /// The server's descriptors can't be read (another user's process): judging it would mean
+  /// judging zeros.
+  Unreadable(String),
   Io(std::io::Error),
 }
 
-/// Samples one process, which must stay the same process.
+/// What is sampled.
+#[derive(Debug)]
+enum Source {
+  /// One process, which must stay the same process.
+  Pid { pid: u32, start_time: u64 },
+  /// Every process in a cgroup directory, read afresh each time.
+  Cgroup { dir: PathBuf },
+}
+
+/// Samples the server.
 #[derive(Debug)]
 pub struct Monitor {
-  pid: u32,
+  source: Source,
   port: u16,
-  start_time: u64,
+}
+
+/// One process's share of a sample.
+struct ProcSample {
+  rss_kib: u64,
+  hwm_kib: u64,
+  fds: u32,
+  io_uring_fds: u32,
+  cpu_ticks: u64,
+}
+
+/// `pid`'s memory, descriptors and CPU; `start_time` checks it is the same process.
+fn sample_proc(pid: u32, start_time: Option<u64>) -> Result<ProcSample, MonitorError> {
+  let (state, stat) = stat_fields(pid)?;
+  let field = |n: usize| stat.get(n - 4).copied().unwrap_or(0);
+  // A zombie has exited; another start time is another process with the same pid.
+  if state == 'Z' || start_time.is_some_and(|el| field(22) != el) {
+    return Err(MonitorError::PidGone);
+  }
+  // utime + stime
+  let cpu_ticks = field(14) + field(15);
+  let (rss_kib, hwm_kib) = parse_status(&read(&format!("/proc/{pid}/status"))?).unwrap_or((0, 0));
+  let dir = std::fs::read_dir(format!("/proc/{pid}/fd")).map_err(|err| match err.kind() {
+    std::io::ErrorKind::NotFound => MonitorError::PidGone,
+    std::io::ErrorKind::PermissionDenied => {
+      MonitorError::Unreadable(format!("/proc/{pid}/fd: {err}"))
+    }
+    _ => MonitorError::Io(err),
+  })?;
+  let (mut fds, mut io_uring_fds) = (0, 0);
+  for entry in dir.flatten() {
+    fds += 1;
+    if std::fs::read_link(entry.path()).is_ok_and(|el| el.as_os_str() == "anon_inode:[io_uring]") {
+      io_uring_fds += 1;
+    }
+  }
+  Ok(ProcSample { rss_kib, hwm_kib, fds, io_uring_fds, cpu_ticks })
+}
+
+/// The pids in a cgroup's `cgroup.procs`.
+fn cgroup_pids(dir: &std::path::Path) -> Result<Vec<u32>, MonitorError> {
+  let text = std::fs::read_to_string(dir.join("cgroup.procs")).map_err(|err| match err.kind() {
+    std::io::ErrorKind::NotFound => MonitorError::PidGone,
+    _ => MonitorError::Io(err),
+  })?;
+  Ok(text.lines().filter_map(|el| el.trim().parse().ok()).collect())
 }
 
 impl Monitor {
   pub fn new(pid: u32, port: u16) -> Result<Monitor, MonitorError> {
     let start_time = stat_fields(pid)?.1.get(22 - 4).copied().unwrap_or(0);
-    Ok(Monitor { pid, port, start_time })
+    Ok(Monitor { source: Source::Pid { pid, start_time }, port })
   }
 
-  pub fn pid(&self) -> u32 {
-    self.pid
+  /// Every process of the cgroup at `dir` (a container's), summed.
+  pub fn cgroup(dir: PathBuf, port: u16) -> Result<Monitor, MonitorError> {
+    if cgroup_pids(&dir)?.is_empty() {
+      return Err(MonitorError::PidGone);
+    }
+    Ok(Monitor { source: Source::Cgroup { dir }, port })
+  }
+
+  /// The server's processes, for the RSS ceiling's kill.
+  pub fn pids(&self) -> Vec<u32> {
+    match &self.source {
+      Source::Pid { pid, .. } => vec![*pid],
+      Source::Cgroup { dir } => cgroup_pids(dir).unwrap_or_default(),
+    }
   }
 
   pub fn sample(&mut self) -> Result<Sample, MonitorError> {
-    let (state, stat) = stat_fields(self.pid)?;
-    let field = |n: usize| stat.get(n - 4).copied().unwrap_or(0);
-    // A zombie has exited; another start time is another process with the same pid.
-    if state == 'Z' || field(22) != self.start_time {
-      return Err(MonitorError::PidGone);
+    let mut sample = Sample::default();
+    let mut add = |part: ProcSample| {
+      sample.procs += 1;
+      sample.rss_kib += part.rss_kib;
+      sample.hwm_kib += part.hwm_kib;
+      sample.fds += part.fds;
+      sample.io_uring_fds += part.io_uring_fds;
+      sample.cpu_ticks += part.cpu_ticks;
+    };
+    match &self.source {
+      Source::Pid { pid, start_time } => add(sample_proc(*pid, Some(*start_time))?),
+      Source::Cgroup { dir } => {
+        for pid in cgroup_pids(dir)? {
+          match sample_proc(pid, None) {
+            Ok(part) => add(part),
+            // It exited between the listing and the read.
+            Err(MonitorError::PidGone) => {}
+            Err(err) => return Err(err),
+          }
+        }
+        if sample.procs == 0 {
+          return Err(MonitorError::PidGone);
+        }
+        sample.cgroup_mem_kib = std::fs::read_to_string(dir.join("memory.current"))
+          .ok()
+          .and_then(|el| el.trim().parse::<u64>().ok())
+          .map(|el| el / 1024);
+      }
     }
-    // utime + stime
-    let cpu_ticks = field(14) + field(15);
-    let (rss_kib, hwm_kib) =
-      parse_status(&read(&format!("/proc/{}/status", self.pid))?).unwrap_or((0, 0));
-    let fds = std::fs::read_dir(format!("/proc/{}/fd", self.pid))
-      .map_err(|err| match err.kind() {
-        std::io::ErrorKind::NotFound => MonitorError::PidGone,
-        _ => MonitorError::Io(err),
-      })?
-      .count() as u32;
     let mut tcp = TcpStates::default();
     for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
       if let Ok(text) = std::fs::read_to_string(table) {
@@ -128,7 +223,8 @@ impl Monitor {
         tcp.send_q += part.send_q;
       }
     }
-    Ok(Sample { rss_kib, hwm_kib, fds, cpu_ticks, tcp })
+    sample.tcp = tcp;
+    Ok(sample)
   }
 }
 
@@ -188,6 +284,8 @@ pub enum Violation {
     unserved: u32,
     n: u32,
   },
+  /// The server's descriptors couldn't be read, which ends the run.
+  Unreadable(String),
 }
 
 /// While clients are connected.

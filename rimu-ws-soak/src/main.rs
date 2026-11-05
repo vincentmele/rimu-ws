@@ -69,8 +69,14 @@ struct RunArgs {
   #[command(flatten)]
   common: Common,
   /// The server's pid, for the monitor.
-  #[arg(long)]
+  #[arg(long, conflicts_with = "cgroup")]
   pid: Option<u32>,
+  /// A container's cgroup directory: the monitor sums every process in it.
+  #[arg(long)]
+  cgroup: Option<PathBuf>,
+  /// The server claims io_uring: a run that never sees an io_uring descriptor is invalid (exit 4).
+  #[arg(long)]
+  expect_io_uring: bool,
   #[arg(long, default_value_t = 1)]
   seed: u64,
   #[arg(long, default_value_t = 100)]
@@ -273,6 +279,8 @@ async fn run(args: RunArgs) -> Result<ExitCode, String> {
     fd_flood: args.fd_flood,
     ext: Extended {
       label: args.label,
+      cgroup: args.cgroup,
+      expect_io_uring: args.expect_io_uring,
       rotation,
       records: match args.records {
         Records::All => RecordMode::All,

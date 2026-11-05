@@ -109,6 +109,10 @@ pub enum RecordMode {
 pub struct Extended {
   /// The server's name in the summary, which the report card's rows are keyed by.
   pub label: Option<String>,
+  /// Monitors every process of this cgroup (a container's) instead of `CycleConfig::pid`.
+  pub cgroup: Option<std::path::PathBuf>,
+  /// The server claims io_uring: a run that never sees an io_uring descriptor is invalid.
+  pub expect_io_uring: bool,
   /// Cycle `i` runs profile `i % len`; empty runs `RunConfig::weights` every cycle.
   pub rotation: Vec<(String, Weights)>,
   pub records: RecordMode,
@@ -151,6 +155,12 @@ pub fn drain_baseline(
   first_drained: Option<Baseline>,
 ) -> Option<Baseline> {
   (cycle > 0).then(|| first_drained.unwrap_or(warm))
+}
+
+/// Why a run is invalid when the server claims io_uring (`expected`) but at most `max_seen` of its
+/// descriptors were io_uring instances: none means it fell back to something else.
+pub fn io_uring_verdict(expected: bool, max_seen: u32) -> Option<String> {
+  (expected && max_seen == 0).then(|| "no io_uring descriptors seen".to_owned())
 }
 
 /// One scenario's runs, by how they went, with a replay id of each kind's first.
@@ -235,6 +245,8 @@ struct State<'out> {
   drained: Vec<u64>,
   // Set once the server is gone, which is reported once.
   gone: bool,
+  // The most io_uring descriptors one sample saw.
+  io_uring_max: u32,
   last_beat: Instant,
   last_sample: Option<Sample>,
   monitor: Option<Monitor>,
@@ -316,14 +328,18 @@ impl State<'_> {
       Ok(el) => el,
       Err(_) => return Some(None),
     };
-    let pid = monitor.pid();
+    let pids = monitor.pids();
     self.monitor = Some(monitor);
     match rslt {
       Ok(sample) => {
         self.last_sample = Some(sample);
+        self.io_uring_max = self.io_uring_max.max(sample.io_uring_fds);
         if let Some(ceiling_kib) = self.ceiling_kib.filter(|el| sample.rss_kib > *el) {
-          // SAFETY: no pointers
-          let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+          for pid in pids {
+            // SAFETY: no pointers. Another user's process refuses (EPERM): its container's
+            // `--memory` cap and the runner's cleanup stop it instead.
+            let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+          }
           self.gone = true;
           let _ = self.stop.get_or_insert("rss ceiling");
           self.violation(cycle, Violation::RssCeiling { rss_kib: sample.rss_kib, ceiling_kib });
@@ -334,6 +350,12 @@ impl State<'_> {
       Err(MonitorError::PidGone) => {
         self.gone = true;
         self.violation(cycle, Violation::PidGone);
+        None
+      }
+      Err(MonitorError::Unreadable(reason)) => {
+        self.gone = true;
+        let _ = self.stop.get_or_insert("unreadable");
+        self.violation(cycle, Violation::Unreadable(reason));
         None
       }
       Err(MonitorError::Io(err)) => {
@@ -351,6 +373,7 @@ pub async fn run(cfg: CycleConfig, out: &mut dyn Write) -> Summary {
     ceiling_kib: cfg.ext.rss_ceiling_kib,
     drained: Vec::new(),
     gone: false,
+    io_uring_max: 0,
     last_beat: started,
     last_sample: None,
     monitor: None,
@@ -368,13 +391,21 @@ pub async fn run(cfg: CycleConfig, out: &mut dyn Write) -> Summary {
       ..Summary::default()
     },
   };
-  match cfg.pid.map(|pid| Monitor::new(pid, cfg.port)) {
+  let monitor = match &cfg.ext.cgroup {
+    Some(dir) => Some(Monitor::cgroup(dir.clone(), cfg.port)),
+    None => cfg.pid.map(|pid| Monitor::new(pid, cfg.port)),
+  };
+  match monitor {
     Some(Ok(monitor)) => state.monitor = Some(monitor),
+    Some(Err(MonitorError::Unreadable(reason))) => {
+      state.violation(0, Violation::Unreadable(reason));
+      return finish(state, false);
+    }
     Some(Err(_)) => {
       state.violation(0, Violation::PidGone);
-      return finish(state);
+      return finish(state, false);
     }
-    None => eprintln!("warning: no --pid, so the server is not monitored"),
+    None => eprintln!("warning: no --pid or --cgroup, so the server is not monitored"),
   }
   let deadline = cfg.ext.max_time.map(|el| started + el);
   let probes =
@@ -472,11 +503,14 @@ pub async fn run(cfg: CycleConfig, out: &mut dyn Write) -> Summary {
     state.summary.latency = probes.totals();
     probes.stop();
   }
-  finish(state)
+  finish(state, cfg.ext.expect_io_uring)
 }
 
-fn finish(mut state: State<'_>) -> Summary {
+fn finish(mut state: State<'_>, expect_io_uring: bool) -> Summary {
   state.summary.stopped = state.stop.map(String::from);
+  if state.summary.invalid.is_none() && !state.summary.violations.contains(&Violation::PidGone) {
+    state.summary.invalid = io_uring_verdict(expect_io_uring, state.io_uring_max);
+  }
   line(state.out, "summary", &state.summary);
   let _ = state.out.flush();
   state.summary

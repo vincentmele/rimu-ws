@@ -70,6 +70,7 @@ pub async fn fd_flood(
   let mut last = match monitor.sample() {
     Ok(sample) => (Instant::now(), sample.cpu_ticks),
     Err(MonitorError::PidGone) => return vec![Violation::PidGone],
+    Err(MonitorError::Unreadable(reason)) => return vec![Violation::Unreadable(reason)],
     Err(MonitorError::Io(_)) => return found,
   };
   let mut busiest: Option<Violation> = None;
@@ -78,11 +79,13 @@ pub async fn fd_flood(
     let sample = match monitor.sample() {
       Ok(sample) => sample,
       Err(MonitorError::PidGone) => return vec![Violation::PidGone],
+      Err(MonitorError::Unreadable(reason)) => return vec![Violation::Unreadable(reason)],
       Err(MonitorError::Io(_)) => continue,
     };
     let now = Instant::now();
     if let Some(Violation::Busy { cpu_pct }) =
-      busy_verdict(sample.cpu_ticks - last.1, now - last.0, clk_tck)
+      // A cgroup's sum drops when one of its processes exits.
+      busy_verdict(sample.cpu_ticks.saturating_sub(last.1), now - last.0, clk_tck)
     {
       let worse = !matches!(busiest, Some(Violation::Busy { cpu_pct: prev }) if prev >= cpu_pct);
       if worse {
