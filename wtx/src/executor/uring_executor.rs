@@ -45,6 +45,7 @@ const KIND_TIMER: u64 = 5;
 const KIND_ACCEPT_RETRY: u64 = 6;
 const KIND_DOORBELL: u64 = 7;
 const KIND_SLEEP: u64 = 8;
+const KIND_CONNECT: u64 = 9;
 // One-shot accepts kept armed per listener with direct descriptors close to running out
 const ACCEPT_DEPTH: u32 = 16;
 // The `generation` of a one-shot accept's `user_data`; a multishot accept's is 0.
@@ -689,18 +690,34 @@ impl StreamWriter for UringTcpStream {
 impl TcpStream for UringTcpStream {
   type Executor = UringExecutor;
 
-  /// Connects with a blocking `connect`, then hands the socket to the ring.
+  /// Connects through the ring, trying each address `addr` resolves to in turn. Names are
+  /// resolved on a thread of their own, so neither step holds up the runtime's other tasks.
   #[inline]
   async fn connect<A>(addr: A, tcp_params: TcpParams) -> crate::Result<Self>
   where
     A: ToSocketAddrs,
   {
-    let stream = resolve_addrs(addr, &UringExecutor::default(), async |socket_addr| {
-      Ok(std::net::TcpStream::connect(socket_addr)?)
+    let fd = resolve_addrs(addr, &UringExecutor::default(), async |socket_addr| {
+      UringConnect::new(socket_addr)?.await
     })
     .await?;
-    stream.set_nodelay(tcp_params.tcp_nodelay())?;
-    let fd = stream.into_raw_fd();
+    let nodelay = libc::c_int::from(tcp_params.tcp_nodelay());
+    // SAFETY: `nodelay` outlives the call and its size is passed
+    let rslt = unsafe {
+      libc::setsockopt(
+        fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_NODELAY,
+        (&raw const nodelay).cast(),
+        size_of::<libc::c_int>() as libc::socklen_t,
+      )
+    };
+    if rslt != 0 {
+      let err = std::io::Error::last_os_error();
+      // SAFETY: a connected socket that nothing else owns
+      let _rslt = unsafe { libc::close(fd) };
+      return Err(err.into());
+    }
     let conn = with_reactor(|reactor| reactor.add_conn(fd, 1, false, false))?;
     Ok(Self { conn })
   }
@@ -846,6 +863,95 @@ impl Drop for UringSleep {
       reactor.drop_sleep(idx, generation);
     }
   }
+}
+
+/// A connect submitted to the ring. Resolves to the connected socket, which the caller then owns.
+struct UringConnect {
+  addr: SocketAddr,
+  // Until the first poll hands it to the reactor
+  fd: Option<RawFd>,
+  // Slot, generation and runtime, from the first poll until the result is taken
+  armed: Option<(u32, u32, u32)>,
+}
+
+impl UringConnect {
+  fn new(addr: SocketAddr) -> crate::Result<Self> {
+    let family = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+    // SAFETY: no pointers involved
+    let fd = unsafe { libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+      return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(Self { addr, fd: Some(fd), armed: None })
+  }
+}
+
+impl Future for UringConnect {
+  type Output = crate::Result<RawFd>;
+
+  fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    if let Some(fd) = self.fd {
+      let addr = self.addr;
+      let armed = with_reactor(|reactor| {
+        let (idx, generation) = reactor.add_connect(fd, &addr, cx);
+        Ok((idx, generation, reactor.id))
+      });
+      // The slot owns the socket from here, or nobody would close it.
+      self.fd = None;
+      return match armed {
+        Ok(elem) => {
+          self.armed = Some(elem);
+          Poll::Pending
+        }
+        Err(err) => {
+          // SAFETY: never handed out
+          let _rslt = unsafe { libc::close(fd) };
+          Poll::Ready(Err(err))
+        }
+      };
+    }
+    let Some((idx, generation, runtime)) = self.armed else {
+      return Poll::Ready(Err(crate::Error::FuturePolledAfterFinalization));
+    };
+    let poll = poll_own_reactor(runtime, |reactor| reactor.poll_connect(idx, generation, cx));
+    if poll.is_ready() {
+      self.armed = None;
+    }
+    poll
+  }
+}
+
+impl Drop for UringConnect {
+  fn drop(&mut self) {
+    if let Some(fd) = self.fd {
+      // SAFETY: never handed out
+      let _rslt = unsafe { libc::close(fd) };
+    }
+    if let Some((idx, generation, runtime)) = self.armed
+      && let Some(reactor) = own_reactor(runtime)
+    {
+      reactor.drop_connect(idx, generation);
+    }
+  }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectState {
+  Armed,
+  // Its future was dropped before it completed; the slot waits for the kernel's completion.
+  Dropped,
+  Done,
+  Free,
+}
+
+struct ConnectSlot {
+  // Boxed, so that it stays put until the kernel is done with it, however `connects` grows
+  addr: Box<libc::sockaddr_storage>,
+  fd: RawFd,
+  generation: u32,
+  res: i32,
+  state: ConnectState,
+  waker: Option<Waker>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1442,6 +1548,8 @@ struct Reactor {
   current: Cell<Option<Rc<dyn RunTask>>>,
   // `UringSleep`s, by slot, and the free slots
   sleeps: RefCell<Vec<SleepSlot>>,
+  connects: RefCell<Vec<ConnectSlot>>,
+  free_connects: RefCell<Vec<u32>>,
   free_sleeps: RefCell<Vec<u32>>,
   counters: Counters,
   // Waits for completions that failed in a row
@@ -1463,6 +1571,10 @@ impl Drop for Reactor {
     for conn in self.conns.get_mut().iter().filter(|el| el.in_use && !el.direct) {
       // SAFETY: closed once, here; the ring that could still use it is dropped right after
       let _rslt = unsafe { libc::close(conn.fd) };
+    }
+    for slot in self.connects.get_mut().iter().filter(|el| el.state != ConnectState::Free) {
+      // SAFETY: closed once, here; the ring that could still use it is dropped right after
+      let _rslt = unsafe { libc::close(slot.fd) };
     }
     let direct = self.params.direct_files > 0;
     for listener in self.listeners.get_mut().iter_mut().filter(|el| !el.closed) {
@@ -1569,6 +1681,8 @@ impl Reactor {
       polling: Cell::new(usize::MAX),
       current: Cell::new(None),
       sleeps: RefCell::new(Vec::new()),
+      connects: RefCell::new(Vec::new()),
+      free_connects: RefCell::new(Vec::new()),
       free_sleeps: RefCell::new(Vec::new()),
       counters: Counters::default(),
       enter_failures: Cell::new(0),
@@ -1691,6 +1805,122 @@ impl Reactor {
         self.free_sleeps.borrow_mut().push(idx);
       }
       SleepState::Fired | SleepState::Free => {}
+    }
+  }
+
+  // ---- connects
+
+  fn add_connect(&self, fd: RawFd, addr: &SocketAddr, cx: &Context<'_>) -> (u32, u32) {
+    let mut connects = self.connects.borrow_mut();
+    let idx = match self.free_connects.borrow_mut().pop() {
+      Some(idx) => idx as usize,
+      None => {
+        connects.push(ConnectSlot {
+          // SAFETY: all zeroes is a valid `sockaddr_storage`
+          addr: Box::new(unsafe { core::mem::zeroed() }),
+          fd: -1,
+          generation: 0,
+          res: 0,
+          state: ConnectState::Free,
+          waker: None,
+        });
+        connects.len() - 1
+      }
+    };
+    let slot = &mut connects[idx];
+    slot.generation = slot.generation.wrapping_add(1) & 0x0FFF_FFFF;
+    slot.fd = fd;
+    slot.res = 0;
+    slot.state = ConnectState::Armed;
+    slot.waker = Some(cx.waker().clone());
+    let len = write_sockaddr(addr, &mut slot.addr);
+    let generation = slot.generation;
+    let sqe = opcode::Connect::new(types::Fd(fd), (&raw const *slot.addr).cast(), len)
+      .build()
+      .user_data(user_data(KIND_CONNECT, generation, idx as u32));
+    drop(connects);
+    self.push_sqe(&sqe);
+    (idx as u32, generation)
+  }
+
+  /// The connected socket, or the connect's error with the socket closed.
+  fn poll_connect(
+    &self,
+    idx: u32,
+    generation: u32,
+    cx: &Context<'_>,
+  ) -> Poll<crate::Result<RawFd>> {
+    let mut connects = self.connects.borrow_mut();
+    let Some(slot) = connects.get_mut(idx as usize).filter(|el| el.generation == generation) else {
+      return Poll::Ready(Err(io_err(libc::EBADF)));
+    };
+    if slot.state == ConnectState::Armed {
+      set_waker(&mut slot.waker, cx);
+      return Poll::Pending;
+    }
+    let (fd, res) = (slot.fd, slot.res);
+    slot.state = ConnectState::Free;
+    slot.fd = -1;
+    drop(connects);
+    self.free_connects.borrow_mut().push(idx);
+    if res < 0 {
+      // SAFETY: the slot's socket, which nobody else has
+      let _rslt = unsafe { libc::close(fd) };
+      return Poll::Ready(Err(io_err(-res)));
+    }
+    Poll::Ready(Ok(fd))
+  }
+
+  fn drop_connect(&self, idx: u32, generation: u32) {
+    let mut connects = self.connects.borrow_mut();
+    let Some(slot) = connects.get_mut(idx as usize).filter(|el| el.generation == generation) else {
+      return;
+    };
+    slot.waker = None;
+    match slot.state {
+      ConnectState::Armed => {
+        slot.state = ConnectState::Dropped;
+        drop(connects);
+        self.push_sqe(&cancel_sqe(user_data(KIND_CONNECT, generation, idx)));
+      }
+      ConnectState::Done => {
+        let fd = slot.fd;
+        slot.state = ConnectState::Free;
+        slot.fd = -1;
+        drop(connects);
+        self.free_connects.borrow_mut().push(idx);
+        // SAFETY: the slot's socket, which nobody else has
+        let _rslt = unsafe { libc::close(fd) };
+      }
+      ConnectState::Dropped | ConnectState::Free => {}
+    }
+  }
+
+  fn on_connect(&self, idx: u32, generation: u32, res: i32) {
+    let mut connects = self.connects.borrow_mut();
+    let Some(slot) = connects.get_mut(idx as usize).filter(|el| el.generation == generation) else {
+      return;
+    };
+    match slot.state {
+      ConnectState::Armed => {
+        slot.state = ConnectState::Done;
+        slot.res = res;
+        let waker = slot.waker.take();
+        drop(connects);
+        if let Some(elem) = waker {
+          elem.wake();
+        }
+      }
+      ConnectState::Dropped => {
+        let fd = slot.fd;
+        slot.state = ConnectState::Free;
+        slot.fd = -1;
+        drop(connects);
+        self.free_connects.borrow_mut().push(idx);
+        // SAFETY: the slot's socket, which nobody else has
+        let _rslt = unsafe { libc::close(fd) };
+      }
+      ConnectState::Done | ConnectState::Free => {}
     }
   }
 
@@ -1957,6 +2187,7 @@ impl Reactor {
         KIND_TIMER => self.on_tick(),
         KIND_DOORBELL => self.on_doorbell(res),
         KIND_SLEEP => self.on_sleep(idx, generation),
+        KIND_CONNECT => self.on_connect(idx, generation, res),
         _ => {}
       }
     }
@@ -2857,6 +3088,35 @@ fn ring_failed(errno: i32) -> ! {
   );
 }
 
+/// Writes `addr` the way the kernel takes it, returning its length.
+fn write_sockaddr(addr: &SocketAddr, dst: &mut libc::sockaddr_storage) -> libc::socklen_t {
+  let dst: *mut libc::sockaddr_storage = dst;
+  match addr {
+    SocketAddr::V4(elem) => {
+      // SAFETY: all zeroes is a valid `sockaddr_in`
+      let mut sin: libc::sockaddr_in = unsafe { core::mem::zeroed() };
+      sin.sin_family = libc::AF_INET as libc::sa_family_t;
+      sin.sin_port = elem.port().to_be();
+      sin.sin_addr.s_addr = u32::from_ne_bytes(elem.ip().octets());
+      // SAFETY: `sockaddr_storage` is larger than, and aligned for, `sockaddr_in`
+      unsafe { dst.cast::<libc::sockaddr_in>().write(sin) };
+      size_of::<libc::sockaddr_in>() as libc::socklen_t
+    }
+    SocketAddr::V6(elem) => {
+      // SAFETY: all zeroes is a valid `sockaddr_in6`
+      let mut sin6: libc::sockaddr_in6 = unsafe { core::mem::zeroed() };
+      sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+      sin6.sin6_port = elem.port().to_be();
+      sin6.sin6_flowinfo = elem.flowinfo();
+      sin6.sin6_addr.s6_addr = elem.ip().octets();
+      sin6.sin6_scope_id = elem.scope_id();
+      // SAFETY: `sockaddr_storage` is larger than, and aligned for, `sockaddr_in6`
+      unsafe { dst.cast::<libc::sockaddr_in6>().write(sin6) };
+      size_of::<libc::sockaddr_in6>() as libc::socklen_t
+    }
+  }
+}
+
 /// Drops the read bytes from the front of a connection's received ones, which a reader that never
 /// takes everything there is would otherwise keep for as long as the connection lives.
 #[cold]
@@ -2896,7 +3156,7 @@ mod tests {
     web_socket::{Fill, OpCode, WebSocketAcceptor, WebSocketPayloadOrigin},
   };
   use alloc::vec::Vec;
-  use core::{future::poll_fn, task::Poll};
+  use core::{cell::Cell, future::poll_fn, task::Poll};
   use std::io::{Read, Write};
 
   // Sixteen texts with a ping in the middle sent in one write, then a close: the server echoes
@@ -4842,5 +5102,144 @@ mod tests {
     let msg = done_rx.recv_timeout(core::time::Duration::from_secs(5));
     let msg = msg.expect("the runtime spun on a full submission queue").unwrap_or_default();
     assert!(msg.contains("submission"), "{msg}");
+  }
+
+  // A listener on loopback whose accept queue is full: the kernel drops further SYNs, so a
+  // connect to it waits for a retransmission, a second or more.
+  fn full_listener() -> (std::os::fd::OwnedFd, std::net::SocketAddr, Vec<std::net::TcpStream>) {
+    use std::os::fd::FromRawFd;
+    // SAFETY: plain socket calls on a socket this function owns
+    unsafe {
+      let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+      assert!(fd >= 0);
+      let owned = std::os::fd::OwnedFd::from_raw_fd(fd);
+      let mut addr: libc::sockaddr_in = core::mem::zeroed();
+      addr.sin_family = libc::AF_INET as libc::sa_family_t;
+      addr.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+      let len = size_of::<libc::sockaddr_in>() as libc::socklen_t;
+      assert_eq!(libc::bind(fd, (&raw const addr).cast(), len), 0);
+      assert_eq!(libc::listen(fd, 0), 0);
+      let mut bound: libc::sockaddr_in = core::mem::zeroed();
+      let mut bound_len = len;
+      assert_eq!(libc::getsockname(fd, (&raw mut bound).cast(), &raw mut bound_len), 0);
+      let port = u16::from_be(bound.sin_port);
+      let socket_addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+      let mut held = Vec::new();
+      loop {
+        let timeout = core::time::Duration::from_millis(100);
+        match std::net::TcpStream::connect_timeout(&socket_addr, timeout) {
+          Ok(elem) => held.push(elem),
+          Err(_) => break,
+        }
+        assert!(held.len() < 16, "the accept queue never filled");
+      }
+      (owned, socket_addr, held)
+    }
+  }
+
+  // A connect that takes a while leaves the runtime running its other tasks, and dropping it
+  // cancels it. A blocking `connect` held the whole runtime until the kernel gave up or got
+  // through.
+  #[test]
+  fn connect_does_not_block_the_runtime() {
+    use crate::net::TcpStream as _;
+    let (_listener, socket_addr, _held) = full_listener();
+    let runtime = UringRuntime::new().unwrap();
+    let (ticks, elapsed) = runtime.block_on(async {
+      let ticks = std::rc::Rc::new(Cell::new(0u32));
+      let ticker_ticks = ticks.clone();
+      let _ticker = crate::executor::Executor::spawn_local(
+        &UringExecutor::default(),
+        async move {
+          loop {
+            crate::futures::Sleep::new(core::time::Duration::from_millis(10))
+              .unwrap()
+              .await
+              .unwrap();
+            ticker_ticks.set(ticker_ticks.get() + 1);
+          }
+        },
+        &UringRuntime::new().unwrap(),
+      );
+      let begin = std::time::Instant::now();
+      let mut connect =
+        alloc::boxed::Box::pin(super::UringTcpStream::connect(socket_addr, TcpParams::default()));
+      let mut sleep = crate::futures::Sleep::new(core::time::Duration::from_millis(200)).unwrap();
+      poll_fn(|cx| {
+        if let Poll::Ready(rslt) = connect.as_mut().poll(cx) {
+          let _rslt = rslt;
+          return Poll::Ready(());
+        }
+        core::pin::Pin::new(&mut sleep).poll(cx).map(|_| ())
+      })
+      .await;
+      let elapsed = begin.elapsed();
+      // The cancelled connect gives its slot back, its socket closed.
+      drop(connect);
+      let free = || {
+        super::with_reactor(|reactor| {
+          Ok(reactor.connects.borrow().iter().all(|el| el.state == super::ConnectState::Free))
+        })
+        .unwrap()
+      };
+      for _ in 0..100 {
+        if free() {
+          break;
+        }
+        crate::futures::Sleep::new(core::time::Duration::from_millis(1)).unwrap().await.unwrap();
+      }
+      assert!(free(), "the cancelled connect kept its slot");
+      (ticks.get(), elapsed)
+    });
+    assert!(
+      elapsed < core::time::Duration::from_millis(900),
+      "connect held the runtime {elapsed:?}"
+    );
+    assert!(ticks >= 5, "{ticks} ticks in {elapsed:?}");
+  }
+
+  // Connects reach IPv4 and IPv6 addresses and names, and a refused one fails with its error.
+  #[test]
+  fn connect_reaches_both_families_and_names() {
+    use crate::net::{StreamReader, StreamWriter, TcpStream as _};
+    let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let v6 = std::net::TcpListener::bind("[::1]:0").unwrap();
+    let (v4_addr, v6_addr) = (v4.local_addr().unwrap(), v6.local_addr().unwrap());
+    let echo = |listener: std::net::TcpListener, count: usize| {
+      std::thread::spawn(move || {
+        for _ in 0..count {
+          let (mut stream, _) = listener.accept().unwrap();
+          let mut byte = [0; 1];
+          Read::read_exact(&mut stream, &mut byte).unwrap();
+          Write::write_all(&mut stream, &byte).unwrap();
+        }
+      })
+    };
+    let (v4_server, v6_server) = (echo(v4, 2), echo(v6, 1));
+    // A port nothing listens on: bound, then closed.
+    let refused = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    UringRuntime::new().unwrap().block_on(async {
+      let name = alloc::format!("localhost:{}", v4_addr.port());
+      for (addr, byte) in [(v4_addr, 1u8), (v6_addr, 2)] {
+        let mut stream = super::UringTcpStream::connect(addr, TcpParams::default()).await.unwrap();
+        stream.write_all(&[byte]).await.unwrap();
+        let mut buf = [0; 1];
+        let _len = stream.read(buf.as_mut_slice().into()).await.unwrap();
+        assert_eq!(buf, [byte]);
+      }
+      let mut stream =
+        super::UringTcpStream::connect(name.as_str(), TcpParams::default()).await.unwrap();
+      stream.write_all(&[3]).await.unwrap();
+      let mut buf = [0; 1];
+      let _len = stream.read(buf.as_mut_slice().into()).await.unwrap();
+      assert_eq!(buf, [3]);
+      let err = super::UringTcpStream::connect(refused, TcpParams::default()).await.unwrap_err();
+      assert!(
+        matches!(&err, crate::Error::Io(elem) if elem.raw_os_error() == Some(libc::ECONNREFUSED)),
+        "{err:?}"
+      );
+    });
+    v4_server.join().unwrap();
+    v6_server.join().unwrap();
   }
 }
