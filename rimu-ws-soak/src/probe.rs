@@ -27,7 +27,7 @@ const TIMER_TICK: Duration = Duration::from_millis(1);
 const ECHO_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Probe results since the last snapshot.
-#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProbeStats {
   pub count: u64,
   pub p50_us: u64,
@@ -45,7 +45,7 @@ pub fn lag_exceeds(lag_p99_us: u64, baseline_lag_p99_us: u64) -> bool {
 }
 
 /// Probe results over the whole run.
-#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProbeTotals {
   pub count: u64,
   pub p50_us: u64,

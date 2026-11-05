@@ -127,7 +127,7 @@ async fn replay_reproduces_scenario_and_bytes() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let addr = spawn_fake(Faults { log: Some(log.clone()), ..Faults::default() }).await;
     let again = replay(&ctx(addr), &weights, (42, 7, 3)).await;
-    assert_eq!((again.scenario, again.outcome), (target.scenario, "pass"));
+    assert_eq!((again.scenario, again.outcome.as_str()), (target.scenario, "pass"));
     logs.push(log.lock().unwrap().clone());
   }
   assert_eq!(logs[0].len(), 1);

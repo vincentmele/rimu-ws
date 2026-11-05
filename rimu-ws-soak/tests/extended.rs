@@ -230,3 +230,36 @@ async fn burst_phase_runs_after_each_cycle() {
   assert!(summary.violations.is_empty(), "{summary:?}");
   assert_eq!(lines(&out, "burst").len(), 1);
 }
+
+#[test]
+fn drained_rss_is_judged_from_the_first_drain() {
+  use rimu_ws_soak::{cycle::drain_baseline, monitor::Baseline};
+  let warm = Baseline { rss_kib: 100, fds: 10 };
+  let first = Baseline { rss_kib: 300, fds: 12 };
+  assert_eq!(drain_baseline(0, warm, None), None);
+  assert_eq!(drain_baseline(0, warm, Some(first)), None);
+  assert_eq!(drain_baseline(1, warm, Some(first)), Some(first));
+  assert_eq!(drain_baseline(2, warm, Some(first)), Some(first));
+  assert_eq!(drain_baseline(1, warm, None), Some(warm));
+}
+
+#[test]
+fn summary_round_trips_through_json() {
+  use rimu_ws_soak::{
+    cycle::{ScenarioCounts, Summary},
+    monitor::Violation,
+    scenario::Scenario,
+  };
+  let mut summary = Summary::default();
+  let counts = ScenarioCounts {
+    runs: 3,
+    should: 1,
+    example_should: Some("1:2:3".into()),
+    ..ScenarioCounts::default()
+  };
+  let _ = summary.scenarios.insert(Scenario::Echo, counts);
+  summary.violations.push(Violation::PidGone);
+  let back: Summary = serde_json::from_str(&serde_json::to_string(&summary).unwrap()).unwrap();
+  assert_eq!(back.scenarios, summary.scenarios);
+  assert_eq!(back.violations, summary.violations);
+}

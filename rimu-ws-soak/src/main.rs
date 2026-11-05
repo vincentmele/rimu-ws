@@ -59,6 +59,9 @@ struct Common {
   /// scenario is left out.
   #[arg(long)]
   server_sndbuf: Option<u32>,
+  /// `strict` (rimu-ws's gate) or `common` (the comparison between servers; see RULES.md).
+  #[arg(long, value_enum, default_value_t = Mode::Strict)]
+  mode: Mode,
 }
 
 #[derive(clap::Args)]
@@ -120,6 +123,9 @@ struct RunArgs {
   /// and echo within 5 s.
   #[arg(long)]
   burst: Option<u32>,
+  /// The server's name in the summary, for the report card.
+  #[arg(long)]
+  label: Option<String>,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -204,14 +210,7 @@ fn ctx(common: &Common) -> Result<(Ctx, Weights, Vec<(String, Weights)>), String
     .collect::<Result<Vec<_>, String>>()?;
   let host = authority.to_owned();
   Ok((
-    Ctx {
-      addr,
-      host,
-      path: path.to_owned(),
-      limits,
-      mode: Mode::Strict,
-      opts: ConnOpts::default(),
-    },
+    Ctx { addr, host, path: path.to_owned(), limits, mode: common.mode, opts: ConnOpts::default() },
     weights,
     rotation,
   ))
@@ -273,6 +272,7 @@ async fn run(args: RunArgs) -> Result<ExitCode, String> {
     probe_rate: args.probe_rate,
     fd_flood: args.fd_flood,
     ext: Extended {
+      label: args.label,
       rotation,
       records: match args.records {
         Records::All => RecordMode::All,
@@ -288,10 +288,12 @@ async fn run(args: RunArgs) -> Result<ExitCode, String> {
   };
   let summary = cycle::run(cfg, &mut out).await;
   eprintln!(
-    "cycles {}, records {}, fails {}, harness errors {}, violations {}, saturated cycles {}; probe p50/p99/p99.9/max {}/{}/{}/{} us{}; {}",
+    "cycles {}, records {}, fails {} ({} SHOULD), limit marks {}, harness errors {}, violations {}, saturated cycles {}; probe p50/p99/p99.9/max {}/{}/{}/{} us{}{}; {}",
     summary.cycles,
     summary.records,
     summary.fails,
+    summary.should_fails,
+    summary.marks,
     summary.harness_errors,
     summary.violations.len(),
     summary.client_saturated_cycles,
@@ -300,9 +302,12 @@ async fn run(args: RunArgs) -> Result<ExitCode, String> {
     summary.latency.p999_us,
     summary.latency.max_us,
     summary.stopped.as_deref().map(|el| format!("; stopped: {el}")).unwrap_or_default(),
+    summary.invalid.as_deref().map(|el| format!("; INVALID: {el}")).unwrap_or_default(),
     out_path.display()
   );
-  Ok(ExitCode::from(if summary.fails > 0 || !summary.violations.is_empty() {
+  Ok(ExitCode::from(if summary.invalid.is_some() {
+    4
+  } else if summary.fails > 0 || !summary.violations.is_empty() {
     1
   } else if summary.harness_errors > 0 {
     2

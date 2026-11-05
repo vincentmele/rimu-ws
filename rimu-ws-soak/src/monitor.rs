@@ -2,7 +2,7 @@
 //! and the invariants a bounded server keeps.
 
 /// Socket states on the server's port (sockets whose local port it is).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TcpStates {
   pub established: u32,
   pub close_wait: u32,
@@ -13,7 +13,7 @@ pub struct TcpStates {
 }
 
 /// One look at the server.
-#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Sample {
   pub rss_kib: u64,
   pub hwm_kib: u64,
@@ -133,7 +133,7 @@ impl Monitor {
 }
 
 /// What a sample is checked against: the server after warmup.
-#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Baseline {
   pub rss_kib: u64,
   pub fds: u32,
@@ -148,7 +148,7 @@ pub struct Budgets {
 }
 
 /// A broken invariant.
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Violation {
   PidGone,
   Fds {
@@ -222,6 +222,13 @@ pub fn check_running(
 
 /// After every client has gone.
 pub fn check_drained(base: &Baseline, s: &Sample) -> Vec<Violation> {
+  let mut found = check_drained_fds(base, s);
+  found.extend(check_drained_rss(base, s));
+  found
+}
+
+/// Descriptors and CLOSE_WAIT after every client has gone, against the warmup.
+pub fn check_drained_fds(base: &Baseline, s: &Sample) -> Vec<Violation> {
   let mut found = Vec::new();
   if s.fds > base.fds + 16 {
     found.push(Violation::Leak(format!(
@@ -229,16 +236,21 @@ pub fn check_drained(base: &Baseline, s: &Sample) -> Vec<Violation> {
       s.fds, base.fds
     )));
   }
-  let rss_limit = base.rss_kib * 11 / 10 + 16384;
-  if s.rss_kib > rss_limit {
-    found.push(Violation::Leak(format!(
-      "RSS {} KiB after the drain, limit {rss_limit} KiB",
-      s.rss_kib
-    )));
-  }
   if s.tcp.close_wait > 0 {
     found
       .push(Violation::Leak(format!("{} sockets in CLOSE_WAIT after the drain", s.tcp.close_wait)));
   }
   found
+}
+
+/// RSS after every client has gone, against `base` (`cycle::drain_baseline`).
+pub fn check_drained_rss(base: &Baseline, s: &Sample) -> Vec<Violation> {
+  let rss_limit = base.rss_kib * 11 / 10 + 16384;
+  if s.rss_kib > rss_limit {
+    return vec![Violation::Leak(format!(
+      "RSS {} KiB after the drain, limit {rss_limit} KiB",
+      s.rss_kib
+    ))];
+  }
+  Vec::new()
 }

@@ -4,8 +4,8 @@ use rimu_ws_soak::{
   conn::ConnOpts,
   cycle::{CycleConfig, Verdict, latency_verdict, run},
   probe::{ProbeStats, lag_exceeds},
-  runner::RunConfig,
-  scenario::{Ctx, Limits, profile},
+  runner::{RunConfig, parse_replay},
+  scenario::{Ctx, Limits, Mode, Scenario, parse_weights, profile},
 };
 use std::{net::SocketAddr, time::Duration};
 use support::{Faults, spawn_fake};
@@ -182,7 +182,8 @@ fn failures_in_saturated_seconds_are_marked() {
     seed: 3,
     replay: "9:1:2".into(),
     scenario: Scenario::Echo,
-    outcome: "fail",
+    outcome: "fail".into(),
+    kind: None,
     reason: Some("timed out".into()),
     transcript: None,
     elapsed_ms: 10,
@@ -192,4 +193,22 @@ fn failures_in_saturated_seconds_are_marked() {
   assert!(line.contains("replay=9:1:2") && line.contains("client saturated"), "{line}");
   let calm = Record { client_saturated: false, ..record };
   assert!(!fail_line(&calm).contains("saturated"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn summary_counts_kinds_and_marks_per_scenario() {
+  let addr = spawn_fake(Faults { no_close_frame: true, ..Faults::default() }).await;
+  let mut child = stand_in();
+  let mut cfg = cfg(addr, child.id());
+  cfg.run.ctx.mode = Mode::Common;
+  cfg.run.weights = parse_weights("invalid=1").unwrap();
+  let summary = run(cfg, &mut Vec::new()).await;
+  let _ = child.kill();
+  let _ = child.wait();
+  let invalid = &summary.scenarios[&Scenario::Invalid];
+  assert!(invalid.should > 0 && invalid.must == 0, "{invalid:?}");
+  assert!(parse_replay(invalid.example_should.as_deref().unwrap()).is_some(), "{invalid:?}");
+  assert_eq!(summary.rules_version, "1");
+  assert_eq!(summary.mode, Mode::Common);
+  assert_eq!(summary.should_fails, invalid.should);
 }

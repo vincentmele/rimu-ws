@@ -5,14 +5,16 @@ use crate::{
   codec::client_frame,
   conn::{Conn, Next},
   monitor::{
-    Baseline, Budgets, Monitor, MonitorError, Sample, Violation, check_drained, check_running,
+    Baseline, Budgets, Monitor, MonitorError, Sample, Violation, check_drained_fds,
+    check_drained_rss, check_running,
   },
   probe::{ProbeStats, ProbeTotals, Probes, lag_exceeds},
   rng::rng,
   runner::{Record, RunConfig, run_slots},
-  scenario::{Ctx, Weights},
+  scenario::{Ctx, Kind, Mode, Scenario, Weights},
 };
 use std::{
+  collections::BTreeMap,
   io::Write,
   sync::{
     Arc,
@@ -53,8 +55,9 @@ pub fn cycle_seed(global: u64, cycle: u32) -> u64 {
 /// The stderr line of a failed run.
 pub fn fail_line(record: &Record) -> String {
   format!(
-    "FAIL {:?} replay={} — {}{}",
+    "FAIL {:?}{} replay={} — {}{}",
     record.scenario,
+    if record.kind == Some(Kind::Should) { " (SHOULD)" } else { "" },
     record.replay,
     record.reason.as_deref().unwrap_or_default(),
     if record.client_saturated { " (client saturated: may be the harness)" } else { "" }
@@ -104,6 +107,8 @@ pub enum RecordMode {
 /// What long runs add to the cycles.
 #[derive(Clone, Debug, Default)]
 pub struct Extended {
+  /// The server's name in the summary, which the report card's rows are keyed by.
+  pub label: Option<String>,
   /// Cycle `i` runs profile `i % len`; empty runs `RunConfig::weights` every cycle.
   pub rotation: Vec<(String, Weights)>,
   pub records: RecordMode,
@@ -137,11 +142,67 @@ pub fn trend_violation(what: &str, values: &[u64], cycles: u32) -> Option<Violat
   })
 }
 
-#[derive(Clone, Debug, Default, serde::Serialize)]
+/// The baseline the RSS after cycle `cycle`'s drain is judged against: none in cycle 0, whose
+/// growth is the server touching its buffers for the first time, then the first cycle's drain
+/// (the warmup, if that wasn't sampled). Growth over the cycles is `--trend`'s.
+pub fn drain_baseline(
+  cycle: u32,
+  warm: Baseline,
+  first_drained: Option<Baseline>,
+) -> Option<Baseline> {
+  (cycle > 0).then(|| first_drained.unwrap_or(warm))
+}
+
+/// One scenario's runs, by how they went, with a replay id of each kind's first.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScenarioCounts {
+  pub runs: u64,
+  pub must: u64,
+  pub should: u64,
+  pub marks: u64,
+  pub harness_errors: u64,
+  pub example_must: Option<String>,
+  pub example_should: Option<String>,
+  pub example_mark: Option<String>,
+}
+
+impl ScenarioCounts {
+  fn count(&mut self, record: &Record) {
+    self.runs += 1;
+    let (counter, example) = match (record.outcome.as_str(), record.kind) {
+      ("fail", Some(Kind::Should)) => (&mut self.should, &mut self.example_should),
+      ("fail", _) => (&mut self.must, &mut self.example_must),
+      ("mark", _) => (&mut self.marks, &mut self.example_mark),
+      ("harness_error", _) => {
+        self.harness_errors += 1;
+        return;
+      }
+      _ => return,
+    };
+    *counter += 1;
+    let _ = example.get_or_insert_with(|| record.replay.clone());
+  }
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Summary {
+  /// `--label`: the server.
+  pub label: Option<String>,
+  pub mode: Mode,
+  /// `rules::RULES_VERSION` of the harness that judged the run.
+  pub rules_version: String,
+  pub seed: u64,
   pub cycles: u32,
   pub records: u64,
+  /// MUST and SHOULD failures both.
   pub fails: u64,
+  pub should_fails: u64,
+  pub marks: u64,
+  pub scenarios: BTreeMap<Scenario, ScenarioCounts>,
+  /// Why the run judges nothing, if it doesn't: the server never started, or never used the
+  /// io_uring it claims.
+  pub invalid: Option<String>,
   pub harness_errors: u64,
   pub violations: Vec<Violation>,
   pub client_saturated_cycles: u32,
@@ -299,7 +360,13 @@ pub async fn run(cfg: CycleConfig, out: &mut dyn Write) -> Summary {
     started,
     stop: None,
     stop_on_first: cfg.ext.stop_on_first,
-    summary: Summary::default(),
+    summary: Summary {
+      label: cfg.ext.label.clone(),
+      mode: cfg.run.ctx.mode,
+      rules_version: crate::rules::RULES_VERSION.into(),
+      seed: cfg.run.global_seed,
+      ..Summary::default()
+    },
   };
   match cfg.pid.map(|pid| Monitor::new(pid, cfg.port)) {
     Some(Ok(monitor)) => state.monitor = Some(monitor),
@@ -313,6 +380,7 @@ pub async fn run(cfg: CycleConfig, out: &mut dyn Write) -> Summary {
   let probes =
     (cfg.probes > 0).then(|| Probes::spawn(cfg.run.ctx.clone(), cfg.probes, cfg.probe_rate));
   let mut first_base: Option<Baseline> = None;
+  let mut first_drained: Option<Baseline> = None;
   for cycle in 0..cfg.cycles {
     if deadline.is_some_and(|el| Instant::now() >= el) {
       let _ = state.stop.get_or_insert("max time");
@@ -359,9 +427,14 @@ pub async fn run(cfg: CycleConfig, out: &mut dyn Write) -> Summary {
         "sample",
         serde_json::json!({ "cycle": cycle, "phase": "drained", "sample": sample }),
       );
-      for violation in check_drained(&first, &sample) {
+      let mut found = check_drained_fds(&first, &sample);
+      if let Some(base) = drain_baseline(cycle, first, first_drained) {
+        found.extend(check_drained_rss(&base, &sample));
+      }
+      for violation in found {
         state.violation(cycle, violation);
       }
+      let _ = first_drained.get_or_insert(Baseline { rss_kib: sample.rss_kib, fds: sample.fds });
       state.trend(cycle, &sample, cfg.ext.trend);
     }
     if let Err(reason) = recovery(&cfg.run.ctx, RECOVERY).await {
@@ -443,9 +516,14 @@ async fn mix(
         let Some(mut record) = record else { break };
         record.client_saturated = saturated_now;
         state.summary.records += 1;
-        match record.outcome {
+        state.summary.scenarios.entry(record.scenario).or_default().count(&record);
+        match record.outcome.as_str() {
+          "mark" => state.summary.marks += 1,
           "fail" => {
             state.summary.fails += 1;
+            if record.kind == Some(Kind::Should) {
+              state.summary.should_fails += 1;
+            }
             if saturated_now {
               state.summary.fails_while_saturated += 1;
             }

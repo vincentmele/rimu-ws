@@ -18,7 +18,19 @@ use std::{
 };
 
 /// A client behaviour, with the oracle that judges the server's answer to it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, clap::ValueEnum)]
+#[derive(
+  Clone,
+  Copy,
+  Debug,
+  PartialEq,
+  Eq,
+  Hash,
+  PartialOrd,
+  Ord,
+  serde::Serialize,
+  serde::Deserialize,
+  clap::ValueEnum,
+)]
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
 pub enum Scenario {

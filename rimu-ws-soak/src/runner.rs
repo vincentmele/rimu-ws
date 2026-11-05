@@ -2,7 +2,7 @@
 
 use crate::{
   rng::{rng, seed_for},
-  scenario::{self, Ctx, Outcome, Scenario, Weights},
+  scenario::{self, Ctx, Kind, Outcome, Scenario, Weights},
 };
 use std::{
   net::IpAddr,
@@ -26,20 +26,23 @@ pub struct RunConfig {
 }
 
 /// One scenario run.
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Record {
   pub slot: u32,
   pub generation: u32,
   pub seed: u64,
   pub replay: String,
   pub scenario: Scenario,
-  /// `"pass"`, `"fail"` or `"harness_error"`.
-  pub outcome: &'static str,
+  /// `"pass"`, `"fail"`, `"mark"` or `"harness_error"`.
+  pub outcome: String,
+  /// A failure's kind.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub kind: Option<Kind>,
   pub reason: Option<String>,
   pub transcript: Option<String>,
   pub elapsed_ms: u64,
   /// Set by the cycle when the probes showed the harness's CPU saturated in this run's second.
-  #[serde(skip_serializing_if = "core::ops::Not::not")]
+  #[serde(default, skip_serializing_if = "core::ops::Not::not")]
   pub client_saturated: bool,
 }
 
@@ -98,11 +101,13 @@ async fn run_one(ctx: &Ctx, weights: &Weights, global: u64, slot: u32, generatio
   let begin = Instant::now();
   let outcome = scenario::run(scenario, ctx, &mut rng).await;
   let elapsed_ms = begin.elapsed().as_millis() as u64;
-  let (outcome, reason, transcript) = match outcome {
-    Outcome::Pass => ("pass", None, None),
-    Outcome::Fail { reason, transcript, .. } => ("fail", Some(reason), Some(transcript)),
-    Outcome::Mark { reason } => ("mark", Some(reason), None),
-    Outcome::HarnessError(reason) => ("harness_error", Some(reason), None),
+  let (outcome, kind, reason, transcript) = match outcome {
+    Outcome::Pass => ("pass", None, None, None),
+    Outcome::Fail { kind, reason, transcript } => {
+      ("fail", Some(kind), Some(reason), Some(transcript))
+    }
+    Outcome::Mark { reason } => ("mark", None, Some(reason), None),
+    Outcome::HarnessError(reason) => ("harness_error", None, Some(reason), None),
   };
   Record {
     slot,
@@ -110,7 +115,8 @@ async fn run_one(ctx: &Ctx, weights: &Weights, global: u64, slot: u32, generatio
     seed,
     replay: replay_id(global, slot, generation),
     scenario,
-    outcome,
+    outcome: outcome.into(),
+    kind,
     reason,
     transcript,
     elapsed_ms,
