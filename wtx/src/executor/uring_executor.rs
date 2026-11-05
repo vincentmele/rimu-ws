@@ -1388,9 +1388,31 @@ fn cq_is_empty(ring: &mut IoUring) -> bool {
   core::mem::ManuallyDrop::new(ring.completion()).is_empty()
 }
 
-fn set_waker(slot: &mut Option<Waker>, cx: &Context<'_>) {
+/// Registers the waker of `cx`, returning the one it replaces, which the caller drops once it
+/// has released its borrows (see [`Deferred`]).
+#[must_use]
+fn set_waker(slot: &mut Option<Waker>, cx: &Context<'_>) -> Option<Waker> {
   if !slot.as_ref().is_some_and(|el| el.will_wake(cx.waker())) {
-    *slot = Some(cx.waker().clone());
+    return slot.replace(cx.waker().clone());
+  }
+  None
+}
+
+/// Wakers taken out while the reactor's state is borrowed, woken (`wake`) or just dropped
+/// (`stale`) once the borrow is over. A waker from another executor may run anything when it is
+/// woken or dropped, the drop of one of this runtime's streams included, and that borrows the
+/// state again. Declared before the borrow, so that it drops after it.
+#[derive(Default)]
+struct Deferred {
+  wake: Option<Waker>,
+  stale: [Option<Waker>; 2],
+}
+
+impl Drop for Deferred {
+  fn drop(&mut self) {
+    if let Some(elem) = self.wake.take() {
+      elem.wake();
+    }
   }
 }
 
@@ -1720,6 +1742,7 @@ impl Reactor {
   // ---- sleeps
 
   fn add_sleep(&self, duration: Duration, cx: &Context<'_>) -> (u32, u32) {
+    let mut deferred = Deferred::default();
     let mut sleeps = self.sleeps.borrow_mut();
     // A free list, not a scan: every closing TLS stream (plaintext too) starts an after-close
     // timer, so with many connections closing the table is large.
@@ -1739,7 +1762,7 @@ impl Reactor {
     slot.generation = slot.generation.wrapping_add(1) & 0x0FFF_FFFF;
     slot.state = SleepState::Armed;
     *slot.ts = types::Timespec::from(duration);
-    slot.waker = Some(cx.waker().clone());
+    deferred.stale[0] = slot.waker.replace(cx.waker().clone());
     let generation = slot.generation;
     let sqe = opcode::Timeout::new(&raw const *slot.ts)
       .build()
@@ -1750,23 +1773,25 @@ impl Reactor {
   }
 
   fn poll_sleep(&self, idx: u32, generation: u32, cx: &Context<'_>) -> Poll<crate::Result<()>> {
+    let mut deferred = Deferred::default();
     let mut sleeps = self.sleeps.borrow_mut();
     let Some(slot) = sleeps.get_mut(idx as usize).filter(|el| el.generation == generation) else {
       return Poll::Ready(Ok(()));
     };
     if slot.state == SleepState::Armed {
-      set_waker(&mut slot.waker, cx);
+      deferred.stale[0] = set_waker(&mut slot.waker, cx);
       return Poll::Pending;
     }
     Poll::Ready(Ok(()))
   }
 
   fn drop_sleep(&self, idx: u32, generation: u32) {
+    let mut deferred = Deferred::default();
     let mut sleeps = self.sleeps.borrow_mut();
     let Some(slot) = sleeps.get_mut(idx as usize).filter(|el| el.generation == generation) else {
       return;
     };
-    slot.waker = None;
+    deferred.stale[0] = slot.waker.take();
     match slot.state {
       SleepState::Armed => {
         slot.state = SleepState::Dropped;
@@ -1811,6 +1836,7 @@ impl Reactor {
   // ---- connects
 
   fn add_connect(&self, fd: RawFd, addr: &SocketAddr, cx: &Context<'_>) -> (u32, u32) {
+    let mut deferred = Deferred::default();
     let mut connects = self.connects.borrow_mut();
     let idx = match self.free_connects.borrow_mut().pop() {
       Some(idx) => idx as usize,
@@ -1832,7 +1858,7 @@ impl Reactor {
     slot.fd = fd;
     slot.res = 0;
     slot.state = ConnectState::Armed;
-    slot.waker = Some(cx.waker().clone());
+    deferred.stale[0] = slot.waker.replace(cx.waker().clone());
     let len = write_sockaddr(addr, &mut slot.addr);
     let generation = slot.generation;
     let sqe = opcode::Connect::new(types::Fd(fd), (&raw const *slot.addr).cast(), len)
@@ -1850,12 +1876,13 @@ impl Reactor {
     generation: u32,
     cx: &Context<'_>,
   ) -> Poll<crate::Result<RawFd>> {
+    let mut deferred = Deferred::default();
     let mut connects = self.connects.borrow_mut();
     let Some(slot) = connects.get_mut(idx as usize).filter(|el| el.generation == generation) else {
       return Poll::Ready(Err(io_err(libc::EBADF)));
     };
     if slot.state == ConnectState::Armed {
-      set_waker(&mut slot.waker, cx);
+      deferred.stale[0] = set_waker(&mut slot.waker, cx);
       return Poll::Pending;
     }
     let (fd, res) = (slot.fd, slot.res);
@@ -1872,11 +1899,12 @@ impl Reactor {
   }
 
   fn drop_connect(&self, idx: u32, generation: u32) {
+    let mut deferred = Deferred::default();
     let mut connects = self.connects.borrow_mut();
     let Some(slot) = connects.get_mut(idx as usize).filter(|el| el.generation == generation) else {
       return;
     };
-    slot.waker = None;
+    deferred.stale[0] = slot.waker.take();
     match slot.state {
       ConnectState::Armed => {
         slot.state = ConnectState::Dropped;
@@ -2270,6 +2298,7 @@ impl Reactor {
 
   fn on_accept(&self, idx: usize, one_shot: bool, res: i32, flags: u32) {
     let direct = self.params.direct_files > 0;
+    let mut deferred = Deferred::default();
     let mut listeners = self.listeners.borrow_mut();
     let Some(listener) = listeners.get_mut(idx) else {
       return;
@@ -2297,9 +2326,7 @@ impl Reactor {
     if res >= 0 {
       listener.queue.push_back(res);
       bump(&self.counters.accepted);
-      if let Some(elem) = listener.waker.take() {
-        elem.wake();
-      }
+      deferred.wake = listener.waker.take();
     }
     // Anything but a connection that went away before it was taken, or a cancel of our own,
     // would fail again at once: wait before retrying, and tell `accept`.
@@ -2316,8 +2343,8 @@ impl Reactor {
     if failed {
       bump(&self.counters.accept_errors);
       listener.error = Some(-res);
-      if let Some(elem) = listener.waker.take() {
-        elem.wake();
+      if deferred.wake.is_none() {
+        deferred.wake = listener.waker.take();
       }
     }
     drop(listeners);
@@ -2365,13 +2392,14 @@ impl Reactor {
   /// Stops listening: the armed accepts are cancelled, and the connections they took that nobody
   /// claimed are closed, along with any they still complete.
   fn drop_listener(&self, idx: usize) {
+    let mut deferred = Deferred::default();
     let (armed, fd, queue) = {
       let mut listeners = self.listeners.borrow_mut();
       let Some(listener) = listeners.get_mut(idx).filter(|el| !el.closed) else {
         return;
       };
       listener.closed = true;
-      listener.waker = None;
+      deferred.stale[0] = listener.waker.take();
       (listener.armed || listener.pending > 0, listener.fd, core::mem::take(&mut listener.queue))
     };
     for accepted in queue {
@@ -2406,6 +2434,7 @@ impl Reactor {
   }
 
   fn poll_accept(&self, idx: usize, cx: &mut Context<'_>) -> Poll<crate::Result<RawFd>> {
+    let mut deferred = Deferred::default();
     let mut listeners = self.listeners.borrow_mut();
     let Some(listener) = listeners.get_mut(idx) else {
       return Poll::Ready(Err(io_err(libc::EBADF)));
@@ -2416,7 +2445,7 @@ impl Reactor {
     if let Some(errno) = listener.error.take() {
       return Poll::Ready(Err(io_err(errno)));
     }
-    listener.waker = Some(cx.waker().clone());
+    deferred.stale[0] = listener.waker.replace(cx.waker().clone());
     Poll::Pending
   }
 
@@ -2424,6 +2453,7 @@ impl Reactor {
 
   fn add_conn(&self, fd: RawFd, refs: u8, direct: bool, accepted: bool) -> crate::Result<ConnRef> {
     let tick = self.timers.borrow().tick;
+    let mut deferred = Deferred::default();
     let (idx, generation) = {
       let mut conns = self.conns.borrow_mut();
       let mut free = self.free_conns.borrow_mut();
@@ -2445,7 +2475,7 @@ impl Reactor {
       conn.in_use = true;
       conn.last_active = tick;
       conn.lingering = false;
-      conn.reader = None;
+      deferred.stale[0] = conn.reader.take();
       conn.refs = refs;
       conn.rx.clear();
       conn.rx_eof = false;
@@ -2457,7 +2487,7 @@ impl Reactor {
       conn.tx_err = 0;
       conn.tx_inflight.clear();
       conn.tx_pending.clear();
-      conn.writer = None;
+      deferred.stale[1] = conn.writer.take();
       (idx, conn.generation)
     };
     self.arm_recv(idx, generation, fd);
@@ -2510,6 +2540,7 @@ impl Reactor {
   /// Returns `true` if a provided buffer was given back to the ring.
   fn on_recv(&self, idx: u32, generation: u32, res: i32, flags: u32) -> bool {
     let mut recycled = false;
+    let mut deferred = Deferred::default();
     let mut conns = self.conns.borrow_mut();
     let Some(conn) = conns.get_mut(idx as usize).filter(|el| el.generation == generation) else {
       if let Some(bid) = cqueue::buffer_select(flags) {
@@ -2549,9 +2580,7 @@ impl Reactor {
     } else if res != -libc::ECANCELED {
       conn.rx_err = errno(res);
     }
-    if let Some(elem) = conn.reader.take() {
-      elem.wake();
-    }
+    deferred.wake = conn.reader.take();
     if !cqueue::more(flags) {
       conn.recv_armed = false;
       if conn.closing {
@@ -2607,13 +2636,14 @@ impl Reactor {
     bytes: &mut MaybeUninitSlice<'_, u8>,
     cx: &mut Context<'_>,
   ) -> Poll<crate::Result<Option<NonZeroUsize>>> {
+    let mut deferred = Deferred::default();
     let mut conns = self.conns.borrow_mut();
     let Some(conn) = conns.get_mut(idx as usize).filter(|el| el.generation == generation) else {
       return Poll::Ready(Err(io_err(libc::EBADF)));
     };
     let rslt = take_rx(conn, bytes);
     if let Ok(TryRead::Pending | TryRead::Unsupported) = rslt {
-      set_waker(&mut conn.reader, cx);
+      deferred.stale[0] = set_waker(&mut conn.reader, cx);
     }
     if conn.rx_paused {
       self.maybe_resume_recv(conns, idx);
@@ -2632,6 +2662,7 @@ impl Reactor {
     generation: u32,
     cx: &mut Context<'_>,
   ) -> Poll<crate::Result<()>> {
+    let mut deferred = Deferred::default();
     let mut conns = self.conns.borrow_mut();
     let Some(conn) = conns.get_mut(idx as usize).filter(|el| el.generation == generation) else {
       return Poll::Ready(Err(io_err(libc::EBADF)));
@@ -2639,7 +2670,7 @@ impl Reactor {
     if conn.rx_off as usize != conn.rx.len() || conn.rx_err != 0 || conn.rx_eof {
       return Poll::Ready(Ok(()));
     }
-    set_waker(&mut conn.reader, cx);
+    deferred.stale[0] = set_waker(&mut conn.reader, cx);
     Poll::Pending
   }
 
@@ -2711,6 +2742,7 @@ impl Reactor {
   }
 
   fn on_send(&self, idx: u32, generation: u32, res: i32) {
+    let mut deferred = Deferred::default();
     let mut conns = self.conns.borrow_mut();
     let Some(conn) = conns.get_mut(idx as usize).filter(|el| el.generation == generation) else {
       return;
@@ -2739,9 +2771,7 @@ impl Reactor {
       conn.sending = false;
       conn.tx_inflight.clear();
     }
-    if let Some(elem) = conn.writer.take() {
-      elem.wake();
-    }
+    deferred.wake = conn.writer.take();
     if !conn.tx_pending.is_empty() && conn.tx_err == 0 {
       drop(conns);
       self.start_send(idx, generation);
@@ -2827,6 +2857,7 @@ impl Reactor {
     generation: u32,
     cx: &mut Context<'_>,
   ) -> Poll<crate::Result<()>> {
+    let mut deferred = Deferred::default();
     let mut conns = self.conns.borrow_mut();
     let Some(conn) = conns.get_mut(idx as usize).filter(|el| el.generation == generation) else {
       return Poll::Ready(Err(io_err(libc::EBADF)));
@@ -2837,11 +2868,12 @@ impl Reactor {
     if conn.tx_pending.len() < self.params.tx_high_water {
       return Poll::Ready(Ok(()));
     }
-    conn.writer = Some(cx.waker().clone());
+    deferred.stale[0] = conn.writer.replace(cx.waker().clone());
     Poll::Pending
   }
 
   fn drop_conn_ref(&self, idx: u32, generation: u32) {
+    let mut deferred = Deferred::default();
     let fd = {
       let mut conns = self.conns.borrow_mut();
       let Some(conn) = conns.get_mut(idx as usize).filter(|el| el.generation == generation) else {
@@ -2852,8 +2884,7 @@ impl Reactor {
         return;
       }
       conn.closing = true;
-      conn.reader = None;
-      conn.writer = None;
+      deferred.stale = [conn.reader.take(), conn.writer.take()];
       conn.fd
     };
     self.maybe_close(idx, fd);
@@ -2966,6 +2997,8 @@ impl Reactor {
   /// still watched. The handshake and close checks read the activity bits before the idle sweep
   /// clears them.
   fn on_tick(&self) {
+    // Woken once the borrows below are over (see `Deferred`)
+    let mut woken = Vec::new();
     let mut timers = self.timers.borrow_mut();
     timers.armed = false;
     timers.tick = timers.tick.wrapping_add(1);
@@ -2986,7 +3019,7 @@ impl Reactor {
         return false;
       }
       if past(deadline) {
-        self.time_out(conn, idx);
+        self.time_out(conn, idx, &mut woken);
         return false;
       }
       true
@@ -3002,7 +3035,7 @@ impl Reactor {
         return true;
       }
       if tick.wrapping_sub(*since) >= *close_ticks {
-        self.time_out(conn, *idx);
+        self.time_out(conn, *idx, &mut woken);
         return false;
       }
       true
@@ -3018,7 +3051,7 @@ impl Reactor {
           conn.activity &= !ACTIVE_ANY;
           conn.last_active = tick;
         } else if tick.wrapping_sub(conn.last_active) >= *idle_ticks {
-          self.time_out(conn, idx as u32);
+          self.time_out(conn, idx as u32, &mut woken);
         }
       }
     } else if *idle_ticks > 0 {
@@ -3030,13 +3063,16 @@ impl Reactor {
     if watch {
       self.arm_timer();
     }
+    for elem in woken {
+      elem.wake();
+    }
   }
 
   /// Fails a connection's reads and writes with `ETIMEDOUT` and cancels what it has in flight,
   /// which also lets a dropped connection close.
   #[cold]
   #[inline(never)]
-  fn time_out(&self, conn: &mut Conn, idx: u32) {
+  fn time_out(&self, conn: &mut Conn, idx: u32, woken: &mut Vec<Waker>) {
     bump(&self.counters.timeouts);
     let timed_out = libc::ETIMEDOUT as u8;
     if conn.rx_err == 0 {
@@ -3053,12 +3089,8 @@ impl Reactor {
     if conn.sending {
       self.push_sqe(&cancel_sqe(user_data(KIND_SEND, conn.generation, idx)));
     }
-    if let Some(elem) = conn.reader.take() {
-      elem.wake();
-    }
-    if let Some(elem) = conn.writer.take() {
-      elem.wake();
-    }
+    woken.extend(conn.reader.take());
+    woken.extend(conn.writer.take());
   }
 }
 
@@ -5241,5 +5273,81 @@ mod tests {
     });
     v4_server.join().unwrap();
     v6_server.join().unwrap();
+  }
+
+  // A waker from another executor that, woken or dropped, drops a stream of this runtime: the
+  // last reference to a nested executor's task, say, whose future holds the stream. Waking it,
+  // or replacing it, with the connections borrowed made the stream's drop borrow them again, a
+  // panic outside any task.
+  #[test]
+  fn a_waker_that_drops_a_stream_when_woken_or_replaced() {
+    use crate::net::StreamReader;
+    use core::task::{Context, RawWaker, RawWakerVTable, Waker};
+    use std::rc::Rc;
+
+    type Holder = core::cell::RefCell<Option<super::UringTcpStream>>;
+
+    fn raw(holder: Rc<Holder>) -> RawWaker {
+      RawWaker::new(Rc::into_raw(holder).cast(), &VTABLE)
+    }
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(
+      |data| {
+        // SAFETY: `data` came from `Rc::into_raw` and is still counted
+        unsafe { Rc::increment_strong_count(data.cast::<Holder>()) };
+        raw_from(data)
+      },
+      |data| {
+        // SAFETY: as above; the waker's count is taken back
+        let holder = unsafe { Rc::from_raw(data.cast::<Holder>()) };
+        drop(holder.borrow_mut().take());
+      },
+      |data| {
+        // SAFETY: as above, borrowed
+        let holder = unsafe { &*data.cast::<Holder>() };
+        drop(holder.borrow_mut().take());
+      },
+      // SAFETY: as above; the waker's count is taken back
+      |data| drop(unsafe { Rc::from_raw(data.cast::<Holder>()) }),
+    );
+    fn raw_from(data: *const ()) -> RawWaker {
+      RawWaker::new(data, &VTABLE)
+    }
+
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let client = std::thread::spawn(move || {
+      let mut first = connect(&client_addr);
+      let mut second = connect(&client_addr);
+      let mut third = connect(&client_addr);
+      std::thread::sleep(core::time::Duration::from_millis(100));
+      Write::write_all(&mut first, b"x").unwrap();
+      // The other two streams were dropped by the wakers, so the server closed them.
+      for stream in [&mut second, &mut third] {
+        let mut rest = Vec::new();
+        let _len = stream.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty());
+      }
+    });
+    let runtime = UringRuntime::new().unwrap();
+    runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let (mut first, _) = listener.accept(TcpParams::default()).await.unwrap();
+      let (second, _) = listener.accept(TcpParams::default()).await.unwrap();
+      let (third, _) = listener.accept(TcpParams::default()).await.unwrap();
+      let mut buf = [0u8; 1];
+      // Registered, then replaced by the next one: dropped with the connections borrowed.
+      for stream in [third, second] {
+        let holder = Rc::new(core::cell::RefCell::new(Some(stream)));
+        // SAFETY: the vtable keeps the `Rc` counts; the waker stays on this thread
+        let waker = unsafe { Waker::from_raw(raw(holder)) };
+        let mut read = core::pin::pin!(first.read(buf.as_mut_slice().into()));
+        assert!(read.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+      }
+      // The client's byte completes the receive, which wakes the waker above.
+      crate::futures::Sleep::new(core::time::Duration::from_millis(300)).unwrap().await.unwrap();
+      let len = first.read(buf.as_mut_slice().into()).await.unwrap();
+      assert_eq!((len.map(core::num::NonZeroUsize::get), buf), (Some(1), *b"x"));
+    });
+    client.join().unwrap();
   }
 }
