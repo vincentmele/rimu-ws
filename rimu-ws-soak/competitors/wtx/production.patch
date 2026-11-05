@@ -1,0 +1,12 @@
+diff -ruN a/src/main.rs b/src/main.rs
+--- a/src/main.rs	2026-11-04 18:40:26.000000000 +0100
++++ b/src/main.rs	2026-11-05 22:46:14.030509740 +0100
+@@ -17,6 +17,8 @@
+ }
+ 
+ async fn ws(mut buffer: Vector<u8>, mut ws: LocalWebSocket) -> wtx::Result<()> {
++  // Production: 1 MiB messages (the default is 64 MiB).
++  *ws.max_payload_len_mut() = 1 << 20;
+   let (mut common, mut reader, mut writer) = ws.split_mut();
+   loop {
+     let origin = WebSocketPayloadOrigin::Adaptive;

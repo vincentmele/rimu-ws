@@ -1,0 +1,22 @@
+[package]
+authors = ["Vincent Mele <vince@mele.law>"]
+description = "fastwebsockets in the rimu-ws soak's comparison: an echo server in production configuration"
+edition = "2024"
+license = "Apache-2.0"
+name = "soak-competitor-fastwebsockets"
+publish = false
+version = "0.1.0"
+
+# Its own workspace: built on its own, as a user's project would be.
+[workspace]
+
+[dependencies]
+fastwebsockets = { version = "=0.10.0", features = ["upgrade"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+
+[profile.release]
+codegen-units = 1
+lto = true

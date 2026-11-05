@@ -1,0 +1,20 @@
+[package]
+authors = ["Vincent Mele <vince@mele.law>"]
+description = "tokio-tungstenite in the rimu-ws soak's comparison: an echo server in production configuration"
+edition = "2024"
+license = "Apache-2.0"
+name = "soak-competitor-tokio-tungstenite"
+publish = false
+version = "0.1.0"
+
+# Its own workspace: built on its own, as a user's project would be.
+[workspace]
+
+[dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tokio-tungstenite = "0.30"
+
+[profile.release]
+codegen-units = 1
+lto = true
