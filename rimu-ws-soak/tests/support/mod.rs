@@ -37,6 +37,10 @@ pub struct Faults {
   pub header_cap: Option<usize>,
   /// Upgrades any request with a key, as RFC 6455 says not to.
   pub lax_upgrade: bool,
+  /// On a protocol error, drops TCP without a close frame.
+  pub no_close_frame: bool,
+  /// Answers a ping inside a fragmented message only after that message's echo.
+  pub slow_pong: bool,
 }
 
 impl Default for Faults {
@@ -55,6 +59,8 @@ impl Default for Faults {
       echo_delay: None,
       header_cap: Some(16 * 1024),
       lax_upgrade: false,
+      no_close_frame: false,
+      slow_pong: false,
     }
   }
 }
@@ -126,6 +132,14 @@ impl Peer {
 
   async fn close(&mut self, code: u16) {
     let _ = self.send_frame(8, &code.to_be_bytes()).await;
+    let _ = self.stream.shutdown().await;
+  }
+
+  /// Fails the connection on an error: a close with `code`, or none with `no_close_frame`.
+  async fn fail_conn(&mut self, code: u16) {
+    if !self.faults.no_close_frame {
+      let _ = self.send_frame(8, &code.to_be_bytes()).await;
+    }
     let _ = self.stream.shutdown().await;
   }
 }
@@ -272,12 +286,14 @@ async fn echo(peer: &mut Peer) {
   let protocol = peer.faults.close_code_for_protocol_errors;
   let mut message: Option<(u8, Vec<u8>)> = None;
   let mut echoed = 0;
+  // A pong held back until the echo of the message it arrived inside (`slow_pong`).
+  let mut late_pong: Option<Vec<u8>> = None;
   loop {
     let (frame, used) = match parse(&peer.buf[peer.pos..]) {
       Parsed::Frame(frame, used) => (frame, used),
       Parsed::Partial { declared } => {
         if declared.is_some_and(|el| el > peer.faults.max_payload) {
-          return peer.close(peer.faults.huge_len_code).await;
+          return peer.fail_conn(peer.faults.huge_len_code).await;
         }
         if !peer.fill(earliest(None, peer.faults.idle_timeout)).await {
           return;
@@ -287,25 +303,29 @@ async fn echo(peer: &mut Peer) {
     };
     peer.pos += used;
     if frame.declared > peer.faults.max_payload {
-      return peer.close(peer.faults.huge_len_code).await;
+      return peer.fail_conn(peer.faults.huge_len_code).await;
     }
     if !frame.masked || frame.rsv != 0 {
-      return peer.close(protocol).await;
+      return peer.fail_conn(protocol).await;
     }
     if frame.opcode >= 8 && (!frame.fin || frame.payload.len() > 125) {
-      return peer.close(protocol).await;
+      return peer.fail_conn(protocol).await;
     }
     match frame.opcode {
       8 => {
         let code = match frame.payload.len() {
           0 => 1000,
-          1 => return peer.close(protocol).await,
+          1 => return peer.fail_conn(protocol).await,
           _ => u16::from_be_bytes([frame.payload[0], frame.payload[1]]),
         };
         let valid = matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999);
-        return peer.close(if valid { code } else { protocol }).await;
+        return if valid { peer.close(code).await } else { peer.fail_conn(protocol).await };
       }
       9 => {
+        if peer.faults.slow_pong && message.is_some() {
+          late_pong = Some(frame.payload);
+          continue;
+        }
         if !peer.send_frame(10, &frame.payload).await {
           return;
         }
@@ -316,25 +336,25 @@ async fn echo(peer: &mut Peer) {
         Some((_, data)) => {
           data.extend_from_slice(&frame.payload);
           if data.len() as u64 > peer.faults.max_payload {
-            return peer.close(peer.faults.huge_len_code).await;
+            return peer.fail_conn(peer.faults.huge_len_code).await;
           }
         }
-        None => return peer.close(protocol).await,
+        None => return peer.fail_conn(protocol).await,
       },
       1 | 2 => {
         if message.is_some() {
-          return peer.close(protocol).await;
+          return peer.fail_conn(protocol).await;
         }
         message = Some((frame.opcode, frame.payload));
       }
-      _ => return peer.close(protocol).await,
+      _ => return peer.fail_conn(protocol).await,
     }
     if !frame.fin {
       continue;
     }
     let Some((opcode, mut data)) = message.take() else { continue };
     if opcode == 1 && core::str::from_utf8(&data).is_err() {
-      return peer.close(peer.faults.close_code_for_bad_utf8).await;
+      return peer.fail_conn(peer.faults.close_code_for_bad_utf8).await;
     }
     if peer.faults.close_mid_echo_after == Some(echoed) {
       return;
@@ -346,6 +366,11 @@ async fn echo(peer: &mut Peer) {
       data[0] ^= 0xFF;
     }
     if !peer.send_frame(opcode, &data).await {
+      return;
+    }
+    if let Some(pong) = late_pong.take()
+      && !peer.send_frame(10, &pong).await
+    {
       return;
     }
     echoed += 1;

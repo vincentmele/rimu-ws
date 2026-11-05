@@ -100,7 +100,8 @@ async fn run_one(ctx: &Ctx, weights: &Weights, global: u64, slot: u32, generatio
   let elapsed_ms = begin.elapsed().as_millis() as u64;
   let (outcome, reason, transcript) = match outcome {
     Outcome::Pass => ("pass", None, None),
-    Outcome::Fail { reason, transcript } => ("fail", Some(reason), Some(transcript)),
+    Outcome::Fail { reason, transcript, .. } => ("fail", Some(reason), Some(transcript)),
+    Outcome::Mark { reason } => ("mark", Some(reason), None),
     Outcome::HarnessError(reason) => ("harness_error", Some(reason), None),
   };
   Record {

@@ -2,8 +2,8 @@
 //! reset mid-frame, half-close, flood pings or send garbage.
 
 use super::{
-  Ctx, Outcome,
-  echo::{Expect, Oracle, encode_message, message, read_expected},
+  Ctx, Mode, Outcome,
+  echo::{Expect, Oracle, encode_message, judged, message, read_expected},
   fail, from_err, slack, upgraded,
 };
 use crate::{
@@ -20,6 +20,8 @@ use tokio::{
 
 /// How long a send must block to show the server stopped reading.
 const BLOCKED: Duration = Duration::from_millis(500);
+/// How long the common mode reads what a never-read client was sent, once it starts reading.
+const READ_BACK: Duration = Duration::from_millis(500);
 /// How long a server may take to close once it has every reason to.
 const CLOSE: Duration = Duration::from_secs(2);
 /// The gap between the bytes of a trickled handshake.
@@ -49,12 +51,21 @@ pub(super) async fn never_read(ctx: &Ctx, rng: &mut Rng) -> Outcome {
   for _ in 0..64 {
     client_frame(true, 1, &text, rng.random(), &mut batch);
   }
-  unread_flood(ctx, rng, &batch).await
+  unread_flood(ctx, rng, &batch, &|frame| frame.opcode == 1 && frame.payload == text).await
 }
 
 /// Sends `batch` over and over with a 4 KiB receive buffer and never reads: a bounded server stops
 /// reading, so a send soon blocks, or it closes.
-pub(super) async fn unread_flood(ctx: &Ctx, rng: &mut Rng, batch: &[u8]) -> Outcome {
+///
+/// In the common mode, a server that keeps reading is judged by its memory (the monitor), not
+/// failed here: RFC 6455 lets it answer only the latest ping. The client then reads for a moment,
+/// and every frame must be one the server owed it (`owed`), or a close.
+pub(super) async fn unread_flood(
+  ctx: &Ctx,
+  rng: &mut Rng,
+  batch: &[u8],
+  owed: &(dyn Fn(&ServerFrame) -> bool + Sync),
+) -> Outcome {
   let opts = ConnOpts { rcvbuf: Some(4096), ..ctx.opts.clone() };
   let mut conn = match upgraded(ctx, &opts, rng).await {
     Ok(conn) => conn,
@@ -64,6 +75,9 @@ pub(super) async fn unread_flood(ctx: &Ctx, rng: &mut Rng, batch: &[u8]) -> Outc
   let mut sent = 0usize;
   loop {
     if begin.elapsed() >= ctx.limits.never_read_budget {
+      if ctx.mode == Mode::Common {
+        break;
+      }
       let reason = format!(
         "server buffered without bound: {sent} bytes sent in {:?} without blocking",
         begin.elapsed()
@@ -76,22 +90,46 @@ pub(super) async fn unread_flood(ctx: &Ctx, rng: &mut Rng, batch: &[u8]) -> Outc
       Ok(Ok(())) => sent += batch.len(),
     }
   }
+  if ctx.mode == Mode::Common {
+    let deadline = Instant::now() + READ_BACK;
+    loop {
+      match conn.next_frame(deadline).await {
+        Ok(crate::conn::Next::Frame(frame)) if frame.opcode == 8 => break,
+        Ok(crate::conn::Next::Frame(frame)) if owed(&frame) => {}
+        Ok(crate::conn::Next::Frame(frame)) => {
+          let reason = format!("a frame the client was not owed: opcode {}", frame.opcode);
+          return fail(reason, &conn);
+        }
+        Ok(crate::conn::Next::Eof) | Err(ConnError::Server(_)) => break,
+        Err(err) => return from_err(err, Some(&conn)),
+      }
+    }
+  }
   conn.reset();
   Outcome::Pass
 }
 
 /// Sends the upgrade request a byte every 100 ms, which keeps an idle timeout from firing: the
 /// server must cut it off within its handshake timeout.
+///
+/// In the common mode, a server without a handshake timeout may wait for the whole request, which
+/// the monitor judges; answering 101 before the request is complete is still a failure.
 pub(super) async fn slowloris(ctx: &Ctx, rng: &mut Rng) -> Outcome {
   let opts = ConnOpts { nodelay: true, ..ctx.opts.clone() };
   let mut conn = match connect(ctx, &opts).await {
     Ok(conn) => conn,
     Err(outcome) => return outcome,
   };
-  let deadline = Instant::now() + slack(ctx.limits.handshake);
+  let common = ctx.mode == Mode::Common;
   let req = upgrade_request(&ctx.host, &ctx.path, &key(rng));
+  let deadline = if common {
+    Instant::now() + TRICKLE * u32::try_from(req.len()).unwrap_or(u32::MAX) + CLOSE
+  } else {
+    Instant::now() + slack(ctx.limits.handshake)
+  };
   let mut buf = vec![0; 1024];
-  for byte in req {
+  let total = req.len();
+  for (idx, byte) in req.into_iter().enumerate() {
     if Instant::now() >= deadline {
       let reason =
         format!("still open after {:?} of a trickled handshake", slack(ctx.limits.handshake));
@@ -109,10 +147,17 @@ pub(super) async fn slowloris(ctx: &Ctx, rng: &mut Rng) -> Outcome {
       Ok(Ok(len)) => {
         conn.transcript_mut().note(&String::from_utf8_lossy(&buf[..len]));
         if buf[..len].starts_with(b"HTTP/1.1 101") {
-          return fail("a trickled, incomplete request was answered 101", &conn);
+          if idx + 1 < total {
+            return fail("a trickled, incomplete request was answered 101", &conn);
+          }
+          break;
         }
       }
     }
+  }
+  if common {
+    conn.reset();
+    return Outcome::Pass;
   }
   fail("the whole trickled request got through before the handshake timeout", &conn)
 }
@@ -199,11 +244,14 @@ pub(super) async fn half_close(ctx: &Ctx, rng: &mut Rng) -> Outcome {
   let mut oracle = Oracle::new(expected);
   match read_expected(&mut conn, &mut oracle, Instant::now() + CLOSE).await {
     Err(err) => return from_err(err, Some(&conn)),
-    Ok(_) if oracle.failure.is_some() => {
-      return fail(oracle.failure.take().unwrap_or_default(), &conn);
-    }
-    Ok(true) => return fail(oracle.closed_early(), &conn),
+    Ok(_) if oracle.failure.is_some() => return judged(ctx, &mut oracle, &conn),
+    Ok(true) => return judged(ctx, &mut oracle, &conn),
     Ok(false) => {}
+  }
+  if !with_close && ctx.mode == Mode::Common {
+    // Whether the server closes after the client's FIN alone is the monitor's (CLOSE_WAIT).
+    conn.reset();
+    return Outcome::Pass;
   }
   let wait = if with_close { CLOSE } else { slack(ctx.limits.close) + CLOSE };
   eof_by(conn, Instant::now() + wait).await
@@ -270,6 +318,13 @@ pub(super) async fn garbage(ctx: &Ctx, rng: &mut Rng) -> Outcome {
   };
   if let Err(err) = conn.send(&bytes).await {
     return from_err(err, Some(&conn));
+  }
+  if ctx.mode == Mode::Common {
+    // Random bytes can form a valid frame with a large length, which a server may legally wait
+    // for: judged by the monitor.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    conn.reset();
+    return Outcome::Pass;
   }
   eof_by(conn, Instant::now() + slack(ctx.limits.idle)).await
 }

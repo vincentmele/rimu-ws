@@ -6,7 +6,7 @@ use rimu_ws_soak::{
   conn::ConnOpts,
   cycle::{self, CycleConfig, Extended, RecordMode},
   runner::{RunConfig, parse_replay, replay},
-  scenario::{Ctx, Limits, Weights, parse_weights, profile},
+  scenario::{Ctx, Limits, Mode, Weights, parse_weights, profile},
 };
 use std::{
   net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs as _},
@@ -204,7 +204,14 @@ fn ctx(common: &Common) -> Result<(Ctx, Weights, Vec<(String, Weights)>), String
     .collect::<Result<Vec<_>, String>>()?;
   let host = authority.to_owned();
   Ok((
-    Ctx { addr, host, path: path.to_owned(), limits, opts: ConnOpts::default() },
+    Ctx {
+      addr,
+      host,
+      path: path.to_owned(),
+      limits,
+      mode: Mode::Strict,
+      opts: ConnOpts::default(),
+    },
     weights,
     rotation,
   ))

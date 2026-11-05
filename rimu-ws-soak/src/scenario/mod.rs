@@ -46,6 +46,28 @@ pub enum Scenario {
   SlowReader,
 }
 
+/// How strictly scenarios judge the server.
+#[derive(
+  Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, clap::ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum Mode {
+  /// rimu-ws's own rules: every limit and timeout is configured and judged.
+  #[default]
+  Strict,
+  /// The comparison's rules (`RULES.md`): what needs a configured limit is judged by survival only.
+  Common,
+}
+
+/// How bad a failure is: what RFC 6455 requires, or what it asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+  Must,
+  Should,
+}
+
 /// Scenario runs holding a message of up to `max_payload` on the server, which the memory budget
 /// allows for.
 pub static LARGE_INFLIGHT: AtomicU32 = AtomicU32::new(0);
@@ -111,6 +133,8 @@ impl Weights {
 /// - `storm`: connection churn.
 /// - `untimed`: `hostile` without the scenarios that need server timeouts.
 /// - `drip`: large messages trickled in fragments, for the memory budget.
+/// - `common`: the comparison's mix (`RULES.md`): `untimed` with the attacks no limit is needed
+///   for, run with `--mode common`.
 pub fn profile(name: &str) -> Option<Weights> {
   let spec = match name {
     "baseline" => "echo=100",
@@ -132,6 +156,11 @@ pub fn profile(name: &str) -> Option<Weights> {
        zero_flood=1,frag_drip=2,ping_no_read=2,slow_reader=3"
     }
     "drip" => "frag_drip=100",
+    "common" => {
+      "echo=40,split_every_byte=5,ctrl_in_fragments=5,never_read=5,close_in_handshake=4,\
+       rst_midframe=6,half_close=4,ping_flood=4,invalid=10,huge_len=2,bad_upgrade=4,frag_flood=1,\
+       zero_flood=1,frag_drip=2,ping_no_read=2,slow_reader=3,garbage=4,header_flood=1,slowloris=5"
+    }
     _ => return None,
   };
   parse_weights(spec).ok()
@@ -194,6 +223,7 @@ pub struct Ctx {
   pub host: String,
   pub path: String,
   pub limits: Limits,
+  pub mode: Mode,
   pub opts: ConnOpts,
 }
 
@@ -202,8 +232,13 @@ pub struct Ctx {
 pub enum Outcome {
   Pass,
   Fail {
+    kind: Kind,
     reason: String,
     transcript: String,
+  },
+  /// Not judged: the server's own size limit is below the common size (`--mode common`).
+  Mark {
+    reason: String,
   },
   /// The client, not the server, failed: out of ports or descriptors, say.
   HarnessError(String),
@@ -243,6 +278,7 @@ fn from_err(err: ConnError, conn: Option<&Conn>) -> Outcome {
   match err {
     ConnError::Harness(reason) => Outcome::HarnessError(reason),
     ConnError::Server(Failure(reason)) => Outcome::Fail {
+      kind: Kind::Must,
       reason,
       transcript: conn.map(|el| el.transcript().dump()).unwrap_or_default(),
     },
@@ -250,7 +286,17 @@ fn from_err(err: ConnError, conn: Option<&Conn>) -> Outcome {
 }
 
 fn fail(reason: impl Into<String>, conn: &Conn) -> Outcome {
-  Outcome::Fail { reason: reason.into(), transcript: conn.transcript().dump() }
+  Outcome::Fail { kind: Kind::Must, reason: reason.into(), transcript: conn.transcript().dump() }
+}
+
+/// A failure of what RFC 6455 asks for but doesn't require.
+fn fail_should(reason: impl Into<String>, conn: &Conn) -> Outcome {
+  Outcome::Fail { kind: Kind::Should, reason: reason.into(), transcript: conn.transcript().dump() }
+}
+
+/// The server refused, under its own smaller size limit, a message within the common size.
+fn mark(reason: impl Into<String>) -> Outcome {
+  Outcome::Mark { reason: reason.into() }
 }
 
 /// A connection that has completed the upgrade.

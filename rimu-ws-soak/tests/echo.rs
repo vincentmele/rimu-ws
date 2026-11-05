@@ -25,6 +25,7 @@ pub fn ctx(addr: SocketAddr) -> Ctx {
       max_payload: 1 << 20,
       ..Limits::default()
     },
+    mode: rimu_ws_soak::scenario::Mode::Strict,
     opts: ConnOpts::default(),
   }
 }

@@ -18,6 +18,7 @@ fn ctx(addr: SocketAddr) -> Ctx {
     host: "localhost".into(),
     path: "/".into(),
     limits: Limits::default(),
+    mode: rimu_ws_soak::scenario::Mode::Strict,
     opts: ConnOpts::default(),
   }
 }

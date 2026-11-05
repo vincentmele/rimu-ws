@@ -2,13 +2,13 @@
 //! declared lengths the server must refuse without allocating them.
 
 use super::{
-  Ctx, Outcome,
-  echo::{Expect, Oracle, encode_message, message, read_expected},
-  fail, from_err, upgraded,
+  Ctx, Mode, Outcome,
+  echo::{Expect, Oracle, encode_message, judged, message, read_expected},
+  fail, fail_should, from_err, upgraded,
 };
 use crate::{
   codec::{FrameSpec, LenForm, close_code, encode},
-  conn::{ConnError, Failure, Next},
+  conn::{Conn, ConnError, Failure, Next},
   rng::Rng,
 };
 use rand::Rng as _;
@@ -60,6 +60,12 @@ pub fn expected_codes(case: InvalidCase) -> &'static [u16] {
     InvalidCase::Oversized => &[1009],
     _ => &[1002],
   }
+}
+
+/// Whether RFC 6455 requires the server to fail the connection on `case`, rather than only asks
+/// it to. `Oversized` depends on the server's own limit.
+pub fn must_fail(case: InvalidCase) -> bool {
+  !matches!(case, InvalidCase::BadCloseCode | InvalidCase::OneByteClose | InvalidCase::Oversized)
 }
 
 /// The bytes of `case`.
@@ -127,16 +133,17 @@ pub async fn run_case(case: InvalidCase, ctx: &Ctx, rng: &mut Rng) -> Outcome {
     let mut oracle = Oracle::new(expected);
     match read_expected(&mut conn, &mut oracle, Instant::now() + CLOSE).await {
       Err(err) => return from_err(err, Some(&conn)),
-      Ok(_) if oracle.failure.is_some() => {
-        return fail(oracle.failure.take().unwrap_or_default(), &conn);
-      }
-      Ok(true) => return fail(oracle.closed_early(), &conn),
+      Ok(_) if oracle.failure.is_some() => return judged(ctx, &mut oracle, &conn),
+      Ok(true) => return judged(ctx, &mut oracle, &conn),
       Ok(false) => {}
     }
   }
   conn.transcript_mut().note(&format!("{case:?}"));
   if let Err(err) = conn.send(&case_bytes(case, ctx.limits.max_payload, rng)).await {
     return from_err(err, Some(&conn));
+  }
+  if ctx.mode == Mode::Common {
+    return common_verdict(case, conn).await;
   }
   let codes = expected_codes(case);
   if let Err(err) = conn.expect_close(codes, Instant::now() + CLOSE).await {
@@ -145,6 +152,40 @@ pub async fn run_case(case: InvalidCase, ctx: &Ctx, rng: &mut Rng) -> Outcome {
   match conn.expect_eof(Instant::now() + CLOSE).await {
     Ok(()) => Outcome::Pass,
     Err(err) => from_err(err, Some(&conn)),
+  }
+}
+
+/// The common mode's judgement of `case` (`RULES.md`): failing the connection is MUST or SHOULD
+/// by `must_fail`; the close frame and its code are SHOULD; `Oversized` is the monitor's.
+async fn common_verdict(case: InvalidCase, mut conn: Conn) -> Outcome {
+  if case == InvalidCase::Oversized {
+    tokio::time::sleep(HUGE).await;
+    conn.reset();
+    return Outcome::Pass;
+  }
+  let deadline = Instant::now() + CLOSE;
+  let (mut close, mut closed) = (None, false);
+  loop {
+    match conn.next_frame(deadline).await {
+      Ok(Next::Frame(frame)) if frame.opcode == 8 => close = Some(close_code(&frame)),
+      Ok(Next::Frame(_)) => {}
+      Ok(Next::Eof) => {
+        closed = true;
+        break;
+      }
+      Err(ConnError::Server(_)) => break,
+      Err(err) => return from_err(err, Some(&conn)),
+    }
+  }
+  if !closed {
+    let reason = format!("{case:?}: the connection was not failed within {CLOSE:?}");
+    return if must_fail(case) { fail(reason, &conn) } else { fail_should(reason, &conn) };
+  }
+  let codes = expected_codes(case);
+  match close {
+    Some(Some(code)) if codes.contains(&code) => Outcome::Pass,
+    Some(code) => fail_should(format!("{case:?}: close code {code:?}, expected {codes:?}"), &conn),
+    None => fail_should(format!("{case:?}: TCP closed without a close frame {codes:?}"), &conn),
   }
 }
 
@@ -174,6 +215,16 @@ pub(super) async fn huge_len(ctx: &Ctx, rng: &mut Rng) -> Outcome {
   conn.transcript_mut().note(&format!("declares {declared} bytes"));
   if let Err(err) = conn.send(&header).await {
     return from_err(err, Some(&conn));
+  }
+  if ctx.mode == Mode::Common {
+    // Every declared length is legal; what the server allocates for it is the monitor's to judge.
+    let end = Instant::now() + HUGE;
+    while Instant::now() < end {
+      tokio::time::sleep(TRICKLE).await;
+      let _ = conn.send(&[0]).await;
+    }
+    conn.reset();
+    return Outcome::Pass;
   }
   let deadline = Instant::now() + HUGE;
   loop {

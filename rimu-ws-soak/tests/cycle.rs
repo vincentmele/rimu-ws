@@ -22,6 +22,7 @@ fn cfg(addr: SocketAddr, pid: u32) -> CycleConfig {
     host: "localhost".into(),
     path: "/".into(),
     limits: Limits::default(),
+    mode: rimu_ws_soak::scenario::Mode::Strict,
     opts: ConnOpts::default(),
   };
   CycleConfig {

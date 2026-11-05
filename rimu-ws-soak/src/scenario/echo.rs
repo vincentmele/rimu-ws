@@ -1,9 +1,9 @@
 //! Echo scenarios: messages whose echoes must come back byte for byte and in order.
 
-use super::{Ctx, Outcome, fail, from_err, upgraded};
+use super::{Ctx, Mode, Outcome, fail, fail_should, from_err, mark, upgraded};
 use crate::{
   codec::{ServerFrame, client_frame, close_code},
-  conn::{Exchange, Flow},
+  conn::{Conn, Exchange, Flow},
   rng::Rng,
 };
 use rand::Rng as _;
@@ -18,7 +18,6 @@ const CLOSE: Duration = Duration::from_secs(2);
 #[derive(Debug)]
 pub(super) enum Expect {
   Message(u8, Vec<u8>),
-  Pong(Vec<u8>),
   Close(u16),
 }
 
@@ -26,6 +25,8 @@ pub(super) enum Expect {
 pub(super) struct Oracle {
   pub(super) expected: VecDeque<Expect>,
   pub(super) failure: Option<String>,
+  /// The code of the server's close frame, once one came.
+  pub(super) server_close: Option<u16>,
   messages: usize,
   partial: Option<(u8, Vec<u8>)>,
   received: usize,
@@ -34,7 +35,14 @@ pub(super) struct Oracle {
 impl Oracle {
   pub(super) fn new(expected: Vec<Expect>) -> Self {
     let messages = expected.iter().filter(|el| matches!(el, Expect::Message(..))).count();
-    Self { expected: expected.into(), failure: None, messages, partial: None, received: 0 }
+    Self {
+      expected: expected.into(),
+      failure: None,
+      server_close: None,
+      messages,
+      partial: None,
+      received: 0,
+    }
   }
 
   fn fail(&mut self, reason: String) -> Flow {
@@ -60,6 +68,7 @@ impl Oracle {
       }
       8 => {
         let code = close_code(&frame);
+        self.server_close = code;
         return match self.expected.pop_front() {
           Some(Expect::Close(want)) if code == Some(want) => Flow::Done,
           Some(Expect::Close(want)) => self.fail(format!("close code {code:?}, expected {want}")),
@@ -71,10 +80,9 @@ impl Oracle {
       }
       9 => return Flow::More,
       10 => {
-        return match self.expected.pop_front() {
-          Some(Expect::Pong(want)) if want == frame.payload => Flow::More,
-          other => self.fail(format!("unexpected pong {:?}, expected {other:?}", frame.payload)),
-        };
+        let reason =
+          format!("unexpected pong {:?}, expected {:?}", frame.payload, self.expected.front());
+        return self.fail(reason);
       }
       other => return self.fail(format!("server sent opcode {other}")),
     }
@@ -99,6 +107,16 @@ impl Oracle {
       other => self.fail(format!("unexpected message (opcode {opcode}), expected {other:?}")),
     }
   }
+}
+
+/// The outcome of a failed oracle, or of the server closing early. In the common mode a close
+/// 1009 before every echo came is the server's own, smaller, size limit: marked, not failed.
+pub(super) fn judged(ctx: &Ctx, oracle: &mut Oracle, conn: &Conn) -> Outcome {
+  let reason = oracle.failure.take().unwrap_or_else(|| oracle.closed_early());
+  if ctx.mode == Mode::Common && oracle.server_close == Some(1009) {
+    return mark(format!("limit below the common size: {reason}"));
+  }
+  fail(reason, conn)
 }
 
 /// A random message: mostly small, sometimes up to 4 KiB, one in ten 70 to 200 KB.
@@ -153,10 +171,8 @@ pub(super) async fn exchange(
     conn.exchange(&data, &chunks, Instant::now() + EXCHANGE, |frame| oracle.on_frame(frame)).await;
   match ended {
     Err(err) => return from_err(err, Some(&conn)),
-    Ok(_) if oracle.failure.is_some() => {
-      return fail(oracle.failure.take().unwrap_or_default(), &conn);
-    }
-    Ok(Exchange::Eof) => return fail(oracle.closed_early(), &conn),
+    Ok(_) if oracle.failure.is_some() => return judged(ctx, &mut oracle, &conn),
+    Ok(Exchange::Eof) => return judged(ctx, &mut oracle, &conn),
     Ok(Exchange::Done) => {}
   }
   match conn.expect_eof(Instant::now() + CLOSE).await {
@@ -181,7 +197,8 @@ pub(super) async fn split_every_byte(ctx: &Ctx, rng: &mut Rng) -> Outcome {
   exchange(ctx, &opts, rng, data, vec![1], expected).await
 }
 
-/// A text in 3 fragments with a ping between the first two: the pong comes before the echo.
+/// A text in 3 fragments with a ping between the first two: the pong comes before the echo. A
+/// pong after it is a SHOULD failure (RFC 6455 5.5.2: "as soon as is practical").
 pub(super) async fn ctrl_in_fragments(ctx: &Ctx, rng: &mut Rng) -> Outcome {
   let len: usize = rng.random_range(3..=300);
   let text: Vec<u8> = (0..len).map(|_| rng.random_range(b'a'..=b'z')).collect();
@@ -193,9 +210,42 @@ pub(super) async fn ctrl_in_fragments(ctx: &Ctx, rng: &mut Rng) -> Outcome {
   client_frame(false, 0, &text[step..2 * step], rng.random(), &mut data);
   client_frame(true, 0, &text[2 * step..], rng.random(), &mut data);
   client_frame(true, 8, &1000u16.to_be_bytes(), rng.random(), &mut data);
-  let expected = vec![Expect::Pong(ping), Expect::Message(1, text), Expect::Close(1000)];
-  let chunks = (0..8).map(|_| rng.random_range(1..=64)).collect();
-  exchange(ctx, &ctx.opts, rng, data, chunks, expected).await
+  let chunks: Vec<usize> = (0..8).map(|_| rng.random_range(1..=64)).collect();
+  let mut conn = match upgraded(ctx, &ctx.opts, rng).await {
+    Ok(conn) => conn,
+    Err(outcome) => return outcome,
+  };
+  let mut oracle = Oracle::new(vec![Expect::Message(1, text), Expect::Close(1000)]);
+  // Pongs before the echo, and after it.
+  let (mut early, mut late) = (0u32, 0u32);
+  let ended = conn
+    .exchange(&data, &chunks, Instant::now() + EXCHANGE, |frame| {
+      if frame.opcode == 10 && frame.payload == ping {
+        if oracle.received == 0 {
+          early += 1
+        } else {
+          late += 1
+        }
+        return Flow::More;
+      }
+      oracle.on_frame(frame)
+    })
+    .await;
+  match ended {
+    Err(err) => return from_err(err, Some(&conn)),
+    Ok(_) if oracle.failure.is_some() => return judged(ctx, &mut oracle, &conn),
+    Ok(Exchange::Eof) => return judged(ctx, &mut oracle, &conn),
+    Ok(Exchange::Done) => {}
+  }
+  if let Err(err) = conn.expect_eof(Instant::now() + CLOSE).await {
+    return from_err(err, Some(&conn));
+  }
+  match (early, late) {
+    (1, 0) => Outcome::Pass,
+    (0, 1) => fail_should("the pong came after the echo of the message the ping was inside", &conn),
+    (0, 0) => fail("no pong for the ping inside a fragmented message", &conn),
+    _ => fail(format!("{} pongs for one ping", early + late), &conn),
+  }
 }
 
 /// Reads frames into `oracle` until it has everything it expected, fails, or the server closes.

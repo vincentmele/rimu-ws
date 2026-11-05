@@ -2,9 +2,9 @@
 //! limit, a reply nobody reads after the close, pongs nobody reads, and a slow reader.
 
 use super::{
-  Ctx, LargeInflight, Outcome,
+  Ctx, LargeInflight, Mode, Outcome,
   abuse::unread_flood,
-  echo::{Expect, Oracle, read_expected},
+  echo::{Expect, Oracle, judged, read_expected},
   fail, from_err, slack, upgraded,
 };
 use crate::{
@@ -30,7 +30,8 @@ const SLOW: Duration = Duration::from_secs(20);
 /// connection: up to the limit, which the monitor's budget allows for.
 pub(super) async fn frag_drip(ctx: &Ctx, rng: &mut Rng) -> Outcome {
   let max = usize::try_from(ctx.limits.max_payload).unwrap_or(usize::MAX);
-  let over = rng.random_bool(0.25);
+  // The common mode never goes over the limit: refusing that needs a configured limit.
+  let over = rng.random_bool(0.25) && ctx.mode == Mode::Strict;
   let len = if over { max + 1 } else { rng.random_range(max * 3 / 4..max) };
   let payload: Vec<u8> = (0..len).map(|_| rng.random()).collect();
   let _large = LargeInflight::new();
@@ -59,16 +60,13 @@ pub(super) async fn frag_drip(ctx: &Ctx, rng: &mut Rng) -> Outcome {
   } else {
     let mut close = Vec::new();
     client_frame(true, 8, &1000u16.to_be_bytes(), rng.random(), &mut close);
-    if let Err(err) = conn.send(&close).await {
-      return from_err(err, Some(&conn));
-    }
+    // As above: a failed send is the server closing, which the reads judge.
+    let _ = conn.send(&close).await;
     let mut oracle = Oracle::new(vec![Expect::Message(2, payload), Expect::Close(1000)]);
     match read_expected(&mut conn, &mut oracle, Instant::now() + SLOW).await {
       Err(err) => return from_err(err, Some(&conn)),
-      Ok(_) if oracle.failure.is_some() => {
-        return fail(oracle.failure.take().unwrap_or_default(), &conn);
-      }
-      Ok(true) => return fail(oracle.closed_early(), &conn),
+      Ok(_) if oracle.failure.is_some() => return judged(ctx, &mut oracle, &conn),
+      Ok(true) => return judged(ctx, &mut oracle, &conn),
       Ok(false) => {}
     }
   }
@@ -140,7 +138,7 @@ pub(super) async fn ping_no_read(ctx: &Ctx, rng: &mut Rng) -> Outcome {
   for _ in 0..64 {
     client_frame(true, 9, &ping, rng.random(), &mut batch);
   }
-  unread_flood(ctx, rng, &batch).await
+  unread_flood(ctx, rng, &batch, &|frame| frame.opcode == 10 && frame.payload == ping).await
 }
 
 /// 2 to 4 messages of 64 to 200 KB, read 8 KiB every 10 ms through a 16 KiB receive buffer: every
@@ -166,10 +164,8 @@ pub(super) async fn slow_reader(ctx: &Ctx, rng: &mut Rng) -> Outcome {
     .await;
   match ended {
     Err(err) => return from_err(err, Some(&conn)),
-    Ok(_) if oracle.failure.is_some() => {
-      return fail(oracle.failure.take().unwrap_or_default(), &conn);
-    }
-    Ok(Exchange::Eof) => return fail(oracle.closed_early(), &conn),
+    Ok(_) if oracle.failure.is_some() => return judged(ctx, &mut oracle, &conn),
+    Ok(Exchange::Eof) => return judged(ctx, &mut oracle, &conn),
     Ok(Exchange::Done) => {}
   }
   match conn.expect_eof(Instant::now() + CLOSE).await {

@@ -2,9 +2,9 @@
 //! frames that cost the server more than they cost the client.
 
 use super::{
-  Ctx, Outcome,
+  Ctx, Mode, Outcome,
   echo::{Expect, exchange},
-  fail, from_err,
+  fail, fail_should, from_err,
 };
 use crate::{
   codec::{accept_key, client_frame},
@@ -167,6 +167,11 @@ pub async fn run_upgrade_case(case: UpgradeCase, ctx: &Ctx, rng: &mut Rng) -> Ou
   }
   let res = match conn.read_response(Instant::now() + ANSWER).await {
     Ok(res) => res,
+    // Without a handshake timeout a server may leave it unanswered; the monitor judges that.
+    Err(ConnError::Server(_)) if ctx.mode == Mode::Common => {
+      conn.reset();
+      return Outcome::Pass;
+    }
     Err(ConnError::Server(_)) => {
       return fail(format!("{case:?}: neither answered nor closed within {ANSWER:?}"), &conn);
     }
@@ -174,7 +179,8 @@ pub async fn run_upgrade_case(case: UpgradeCase, ctx: &Ctx, rng: &mut Rng) -> Ou
   };
   let Some(res) = res.filter(|el| el.status == 101) else {
     if case == UpgradeCase::Pipelined {
-      return fail("a valid request with frames behind it was refused", &conn);
+      // RFC 6455 4.1 lets a client send frames before it has the 101.
+      return fail_should("a valid request with frames behind it was refused", &conn);
     }
     conn.reset();
     return Outcome::Pass;
@@ -218,12 +224,22 @@ pub(super) async fn header_flood(ctx: &Ctx, rng: &mut Rng) -> Outcome {
   let mut next: &[u8] = head.as_bytes();
   loop {
     if sent >= HEADER_CAP {
+      if ctx.mode == Mode::Common {
+        // What it holds is the monitor's to judge.
+        conn.reset();
+        return Outcome::Pass;
+      }
       return fail(format!("still reading an unterminated request after {sent} bytes"), &conn);
     }
     match timeout(BLOCKED, conn.raw().write_all(next)).await {
       Ok(Ok(())) => sent += next.len(),
       // Closed on us: refused.
       Ok(Err(_)) => return Outcome::Pass,
+      // A server that stopped reading holds what it read; the monitor judges that.
+      Err(_) if ctx.mode == Mode::Common => {
+        conn.reset();
+        return Outcome::Pass;
+      }
       // It stopped reading without closing: it must close before the handshake timeout ends.
       Err(_) => {
         let deadline = Instant::now() + super::slack(ctx.limits.handshake);

@@ -31,6 +31,7 @@ fn ctx(addr: SocketAddr) -> Ctx {
       never_read_budget: Duration::from_secs(5),
       server_sndbuf: None,
     },
+    mode: rimu_ws_soak::scenario::Mode::Strict,
     opts: ConnOpts::default(),
   }
 }
