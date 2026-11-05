@@ -103,6 +103,13 @@ pub struct UringRuntime {
 }
 
 impl UringRuntime {
+  /// See [`UringStats`].
+  #[inline]
+  #[must_use]
+  pub fn stats(&self) -> UringStats {
+    self.reactor.stats()
+  }
+
   #[cfg(test)]
   fn open_conns(&self) -> usize {
     self.reactor.conns.borrow().iter().filter(|conn| conn.in_use).count()
@@ -270,6 +277,62 @@ impl UringParams {
     self.spin = value;
     self
   }
+}
+
+/// What a [`UringRuntime`] has seen since it started: counts of the events an operator wants to
+/// watch. Taken with [`UringRuntime::stats`], or [`uring_stats`] from inside a task.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UringStats {
+  /// Connections accepted.
+  pub accepted: u64,
+  /// Accepts that failed with something other than a connection that went away.
+  pub accept_errors: u64,
+  /// Times accepting paused 100 ms after such a failure.
+  pub accept_backoffs: u64,
+  /// Completions the kernel had to hold back because the completion ring was full. More than a
+  /// few means the ring is too small (see [`UringParams::set_ring_entries`]).
+  pub cq_overflows: u64,
+  /// Messages from other threads: wakes and dropped handles.
+  pub remote_messages: u64,
+  /// Connections open now.
+  pub open_connections: u64,
+  /// Receives that found every provided buffer in use (see [`UringParams::set_recv_buffers`]).
+  pub recv_buffers_exhausted: u64,
+  /// Times a connection stopped receiving because its unread bytes reached the high-water mark.
+  pub recv_pauses: u64,
+  /// Submissions the kernel refused.
+  pub submit_errors: u64,
+  /// Tasks that panicked.
+  pub task_panics: u64,
+  /// Connections cut off by a handshake, idle or close timeout.
+  pub timeouts: u64,
+}
+
+/// The [`UringStats`] of the runtime running on this thread, if any.
+#[inline]
+#[must_use]
+pub fn uring_stats() -> Option<UringStats> {
+  let reactor = CURRENT.with(Cell::get);
+  // SAFETY: set by `block_on`, which outlives everything it polls
+  unsafe { reactor.as_ref() }.map(Reactor::stats)
+}
+
+#[derive(Default)]
+struct Counters {
+  accept_backoffs: Cell<u64>,
+  accept_errors: Cell<u64>,
+  accepted: Cell<u64>,
+  recv_buffers_exhausted: Cell<u64>,
+  recv_pauses: Cell<u64>,
+  remote_messages: Cell<u64>,
+  submit_errors: Cell<u64>,
+  task_panics: Cell<u64>,
+  timeouts: Cell<u64>,
+}
+
+fn bump(counter: &Cell<u64>) {
+  counter.set(counter.get().wrapping_add(1));
 }
 
 impl Default for UringParams {
@@ -1306,6 +1369,7 @@ struct Reactor {
   current: Cell<Option<Rc<dyn RunTask>>>,
   // `UringSleep`s, by slot
   sleeps: RefCell<Vec<SleepSlot>>,
+  counters: Counters,
   ready: RefCell<VecDeque<usize>>,
   tasks: RefCell<Vec<TaskSlot>>,
   timers: RefCell<Timers>,
@@ -1427,10 +1491,30 @@ impl Reactor {
       polling: Cell::new(usize::MAX),
       current: Cell::new(None),
       sleeps: RefCell::new(Vec::new()),
+      counters: Counters::default(),
       ready: RefCell::new(VecDeque::new()),
       tasks: RefCell::new(Vec::new()),
       timers: RefCell::new(timers),
     })
+  }
+
+  fn stats(&self) -> UringStats {
+    let counters = &self.counters;
+    let open = self.conns.borrow().len().saturating_sub(self.free_conns.borrow().len());
+    let cq_overflows = core::mem::ManuallyDrop::new(self.ring.borrow_mut().completion()).overflow();
+    UringStats {
+      accepted: counters.accepted.get(),
+      accept_errors: counters.accept_errors.get(),
+      accept_backoffs: counters.accept_backoffs.get(),
+      cq_overflows: cq_overflows.into(),
+      remote_messages: counters.remote_messages.get(),
+      open_connections: open as u64,
+      recv_buffers_exhausted: counters.recv_buffers_exhausted.get(),
+      recv_pauses: counters.recv_pauses.get(),
+      submit_errors: counters.submit_errors.get(),
+      task_panics: counters.task_panics.get(),
+      timeouts: counters.timeouts.get(),
+    }
   }
 
   /// This runtime's slot in `RUNTIMES`.
@@ -1533,6 +1617,7 @@ impl Reactor {
   /// The eventfd rang: runs what other threads asked for, then listens again.
   fn on_doorbell(&self, res: i32) {
     for message in self.inbox.take() {
+      bump(&self.counters.remote_messages);
       match message {
         Message::DropConn(idx, generation) => self.drop_conn_ref(idx, generation),
         Message::DropListener(idx) => self.drop_listener(idx),
@@ -1593,6 +1678,7 @@ impl Reactor {
   #[cold]
   #[inline(never)]
   fn end_panicked_task(&self) {
+    bump(&self.counters.task_panics);
     let idx = self.polling.replace(usize::MAX);
     if let Some(task) = self.current.take() {
       // Dropping its future may panic too; the task is over either way.
@@ -1674,23 +1760,25 @@ impl Reactor {
     let mut ring = self.ring.borrow_mut();
     // SAFETY: as in `push_sqe`
     while unsafe { ring.submission().push(sqe) }.is_err() {
-      let _rslt = ring.submit();
+      if ring.submit().is_err() {
+        bump(&self.counters.submit_errors);
+      }
     }
   }
 
   fn enter(&self, wait: bool) {
     let mut ring = self.ring.borrow_mut();
     if !wait {
-      if needs_enter(&mut ring) {
-        let _rslt = ring.submit();
+      if needs_enter(&mut ring) && ring.submit().is_err() {
+        bump(&self.counters.submit_errors);
       }
       return;
     }
     if !self.params.spin.is_zero() {
       // Sends usually complete inside this submit and post their completions at once; `reap`
       // takes those without another syscall.
-      if needs_enter(&mut ring) {
-        let _rslt = ring.submit();
+      if needs_enter(&mut ring) && ring.submit().is_err() {
+        bump(&self.counters.submit_errors);
       }
       if !cq_is_empty(&mut ring) {
         return;
@@ -1701,7 +1789,9 @@ impl Reactor {
         // With `DEFER_TASKRUN` the kernel only flags task work while this thread is out of the
         // kernel, and `submit` runs it.
         if needs_kernel(&mut ring) {
-          let _rslt = ring.submit();
+          if ring.submit().is_err() {
+            bump(&self.counters.submit_errors);
+          }
           return;
         }
         if !cq_is_empty(&mut ring) {
@@ -1714,7 +1804,12 @@ impl Reactor {
         core::hint::spin_loop();
       }
     }
-    let _rslt = ring.submit_and_wait(1);
+    // EINTR from a signal is not a refusal: the next turn waits again.
+    if let Err(err) = ring.submit_and_wait(1)
+      && err.kind() != std::io::ErrorKind::Interrupted
+    {
+      bump(&self.counters.submit_errors);
+    }
   }
 
   fn reap(&self) {
@@ -1843,6 +1938,7 @@ impl Reactor {
     }
     if res >= 0 {
       listener.queue.push_back(res);
+      bump(&self.counters.accepted);
       if let Some(elem) = listener.waker.take() {
         elem.wake();
       }
@@ -1857,8 +1953,10 @@ impl Reactor {
     let backoff = failed && !listener.backoff;
     if backoff {
       listener.backoff = true;
+      bump(&self.counters.accept_backoffs);
     }
     if failed {
+      bump(&self.counters.accept_errors);
       listener.error = Some(-res);
       if let Some(elem) = listener.waker.take() {
         elem.wake();
@@ -2084,6 +2182,7 @@ impl Reactor {
     } else if res == 0 {
       conn.rx_eof = true;
     } else if res == -libc::ENOBUFS {
+      bump(&self.counters.recv_buffers_exhausted);
       #[cfg(test)]
       let _ = tests::ENOBUFS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     } else if res != -libc::ECANCELED {
@@ -2114,6 +2213,7 @@ impl Reactor {
   #[cold]
   #[inline(never)]
   fn pause_recv(&self, conn: &mut Conn, idx: u32, generation: u32) {
+    bump(&self.counters.recv_pauses);
     conn.rx_paused = true;
     if conn.recv_armed {
       self.push_sqe(&cancel_sqe(user_data(KIND_RECV, generation, idx)));
@@ -2506,6 +2606,7 @@ impl Reactor {
   #[cold]
   #[inline(never)]
   fn time_out(&self, conn: &mut Conn, idx: u32) {
+    bump(&self.counters.timeouts);
     let timed_out = libc::ETIMEDOUT as u8;
     if conn.rx_err == 0 {
       conn.rx_err = timed_out;
@@ -4145,6 +4246,55 @@ mod tests {
       }
       yield_once().await;
     }
+  }
+
+  // The counters an operator watches follow what the runtime did: two accepts, one idle timeout,
+  // one panicked task, one wake from another thread.
+  #[test]
+  fn stats_count_what_happened() {
+    use crate::net::StreamReader;
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let clients = std::thread::spawn(move || {
+      let mut first = connect(&client_addr);
+      let mut second = connect(&client_addr);
+      let mut rest = Vec::new();
+      let _rslt = first.read_to_end(&mut rest);
+      let _rslt = second.read_to_end(&mut rest);
+    });
+    let params = crate::executor::UringParams::new()
+      .set_idle_timeout(Some(core::time::Duration::from_millis(100)));
+    let runtime = UringRuntime::with_params(params).unwrap();
+    let inside = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let (mut first, _) = listener.accept(TcpParams::default()).await.unwrap();
+      let (second, _) = listener.accept(TcpParams::default()).await.unwrap();
+      let mut buf = [0; 4];
+      let _err = first.read(buf.as_mut_slice().into()).await.unwrap_err();
+      let exec = UringExecutor::default();
+      let bad = crate::executor::Executor::spawn_local(
+        &exec,
+        async { panic!("a task panicked on purpose") },
+        &UringRuntime::new().unwrap(),
+      );
+      let _rslt = bad.await;
+      let flag = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+      let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+      let waking = wake_from_another_thread(flag.clone(), slot.clone());
+      woken_by_another_thread(flag, slot).await;
+      waking.join().unwrap();
+      let inside = super::uring_stats().unwrap();
+      drop((first, second));
+      inside
+    });
+    clients.join().unwrap();
+    assert_eq!(inside.accepted, 2);
+    assert_eq!(inside.open_connections, 2);
+    assert!(inside.timeouts >= 1, "{inside:?}");
+    assert_eq!(inside.task_panics, 1);
+    assert_eq!(inside.remote_messages, 1);
+    assert_eq!(inside.accept_errors, 0);
+    assert_eq!(runtime.stats().open_connections, 0);
   }
 
   // Reading into an empty buffer would report the end of the stream: it fails instead, and the

@@ -22,8 +22,8 @@ pub use tokio_executor::{TokioExecutor, TokioSpawnFutureFuture};
 pub(crate) use uring_executor::UringSleep;
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 pub use uring_executor::{
-  UringExecutor, UringJoinHandle, UringParams, UringReadHalf, UringRuntime, UringTcpListener,
-  UringTcpStream, UringWriteHalf,
+  UringExecutor, UringJoinHandle, UringParams, UringReadHalf, UringRuntime, UringStats,
+  UringTcpListener, UringTcpStream, UringWriteHalf, uring_stats,
 };
 #[cfg(feature = "std")]
 use {crate::net::ToSocketAddrs, core::net::SocketAddr};
