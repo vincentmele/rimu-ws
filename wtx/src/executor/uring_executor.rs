@@ -62,6 +62,15 @@ const SLOT_BUFFER_KEEP: usize = 64 * 1024;
 // Free slots that keep their buffers however few connections are open; more stay warm while more
 // are open.
 const WARM_FREE_MIN: usize = 64;
+// A connection's offsets into its buffers are `u32`s, so that its hot fields fit two cache lines.
+// These keep them under 4 GiB: one send covers at most `MAX_SEND` bytes, and the sent ones are
+// dropped from the front once they pass it. Unread received bytes stay under the high-water mark
+// plus what the completions of a turn or two bring, at most twice the receive ring; the read ones
+// are dropped from the front once they outnumber the unread ones and pass `RX_COMPACT`.
+const MAX_SEND: usize = 1 << 30;
+const MAX_RX_HIGH_WATER: usize = 512 << 20;
+const MAX_RECV_RING: usize = 512 << 20;
+const RX_COMPACT: usize = 32 * 1024;
 
 std::thread_local! {
   static CURRENT: Cell<*const Reactor> = const { Cell::new(core::ptr::null()) };
@@ -201,18 +210,19 @@ impl UringParams {
 
   /// How many received bytes a connection can hold that nobody has read before it stops
   /// receiving, which leaves the rest in the socket and lets TCP slow the peer down. It receives
-  /// again once reads take it under half of that. Defaults to 64 KiB.
+  /// again once reads take it under half of that. Defaults to 64 KiB, at most 512 MiB.
   #[inline]
   #[must_use]
   pub const fn set_rx_high_water(mut self, value: usize) -> Self {
-    self.rx_high_water = value;
+    self.rx_high_water = if value > MAX_RX_HIGH_WATER { MAX_RX_HIGH_WATER } else { value };
     self
   }
 
   /// The ring of buffers that receives are made into: `count` buffers (rounded up to a power of
-  /// two, at most 32768, the kernel's limit) of `len` bytes each, shared by the connections of a runtime. Received bytes are copied
-  /// out as soon as they complete, so the ring only has to cover one turn. Defaults to 512 of
-  /// 4096 bytes.
+  /// two, at most 32768, the kernel's limit) of `len` bytes each, shared by the connections of a
+  /// runtime. Received bytes are copied out as soon as they complete, so the ring only has to
+  /// cover one turn. `len` is lowered to keep the ring within 512 MiB. Defaults to 512 of 4096
+  /// bytes.
   #[inline]
   #[must_use]
   pub const fn set_recv_buffers(mut self, count: u16, len: u32) -> Self {
@@ -1477,7 +1487,7 @@ impl Reactor {
     // The kernel takes at most 32768 buffers in a ring, and the next power of two above that
     // overflows a `u16`.
     let count = params.recv_buffers.clamp(1, 32768).next_power_of_two();
-    let len = params.recv_buffer_len.max(1) as usize;
+    let len = (params.recv_buffer_len.max(1) as usize).min(MAX_RECV_RING / usize::from(count));
     let layout = Layout::from_size_align(usize::from(count) * 16, 4096)
       .map_err(|_err| io_err(libc::EINVAL))?;
     // SAFETY: `layout` has a non-zero size
@@ -2234,9 +2244,12 @@ impl Reactor {
         let bufs_len = self.bufs.borrow().len;
         let begin = usize::from(bid) * bufs_len;
         let len = res as usize;
-        if conn.rx_off as usize == conn.rx.len() {
+        let off = conn.rx_off as usize;
+        if off == conn.rx.len() {
           conn.rx.clear();
           conn.rx_off = 0;
+        } else if off >= RX_COMPACT && off >= conn.rx.len() - off {
+          compact_rx(conn);
         }
         let bufs = self.bufs.borrow();
         conn.rx.extend_from_slice(bufs.mem.get(begin..begin + len).unwrap_or_default());
@@ -2432,6 +2445,9 @@ impl Reactor {
     } else {
       conn.activity |= ACTIVE_TX;
       conn.tx_done += res as u32;
+      if conn.tx_done as usize >= MAX_SEND {
+        drop_sent(conn);
+      }
       // A timed-out connection sends nothing more, even if the cancel found the send half done.
       if (conn.tx_done as usize) < conn.tx_inflight.len() && conn.tx_err == 0 {
         let rest = conn.tx_inflight.get(conn.tx_done as usize..).unwrap_or_default();
@@ -2783,8 +2799,26 @@ fn send_pending_tls_alert(conn: &mut Conn) {
   }
 }
 
+/// Drops the read bytes from the front of a connection's received ones, which a reader that never
+/// takes everything there is would otherwise keep for as long as the connection lives.
+#[cold]
+#[inline(never)]
+fn compact_rx(conn: &mut Conn) {
+  let _drained = conn.rx.drain(..conn.rx_off as usize);
+  conn.rx_off = 0;
+}
+
+/// Drops the sent bytes from the front of a write larger than [`MAX_SEND`].
+#[cold]
+#[inline(never)]
+fn drop_sent(conn: &mut Conn) {
+  let _drained = conn.tx_inflight.drain(..conn.tx_done as usize);
+  conn.tx_done = 0;
+}
+
 fn send_sqe(conn: &Conn, bytes: &[u8]) -> squeue::Entry {
-  let (ptr, len) = (bytes.as_ptr(), bytes.len() as u32);
+  // At most `MAX_SEND`, which fits the `u32` length; the completion sends the rest.
+  let (ptr, len) = (bytes.as_ptr(), bytes.len().min(MAX_SEND) as u32);
   if conn.direct {
     opcode::Send::new(types::Fixed(conn.fd as u32), ptr, len).flags(libc::MSG_NOSIGNAL).build()
   } else {
@@ -4078,6 +4112,18 @@ mod tests {
     assert_eq!(runtime.block_on(async { 1 }), 1);
   }
 
+  // A receive ring asked for past 512 MiB gets shorter buffers instead of the allocation: the
+  // most a connection holds unread is bounded by it, and has to stay under 4 GiB.
+  #[test]
+  fn a_receive_ring_past_512_mib_is_lowered() {
+    let params = crate::executor::UringParams::new().set_recv_buffers(32768, u32::MAX);
+    let runtime = UringRuntime::with_params(params).unwrap();
+    let bufs = runtime.reactor.bufs.borrow();
+    assert_eq!(usize::from(bufs.count) * bufs.len, super::MAX_RECV_RING);
+    drop(bufs);
+    assert_eq!(runtime.block_on(async { 1 }), 1);
+  }
+
   // A task that panics ends with an error at its join handle; the runtime and its other tasks
   // carry on, and the task's slot is freed.
   #[test]
@@ -4598,5 +4644,105 @@ mod tests {
     drop(runtime);
     client.join().unwrap();
     drop(stream);
+  }
+
+  // A reader that always leaves a byte unread never empties a connection's received bytes, so
+  // they were never cleared: the ones it had read stayed in front of the rest, and the buffer
+  // grew with everything the connection ever received (its offset wrapping past 4 GiB).
+  #[test]
+  fn a_reader_that_never_catches_up_does_not_keep_what_it_read() {
+    use crate::net::StreamReader;
+    const TOTAL: usize = 8 << 20;
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let client = std::thread::spawn(move || {
+      let mut stream = connect(&client_addr);
+      let data: Vec<u8> = (0..TOTAL).map(|idx| (idx % 251) as u8).collect();
+      Write::write_all(&mut stream, &data).unwrap();
+      let mut rest = Vec::new();
+      let _len = stream.read_to_end(&mut rest);
+    });
+    let params =
+      crate::executor::UringParams::new().set_recv_buffers(8, 4096).set_rx_high_water(16 * 1024);
+    let runtime = UringRuntime::with_params(params).unwrap();
+    let largest = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+      let idx = stream.conn.idx as usize;
+      let mut buf = alloc::vec![0; 64 * 1024];
+      let (mut read, mut largest) = (0, 0);
+      while read < TOTAL {
+        let (len, unread) = super::with_reactor(|reactor| {
+          let conns = reactor.conns.borrow();
+          Ok((conns[idx].rx.len(), conns[idx].rx.len() - conns[idx].rx_off as usize))
+        })
+        .unwrap();
+        largest = largest.max(len);
+        let want = if read + unread == TOTAL { unread } else { unread.saturating_sub(1) };
+        if want == 0 {
+          crate::futures::Sleep::new(core::time::Duration::from_micros(100))
+            .unwrap()
+            .await
+            .unwrap();
+          continue;
+        }
+        let want = want.min(buf.len());
+        let got = stream.read(buf[..want].as_mut().into()).await.unwrap().unwrap().get();
+        for (offset, byte) in buf[..got].iter().enumerate() {
+          assert_eq!(*byte, ((read + offset) % 251) as u8, "byte {}", read + offset);
+        }
+        read += got;
+      }
+      drop(stream);
+      largest
+    });
+    client.join().unwrap();
+    assert!(largest <= 256 * 1024, "{largest} bytes held to receive {TOTAL}");
+  }
+
+  // One write of more than 4 GiB arrives whole and in order. Its length and progress were kept
+  // as `u32`: the send was cut to the length modulo 4 GiB, and then sent nothing, forever.
+  // Ignored by default: it needs about 9 GiB of memory.
+  #[ignore = "needs about 9 GiB of memory"]
+  #[test]
+  fn a_write_past_4_gib_arrives_whole() {
+    use crate::net::StreamWriter;
+    const LEN: usize = (4 << 30) + 3;
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let _client = std::thread::spawn(move || {
+      let mut stream = connect(&client_addr);
+      let mut buf = alloc::vec![0; 1 << 20];
+      let mut read = 0;
+      let mut bad = None;
+      loop {
+        let len = match stream.read(&mut buf) {
+          Ok(0) | Err(_) => break,
+          Ok(elem) => elem,
+        };
+        if bad.is_none() {
+          bad = buf[..len]
+            .iter()
+            .enumerate()
+            .find(|(offset, byte)| **byte != ((read + offset) % 251) as u8)
+            .map(|(offset, _)| read + offset);
+        }
+        read += len;
+      }
+      let _rslt = done_tx.send((read, bad));
+    });
+    let _server = std::thread::spawn(move || {
+      UringRuntime::new().unwrap().block_on(async {
+        let listener = bind(&addr).await;
+        let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+        let data: Vec<u8> = (0..LEN).map(|idx| (idx % 251) as u8).collect();
+        stream.write_all(&data).await.unwrap();
+        drop(data);
+        drop(stream);
+      });
+    });
+    let rslt = done_rx.recv_timeout(core::time::Duration::from_secs(120));
+    assert_eq!(rslt, Ok((LEN, None)));
   }
 }
