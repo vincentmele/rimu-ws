@@ -21,7 +21,17 @@ impl Stream for TcpStream {
   }
 }
 
-impl StreamCommon for TcpStream {}
+impl StreamCommon for TcpStream {
+  // Reads and writes are synchronous: nothing is read ahead of the caller or left to send.
+  #[cfg(all(feature = "libc", feature = "tls", target_os = "linux"))]
+  #[inline]
+  fn with_kernel_tls(
+    &mut self,
+    cb: impl FnOnce(std::os::fd::RawFd) -> crate::Result<bool>,
+  ) -> crate::Result<bool> {
+    cb(std::os::fd::AsRawFd::as_raw_fd(self))
+  }
+}
 
 #[cfg(unix)]
 impl StreamCommon for std::os::unix::net::UnixStream {}
@@ -33,6 +43,12 @@ impl StreamReader for TcpStream {
     mut bytes: MaybeUninitSlice<'_, u8>,
   ) -> crate::Result<Option<NonZeroUsize>> {
     Ok(NonZeroUsize::new(<Self as Read>::read(self, bytes.initialize_all_bytes())?))
+  }
+
+  #[cfg(all(feature = "libc", feature = "tls", target_os = "linux"))]
+  #[inline]
+  fn read_kernel_tls_record(&mut self, buffer: &mut [u8]) -> crate::Result<(u8, usize)> {
+    crate::tls::kernel_tls::read_record(std::os::fd::AsRawFd::as_raw_fd(self), buffer)
   }
 }
 
@@ -52,6 +68,16 @@ impl StreamWriter for TcpStream {
   async fn write_all(&mut self, bytes: &[u8]) -> crate::Result<()> {
     <Self as Write>::write_all(self, bytes)?;
     Ok(())
+  }
+
+  #[cfg(all(feature = "libc", feature = "tls", target_os = "linux"))]
+  #[inline]
+  fn send_kernel_tls_alert(&mut self, level: u8, description: u8) -> crate::Result<()> {
+    crate::tls::kernel_tls::send_record(
+      std::os::fd::AsRawFd::as_raw_fd(self),
+      crate::tls::kernel_tls::RECORD_ALERT,
+      &[level, description],
+    )
   }
 
   #[inline]

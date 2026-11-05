@@ -46,6 +46,10 @@ pub struct TlsStream<S, TCX, const IS_CLIENT: bool> {
   pub(crate) can_reply_key_update: bool,
   pub(crate) key_updates: u8,
   pub(crate) warning_alerts: u8,
+  // The kernel encrypts and decrypts this connection's records (see `kernel_tls`)
+  pub(crate) kernel_tls: bool,
+  // Reads left that may still hand the records to the kernel
+  pub(crate) kernel_tls_tries: u8,
   pub(crate) max_fragment_length: u16,
   pub(crate) max_fragment_length_send: u16,
   pub(crate) phantom: PhantomData<TCX>,
@@ -96,6 +100,8 @@ where
       buffer,
       can_reply_key_update: true,
       connection_state: ConnectionState::Open,
+      kernel_tls: false,
+      kernel_tls_tries: 0,
       key_schedule,
       key_updates: 0,
       max_fragment_length,
@@ -155,6 +161,9 @@ where
   /// Refreshes the connection's keys through the sending of a `KeyUpdate` record.
   #[inline]
   pub async fn refresh_traffic_keys(&mut self) -> crate::Result<()> {
+    if self.kernel_tls {
+      return Err(TlsError::KernelTlsKeyUpdate.into());
+    }
     let key_update = KeyUpdate::new(KeyUpdateRequest::UpdateRequested);
     let kss = self.key_schedule.write_mut().state_mut();
     self.stream.write_all(&key_update.record_bytes(kss)?).await?;
@@ -165,6 +174,13 @@ where
   /// Sends a warning alert of type `CloseNotify`, closing the connection.
   #[inline]
   pub async fn send_close_notify(&mut self) -> crate::Result<()> {
+    #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
+    if self.kernel_tls {
+      let alert = Alert::close_notify();
+      self.stream.send_kernel_tls_alert(alert.level().into(), alert.description().into())?;
+      self.connection_state = ConnectionState::WriteClosed;
+      return Ok(());
+    }
     self
       .stream
       .write_all(&Alert::close_notify().record_bytes(self.key_schedule.write_mut().state_mut())?)
@@ -183,6 +199,83 @@ where
   #[inline]
   pub const fn stream_mut(&mut self) -> &mut S {
     &mut self.stream
+  }
+
+  /// Whether the kernel encrypts and decrypts this connection's records. See
+  /// [`crate::tls::TlsConfig::kernel_tls`].
+  #[inline]
+  pub const fn is_kernel_tls(&self) -> bool {
+    self.kernel_tls
+  }
+
+  /// A kernel TLS read met a record that isn't application data. A `close_notify` ends the stream
+  /// as in user space, answered with one of ours; anything else ends the connection.
+  #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
+  #[cold]
+  fn kernel_tls_record(&mut self) -> crate::Result<Option<NonZeroUsize>> {
+    use crate::tls::kernel_tls::{RECORD_ALERT, RECORD_HANDSHAKE};
+    let mut buffer = [0; 256];
+    let (ty, len) = self.stream.read_kernel_tls_record(&mut buffer)?;
+    match (ty, buffer.get(..len).unwrap_or_default()) {
+      (RECORD_ALERT, [level, description]) => {
+        let alert = Alert::new((*level).try_into()?, (*description).try_into()?);
+        if alert.level() == AlertLevel::Warning
+          && alert.description() == AlertDescription::CloseNotify
+        {
+          if !self.connection_state.cannot_write() {
+            let _rslt = self.stream.send_kernel_tls_alert(*level, *description);
+          }
+          self.connection_state = ConnectionState::ClosedGracefully;
+          return Ok(None);
+        }
+        self.connection_state = ConnectionState::ClosedAbruptly;
+        Err(TlsError::AbortedHandshake(alert).into())
+      }
+      (RECORD_HANDSHAKE, _) => {
+        self.connection_state = ConnectionState::ClosedAbruptly;
+        Err(TlsError::KernelTlsKeyUpdate.into())
+      }
+      _ => {
+        self.connection_state = ConnectionState::ClosedAbruptly;
+        Err(TlsError::InvalidAlert.into())
+      }
+    }
+  }
+}
+
+impl<S, TCX, const IS_CLIENT: bool> TlsStream<S, TCX, IS_CLIENT>
+where
+  S: StreamCommon,
+  TCX: TlsCtx,
+{
+  /// Hands the records to the kernel when it can take them: at a record boundary both ways, with
+  /// nothing read past the records user space has decrypted and nothing user space encrypted still
+  /// waiting to be sent. A client usually sends its first request right behind its `Finished`, and
+  /// a reply waits to be sent right after it's written, so the switch is tried at the start of
+  /// every read and write until it happens; a stream gives up after `KERNEL_TLS_TRIES` tries.
+  #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
+  #[cold]
+  #[inline(never)]
+  pub(crate) fn try_kernel_tls(&mut self) -> crate::Result<()> {
+    if TCX::TY.is_plain_text()
+      || !matches!(self.connection_state, ConnectionState::Draining | ConnectionState::Open)
+    {
+      self.kernel_tls_tries = 0;
+      return Ok(());
+    }
+    if !self.buffer.reader_buffer.following().is_empty()
+      || self.plaintext_len > self.plaintext_consumed
+    {
+      return Ok(());
+    }
+    self.kernel_tls_tries = self.kernel_tls_tries.saturating_sub(1);
+    let (read, write) = (self.key_schedule.read().state(), self.key_schedule.write().state());
+    self.kernel_tls =
+      self.stream.with_kernel_tls(|fd| crate::tls::kernel_tls::enable(fd, read, write))?;
+    if self.kernel_tls {
+      self.kernel_tls_tries = 0;
+    }
+    Ok(())
   }
 }
 
@@ -206,6 +299,7 @@ where
     let common = Arc::new(TlsStreamCommon {
       can_reply_key_update: AtomicBool::new(self.can_reply_key_update),
       connection_state: AtomicU8::new(self.connection_state.into()),
+      kernel_tls: self.kernel_tls,
       reader_waker: AtomicWaker::new(),
     });
     Ok((
@@ -249,10 +343,27 @@ where
     {
       return self.stream.read(bytes).await;
     }
+    // So does one whose records the kernel decrypts, but for the records that aren't data.
+    #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
+    if self.kernel_tls_tries > 0 {
+      self.try_kernel_tls()?;
+    }
+    #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
+    if self.kernel_tls {
+      if self.connection_state.cannot_read() {
+        return Ok(None);
+      }
+      return match self.stream.read(bytes).await {
+        Err(err) if crate::tls::kernel_tls::is_record_error(&err) => self.kernel_tls_record(),
+        rslt => rslt,
+      };
+    }
     let Self {
       buffer,
       can_reply_key_update,
       connection_state,
+      kernel_tls: _,
+      kernel_tls_tries: _,
       key_schedule,
       key_updates,
       max_fragment_length_send: _,
@@ -329,6 +440,14 @@ where
     {
       return self.stream.try_read(bytes);
     }
+    // A record that isn't data needs `read`, which is async.
+    #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
+    if self.kernel_tls && !self.connection_state.cannot_read() {
+      return match self.stream.try_read(bytes) {
+        Err(err) if crate::tls::kernel_tls::is_record_error(&err) => Ok(TryRead::Unsupported),
+        rslt => rslt,
+      };
+    }
     Ok(TryRead::Unsupported)
   }
 
@@ -354,6 +473,13 @@ where
       cold_path();
       return Ok(());
     }
+    #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
+    if self.kernel_tls_tries > 0 {
+      self.try_kernel_tls()?;
+    }
+    if self.kernel_tls {
+      return self.stream.write_all(bytes).await;
+    }
     write_payloads(
       RecordContentTy::ApplicationData,
       self.key_schedule.write_mut(),
@@ -376,6 +502,13 @@ where
       cold_path();
       return Ok(());
     }
+    #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
+    if self.kernel_tls_tries > 0 {
+      self.try_kernel_tls()?;
+    }
+    if self.kernel_tls {
+      return self.stream.write_all_vectored(bytes).await;
+    }
     write_payloads(
       RecordContentTy::ApplicationData,
       self.key_schedule.write_mut(),
@@ -392,7 +525,11 @@ where
   /// Plaintext forwards to the stream; records always go through [`Self::write_all_vectored`].
   #[inline]
   fn try_write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<bool> {
-    if TCX::TY.is_plain_text() {
+    #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
+    if self.kernel_tls_tries > 0 {
+      self.try_kernel_tls()?;
+    }
+    if TCX::TY.is_plain_text() || (self.kernel_tls && !self.connection_state.cannot_write()) {
       return self.stream.try_write_all_vectored(bytes);
     }
     Ok(false)

@@ -304,6 +304,17 @@ impl KeyScheduleState {
     self.cipher_suite
   }
 
+  /// The sequence number of the next record.
+  #[inline]
+  pub(crate) const fn counter(&self) -> u64 {
+    self.counter
+  }
+
+  #[inline]
+  pub(crate) const fn iv(&self) -> [u8; IV_LEN] {
+    self.iv
+  }
+
   #[inline]
   pub(crate) const fn increment_counter(&mut self) {
     self.counter = self.counter.wrapping_add(1);

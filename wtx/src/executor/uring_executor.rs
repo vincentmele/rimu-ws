@@ -53,6 +53,10 @@ const ONE_SHOT: u32 = 1;
 // `Conn::activity` bits: something was received, something was sent.
 const ACTIVE_RX: u8 = 1;
 const ACTIVE_TX: u8 = 2;
+const ACTIVE_ANY: u8 = ACTIVE_RX | ACTIVE_TX;
+// Not activity: a kernel TLS alert waits in `Conn::tls_alert` for the sends before it to finish.
+// It sits in the same byte so that the send completion, which reads it, touches no other line.
+const TLS_ALERT_PENDING: u8 = 4;
 // A free slot keeps a buffer up to this capacity for the next connection, and drops a larger one.
 const SLOT_BUFFER_KEEP: usize = 64 * 1024;
 // Free slots that keep their buffers however few connections are open; more stay warm while more
@@ -601,7 +605,22 @@ impl Stream for UringTcpStream {
   }
 }
 
-impl StreamCommon for UringTcpStream {}
+impl StreamCommon for UringTcpStream {
+  #[cfg(feature = "tls")]
+  #[inline]
+  fn with_kernel_tls(
+    &mut self,
+    cb: impl FnOnce(RawFd) -> crate::Result<bool>,
+  ) -> crate::Result<bool> {
+    let conn = self.conn;
+    match with_own_reactor(conn.runtime, |reactor| {
+      Ok(reactor.kernel_tls_fd(conn.idx, conn.generation))
+    })? {
+      Some(fd) => cb(fd),
+      None => Ok(false),
+    }
+  }
+}
 
 impl StreamReader for UringTcpStream {
   #[inline]
@@ -617,6 +636,12 @@ impl StreamReader for UringTcpStream {
   #[inline]
   fn readable(&mut self) -> impl Future<Output = crate::Result<()>> {
     readable(self.conn)
+  }
+
+  #[cfg(feature = "tls")]
+  #[inline]
+  fn read_kernel_tls_record(&mut self, buffer: &mut [u8]) -> crate::Result<(u8, usize)> {
+    read_kernel_tls_record(self.conn, buffer)
   }
 }
 
@@ -634,6 +659,15 @@ impl StreamWriter for UringTcpStream {
   #[inline]
   fn try_write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<bool> {
     try_write_all_vectored(self.conn, bytes)
+  }
+
+  #[cfg(feature = "tls")]
+  #[inline]
+  fn send_kernel_tls_alert(&mut self, level: u8, description: u8) -> crate::Result<()> {
+    let conn = self.conn;
+    with_own_reactor(conn.runtime, |reactor| {
+      reactor.send_kernel_tls_alert(conn.idx, conn.generation, level, description)
+    })
   }
 }
 
@@ -698,6 +732,12 @@ impl StreamReader for UringReadHalf {
   fn readable(&mut self) -> impl Future<Output = crate::Result<()>> {
     readable(self.conn)
   }
+
+  #[cfg(feature = "tls")]
+  #[inline]
+  fn read_kernel_tls_record(&mut self, buffer: &mut [u8]) -> crate::Result<(u8, usize)> {
+    read_kernel_tls_record(self.conn, buffer)
+  }
 }
 
 /// Writing part of a split [`UringTcpStream`].
@@ -729,6 +769,15 @@ impl StreamWriter for UringWriteHalf {
   #[inline]
   fn try_write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<bool> {
     try_write_all_vectored(self.conn, bytes)
+  }
+
+  #[cfg(feature = "tls")]
+  #[inline]
+  fn send_kernel_tls_alert(&mut self, level: u8, description: u8) -> crate::Result<()> {
+    let conn = self.conn;
+    with_own_reactor(conn.runtime, |reactor| {
+      reactor.send_kernel_tls_alert(conn.idx, conn.generation, level, description)
+    })
   }
 }
 
@@ -825,6 +874,13 @@ async fn read(
 
 fn try_read(conn: ConnRef, mut bytes: MaybeUninitSlice<'_, u8>) -> crate::Result<TryRead> {
   with_own_reactor(conn.runtime, |reactor| reactor.try_read(conn.idx, conn.generation, &mut bytes))
+}
+
+#[cfg(feature = "tls")]
+fn read_kernel_tls_record(conn: ConnRef, buffer: &mut [u8]) -> crate::Result<(u8, usize)> {
+  with_own_reactor(conn.runtime, |reactor| {
+    reactor.read_kernel_tls_record(conn.idx, conn.generation, buffer)
+  })
 }
 
 // A plain `fn`: the future holds the ids and nothing else.
@@ -1173,6 +1229,8 @@ struct Conn {
   lingering: bool,
   // Came from a listener, so the idle timeout applies
   accepted: bool,
+  // A kernel TLS alert (level, description) to send once the sends before it are out
+  tls_alert: [u8; 2],
   recv_armed: bool,
   refs: u8,
   // The tick `activity` was last seen set
@@ -1659,7 +1717,7 @@ impl Reactor {
       && !slot.scheduled
     {
       slot.scheduled = true;
-      self.ready.borrow_mut().push_back(idx as usize);
+      self.ready.borrow_mut().push_back(idx);
     }
   }
 
@@ -2383,11 +2441,78 @@ impl Reactor {
       self.start_send(idx, generation);
       return;
     }
+    if conn.activity & TLS_ALERT_PENDING != 0 {
+      send_pending_tls_alert(conn);
+    }
     if conn.closing {
       let fd = conn.fd;
       drop(conns);
       self.maybe_close(idx, fd);
     }
+  }
+
+  // ---- kernel TLS
+
+  /// The socket of a connection the kernel can take for TLS: an ordinary descriptor with nothing
+  /// received and unread, and nothing waiting to be sent (those bytes were encrypted in user space,
+  /// and the kernel would encrypt them again). With `DEFER_TASKRUN` a receive completes only inside
+  /// `io_uring_enter` on this thread, so while no completion waits to be reaped, nothing can land
+  /// in `rx` between this check and the kernel taking the socket; later receives read through it.
+  #[cfg(feature = "tls")]
+  fn kernel_tls_fd(&self, idx: u32, generation: u32) -> Option<RawFd> {
+    let conns = self.conns.borrow();
+    let conn = conns.get(idx as usize).filter(|el| el.generation == generation)?;
+    if conn.direct
+      || conn.rx_off as usize != conn.rx.len()
+      || conn.rx_err != 0
+      || conn.rx_eof
+      || conn.sending
+      || !conn.tx_pending.is_empty()
+    {
+      return None;
+    }
+    cq_is_empty(&mut self.ring.borrow_mut()).then_some(conn.fd)
+  }
+
+  #[cfg(feature = "tls")]
+  fn read_kernel_tls_record(
+    &self,
+    idx: u32,
+    generation: u32,
+    buffer: &mut [u8],
+  ) -> crate::Result<(u8, usize)> {
+    let (fd, direct) = self.conn_fd(idx, generation)?;
+    if direct {
+      return Err(io_err(libc::EOPNOTSUPP));
+    }
+    crate::tls::kernel_tls::read_record(fd, buffer)
+  }
+
+  /// Sends an alert now if nothing is waiting to be sent, else once the sends before it are out.
+  #[cfg(feature = "tls")]
+  fn send_kernel_tls_alert(
+    &self,
+    idx: u32,
+    generation: u32,
+    level: u8,
+    description: u8,
+  ) -> crate::Result<()> {
+    let mut conns = self.conns.borrow_mut();
+    let Some(conn) = conns.get_mut(idx as usize).filter(|el| el.generation == generation) else {
+      return Err(io_err(libc::EBADF));
+    };
+    if conn.tx_err != 0 {
+      return Err(io_err(conn.tx_err.into()));
+    }
+    if conn.direct {
+      return Err(io_err(libc::EOPNOTSUPP));
+    }
+    conn.tls_alert = [level, description];
+    conn.activity |= TLS_ALERT_PENDING;
+    if !conn.sending && conn.tx_pending.is_empty() {
+      send_pending_tls_alert(conn);
+    }
+    Ok(())
   }
 
   fn poll_send_room(
@@ -2583,8 +2708,8 @@ impl Reactor {
           continue;
         }
         open = true;
-        if conn.activity != 0 {
-          conn.activity = 0;
+        if conn.activity & ACTIVE_ANY != 0 {
+          conn.activity &= !ACTIVE_ANY;
           conn.last_active = tick;
         } else if tick.wrapping_sub(conn.last_active) >= *idle_ticks {
           self.time_out(conn, idx as u32);
@@ -2628,6 +2753,23 @@ impl Reactor {
     if let Some(elem) = conn.writer.take() {
       elem.wake();
     }
+  }
+}
+
+/// Sends the alert `Conn::tls_alert` holds. It is a small record on a socket whose sends just
+/// finished, so it goes out at once; if the socket can't take it now, it is dropped, as a TLS stack
+/// would drop an alert it could not send while closing.
+#[cold]
+#[inline(never)]
+fn send_pending_tls_alert(conn: &mut Conn) {
+  conn.activity &= !TLS_ALERT_PENDING;
+  #[cfg(feature = "tls")]
+  {
+    let _rslt = crate::tls::kernel_tls::send_record(
+      conn.fd,
+      crate::tls::kernel_tls::RECORD_ALERT,
+      &conn.tls_alert,
+    );
   }
 }
 
@@ -4295,6 +4437,108 @@ mod tests {
     assert_eq!(inside.remote_messages, 1);
     assert_eq!(inside.accept_errors, 0);
     assert_eq!(runtime.stats().open_connections, 0);
+  }
+
+  // A TLS server on io_uring hands the connection to the kernel after the handshake: the bytes go
+  // both ways through it, and the client's close_notify ends the stream cleanly. All three TLS 1.3
+  // ciphers (their keys and IVs are laid out differently for the kernel), a stream split into
+  // halves, and direct descriptors, which the kernel can't take: those stay in user space.
+  #[test]
+  fn kernel_tls_on_uring() {
+    use crate::tls::CipherSuite;
+    let ulp = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_available_ulp").unwrap_or_default();
+    let offered = ulp.split_whitespace().any(|el| el == "tls");
+    let params = crate::executor::UringParams::new;
+    for cipher in CipherSuite::PRIORITY {
+      for split in [false, true] {
+        assert_eq!(kernel_tls_round_trip(cipher, params(), split), offered, "{cipher:?} {split}");
+      }
+    }
+    assert!(!kernel_tls_round_trip(
+      CipherSuite::Aes128GcmSha256,
+      params().set_direct_files(8),
+      false
+    ));
+  }
+
+  /// A TLS ping, pong and close between a std client and a server on uring; whether the server
+  /// used kernel TLS.
+  fn kernel_tls_round_trip(
+    cipher: crate::tls::CipherSuite,
+    params: crate::executor::UringParams,
+    split: bool,
+  ) -> bool {
+    use crate::{
+      executor::StdRuntime,
+      net::{Stream, StreamReader, StreamWriter},
+      tests::{_PUBLIC_KEY, _ROOT_CA, _SECRET_KEY},
+      tls::TlsConnectorBuilder,
+    };
+    let uri = _uri();
+    let (host, port) = uri.hostname_with_implied_port();
+    let addr = alloc::format!("{host}:{port}");
+    let client = std::thread::spawn(move || {
+      <StdRuntime as Runtime>::new().unwrap().block_on(async move {
+        let mut rng = ChaCha20::from_std_random().unwrap();
+        let config = || {
+          let mut elem = TlsConfig::from_trust_anchors_pem([_ROOT_CA]).unwrap();
+          elem.cipher_suites_mut().clear();
+          elem.cipher_suites_mut().push(cipher).unwrap();
+          elem
+        };
+        let mut tls_stream = loop {
+          let connector = TlsConnectorBuilder::std(uri.clone()).build(config(), &mut rng).await;
+          if let Ok(elem) = connector {
+            break elem.connect().await.unwrap().tls_stream;
+          }
+          std::thread::sleep(core::time::Duration::from_millis(5));
+        };
+        // The first ping arrives with the handshake's last records and is read in user space;
+        // the connection switches at a later read.
+        let mut buf = [0; 16];
+        for _ in 0..4 {
+          tls_stream.write_all(b"ping").await.unwrap();
+          let len = tls_stream.read(buf.as_mut_slice().into()).await.unwrap().unwrap();
+          assert_eq!(&buf[..len.get()], b"pong");
+        }
+        tls_stream.send_close_notify().await.unwrap();
+      });
+    });
+    let runtime = UringRuntime::with_params(params).unwrap();
+    let (kernel, got) = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let (stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+      let mut rng = ChaCha20::from_std_random().unwrap();
+      let config = TlsConfig::from_keys_pem(_PUBLIC_KEY, _SECRET_KEY).unwrap();
+      let mut tls_stream =
+        TlsAcceptor::new(config, &mut rng, stream).accept().await.unwrap().tls_stream;
+      let mut buf = [0; 16];
+      let mut got = Vec::new();
+      // Two rounds whole, so that it can switch, then split for the rest.
+      for _ in 0..2 {
+        let len = tls_stream.read(buf.as_mut_slice().into()).await.unwrap().unwrap();
+        got.extend_from_slice(&buf[..len.get()]);
+        tls_stream.write_all(b"pong").await.unwrap();
+      }
+      if split {
+        let kernel = tls_stream.is_kernel_tls();
+        let (_bridge, mut reader, mut writer) = tls_stream.into_split().unwrap();
+        while let Some(len) = reader.read(buf.as_mut_slice().into()).await.unwrap() {
+          got.extend_from_slice(&buf[..len.get()]);
+          writer.write_all(b"pong").await.unwrap();
+        }
+        return (kernel, got);
+      }
+      while let Some(len) = tls_stream.read(buf.as_mut_slice().into()).await.unwrap() {
+        got.extend_from_slice(&buf[..len.get()]);
+        tls_stream.write_all(b"pong").await.unwrap();
+      }
+      (tls_stream.is_kernel_tls(), got)
+    });
+    client.join().unwrap();
+    assert_eq!(got, b"pingpingpingping");
+    assert_eq!(runtime.open_conns(), 0);
+    kernel
   }
 
   // Reading into an empty buffer would report the end of the stream: it fails instead, and the

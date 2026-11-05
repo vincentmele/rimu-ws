@@ -232,6 +232,7 @@ impl<TCX> TlsConfig<TCX> {
         cipher_suites: self.inner.cipher_suites,
         ctx: value,
         cv_policy: self.inner.cv_policy,
+        kernel_tls: self.inner.kernel_tls,
         max_fragment_length: self.inner.max_fragment_length,
         max_fragment_length_send: self.inner.max_fragment_length_send,
         public_keys: self.inner.public_keys,
@@ -340,6 +341,26 @@ impl<TCX> TlsConfig<TCX> {
   pub const fn unique_signature_algorithms_mut(&mut self) -> &mut bool {
     &mut self.inner.unique_signature_algorithms
   }
+
+  /// Whether a server connection hands its records to the kernel after the handshake (kernel
+  /// TLS), so that reads and writes skip user space encryption.
+  ///
+  /// It is only used where the kernel offers it: Linux with the `tls` module, which the kernel
+  /// loads on first use if it is installed. It also needs a socket the kernel can take: not an
+  /// io_uring direct descriptor. Otherwise the connection stays in user space.
+  ///
+  /// A kernel TLS connection answers a `KeyUpdate` with an error and cannot refresh its own keys.
+  /// Defaults to `true`.
+  #[inline]
+  pub const fn kernel_tls(&self) -> bool {
+    self.inner.kernel_tls
+  }
+
+  /// Mutable version of [`Self::kernel_tls`].
+  #[inline]
+  pub const fn kernel_tls_mut(&mut self) -> &mut bool {
+    &mut self.inner.kernel_tls
+  }
 }
 
 impl<TCX> Lease<TlsConfig<TCX>> for TlsConfig<TCX> {
@@ -385,6 +406,7 @@ pub(crate) struct TlsConfigInner<B, TCX> {
   pub(crate) supported_groups: SupportedGroups,
   pub(crate) trust_anchors: ShortBoxSliceU8<CvTrustAnchor<B>>,
   pub(crate) unique_signature_algorithms: bool,
+  pub(crate) kernel_tls: bool,
 }
 
 impl<B, TCX> TlsConfigInner<B, TCX> {
@@ -404,6 +426,7 @@ impl<B, TCX> TlsConfigInner<B, TCX> {
       supported_groups: SupportedGroups::default(),
       trust_anchors: ShortBoxSliceU8::default(),
       unique_signature_algorithms: false,
+      kernel_tls: true,
     }
   }
 }

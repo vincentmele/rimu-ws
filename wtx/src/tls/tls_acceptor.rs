@@ -181,17 +181,30 @@ where
     let kss = self.key_schedule.write_mut().state_mut();
     manage_err_handshake(true, kss, rslt, &mut self.stream).await?;
     _trace!("Successful handshake");
+    #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
+    let kernel_tls = self.config.lease().inner.kernel_tls;
+    #[cfg_attr(
+      not(all(feature = "libc", feature = "std", target_os = "linux")),
+      expect(unused_mut, reason = "only kernel TLS changes the stream")
+    )]
+    let mut tls_stream = TlsStream::new_boxed(
+      self.buffer,
+      self.key_schedule,
+      self.max_fragment_length,
+      self.max_fragment_length_send,
+      self.stream,
+    )?;
+    // The switch happens at a later read or write if it can't happen now (see `try_kernel_tls`).
+    #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
+    if kernel_tls {
+      tls_stream.kernel_tls_tries = crate::tls::kernel_tls::KERNEL_TLS_TRIES;
+      tls_stream.try_kernel_tls()?;
+    }
     Ok(TlsAcceptOutput {
       handshake_path: self.handshake_path,
       named_group: self.named_group,
       rng: self.rng,
-      tls_stream: TlsStream::new_boxed(
-        self.buffer,
-        self.key_schedule,
-        self.max_fragment_length,
-        self.max_fragment_length_send,
-        self.stream,
-      )?,
+      tls_stream,
     })
   }
 

@@ -140,6 +140,29 @@ where
       if TCX::TY.is_plain_text() {
         return stream_reader.read(bytes).await;
       }
+      // The kernel decrypts; a record that isn't data fails the read with EIO. This half can't
+      // answer a close_notify: the writer's own `send_close_notify` does.
+      #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
+      if common.kernel_tls {
+        return match stream_reader.read(bytes).await {
+          Err(err) if crate::tls::kernel_tls::is_record_error(&err) => {
+            let mut record = [0; 256];
+            let (ty, len) = stream_reader.read_kernel_tls_record(&mut record)?;
+            let close_notify = Alert::close_notify();
+            let is_close_notify = ty == crate::tls::kernel_tls::RECORD_ALERT
+              && record.get(..len)
+                == Some(&[close_notify.level().into(), close_notify.description().into()][..]);
+            let state = if is_close_notify {
+              ConnectionState::ClosedGracefully
+            } else {
+              ConnectionState::ClosedAbruptly
+            };
+            common.connection_state.store(state.into(), Ordering::Relaxed);
+            if is_close_notify { Ok(None) } else { Err(TlsError::InvalidAlert.into()) }
+          }
+          rslt => rslt,
+        };
+      }
       let rslt = read_after_handshake_data::<_, _, IS_CLIENT>(
         Aux { common, key_updates, stream_bridge, warning_alerts },
         bytes,

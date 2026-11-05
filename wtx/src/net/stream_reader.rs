@@ -38,6 +38,15 @@ pub trait StreamReader: StreamCommon {
     async { Ok(()) }
   }
 
+  /// For kernel TLS: reads the record a read refused with `EIO`, returning its content type and
+  /// its length in `buffer`.
+  #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
+  #[inline]
+  fn read_kernel_tls_record(&mut self, buffer: &mut [u8]) -> crate::Result<(u8, usize)> {
+    let _ = buffer;
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported).into())
+  }
+
   /// Reads and at the same time discards exactly `len` bytes.
   #[inline]
   fn read_skip(&mut self, len: usize) -> impl Future<Output = crate::Result<()>> {
@@ -76,6 +85,12 @@ where
   #[inline]
   fn readable(&mut self) -> impl Future<Output = crate::Result<()>> {
     (**self).readable()
+  }
+
+  #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
+  #[inline]
+  fn read_kernel_tls_record(&mut self, buffer: &mut [u8]) -> crate::Result<(u8, usize)> {
+    (**self).read_kernel_tls_record(buffer)
   }
 }
 

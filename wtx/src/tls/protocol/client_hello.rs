@@ -155,6 +155,7 @@ impl<'de> Decode<'de, TlsCc>
         signature_algorithms_cert: extensions.signature_algorithms_cert,
         trust_anchors: ShortBoxSliceU8::default(),
         unique_signature_algorithms: false,
+        kernel_tls: false,
       },
     })
   }

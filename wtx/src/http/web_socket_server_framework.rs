@@ -764,7 +764,8 @@ mod tests {
   // thread it was: it used to join the threads in order and wait on the first forever.
   #[test]
   fn a_failed_thread_ends_run_in_threads() {
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use crate::sync::AtomicUsize;
+    use core::sync::atomic::Ordering;
     static RUNTIMES: AtomicUsize = AtomicUsize::new(0);
     let uri = _uri();
     let (host, port) = uri.hostname_with_implied_port();

@@ -52,6 +52,9 @@ pub enum TlsError {
   InvalidAesData,
   /// Invalid Alert
   InvalidAlert,
+  /// The kernel encrypts this connection's records (kernel TLS), and it can't change their keys:
+  /// neither a `KeyUpdate` from the peer nor [`crate::tls::TlsStream::refresh_traffic_keys`]
+  KernelTlsKeyUpdate,
   /// Invalid array
   InvalidArray,
   /// Invalid slice

@@ -19,6 +19,15 @@ pub trait StreamWriter: StreamCommon {
   fn try_write_all_vectored(&mut self, _bytes: &[&[u8]]) -> crate::Result<bool> {
     Ok(false)
   }
+
+  /// For kernel TLS: sends an alert record after what was written before it, which may be once
+  /// those bytes are out. The default, for streams without kernel TLS, fails with `Unsupported`.
+  #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
+  #[inline]
+  fn send_kernel_tls_alert(&mut self, level: u8, description: u8) -> crate::Result<()> {
+    let _ = (level, description);
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported).into())
+  }
 }
 
 impl<T> StreamWriter for &mut T
@@ -38,6 +47,12 @@ where
   #[inline]
   fn try_write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<bool> {
     (**self).try_write_all_vectored(bytes)
+  }
+
+  #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
+  #[inline]
+  fn send_kernel_tls_alert(&mut self, level: u8, description: u8) -> crate::Result<()> {
+    (**self).send_kernel_tls_alert(level, description)
   }
 }
 

@@ -127,6 +127,14 @@ where
   /// Sends a warning alert of type `CloseNotify`, gracefully closing the connection.
   #[inline]
   pub async fn send_close_notify(&mut self) -> crate::Result<()> {
+    #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
+    if self.common.kernel_tls {
+      let alert = Alert::close_notify();
+      self.stream_writer.send_kernel_tls_alert(alert.level().into(), alert.description().into())?;
+      self.common.connection_state.store(ConnectionState::WriteClosed.into(), Ordering::Relaxed);
+      self.common.reader_waker.wake();
+      return Ok(());
+    }
     self
       .stream_writer
       .write_all(&Alert::close_notify().record_bytes(self.ksw.state_mut())?)
@@ -171,6 +179,9 @@ where
       cold_path();
       return Ok(());
     }
+    if self.common.kernel_tls {
+      return self.stream_writer.write_all(bytes).await;
+    }
     write_payloads(
       RecordContentTy::ApplicationData,
       &mut self.ksw,
@@ -192,6 +203,9 @@ where
     if self.connection_state().cannot_write() {
       cold_path();
       return Ok(());
+    }
+    if self.common.kernel_tls {
+      return self.stream_writer.write_all_vectored(bytes).await;
     }
     write_payloads(
       RecordContentTy::ApplicationData,

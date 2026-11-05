@@ -5,6 +5,8 @@ mod macros;
 
 mod handshake_path;
 mod handshake_ty;
+#[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
+pub(crate) mod kernel_tls;
 mod key_schedule;
 #[cfg(all(feature = "std", target_os = "linux"))]
 mod ktls_bindings;
