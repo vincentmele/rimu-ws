@@ -11,7 +11,9 @@
 //! the turn, in order, and kept alive until the kernel is done with them, even if the stream is
 //! dropped first. A dropped stream is closed once everything written to it has been sent.
 //!
-//! Wakers must be woken on the thread that runs the runtime.
+//! Wakers can be woken, and handles dropped, from any thread: what reaches a runtime from another
+//! thread goes through its inbox, which wakes the ring. A stream is only read or written on the
+//! runtime that made it; elsewhere it fails with `EBADF`.
 
 use crate::{
   collections::MaybeUninitSlice,
