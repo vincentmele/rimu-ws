@@ -138,11 +138,16 @@ struct IdIndex {
   /// (stream id, slot) pairs; the length is 0 or a power of two.
   entries: VectorUsize<(u32, u32)>,
   len: usize,
+  /// The farthest any entry was placed from its home bucket since the last growth. A removal
+  /// only looks that far for entries to shift back: live ids are consecutive and sit in one long
+  /// run of filled buckets, nearly all at home, and scanning the run to its end made each
+  /// removal linear.
+  max_displacement: usize,
 }
 
 impl IdIndex {
   const fn new() -> Self {
-    Self { entries: VectorUsize::new(), len: 0 }
+    Self { entries: VectorUsize::new(), len: 0, max_displacement: 0 }
   }
 
   #[inline]
@@ -172,7 +177,8 @@ impl IdIndex {
     }
     let entries = self.entries.as_slice_mut();
     let mask = entries.len().wrapping_sub(1);
-    let mut idx = (id >> 1) as usize & mask;
+    let home = (id >> 1) as usize & mask;
+    let mut idx = home;
     loop {
       let Some(entry) = entries.get_mut(idx) else {
         return Err(crate::Error::ProgrammingError);
@@ -182,6 +188,7 @@ impl IdIndex {
           self.len = self.len.wrapping_add(1);
         }
         *entry = (id, u32::try_from(slot).unwrap_or(u32::MAX));
+        self.max_displacement = self.max_displacement.max(idx.wrapping_sub(home) & mask);
         return Ok(());
       }
       idx = idx.wrapping_add(1) & mask;
@@ -207,10 +214,16 @@ impl IdIndex {
     }
     let slot = entries.get(hole).map(|el| el.1 as usize);
     // Backward shift: later members of the probe run move into the hole unless their home
-    // bucket lies (cyclically) after the hole.
+    // bucket lies (cyclically) after the hole. One more than `max_displacement` past the hole,
+    // every home does.
     let mut next = hole;
+    let mut distance: usize = 0;
     loop {
       next = next.wrapping_add(1) & mask;
+      distance = distance.wrapping_add(1);
+      if distance > self.max_displacement {
+        break;
+      }
       let moved = entries.get(next).copied().unwrap_or_default();
       if moved.0 == 0 {
         break;
@@ -224,6 +237,7 @@ impl IdIndex {
         *elem = moved;
       }
       hole = next;
+      distance = 0;
     }
     if let Some(elem) = entries.get_mut(hole) {
       *elem = (0, 0);
@@ -237,6 +251,7 @@ impl IdIndex {
     let capacity = self.entries.len().wrapping_mul(2).max(64);
     let old = core::mem::replace(&mut self.entries, VectorUsize::from_cloneable_elem(capacity, (0, 0))?);
     self.len = 0;
+    self.max_displacement = 0;
     for (key, slot) in old.iter() {
       if *key != 0 {
         self.insert(*key, *slot as usize)?;

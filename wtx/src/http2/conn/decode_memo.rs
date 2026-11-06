@@ -9,8 +9,8 @@
 use crate::{
   collections::VectorUsize,
   http::{Headers, Method, MsgBufferString, Protocol},
+  net::UriString,
 };
-use alloc::string::String;
 
 /// Blocks kept per connection.
 const MAX_ENTRIES: usize = 8;
@@ -32,7 +32,7 @@ struct Entry {
   generation: u64,
   headers: Headers,
   last_use: u64,
-  uri: String,
+  uri: UriString,
 }
 
 /// See the module documentation.
@@ -84,7 +84,7 @@ impl DecodeMemo {
       self.hits = self.hits.wrapping_add(1);
     }
     msg.headers.copy_from(&entry.headers)?;
-    msg.uri.reset().push_str(&entry.uri);
+    msg.uri.copy_from(&entry.uri);
     Ok(Some(entry.decoded))
   }
 
@@ -106,7 +106,7 @@ impl DecodeMemo {
         generation,
         headers: Headers::new(),
         last_use: 0,
-        uri: String::new(),
+        uri: UriString::new(alloc::string::String::new()),
       })?;
       self.entries.len().wrapping_sub(1)
     } else {
@@ -128,8 +128,7 @@ impl DecodeMemo {
     entry.generation = generation;
     entry.headers.copy_from(&msg.headers)?;
     entry.last_use = uses;
-    entry.uri.clear();
-    entry.uri.push_str(msg.uri.as_str());
+    entry.uri.copy_from(&msg.uri);
     Ok(())
   }
 }

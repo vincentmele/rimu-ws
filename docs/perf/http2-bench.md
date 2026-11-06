@@ -236,3 +236,18 @@ Interleaved, native, two rounds each, nothing else building:
 - **No allocation per request.** `server_steady_state_no_alloc` counts allocations on the
   server's thread with a counting global allocator. After a warm-up at the same concurrency,
   1000 GETs to an auto endpoint allocate nothing.
+
+### Profile-driven fixes after Step 8
+
+baseline-h2c's profile then showed `StreamTable::close` at 7%: the new id index's removal scanned
+the whole run of filled buckets. Live ids are consecutive, so they form one long run, and each
+removal walked it, quadratic per batch. The scan now stops one past the largest displacement any
+entry has from its home bucket, about one step for consecutive ids. The memo also replays the
+parsed URI (`Uri::copy_from`) instead of re-parsing it (`Uri::process`, `memchr`, `StrSearcher`).
+
+| build | baseline-h2c 256 rps | cycles/req | json-h2c 1024 rps | cycles/req |
+|---|---|---|---|---|
+| Step 8 memo | 5,952k, 5,882k | 3,417, 3,438 | 1,171k, 1,170k | 25,822, 25,699 |
+| bounded scan + URI copy | 5,999k, 5,960k | 2,975, 2,974 | 1,175k, 1,179k | 25,606, 25,418 |
+
+baseline-h2c −13% cycles; throughput is h2load-bound at about 6.0M.

@@ -613,6 +613,23 @@ where
   }
 }
 
+impl Uri<alloc::string::String> {
+  /// Makes this a copy of `other`, reusing this buffer and taking its parsed offsets instead of
+  /// parsing again.
+  #[cfg(feature = "http2")]
+  pub(crate) fn copy_from(&mut self, other: &Self) {
+    let Self { authority_start, fragment_start, href_start, initial_len, port, query_start, uri } = self;
+    uri.clear();
+    uri.push_str(&other.uri);
+    *authority_start = other.authority_start;
+    *fragment_start = other.fragment_start;
+    *href_start = other.href_start;
+    *initial_len = other.initial_len;
+    *port = other.port;
+    *query_start = other.query_start;
+  }
+}
+
 /// URL query writer.
 #[derive(Debug)]
 pub struct QueryWriter<'str, S> {
