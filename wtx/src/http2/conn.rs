@@ -1236,7 +1236,7 @@ impl Http2Conn<true> {
     if self.go_away_recv.is_some() || self.fatal {
       return Err(protocol_err(Http2Error::UnknownStreamReceiver));
     }
-    if !self.can_open_stream() {
+    if !self.can_open_stream(0) {
       return Err(protocol_err(Http2Error::ExceedAmountOfActiveConcurrentStreams));
     }
     let id = self.next_local_id;
@@ -1318,13 +1318,13 @@ impl Http2Conn<true> {
     u32::try_from(ids).unwrap_or(u32::MAX)
   }
 
-  /// Whether a stream can open now: the server's SETTINGS arrived, it did not send GOAWAY and its
-  /// limit on concurrent streams leaves room.
-  pub(crate) fn can_open_stream(&self) -> bool {
+  /// Whether a stream can open now, beside `reserved` more that will: the server's SETTINGS
+  /// arrived, it did not send GOAWAY and its limit on concurrent streams leaves room.
+  pub(crate) fn can_open_stream(&self, reserved: u32) -> bool {
     self.peer_settings_seen
       && self.go_away_recv.is_none()
       && !self.fatal
-      && self.active_streams() < self.peer.max_concurrent_streams
+      && self.active_streams().saturating_add(reserved) < self.peer.max_concurrent_streams
   }
 
   /// The handle of `stream_id` is done with it: its slot is freed. With `reset`, a stream that

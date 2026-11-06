@@ -46,6 +46,7 @@ impl<SW, TCX> ClientShared<SW, TCX> {
         open_wakers: VectorUsize::new(),
         read_done: false,
         read_error: false,
+        reserved: 0,
         streams: HashMap::new(),
         task_waker: None,
       }),
@@ -113,6 +114,10 @@ pub(crate) struct ClientState {
   /// The reading half saw EOF, an error, or a connection error of the core.
   read_done: bool,
   read_error: bool,
+  /// Handles from `Http2::stream` that have not sent their request yet: they hold room under
+  /// the server's limit, and get their stream id only when they send, so ids reach the server in
+  /// increasing order (RFC 9113 §5.1.1).
+  pub(crate) reserved: u32,
   /// The streams whose handles are alive.
   pub(crate) streams: HashMap<u32, StreamSlot>,
   /// The connection task, woken when output is queued.
@@ -155,6 +160,20 @@ impl ClientState {
   pub(crate) fn flush_later(&mut self) {
     self.flush_wanted = true;
     self.wake_task();
+  }
+
+  /// Opens the stream of a reserved handle, at the moment its HEADERS are queued.
+  pub(crate) fn open_reserved(&mut self) -> crate::Result<U31> {
+    self.reserved = self.reserved.saturating_sub(1);
+    let stream_id = self.conn.open_stream()?;
+    let _ = self.streams.insert(stream_id.u32(), StreamSlot::default());
+    Ok(stream_id)
+  }
+
+  /// A reserved handle went away without sending.
+  pub(crate) fn release_reserved(&mut self) {
+    self.reserved = self.reserved.saturating_sub(1);
+    self.wake_openers();
   }
 
   /// Nothing more can be sent or received on this connection.

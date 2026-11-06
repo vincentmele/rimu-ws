@@ -14,13 +14,16 @@ use core::{future::poll_fn, mem, task::Poll};
 /// Dropping it frees the stream; one that has not ended is reset with `CANCEL`.
 #[derive(Debug)]
 pub struct ClientStream<SW, TCX> {
+  /// The handle holds room under the server's limit and has no stream id yet.
+  reserved: bool,
   pub(crate) shared: Arc<ClientShared<SW, TCX>>,
   pub(crate) stream_id: U31,
 }
 
 impl<SW, TCX> ClientStream<SW, TCX> {
-  pub(crate) const fn new(shared: Arc<ClientShared<SW, TCX>>, stream_id: U31) -> Self {
-    Self { shared, stream_id }
+  /// A handle that gets its stream id when it sends its request.
+  pub(crate) const fn new(shared: Arc<ClientShared<SW, TCX>>) -> Self {
+    Self { reserved: true, shared, stream_id: U31::ZERO }
   }
 
   /// See [`CommonStream`].
@@ -104,6 +107,14 @@ where
     let body = req.msg_data.body().lease();
     {
       let mut state = self.shared.state.lock();
+      if self.reserved {
+        if state.is_ended() {
+          return Ok(Http2SendStatus::ClosedConnection);
+        }
+        self.reserved = false;
+        // The id is taken under the lock that queues the HEADERS: ids leave in order.
+        self.stream_id = state.open_reserved()?;
+      }
       if let Some(status) = CommonStream::<SW, TCX, true>::send_status(&state, self.stream_id) {
         return Ok(status);
       }
@@ -128,7 +139,9 @@ impl<SW, TCX> Drop for ClientStream<SW, TCX> {
   #[inline]
   fn drop(&mut self) {
     let mut state = self.shared.state.lock();
-    if state.streams.contains_key(&self.stream_id.u32()) {
+    if self.reserved {
+      state.release_reserved();
+    } else if state.streams.contains_key(&self.stream_id.u32()) {
       state.finish(self.stream_id);
     }
   }

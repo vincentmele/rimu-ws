@@ -1,6 +1,5 @@
-use crate::{net::UriString, sync::AtomicU32};
+use crate::net::UriString;
 use alloc::string::String;
-use core::sync::atomic::Ordering;
 use std::sync::OnceLock;
 use rimu_ws::misc::EnvVars;
 
@@ -15,13 +14,13 @@ pub(crate) struct Vars {
 }
 
 pub(crate) fn _uri() -> UriString {
-  const INITIAL_PORT: u32 = 7000;
-  let port = {
-    static PORT: AtomicU32 = AtomicU32::new(INITIAL_PORT);
-    &PORT
-  };
-  let uri = alloc::format!("http://127.0.0.1:{}", port.fetch_add(1, Ordering::Relaxed));
-  UriString::new(uri)
+  // A port the kernel reports free: fixed ranges collide with other services on the machine and
+  // with the previous run's connections in TIME_WAIT.
+  let port = std::net::TcpListener::bind("127.0.0.1:0")
+    .and_then(|el| el.local_addr())
+    .map(|el| el.port())
+    .unwrap_or(0);
+  UriString::new(alloc::format!("http://127.0.0.1:{port}"))
 }
 
 pub(crate) fn _vars() -> &'static Vars {

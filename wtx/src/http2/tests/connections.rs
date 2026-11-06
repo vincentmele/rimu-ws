@@ -339,3 +339,29 @@ fn client_on_tokio_smoke() {
     assert_eq!(res.msg_data.body.as_slice(), b"tokio");
   });
 }
+
+// Streams opened in one order and sent in the other: stream ids must still reach the server in
+// increasing order (RFC 9113 §5.1.1), so both requests are answered.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn client_streams_sent_out_of_order() {
+  let runtime = StdRuntime::new();
+  let uri = _uri();
+  server(&uri, &runtime);
+  runtime.block_on(async {
+    let http2 = connect_client(&uri, &runtime).await;
+    let mut first = http2.stream().await.unwrap();
+    let mut second = http2.stream().await.unwrap();
+    let headers = Headers::new();
+    let rb = ReqBuilder::get((&b"second"[..], &headers, uri.to_ref()));
+    let _ = second.send_req(&mut VectorUsize::new(), rb.into_request()).await.unwrap();
+    let rb = ReqBuilder::get((&b"first"[..], &headers, uri.to_ref()));
+    let _ = first.send_req(&mut VectorUsize::new(), rb.into_request()).await.unwrap();
+    let (status, msg) = second.recv_res().await.unwrap();
+    assert!(matches!(status, Http2RecvStatus::Eos(StatusCode::Ok)), "{status:?}");
+    assert_eq!(msg.body.as_slice(), b"second");
+    let (status, msg) = first.recv_res().await.unwrap();
+    assert!(matches!(status, Http2RecvStatus::Eos(StatusCode::Ok)), "{status:?}");
+    assert_eq!(msg.body.as_slice(), b"first");
+  });
+}

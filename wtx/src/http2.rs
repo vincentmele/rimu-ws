@@ -165,24 +165,24 @@ where
   }
 
   /// Opens a local stream. Waits for the server's first SETTINGS, and while its limit on
-  /// concurrent streams is reached.
+  /// concurrent streams is reached. The stream id is assigned when the request is sent, so
+  /// streams may send in any order.
   #[inline]
   pub async fn stream(&self) -> crate::Result<ClientStream<SW, TCX>> {
-    let stream_id = poll_fn(|cx| {
+    poll_fn(|cx| {
       let mut state = self.shared.state.lock();
       if state.is_ended() || !state.conn.accepts_streams() {
         return Poll::Ready(Err(crate::Error::ClosedHttpConnection));
       }
-      if !state.conn.can_open_stream() {
+      if !state.conn.can_open_stream(state.reserved) {
         state.wait_open(cx.waker())?;
         return Poll::Pending;
       }
-      let stream_id = state.conn.open_stream()?;
-      let _ = state.streams.insert(stream_id.u32(), client_conn::StreamSlot::default());
-      Poll::Ready(Ok(stream_id))
+      state.reserved = state.reserved.wrapping_add(1);
+      Poll::Ready(Ok(()))
     })
     .await?;
-    Ok(ClientStream::new(self.shared.clone(), stream_id))
+    Ok(ClientStream::new(self.shared.clone()))
   }
 }
 
