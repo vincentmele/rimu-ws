@@ -1046,3 +1046,23 @@ fn conn_requests_answered_between_feeds_share_a_slot() {
   }
   assert_eq!(conn.stream_slots(), 1);
 }
+
+// A feed that reaches its event budget on the input's last frame still announces the connection
+// window that input used: no later feed may come to do it.
+#[test]
+fn conn_feed_some_budget_on_the_last_frame_opens_the_window() {
+  let mut conn = ready_server(HttpRecvParams::with_default_params());
+  let _ = conn.feed(&headers_req(1, "POST", "/", &[], false)).unwrap();
+  let _ = events(&mut conn);
+  let _ = take_frames(&mut conn);
+  let mut input = Vec::new();
+  for _ in 0..4 {
+    input.extend(data(1, &[7; 1000], false));
+  }
+  assert_eq!(conn.feed_some_at(&input, Duration::ZERO, 4).unwrap(), input.len());
+  let frames = take_frames(&mut conn);
+  assert!(
+    frames.iter().any(|el| el.0 == WINDOW_UPDATE && el.2 == 0 && el.3 == 4000u32.to_be_bytes()),
+    "no connection WINDOW_UPDATE of 4000: {frames:?}"
+  );
+}

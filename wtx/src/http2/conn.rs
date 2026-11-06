@@ -281,7 +281,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
           if let Err(err) = self.on_frame(fi, payload) {
             return self.conn_error(err);
           }
-          if self.events.len() >= max_events {
+          if self.events.len() >= max_events && consumed < input.len() {
             // The rest comes in a later call, which announces the window once.
             return Ok(consumed);
           }
