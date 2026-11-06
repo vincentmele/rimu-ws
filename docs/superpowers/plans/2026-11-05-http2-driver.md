@@ -81,6 +81,47 @@ The inputs the spec implies but no task's main tests cover. Each one has a pinni
 
 ---
 
+## Rival techniques: where each lands
+
+Every item in `/mnt/nvme1tb/claude-tmp/httpwin/rivals-h2-code.md` (the ranked list, its design risks
+and the zix, viltrum, plod and cnetmod addenda) has a task here. "R<n>" is item n of that file's ranked list.
+
+| Item | Source | Task, step |
+|---|---|---|
+| R1: MAX_CONCURRENT_STREAMS 128 by default (we send 32; h2load runs `-m 100`) | all four | 10A Step 1 (set it), 13 Step 1 (tune 128/256) |
+| Connection window raised at the preface (plod 1 MiB, zix +65535, viltrum) | plod, zix, viltrum | 13 Step 1 |
+| Stream WINDOW_UPDATE at half a window, batched per pass | plod, viltrum | 13 Step 1 |
+| JSON rendered per request but fast: reused buffer, pre-escaped key literals, fast integer and float formatting, rendered in place behind a reserved frame header (R2d) | zix, viltrum | 10A Step 2, Step 4 |
+| R2a/b: DATA and the HPACK block written straight into the output buffer | zix | 10A Step 4 |
+| R2c: output handed to the reactor by swap, not copied; double-buffer swap | cnetmod | 10A Step 3 |
+| R4: vectored send for `Shared` chunks, no 8-slice cap, bodies under 4 KiB copied | cnetmod | 10A Step 3 |
+| R3: kTLS engages on h2 (`/proc/net/tls_stat`); otherwise a batched userspace path (all buffered records per read, seal in place, one write per batch, keys expanded once) | plod, zix, cnetmod | 10A Step 5 |
+| kTLS TX against userspace sealing on 16 KiB static records (plod retired kTLS: −44% there) | plod | 11 Step 4 |
+| R7: one router lookup per request, no per-request `Arc` clones | (our own cost) | 10A Step 6 |
+| R8: stream lookup by last id or index; no stream slot for a GET answered at once | cnetmod, viltrum | 10A Step 7 |
+| R5: memo of the last request HPACK block | cnetmod | 10A Step 8 |
+| Decode costs: `KnownHeaderName::try_from` twice per field, URI rebuilt with `insert_str(0)` | (our own cost) | 10A Step 8 |
+| R6: `date` folded into the cached response block; hashed cache key | zix, cnetmod | 10A Step 9 |
+| R10: Huffman only when it is shorter | zix, plod, cnetmod | 10A Step 9 |
+| R9: feed the core straight from the reactor's receive buffer | (our own cost) | 10A Step 10 |
+| No allocation per request in steady state, test-gated | viltrum | 10A Step 11, 17 Step 2 |
+| Static: no `stat`/`open` per request (plod: `openat` was 31% of kernel time) | plod, viltrum | 11 (cache rule) |
+| Static: cache every file size the profile uses (plod and viltrum stop at 64 KiB; `vendor.js.br` is 67 KB) | plod, viltrum | 11 (cache rule), `static_caches_large_file` |
+| Static: one pre-encoded HEADERS block per file and encoding | cnetmod | 11 (cache rule) |
+| Static: no per-request `etag`/`last-modified` dynamic-table churn | plod, viltrum | 11 (cache rule) |
+| Static: DATA frames filled to the peer's max frame size | (our own cost) | 11 (cache rule) |
+| Cross-connection write coalescing (cnetmod's 64 KiB / 250 µs writer); splice for large files (plod) | cnetmod, plod | 18 Step 2, candidates 4–5 |
+| Rival bugs we must not share: no HPACK size update after HEADER_TABLE_SIZE changes (cnetmod) | cnetmod | 6, `conn_header_cache_invalid_after_table_size_change` (done) |
+| Rival bugs: HEADERS never split into CONTINUATION (cnetmod) | cnetmod | 15, `conn_large_response_headers_use_continuation` |
+| Rival bugs: CONTINUATION decoded per fragment (zix) | zix | 15, `conn_header_block_split_mid_field` |
+| Rival bugs: dynamic-table inserts dropped when full (zix) | zix | 15, `hpack_decoder_evicts_when_full` |
+| Late frames after RST ignored (viltrum's RST ring) | viltrum | 4, closed-stream rules (done) |
+| h2→h1 translation (plod, viltrum: about 16% of their cycles) | plod, viltrum | not adopted: we decode HTTP/2 natively |
+| Startup-preloaded static files, pre-rendered JSON (zix) | zix | not adopted: breaks the strict rules |
+| `epoll_pwait2` timeouts, handshakes stepped per loop turn (viltrum) | viltrum | not applicable: io_uring, one task per connection |
+
+---
+
 ## Phase A: measurement harness
 
 ### Task 1: Load, rival and baseline harness
@@ -625,36 +666,57 @@ and compiled under the `http2` feature.
 **Why:** a line-level read of plod, cnetmod, zix and viltrum, against our own code, is in
 `/mnt/nvme1tb/claude-tmp/httpwin/rivals-h2-code.md`. It found structural costs that are cheaper to
 fix now than in Task 18. The rivals all write one coalesced buffer per read batch and run handlers
-inline, and we already do both.
+inline, and we already do both. The table "Rival techniques: where each lands" maps every item of
+that file to a step here or a later task.
 
 **Method:** each item is an A/B on `perf stat` user cycles per request (`h2-bench.sh`'s
 `server_ucyc_per_req`), plus throughput on the four profiles. Keep an item only if it wins and
 `cargo test --lib` and h2spec (plaintext and TLS) still pass.
 
-- [ ] **Step 1: json-h2c costs about 72k user cycles per request.** Profile `arena-h2` on json-h2c
-  (`perf record -g`) and fix what dominates before anything else. Expected: under 15k.
-- [ ] **Step 2: send without copies.**
+- [ ] **Step 1: MAX_CONCURRENT_STREAMS 128 by default (R1).** Set `DEFAULT_MAX_CONCURRENT_STREAMS_NUM`
+  (`wtx/src/http.rs:81`) to 128 now, so every later measurement runs with it. Re-run the benches
+  without `ARENA_PARAMS=permissive`. Task 13 tunes the final value.
+- [ ] **Step 2: json-h2c costs about 72k user cycles per request.** Profile `arena-h2` on json-h2c
+  (`perf record -g`) and fix what dominates before anything else. Then apply what the rivals do while
+  still serializing per request: a reused output buffer, pre-escaped key literals, fast integer and
+  float formatting. Expected: under 15k.
+- [ ] **Step 3: send without copies (R2c, R4).**
   - Hand the core's output buffer to the reactor's send queue by swapping, not by copying
-    (`uring_executor.rs` around the `tx_pending` copy at ~2696).
+    (`uring_executor.rs` around the `tx_pending` copy at ~2696), as cnetmod's double buffer does.
   - Send by-reference (`Shared`) chunks with a vectored send (writev/SendMsg), holding the shared
-    bytes until completion.
+    bytes until completion. Copy bodies under 4 KiB into the owned buffer instead (cnetmod's threshold).
   - Drop the 8-slice cap in `write_output`.
-- [ ] **Step 3: write the response straight into the output buffer.**
+- [ ] **Step 4: write the response straight into the output buffer (R2a, R2b, R2d).**
   - When the windows allow the whole body, write DATA straight into the output buffer, skipping
     `stream.owned`.
   - Encode the HPACK block straight into the output buffer, behind a reserved 9-byte header.
-- [ ] **Step 4: one router lookup per request, and no per-request `Arc`, data or `error_cb`
-  clones.** `StreamDispatcher::AutoFut` borrows the dispatcher (a GAT), and the route found in
+  - Let a handler render its body straight into the output buffer behind a reserved DATA header
+    (zix's `responseReserve`); the JSON endpoint uses it.
+- [ ] **Step 5: TLS batching (R3).** Check that kTLS engages on h2 connections (`/proc/net/tls_stat`
+  counters rise during baseline-h2). If it does not, or where it is off, make userspace TLS batch:
+  decrypt every buffered record in one `try_read`, seal all output in place into the send buffer
+  gathering from the owned and shared slices, expand the keys once per connection, and send once per
+  turn.
+- [ ] **Step 6: one router lookup per request, and no per-request `Arc`, data or `error_cb`
+  clones (R7).** `StreamDispatcher::AutoFut` borrows the dispatcher (a GAT), and the route found in
   `is_manual` is passed on to `auto`.
-- [ ] **Step 5: the stream table.** Remember the last stream looked up, or index by stream id.
-  Look at cnetmod's no-node path for END_STREAM GETs.
-- [ ] **Step 6: memo of the request HPACK block** (cnetmod: exact byte compare). Record a block
-  only when decoding it left the table unchanged, and clear the memo on any insert or size change.
-- [ ] **Step 7: header cache.**
+- [ ] **Step 7: the stream table (R8).** Remember the last stream looked up, or index by stream id.
+  A GET with END_STREAM whose handler finishes in the same turn takes no stream slot (cnetmod, viltrum).
+- [ ] **Step 8: the request decode path (R5).**
+  - Memo of the request HPACK block (cnetmod: exact byte compare). Record a block only when decoding
+    it left the table unchanged, and clear the memo on any insert or size change.
+  - Call `KnownHeaderName::try_from` once per field, and build the URI without `insert_str(0)`.
+- [ ] **Step 9: header cache (R6, R10).**
   - Key it by a hash, with an exact compare on hit.
   - Include `date` in the cached block, and invalidate once a second, so a warm response block is
     a memcpy plus the `content-length` literal.
-- [ ] **Step 8: record each kept item, with its numbers, in `docs/perf/http2-bench.md`.** Commit
+  - Huffman-encode a literal only when that is shorter (check `hpack_encoder.rs` around line 281).
+- [ ] **Step 10: feed from the reactor's receive buffer (R9).** Give the driver a borrow of the
+  reactor's received bytes, to skip the second copy. Keep it only if it measures.
+- [ ] **Step 11: no allocation per request (viltrum).** Add `server_steady_state_no_alloc`: with a
+  counting global allocator in the test, 1000 GETs to `/baseline2` after a 100-request warm-up allocate
+  nothing. Fix what it finds.
+- [ ] **Step 12: record each kept item, with its numbers, in `docs/perf/http2-bench.md`.** Commit
   each item separately.
 
 ---
@@ -685,6 +747,11 @@ inline, and we already do both.
     re-`stat`s at most once a second per entry and reloads on any change; a deleted file gives 404. The
     body is sent with `Body::Shared`.
   - ETag / Last-Modified: the builder's call. If done, a conditional GET gets a 304.
+  - Cache rule, from the rivals' static paths (see the roadmap table): no `stat` or `open` per request;
+    every file size the profile uses is cached (no 64 KiB cut-off) within a per-thread byte budget; one
+    pre-encoded HEADERS block per file and encoding; no per-request header that churns the HPACK dynamic
+    table (ETag and Last-Modified, if added, are encoded without indexing); DATA frames filled to the
+    peer's max frame size.
 
 - [ ] **Step 1:** Write the tests:
   - `static_serves_br_when_accepted`: with `Accept-Encoding: br;q=1, gzip;q=0.8` and `a.css` plus
@@ -697,12 +764,16 @@ inline, and we already do both.
   - `static_rejects_traversal`: `/static/../Cargo.toml`, `/static/%2e%2e/x` and `/static//etc/passwd`
     all give 404.
   - `static_missing_404`.
+  - `static_caches_large_file`: a 70 KB file is served twice; the second response comes from the cache
+    (no `open` between the two, checked by a counter in the cache).
   - `router_catch_all_segment`: `/static/{*file}` matches `/static/a/b.css` with `file = "a/b.css"`;
     the existing router tests still pass.
 - [ ] **Step 2:** Run them. Expected: FAIL.
 - [ ] **Step 3:** Implement.
 - [ ] **Step 4:** Run them, then `h2-bench.sh rimu static-h2 256` and `1024`. Expected: tests PASS, and
   the bench gives non-zero rps with no non-2xx responses.
+  Then A/B kTLS TX against userspace sealing on static-h2 (plod retired kTLS after −44% on 16 KiB
+  records). Keep the faster, per record size if they differ, and record it in `docs/perf/http2-bench.md`.
 - [ ] **Step 5:** Commit with the message `server framework: static files with precompressed variants and a disk-following cache`.
 
 ### Task 12: Framework robustness parity
@@ -762,6 +833,8 @@ inline, and we already do both.
   256/1024 conns. Cover:
   - `initial_window_len` ∈ {64 KiB, 1 MiB, 4 MiB};
   - `max_concurrent_streams_num` ∈ {128, 256};
+  - the connection window raised at the preface ∈ {none, 1 MiB} (plod, zix, viltrum);
+  - stream WINDOW_UPDATE at half a window, batched per turn (plod, viltrum), against every DATA frame;
   - read buffer sizes.
 
   Record each run in `docs/perf/http2-bench.md`. Bound memory per connection: worst-case buffered per
@@ -839,6 +912,13 @@ inline, and we already do both.
 
 - [ ] **Step 1:** Write `differential_fixed_seeds`: 2000 seeds from an `Xorshift64`, all passing.
 - [ ] **Step 2:** Run it, fix the bugs it finds, and add each bug's input as a named regression test.
+  Also add these named tests for bugs found in the rivals:
+  - `conn_large_response_headers_use_continuation`: a response header block larger than the peer's
+    max frame size goes out as HEADERS plus CONTINUATION and decodes (cnetmod never splits);
+  - `conn_header_block_split_mid_field`: a request block split across HEADERS and two CONTINUATIONs,
+    with a cut inside a field, decodes (zix resets per fragment);
+  - `hpack_decoder_evicts_when_full`: inserts into a full dynamic table evict the oldest entries and
+    later indexed references resolve (zix drops the insert and desyncs).
 - [ ] **Step 3:** Fuzz for 30 minutes:
   `cargo +nightly fuzz run http2_conn -- -max_total_time=1800` (in `wtx-fuzz`, artefacts under
   `/mnt/nvme1tb/claude-tmp/fuzz-h2`). Expected: no crash. Record the exec count in the commit message.
@@ -885,7 +965,8 @@ inline, and we already do both.
 - [ ] **Step 1:** h2spec: run `.scripts/h2spec.sh high`, `high tls` and `low`. Expected: every listed
   section passes.
 - [ ] **Step 2:** Full test suite, `$FEAT` plus `web-socket`, `web-socket-handshake` and `postgres`
-  where they build. Run it 3 times. Expected: all pass every time.
+  where they build. Run it 3 times. Expected: all pass every time. `server_steady_state_no_alloc`
+  (Task 10A) is part of it.
 - [ ] **Step 3:** ASan. Use
   `RUSTFLAGS=-Zsanitizer=address cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu -p rimu-ws --features "$FEAT" --lib http2`,
   with the target dir under `/mnt/nvme1tb/claude-tmp`. Expected: clean.
@@ -912,14 +993,14 @@ inline, and we already do both.
 - [ ] **Step 1:** Run all four servers on all profiles, interleaved in one session, then run
   `h2-composite.py`. If rimu is #1 on the composite, go to Step 4.
 - [ ] **Step 2:** Find the cost. Use `perf stat -e cycles:u,instructions:u` per request on the losing
-  profile, then `perf record` on `arena-h2`. Candidates, ranked by `rivals.md`:
-  1. memoise the last request header block per connection, so a byte-identical HPACK block becomes a
-     memcmp plus a copy of the decoded headers (cnetmod);
-  2. a larger read buffer and fewer `try_read` calls per turn;
-  3. fill DATA frames to the peer's max frame size, and gather static bodies into fewer larger writes
-     (static-h2);
-  4. serialize JSON straight into the output buffer (json-h2c);
-  5. TLS record sealing straight from body slices, or kTLS for baseline-h2.
+  profile, then `perf record` on `arena-h2`. Candidates, from `rivals-h2-code.md`, beyond what Task 10A
+  already did:
+  1. a larger read buffer and fewer `try_read` calls per turn;
+  2. memo more than one request block (json-h2c rotates URIs, so a last-block memo misses);
+  3. gather static bodies into fewer, larger writes (static-h2);
+  4. coalesce writes across connections in a turn (cnetmod's 64 KiB / 250 µs writer);
+  5. splice or sendfile for large static files (plod);
+  6. any Task 10A item that was dropped, re-measured now that the others have landed.
 
   Each change gets an A/B on cycles per request plus throughput. Keep it only if it wins, and the gate
   tests (Task 17 Steps 1–2) still pass.
