@@ -10,7 +10,7 @@ change one only when your deployment matches the situation described.
 | Shape | Change from the defaults |
 |---|---|
 | A server sharing its host with other work (the default case) | none |
-| Dedicated cores: the server's threads have CPUs no other work uses | `UringParams::set_spin` 20 µs |
+| Dedicated cores: the server's threads have CPUs no other work uses | `UringParams::set_spin` 20 µs for WebSocket servers whose clients reconnect often; HTTP/2 measured level with it |
 | Many mostly idle connections (tens of thousands) | lower `set_initial_window_len`, `set_max_conn_buffered_len` and `set_max_send_queue_len` to bound memory per connection; consider `set_direct_files` |
 | Clients that speak first behind no proxy (HTTP, WebSocket) | `TcpParams::set_tcp_defer_accept` |
 
@@ -74,7 +74,8 @@ The framework starts from `HttpRecvParams::with_optioned_params()`.
 
 ## `UringParams` (`set_local_runtime_cb`)
 
-- `set_spin` (0): busy-polls for up to this long before sleeping. With dedicated cores, 20 µs saves
+- `set_spin` (0): busy-polls for up to this long before sleeping (HTTP/2 profiles: level in
+  throughput, 4% to 7% more user cycles per request). With dedicated cores, 20 µs saves
   the sleep and wake-up between bursts: on the WebSocket echo profile that reconnects constantly it
   measured +4% to +10%, for about 1,000 more user cycles per frame spent spinning; echo and
   pipelined echo were level. On a shared host that spinning is CPU other work needs, and when
@@ -94,7 +95,8 @@ The framework starts from `HttpRecvParams::with_optioned_params()`.
   send and makes closing a queued operation (measured +1% to +2% on WebSocket echo in earlier rounds,
   level in the latest). Accepted connections then can't be passed to other syscalls, and kernel TLS
   can't take them.
-- `set_peer_addrs` (on): look up each peer's address at accept (one `getpeername`).
+- `set_peer_addrs` (on): look up each peer's address at accept (one `getpeername`). Turn it off when
+  no handler uses the peer's address: clients that reconnect often then save a syscall each.
 - `set_handshake_timeout` (10 s), `set_idle_timeout` (300 s), `set_close_timeout` (10 s): the
   runtime's own bounds on a connection: before anything is sent, with nothing moving either way, and
   after the last handle was dropped with bytes still to send. They also bound a peer that stops
