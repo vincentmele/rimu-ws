@@ -146,7 +146,7 @@ pub struct Budgets {
   pub large_inflight: u32,
   pub max_payload: u64,
   /// Memory a connection may cost the server, in KiB: 256 for the WebSocket server; the HTTP/2
-  /// server streaming a large response holds up to about three times its 256 KiB send threshold.
+  /// server streaming a large response holds more: its send buffers plus the largest write.
   pub per_slot_kib: u64,
 }
 

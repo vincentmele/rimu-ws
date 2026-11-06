@@ -187,7 +187,7 @@ impl UringParams {
       send_submit_bytes: 128 * 1024,
       spin: Duration::ZERO,
       sq_entries: 1024,
-      tx_high_water: 256 * 1024,
+      tx_high_water: 16 * 1024,
     }
   }
 
@@ -273,7 +273,10 @@ impl UringParams {
   }
 
   /// How many written bytes a connection can have waiting to be sent before a write waits for
-  /// them. Defaults to 256 KiB.
+  /// them. Defaults to 16 KiB: past that a caller keeps its output until there is room (an HTTP/2
+  /// connection keeps response bodies as references), then writes or seals it into buffers still
+  /// in the cache. More waiting per connection measured slower: static-h2 at 256 KiB ran 17% below
+  /// 16 KiB, as the waiting bytes were copied into buffers out of the cache.
   ///
   /// A peer that stops reading holds about twice this per connection (the bytes being sent and
   /// those queued behind them), plus the largest single write, until a timeout closes it.
@@ -2805,6 +2808,8 @@ impl Reactor {
     if conn.tx_err != 0 {
       return Err(io_err(conn.tx_err.into()));
     }
+    let len = bytes.iter().map(|el| el.len()).sum();
+    reserve_send(&mut conn.tx_pending, len, self.params.tx_high_water);
     for elem in bytes {
       conn.tx_pending.extend_from_slice(elem);
     }
@@ -2858,16 +2863,7 @@ impl Reactor {
         if conn.tx_pending.len() >= self.params.tx_high_water {
           return Ok(false);
         }
-        if conn.tx_pending.is_empty() && conn.tx_pending.capacity() < len {
-          let room = len.saturating_add(self.params.tx_high_water);
-          conn.tx_pending = Vec::with_capacity(room);
-        }
-        // Grown once, to room for the whole window, rather than by doublings that copy it.
-        let want = conn.tx_pending.len().saturating_add(len);
-        if conn.tx_pending.capacity() < want {
-          let room = want.max(len.saturating_add(self.params.tx_high_water));
-          conn.tx_pending.reserve_exact(room.saturating_sub(conn.tx_pending.len()));
-        }
+        reserve_send(&mut conn.tx_pending, len, self.params.tx_high_water);
         let before = conn.tx_pending.len();
         if let Err(err) = write(&mut conn.tx_pending) {
           conn.tx_pending.truncate(before);
@@ -2877,9 +2873,7 @@ impl Reactor {
       }
       // A buffer too small would be grown by a copy of its whole capacity: start a new one.
       let mut buffer = self.send_pool.borrow_mut().pop().unwrap_or_default();
-      if buffer.capacity() < len {
-        buffer = Vec::with_capacity(len);
-      }
+      reserve_send(&mut buffer, len, self.params.tx_high_water);
       if let Err(err) = write(&mut buffer) {
         self.recycle_send_buffer(buffer);
         return Err(err);
@@ -2923,6 +2917,7 @@ impl Reactor {
         if conn.tx_pending.len() >= self.params.tx_high_water {
           return Ok(false);
         }
+        reserve_send(&mut conn.tx_pending, bytes.len(), self.params.tx_high_water);
         conn.tx_pending.extend_from_slice(bytes);
         bytes.clear();
         return Ok(true);
@@ -3436,6 +3431,22 @@ fn compact_rx(conn: &mut Conn) {
 fn drop_sent(conn: &mut Conn) {
   let _drained = conn.tx_inflight.drain(..conn.tx_done as usize);
   conn.tx_done = 0;
+}
+
+/// Room in `buf` for `additional` more bytes, in a size class (a power of two, at least twice
+/// `tx_high_water`), so that buffers settle at sizes later outputs fit rather than grow by a few
+/// bytes now and then. An empty buffer is replaced, not grown: growing copies its whole capacity.
+fn reserve_send(buf: &mut Vec<u8>, additional: usize, tx_high_water: usize) {
+  let want = buf.len().saturating_add(additional);
+  if buf.capacity() >= want {
+    return;
+  }
+  let class = want.max(tx_high_water.saturating_mul(2)).checked_next_power_of_two().unwrap_or(want);
+  if buf.is_empty() {
+    *buf = Vec::with_capacity(class);
+  } else {
+    buf.reserve_exact(class.saturating_sub(buf.len()));
+  }
 }
 
 fn send_sqe(conn: &Conn, bytes: &[u8]) -> squeue::Entry {
@@ -4439,7 +4450,8 @@ mod tests {
     });
     let _rslt = done_tx.send(());
     client.join().unwrap();
-    assert!(largest >= 64 * 1024, "the peer never stopped taking bytes ({largest})");
+    // Blocked once both buffers hold the send threshold (16 KiB by default).
+    assert!(largest >= 32 * 1024, "the peer never stopped taking bytes ({largest})");
     assert!(largest <= 1 << 20, "{largest} bytes of send buffer for one peer");
   }
 
@@ -4594,6 +4606,14 @@ mod tests {
     });
     client.join().unwrap();
     assert!(largest <= 64 * 1024, "a free slot holds a {largest}-byte buffer");
+  }
+
+  // The send threshold defaults to 16 KiB: with less output waiting per connection, the rest
+  // waits as references in the caller (HTTP/2 bodies, for one) and is written, or sealed, into
+  // buffers still in the cache. static-h2 256: 326k req/s at 256 KiB, 393k at 16 KiB.
+  #[test]
+  fn tx_high_water_defaults_to_16_kib() {
+    assert_eq!(crate::executor::UringParams::new().tx_high_water, 16 * 1024);
   }
 
   // A write declined because the queue is full can wait for room instead of being copied into
