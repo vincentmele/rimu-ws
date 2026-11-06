@@ -130,14 +130,46 @@ impl Stream {
 /// Open streams by id. Freed slots keep their buffers for reuse.
 #[derive(Debug)]
 pub(crate) struct StreamTable {
+  /// Body bytes received on open streams.
+  buffered: usize,
   free: VectorUsize<usize>,
   ids: HashMap<u32, usize>,
+  /// Body bytes queued on open streams and not yet sent.
+  queued: usize,
   slots: VectorUsize<Stream>,
 }
 
 impl StreamTable {
   pub(crate) fn new() -> Self {
-    Self { free: VectorUsize::new(), ids: HashMap::new(), slots: VectorUsize::new() }
+    Self {
+      buffered: 0,
+      free: VectorUsize::new(),
+      ids: HashMap::new(),
+      queued: 0,
+      slots: VectorUsize::new(),
+    }
+  }
+
+  /// Body bytes received on open streams.
+  pub(crate) const fn buffered(&self) -> usize {
+    self.buffered
+  }
+
+  /// Body bytes queued on open streams and not yet sent.
+  pub(crate) const fn queued(&self) -> usize {
+    self.queued
+  }
+
+  pub(crate) const fn add_buffered(&mut self, n: usize) {
+    self.buffered = self.buffered.wrapping_add(n);
+  }
+
+  pub(crate) const fn add_queued(&mut self, n: usize) {
+    self.queued = self.queued.wrapping_add(n);
+  }
+
+  pub(crate) const fn sub_queued(&mut self, n: usize) {
+    self.queued = self.queued.saturating_sub(n);
   }
 
   /// Number of open streams.
@@ -184,6 +216,8 @@ impl StreamTable {
       return false;
     };
     if let Some(stream) = self.slots.get_mut(idx) {
+      self.buffered = self.buffered.saturating_sub(stream.recv_body_len);
+      self.queued = self.queued.saturating_sub(stream.send_pending());
       stream.msg.clear();
       stream.owned.clear();
       stream.send_queue.clear();

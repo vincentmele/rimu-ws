@@ -17,6 +17,7 @@ use crate::{
   rng::Xorshift64,
   sync::Arc,
 };
+use core::time::Duration;
 use alloc::{
   string::{String, ToString as _},
   vec,
@@ -457,4 +458,154 @@ fn conn_header_cache_invalid_after_table_size_change() {
     assert!(fields.contains(&(":status".into(), "200".into())), "{fields:?}");
     assert!(fields.contains(&("server".into(), "rimu-ws".into())), "{fields:?}");
   }
+}
+
+fn secs(value: f64) -> Duration {
+  Duration::from_secs_f64(value)
+}
+
+#[test]
+fn limit_rapid_reset_goaway() {
+  let mut conn = ready_server(HttpRecvParams::with_default_params());
+  let mut failed = false;
+  for idx in 0..201u32 {
+    let id = 2 * idx + 1;
+    let mut input = headers_req(id, "GET", "/", &[], false);
+    input.extend(frame(RST_STREAM, 0, id, &8u32.to_be_bytes()));
+    let at = secs(f64::from(idx) / 1000.0);
+    if conn.feed_at(&input, at).is_err() {
+      failed = true;
+      break;
+    }
+  }
+  assert!(failed);
+  assert_eq!(go_away_code(&take_frames(&mut conn)).map(|el| el.1), Some(11));
+
+  let mut conn = ready_server(HttpRecvParams::with_default_params());
+  for idx in 0..200u32 {
+    let id = 2 * idx + 1;
+    let mut input = headers_req(id, "GET", "/", &[], false);
+    input.extend(frame(RST_STREAM, 0, id, &8u32.to_be_bytes()));
+    conn.feed_at(&input, secs(f64::from(idx) * 11.0 / 200.0)).unwrap();
+  }
+  assert_eq!(go_away_code(&take_frames(&mut conn)), None);
+}
+
+#[test]
+fn limit_continuation_flood() {
+  let block = {
+    let full = headers_req(1, "GET", "/", &[("x-a", "1"), ("x-b", "2"), ("x-c", "3")], true);
+    full[9..].to_vec()
+  };
+  let chunks: Vec<&[u8]> = block.chunks(block.len().div_ceil(6)).collect();
+  assert_eq!(chunks.len(), 6);
+  // HEADERS plus 5 CONTINUATIONs is one too many.
+  let mut conn = ready_server(HttpRecvParams::with_default_params());
+  let mut input = frame(HEADERS, 1, 1, chunks[0]);
+  for (idx, chunk) in chunks[1..].iter().enumerate() {
+    input.extend(frame(9, if idx == 4 { 4 } else { 0 }, 1, chunk));
+  }
+  assert!(conn.feed(&input).is_err());
+  assert_eq!(go_away_code(&take_frames(&mut conn)).map(|el| el.1), Some(11));
+  // HEADERS plus 4 CONTINUATIONs is accepted.
+  let chunks: Vec<&[u8]> = block.chunks(block.len().div_ceil(5)).collect();
+  assert_eq!(chunks.len(), 5);
+  let mut conn = ready_server(HttpRecvParams::with_default_params());
+  let mut input = frame(HEADERS, 1, 1, chunks[0]);
+  for (idx, chunk) in chunks[1..].iter().enumerate() {
+    input.extend(frame(9, if idx == 3 { 4 } else { 0 }, 1, chunk));
+  }
+  conn.feed(&input).unwrap();
+  assert!(matches!(events(&mut conn)[..], [ConnEvent::Headers { .. }]));
+}
+
+#[test]
+fn limit_ping_flood() {
+  let mut conn = ready_server(HttpRecvParams::with_default_params());
+  let mut failed = false;
+  for idx in 0..1001u32 {
+    if conn.feed_at(&frame(PING, 0, 0, &[0; 8]), secs(f64::from(idx) / 2000.0)).is_err() {
+      failed = true;
+      break;
+    }
+  }
+  assert!(failed);
+  assert_eq!(go_away_code(&take_frames(&mut conn)).map(|el| el.1), Some(11));
+}
+
+#[test]
+fn limit_header_list_size() {
+  let mut conn = ready_server(HttpRecvParams::with_default_params().set_max_headers_len(300));
+  let big = "v".repeat(200);
+  conn.feed(&headers_req(1, "GET", "/", &[("x-big", &big)], true)).unwrap();
+  let frames = take_frames(&mut conn);
+  let headers = frames.iter().find(|el| el.0 == HEADERS && el.2 == 1).expect("a 431 response");
+  let fields = decode_block(&mut response_decoder(), &headers.3);
+  assert!(fields.contains(&(":status".into(), "431".into())), "{fields:?}");
+  assert!(events(&mut conn).is_empty());
+  conn.feed(&headers_req(3, "GET", "/", &[], true)).unwrap();
+  assert!(matches!(events(&mut conn)[..], [ConnEvent::Headers { .. }]));
+}
+
+#[test]
+fn limit_body_len() {
+  let hp = HttpRecvParams::with_default_params().set_max_body_len(10);
+  let mut conn = ready_server(hp);
+  let mut input = headers_req(1, "POST", "/", &[], false);
+  input.extend(data(1, &[0; 11], true));
+  input.extend(headers_req(3, "GET", "/", &[], true));
+  conn.feed(&input).unwrap();
+  let frames = take_frames(&mut conn);
+  assert_eq!(rst_code(&frames, 1), Some(8), "{frames:?}");
+  assert_eq!(go_away_code(&frames), None);
+  assert!(events(&mut conn).contains(&ConnEvent::Headers { end_stream: true, stream_id: U31::from_u32(3) }));
+}
+
+#[test]
+fn limit_conn_buffered() {
+  let hp = HttpRecvParams::with_default_params().set_max_conn_buffered_len(1000);
+  let mut conn = ready_server(hp);
+  let mut input = Vec::new();
+  for id in [1, 3, 5] {
+    input.extend(headers_req(id, "POST", "/", &[], false));
+    input.extend(data(id, &[0; 400], false));
+  }
+  conn.feed(&input).unwrap();
+  let frames = take_frames(&mut conn);
+  assert_eq!(rst_code(&frames, 1), None);
+  assert_eq!(rst_code(&frames, 3), None);
+  assert_eq!(rst_code(&frames, 5), Some(7), "{frames:?}");
+}
+
+#[test]
+fn limit_send_queue() {
+  let hp = HttpRecvParams::with_default_params().set_max_send_queue_len(1000);
+  let mut conn = ready_server(hp);
+  conn.feed(&settings(&[(4, 0)])).unwrap();
+  let mut queued = 0;
+  let mut failed = false;
+  for id in (1..40).step_by(2) {
+    conn.feed(&headers_req(id, "GET", "/", &[], true)).unwrap();
+    let mut msg = MsgBufferString::default();
+    msg.body.extend_from_copyable_slice(&[1; 100]).unwrap();
+    if conn.send_response(U31::from_u32(id), StatusCode::Ok, &mut msg).is_err() {
+      failed = true;
+      break;
+    }
+    queued += 100;
+  }
+  assert!(failed, "queued {queued} bytes without an error");
+  assert!(queued <= 1000);
+}
+
+#[test]
+fn limit_concurrent_streams() {
+  let hp = HttpRecvParams::with_default_params().set_max_concurrent_streams_num(2);
+  let mut conn = ready_server(hp);
+  for id in [1, 3, 5] {
+    conn.feed(&headers_req(id, "GET", "/", &[], true)).unwrap();
+  }
+  let frames = take_frames(&mut conn);
+  assert_eq!(rst_code(&frames, 5), Some(7), "{frames:?}");
+  assert_eq!(conn.open_streams(), 2);
 }

@@ -25,6 +25,14 @@ pub enum Http2Error {
   ClosedConnectionWhenSendingConcurrentData,
   /// The number of opened streams extrapolated the threshold
   ExceedAmountOfOpenedStreams,
+  /// More CONTINUATION frames than `HttpRecvParams::max_continuations` allows
+  TooManyContinuations,
+  /// More control frames than `HttpRecvParams::max_control_frames_per_window` allows
+  TooManyControlFrames,
+  /// More RST_STREAM frames than `HttpRecvParams::max_resets_per_window` allows
+  TooManyResets,
+  /// The output would exceed `HttpRecvParams::max_send_queue_len`
+  SendQueueFull,
   /// The number of active concurrent streams extrapolated the threshold
   ExceedAmountOfActiveConcurrentStreams,
   /// The system only supports 2 header frames when sending data

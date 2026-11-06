@@ -1,3 +1,5 @@
+use core::time::Duration;
+
 use crate::http::{
   DEFAULT_INITIAL_WINDOW_LEN, DEFAULT_MAX_CONCURRENT_STREAMS_NUM, DEFAULT_MAX_FRAME_LEN,
   DEFAULT_MAX_HEADERS_LEN, DEFAULT_MAX_HPACK_LEN, MAX_FRAME_LEN_LOWER_BOUND,
@@ -12,10 +14,15 @@ pub struct HttpRecvParams {
   linger: bool,
   max_body_len: u32,
   max_concurrent_streams_num: u32,
+  max_conn_buffered_len: u32,
+  max_continuations: u8,
+  max_control_frames_per_window: (u32, Duration),
   max_frame_len: u32,
   max_headers_len: u32,
   max_hpack_len: (u32, u32),
   max_recv_streams_num: u32,
+  max_resets_per_window: (u32, Duration),
+  max_send_queue_len: u32,
 }
 
 impl HttpRecvParams {
@@ -34,6 +41,11 @@ impl HttpRecvParams {
       max_headers_len: DEFAULT_MAX_HEADERS_LEN,
       max_hpack_len: (DEFAULT_MAX_HPACK_LEN, DEFAULT_MAX_HPACK_LEN),
       max_recv_streams_num: 32,
+      max_conn_buffered_len: 4 * 1024 * 1024,
+      max_continuations: 4,
+      max_control_frames_per_window: (1000, Duration::from_secs(10)),
+      max_resets_per_window: (200, Duration::from_secs(10)),
+      max_send_queue_len: 4 * 1024 * 1024,
     }
   }
 
@@ -51,6 +63,11 @@ impl HttpRecvParams {
       max_headers_len: 64 * 1024,
       max_hpack_len: (128 * 1024, 128 * 1024),
       max_recv_streams_num: 256,
+      max_conn_buffered_len: 64 * 1024 * 1024,
+      max_continuations: 8,
+      max_control_frames_per_window: (1000, Duration::from_secs(10)),
+      max_resets_per_window: (200, Duration::from_secs(10)),
+      max_send_queue_len: 64 * 1024 * 1024,
     }
   }
 
@@ -67,6 +84,11 @@ impl HttpRecvParams {
       max_headers_len: u32::MAX,
       max_hpack_len: (u32::MAX, u32::MAX),
       max_recv_streams_num: u32::MAX,
+      max_conn_buffered_len: u32::MAX,
+      max_continuations: u8::MAX,
+      max_control_frames_per_window: (u32::MAX, Duration::from_secs(1)),
+      max_resets_per_window: (u32::MAX, Duration::from_secs(1)),
+      max_send_queue_len: u32::MAX,
     }
   }
 
@@ -157,6 +179,86 @@ impl HttpRecvParams {
   #[inline]
   pub const fn max_recv_streams_num(&self) -> u32 {
     self.max_recv_streams_num
+  }
+
+  /// Maximum number of body bytes buffered across all of a connection's streams.
+  ///
+  /// Servers only. A DATA frame that would cross it resets its stream with `REFUSED_STREAM`.
+  #[inline]
+  pub const fn max_conn_buffered_len(&self) -> u32 {
+    self.max_conn_buffered_len
+  }
+
+  /// Maximum number of CONTINUATION frames after one HEADERS frame.
+  ///
+  /// More is answered with GOAWAY `ENHANCE_YOUR_CALM` (CVE-2024-27316).
+  #[inline]
+  pub const fn max_continuations(&self) -> u8 {
+    self.max_continuations
+  }
+
+  /// Maximum number of PING frames, SETTINGS frames and empty DATA or HEADERS frames the peer may
+  /// send in the given window.
+  ///
+  /// More is answered with GOAWAY `ENHANCE_YOUR_CALM`.
+  #[inline]
+  pub const fn max_control_frames_per_window(&self) -> (u32, Duration) {
+    self.max_control_frames_per_window
+  }
+
+  /// Maximum number of RST_STREAM frames the peer may send in the given window.
+  ///
+  /// More is answered with GOAWAY `ENHANCE_YOUR_CALM` (rapid reset, CVE-2023-44487).
+  #[inline]
+  pub const fn max_resets_per_window(&self) -> (u32, Duration) {
+    self.max_resets_per_window
+  }
+
+  /// Maximum number of bytes queued for the peer, encoded frames and stream bodies waiting for
+  /// window together. A response that would cross it fails, and the connection should close.
+  #[inline]
+  pub const fn max_send_queue_len(&self) -> u32 {
+    self.max_send_queue_len
+  }
+
+  /// Mutable version of [`Self::max_conn_buffered_len`].
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub const fn set_max_conn_buffered_len(mut self, value: u32) -> Self {
+    self.max_conn_buffered_len = value;
+    self
+  }
+
+  /// Mutable version of [`Self::max_continuations`].
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub const fn set_max_continuations(mut self, value: u8) -> Self {
+    self.max_continuations = value;
+    self
+  }
+
+  /// Mutable version of [`Self::max_control_frames_per_window`].
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub const fn set_max_control_frames_per_window(mut self, value: (u32, Duration)) -> Self {
+    self.max_control_frames_per_window = value;
+    self
+  }
+
+  /// Mutable version of [`Self::max_resets_per_window`].
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub const fn set_max_resets_per_window(mut self, value: (u32, Duration)) -> Self {
+    self.max_resets_per_window = value;
+    self
+  }
+
+  /// Mutable version of [`Self::max_send_queue_len`].
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub const fn set_max_send_queue_len(mut self, value: u32) -> Self {
+    self.max_send_queue_len = value;
+    self
   }
 
   /// Mutable version of [`Self::enable_connect_protocol`].

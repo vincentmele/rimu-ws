@@ -38,9 +38,10 @@ use crate::{
     settings_frame::SettingsFrame,
   },
   misc::Lease,
+  calendar::Instant,
   rng::Rng,
 };
-use core::mem;
+use core::{mem, time::Duration};
 
 /// The window every stream and the connection start with (RFC 9113 §6.9.2).
 const DEFAULT_WINDOW: i32 = 65_535;
@@ -73,6 +74,25 @@ struct PeerSettings {
   max_frame_len: u32,
 }
 
+/// Counts events in fixed windows of time.
+#[derive(Clone, Copy, Debug, Default)]
+struct RateWindow {
+  count: u32,
+  start: Duration,
+}
+
+impl RateWindow {
+  /// Counts one event at `now`; true when that makes more than `max` in the current window.
+  fn exceeded(&mut self, now: Duration, (max, window): (u32, Duration)) -> bool {
+    if now.saturating_sub(self.start) >= window {
+      self.start = now;
+      self.count = 0;
+    }
+    self.count = self.count.saturating_add(1);
+    self.count > max
+  }
+}
+
 /// A HEADERS frame whose block continues in CONTINUATION frames.
 #[derive(Clone, Copy, Debug)]
 struct PendingBlock {
@@ -96,6 +116,7 @@ pub(crate) struct Http2Conn<const IS_CLIENT: bool> {
   conn_recv: i32,
   conn_recv_unacked: u32,
   conn_send: i32,
+  control_frames: RateWindow,
   events: DequeUsize<ConnEvent>,
   fatal: bool,
   go_away_recv: Option<U31>,
@@ -111,6 +132,9 @@ pub(crate) struct Http2Conn<const IS_CLIENT: bool> {
   peer: PeerSettings,
   peer_settings_seen: bool,
   pending_block: Option<PendingBlock>,
+  /// The time of the bytes being fed.
+  now: Duration,
+  resets: RateWindow,
   /// The server still expects the client's connection preface.
   wants_preface: bool,
   streams: StreamTable,
@@ -135,6 +159,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       conn_recv: DEFAULT_WINDOW.max(initial),
       conn_recv_unacked: 0,
       conn_send: DEFAULT_WINDOW,
+      control_frames: RateWindow::default(),
       events: DequeUsize::new(),
       fatal: false,
       go_away_recv: None,
@@ -152,6 +177,8 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       },
       peer_settings_seen: false,
       pending_block: None,
+      now: Duration::ZERO,
+      resets: RateWindow::default(),
       wants_preface: !IS_CLIENT,
       streams: StreamTable::new(),
     };
@@ -172,6 +199,13 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
   /// A connection error queues GOAWAY and returns `Err`; the caller writes the output and
   /// closes.
   pub(crate) fn feed(&mut self, input: &[u8]) -> crate::Result<usize> {
+    self.feed_at(input, Instant::now_timestamp().unwrap_or_default())
+  }
+
+  /// [`Self::feed`] with the time the bytes arrived, which the rate limits count against. Any
+  /// clock that only moves forward works.
+  pub(crate) fn feed_at(&mut self, input: &[u8], now: Duration) -> crate::Result<usize> {
+    self.now = self.now.max(now);
     if self.fatal {
       return Err(protocol_err(Http2Error::UnknownStreamReceiver));
     }
@@ -319,11 +353,20 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     end_stream: bool,
   ) -> crate::Result<()> {
     let id = stream_id.u32();
+    let body_len = match &body {
+      Body::Borrowed(elem) => elem.len(),
+      Body::Shared(elem) => elem.len(),
+    };
+    self.check_send_queue(body_len)?;
     let stream =
       self.streams.get_mut(id).ok_or(protocol_err(Http2Error::UnknownStreamReceiver))?;
     if stream.send_closed || stream.end_after_queue {
       return Err(protocol_err(Http2Error::InvalidSendStreamState));
     }
+    self.streams.add_queued(body_len);
+    let Some(stream) = self.streams.get_mut(id) else {
+      return Ok(());
+    };
     match body {
       Body::Borrowed(bytes) => {
         if !bytes.is_empty() {
@@ -383,6 +426,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
   ) -> crate::Result<()> {
     let id = stream_id.u32();
     let body_len = msg.body.len();
+    self.check_send_queue(body_len)?;
     {
       let Self { header_buf, header_cache, hpack_enc, out, peer, streams, .. } = self;
       let stream =
@@ -437,6 +481,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     };
     let max_frame_len = i32::try_from(peer.max_frame_len).unwrap_or(i32::MAX);
     let mut progressed = false;
+    let mut queued_sent: usize = 0;
     loop {
       let Some(item) = stream.send_queue.get(0) else {
         break;
@@ -472,6 +517,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
           out.push_shared(part)?;
         }
       }
+      queued_sent = queued_sent.wrapping_add(n);
       let signed = i32::try_from(n).unwrap_or(i32::MAX);
       *conn_send = conn_send.wrapping_sub(signed);
       stream.send_window = stream.send_window.wrapping_sub(signed);
@@ -503,10 +549,36 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
         progressed = true;
       }
     }
-    if stream.send_closed {
+    let send_closed = stream.send_closed;
+    self.streams.sub_queued(queued_sent);
+    if send_closed {
       self.after_send_closed(id);
     }
     Ok(progressed)
+  }
+
+  /// Counts a PING, SETTINGS or empty frame against the control-frame budget.
+  fn count_control_frame(&mut self) -> crate::Result<()> {
+    if self.control_frames.exceeded(self.now, self.hp.max_control_frames_per_window()) {
+      return Err(crate::Error::Http2ErrorGoAway(
+        Http2ErrorCode::EnhanceYourCalm,
+        Http2Error::TooManyControlFrames,
+      ));
+    }
+    Ok(())
+  }
+
+  /// Fails when `additional` more bytes would put the output over `max_send_queue_len`.
+  fn check_send_queue(&self, additional: usize) -> crate::Result<()> {
+    let max = usize::try_from(self.hp.max_send_queue_len()).unwrap_or(usize::MAX);
+    let total = self.out.len().saturating_add(self.streams.queued()).saturating_add(additional);
+    if total > max {
+      return Err(crate::Error::Http2ErrorGoAway(
+        Http2ErrorCode::EnhanceYourCalm,
+        Http2Error::SendQueueFull,
+      ));
+    }
+    Ok(())
   }
 
   /// Retries every stream that waits for window, reporting those that moved.
@@ -618,6 +690,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       FrameInitTy::Ping => {
         let ping = PingFrame::read(payload, fi)?;
         if !ping.has_ack() {
+          self.count_control_frame()?;
           let mut ack = ping;
           ack.set_ack();
           self.out.push(&ack.bytes())?;
@@ -645,6 +718,12 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       return Err(protocol_err(Http2Error::InvalidContinuationFrame));
     };
     block.continuations = block.continuations.wrapping_add(1);
+    if block.continuations > self.hp.max_continuations() {
+      return Err(crate::Error::Http2ErrorGoAway(
+        Http2ErrorCode::EnhanceYourCalm,
+        Http2Error::TooManyContinuations,
+      ));
+    }
     self.block.extend_from_copyable_slice(payload)?;
     if !fi.cf.has_eoh() {
       self.pending_block = Some(block);
@@ -675,6 +754,9 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     let mut body = payload;
     let _ = trim_frame_pad(fi.cf, &mut body)?;
     let end_stream = fi.cf.has_eos();
+    if payload.is_empty() && !end_stream {
+      self.count_control_frame()?;
+    }
     let Some(stream) = self.streams.get_mut(id) else {
       if self.is_idle(id) {
         return Err(protocol_err(Http2Error::UnknownStreamReceiver));
@@ -691,8 +773,25 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       self.stream_error(id, Http2ErrorCode::FlowControlError);
       return Ok(());
     }
+    let max_body_len = usize::try_from(self.hp.max_body_len()).unwrap_or(usize::MAX);
+    if stream.recv_body_len.saturating_add(body.len()) > max_body_len {
+      self.stream_error(id, Http2ErrorCode::Cancel);
+      return Ok(());
+    }
+    let max_buffered = usize::try_from(self.hp.max_conn_buffered_len()).unwrap_or(usize::MAX);
+    if self.streams.buffered().saturating_add(body.len()) > max_buffered {
+      self.stream_error(id, Http2ErrorCode::RefusedStream);
+      return Ok(());
+    }
+    let Some(stream) = self.streams.get_mut(id) else {
+      return Ok(());
+    };
     stream.msg.body.extend_from_copyable_slice(body)?;
     stream.recv_body_len = stream.recv_body_len.wrapping_add(body.len());
+    self.streams.add_buffered(body.len());
+    let Some(stream) = self.streams.get_mut(id) else {
+      return Ok(());
+    };
     let over_length = stream.content_length.is_some_and(|el| {
       stream.recv_body_len > el || (end_stream && stream.recv_body_len != el)
     });
@@ -738,6 +837,9 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       fragment = rest;
     }
     let end_stream = fi.cf.has_eos();
+    if fragment.is_empty() && fi.cf.has_eoh() && !end_stream {
+      self.count_control_frame()?;
+    }
     if fi.cf.has_eoh() {
       return self.on_header_block(id, end_stream, fragment);
     }
@@ -814,6 +916,12 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     stream.protocol = hf.hsreqh().protocol;
     stream.recv_closed = end_stream;
     stream.recv_headers = true;
+    if hf.is_over_size() {
+      // The fields were decoded, so the HPACK state is intact: answer instead of resetting.
+      stream.msg.clear();
+      let status = Some(StatusCode::RequestHeaderFieldsTooLarge);
+      return self.send_headers(U31::from_u32(id), status, &Headers::new(), true);
+    }
     if end_stream && content_length.is_some_and(|el| el != 0) {
       self.stream_error(id, Http2ErrorCode::ProtocolError);
       return Ok(());
@@ -873,6 +981,12 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     if self.is_idle(id) {
       return Err(protocol_err(Http2Error::UnknownStreamReceiver));
     }
+    if self.resets.exceeded(self.now, self.hp.max_resets_per_window()) {
+      return Err(crate::Error::Http2ErrorGoAway(
+        Http2ErrorCode::EnhanceYourCalm,
+        Http2Error::TooManyResets,
+      ));
+    }
     if self.streams.close(id) {
       let code =
         u32::from_be_bytes([*b0, *b1, *b2, *b3]).try_into().unwrap_or(Http2ErrorCode::InternalError);
@@ -895,6 +1009,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     if sf.has_ack() {
       return Ok(());
     }
+    self.count_control_frame()?;
     if let Some(elem) = sf.header_table_size() {
       let _rslt = self.hpack_enc.set_max_dyn_sub_bytes(elem.min(self.hp.max_hpack_len().1));
     }
