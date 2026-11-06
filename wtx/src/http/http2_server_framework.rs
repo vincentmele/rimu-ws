@@ -103,10 +103,14 @@ where
 {
   /// Taking aside the provided parameters, everything else is set to default values.
   ///
-  /// The "h2" ALPN will always be pushed into the TLS configuration.
+  /// The "h2" ALPN will always be pushed into the TLS configuration, and kernel TLS turned off
+  /// ([`TlsConfig::kernel_tls`]): HTTP/2 connections seal their records in user space, which
+  /// measured faster than the kernel on small and on 16 KiB records alike (the kernel sends one
+  /// TCP segment per record and copies each record twice).
   #[inline]
   pub fn new(executor: EX, rng: RNG, mut tls_config: TlsConfig<TCX>) -> crate::Result<Self> {
     push_h2_alpn(&mut tls_config)?;
+    *tls_config.kernel_tls_mut() = false;
     let error_cb: fn(_) = |_| {};
     let local_runtime_cb: fn() -> _ = || Ok(EX::LocalRuntime::new()?);
     Ok(Self {

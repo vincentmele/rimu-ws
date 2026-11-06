@@ -147,3 +147,25 @@ fn nested_middlewares() {
     }
   });
 }
+
+// HTTP/2 connections seal their records in user space: kernel TLS measured slower on small
+// (baseline) and 16 KiB (static) records alike.
+#[cfg(feature = "io-uring")]
+#[test]
+fn framework_turns_kernel_tls_off() {
+  use crate::{
+    executor::UringExecutor,
+    rng::{ChaCha20, CryptoSeedableRng as _},
+    tests::{_PUBLIC_KEY, _SECRET_KEY},
+    tls::TlsConfig,
+  };
+  let config = TlsConfig::from_keys_pem(_PUBLIC_KEY, _SECRET_KEY).unwrap();
+  assert!(config.kernel_tls());
+  let fw = crate::http::http2_server_framework::Http2ServerFramework::<(), fn(crate::Error), _, _, _, _>::new(
+    UringExecutor::default(),
+    ChaCha20::from_std_random().unwrap(),
+    config,
+  )
+  .unwrap();
+  assert!(!fw.tls_config.kernel_tls());
+}
