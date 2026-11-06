@@ -6,13 +6,16 @@ use crate::{
   executor::{Runtime as _, UringParams, UringRuntime, UringTcpListener, UringTcpStream},
   futures::Sleep,
   http::{
-    HttpRecvParams, MsgBufferString, Request, StatusCode,
+    HttpRecvParams, MsgBufferString, Protocol, Request, StatusCode,
     http2_server_framework::conn_driver::{StreamDispatcher, drive_conn},
   },
-  http2::conn::{
+  http2::{
+    ServerStream,
+    conn::{
     Http2Conn,
     scan::PREFACE,
     test_frames::{data, frame, headers_req, parse_all, settings},
+    },
   },
   net::{StreamCommon, StreamReader, StreamWriter, TcpListener as _, TcpParams},
   rng::Xorshift64,
@@ -38,7 +41,7 @@ use std::{
   time::Instant,
 };
 
-type Frames = Vec<(u8, u8, u32, Vec<u8>)>;
+pub(crate) type Frames = Vec<(u8, u8, u32, Vec<u8>)>;
 type AutoOut = (Request<MsgBufferString>, crate::Result<StatusCode>);
 
 const DATA: u8 = 0;
@@ -64,7 +67,13 @@ impl Drop for DropFlag {
 impl StreamDispatcher for TestDispatcher {
   type AutoFut = Pin<Box<dyn Future<Output = AutoOut>>>;
 
-  fn auto(&self, mut req: Request<MsgBufferString>) -> Self::AutoFut {
+  fn is_manual(&self, _: &Request<MsgBufferString>) -> bool {
+    false
+  }
+
+  fn manual(&self, _: ServerStream, _: Request<MsgBufferString>) {}
+
+  fn auto(&self, mut req: Request<MsgBufferString>, _: Option<Protocol>) -> Self::AutoFut {
     let dropped = self.dropped.clone();
     Box::pin(async move {
       let path = String::from(req.msg_data.uri.path());
@@ -176,13 +185,13 @@ fn serve(hp: HttpRecvParams) -> Served {
 }
 
 /// A raw-frame HTTP/2 client.
-struct Client {
+pub(crate) struct Client {
   buffer: Vec<u8>,
   stream: TcpStream,
 }
 
 impl Client {
-  fn connect(addr: &str, extra_settings: &[(u16, u32)]) -> Self {
+  pub(crate) fn connect(addr: &str, extra_settings: &[(u16, u32)]) -> Self {
     let stream = TcpStream::connect(addr).unwrap();
     stream.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
     let mut this = Self { buffer: Vec::new(), stream };
@@ -192,12 +201,12 @@ impl Client {
     this
   }
 
-  fn send(&mut self, bytes: &[u8]) {
+  pub(crate) fn send(&mut self, bytes: &[u8]) {
     std::io::Write::write_all(&mut self.stream, bytes).unwrap();
   }
 
   /// Every frame that arrives until `done` holds of all of them, or `timeout` passes.
-  fn read_until(&mut self, timeout: Duration, mut done: impl FnMut(&Frames) -> bool) -> Frames {
+  pub(crate) fn read_until(&mut self, timeout: Duration, mut done: impl FnMut(&Frames) -> bool) -> Frames {
     let deadline = Instant::now() + timeout;
     let mut frames = Frames::new();
     let mut chunk = [0; 65_536];
@@ -220,7 +229,7 @@ impl Client {
 }
 
 /// Bytes of whole frames at the start of `bytes`.
-fn complete_len(bytes: &[u8]) -> usize {
+pub(crate) fn complete_len(bytes: &[u8]) -> usize {
   let mut idx = 0;
   while let Some(header) = bytes.get(idx..idx + 9) {
     let len = usize::try_from(u32::from_be_bytes([0, header[0], header[1], header[2]])).unwrap();
@@ -233,7 +242,7 @@ fn complete_len(bytes: &[u8]) -> usize {
 }
 
 /// Streams whose response ended, in the order they ended.
-fn ended(frames: &Frames) -> Vec<u32> {
+pub(crate) fn ended(frames: &Frames) -> Vec<u32> {
   frames
     .iter()
     .filter(|el| (el.0 == DATA || el.0 == HEADERS) && el.1 & 1 == 1)
@@ -241,11 +250,11 @@ fn ended(frames: &Frames) -> Vec<u32> {
     .collect()
 }
 
-fn body_of(frames: &Frames, stream: u32) -> Vec<u8> {
+pub(crate) fn body_of(frames: &Frames, stream: u32) -> Vec<u8> {
   frames.iter().filter(|el| el.0 == DATA && el.2 == stream).flat_map(|el| el.3.clone()).collect()
 }
 
-fn status_of(frames: &Frames, stream: u32) -> Option<u8> {
+pub(crate) fn status_of(frames: &Frames, stream: u32) -> Option<u8> {
   // `:status` comes first, as a static-table index: 0x88 is 200, 0x8e is 500.
   frames.iter().find(|el| el.0 == HEADERS && el.2 == stream).map(|el| el.3[0])
 }
@@ -391,4 +400,74 @@ fn date_header_on_responses() {
     })
     .unwrap();
   assert!(names.iter().any(|el| el == "date"), "{:?}", names.as_slice());
+}
+
+#[test]
+fn server_tls_preface_with_finished_uses_ktls() {
+  use crate::{
+    executor::StdRuntime,
+    tests::{_PUBLIC_KEY, _ROOT_CA, _SECRET_KEY},
+    tls::{TlsAcceptor, TlsConfig, TlsConnectorBuilder},
+  };
+  let ulp = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_available_ulp").unwrap_or_default();
+  let offered = ulp.split_whitespace().any(|el| el == "tls");
+  let uri = _uri();
+  let (host, port) = uri.hostname_with_implied_port();
+  let addr = alloc::format!("{host}:{port}");
+  let client_uri = uri.clone();
+  let client = std::thread::spawn(move || {
+    StdRuntime::new().block_on(async move {
+      let mut rng = <crate::rng::ChaCha20 as crate::rng::CryptoSeedableRng>::from_std_random().unwrap();
+      let mut config = TlsConfig::from_trust_anchors_pem([_ROOT_CA]).unwrap();
+      crate::http::push_h2_alpn(&mut config).unwrap();
+      let mut tls_stream = loop {
+        let connector = TlsConnectorBuilder::std(client_uri.clone()).build(&config, &mut rng).await;
+        if let Ok(elem) = connector {
+          break elem.connect().await.unwrap().tls_stream;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+      };
+      // The preface and the first request go out right behind the client's Finished.
+      let mut opening = PREFACE.to_vec();
+      opening.extend(settings(&[]));
+      opening.extend(headers_req(1, "GET", "/", &[], true));
+      tls_stream.write_all(&opening).await.unwrap();
+      let mut got = Vec::new();
+      let mut answered = 0;
+      let mut next_id = 3;
+      let mut buf = [0u8; 16 * 1024];
+      while answered < 8 {
+        let len = tls_stream.read(buf.as_mut_slice().into()).await.unwrap().unwrap();
+        got.extend_from_slice(&buf[..len.get()]);
+        let complete = complete_len(&got);
+        let frames = parse_all(&got[..complete]);
+        let _ = got.drain(..complete);
+        for _ in ended(&frames) {
+          answered += 1;
+          if next_id < 16 {
+            tls_stream.write_all(&headers_req(next_id, "GET", "/", &[], true)).await.unwrap();
+            next_id += 2;
+          }
+        }
+      }
+      answered
+    })
+  });
+  let runtime = UringRuntime::with_params(UringParams::default()).unwrap();
+  let kernel = runtime.block_on(async {
+    let listener = UringTcpListener::bind(addr.as_str(), TcpParams::default().set_reuse_port(Some(false)))
+      .await
+      .unwrap();
+    let (stream, peer) = listener.accept(TcpParams::default()).await.unwrap();
+    let mut rng = <crate::rng::ChaCha20 as crate::rng::CryptoSeedableRng>::from_std_random().unwrap();
+    let mut config = TlsConfig::from_keys_pem(_PUBLIC_KEY, _SECRET_KEY).unwrap();
+    crate::http::push_h2_alpn(&mut config).unwrap();
+    let mut tls_stream = TlsAcceptor::new(&config, &mut rng, stream).accept().await.unwrap().tls_stream;
+    let conn = Http2Conn::<false>::new(HttpRecvParams::with_default_params(), &mut Xorshift64::from(5u64));
+    let dispatcher = TestDispatcher { dropped: Arc::new(AtomicBool::new(false)) };
+    let _rslt = drive_conn(&mut tls_stream, conn, &dispatcher, peer.ip()).await;
+    tls_stream.is_kernel_tls()
+  });
+  assert_eq!(client.join().unwrap(), 8);
+  assert_eq!(kernel, offered, "kernel TLS offered: {offered}");
 }

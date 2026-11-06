@@ -1,7 +1,7 @@
 //! Browsers usually send `form-data` content when dealing with files.
 
 use rimu_ws::{
-  executor::TokioExecutor,
+  executor::UringExecutor,
   http::http2_server_framework::{
     CorsMiddleware, FormData, FormDataIter, Http2ServerFramework, HttpRouter, State, post,
   },
@@ -15,7 +15,7 @@ fn main() -> rimu_ws::Result<()> {
   let tls_config = TlsConfig::from_keys_pem(PUBLIC_KEY, SECRET_KEY)?;
   let router =
     HttpRouter::new(rimu_ws::paths!(("/form_data", post(form_data))), CorsMiddleware::permissive())?;
-  Http2ServerFramework::new(TokioExecutor::default(), rng, tls_config)?
+  Http2ServerFramework::new(UringExecutor::default(), rng, tls_config)?
     .set_error_cb(|err| eprintln!("Error: {err}"))
     .run_in_threads(&host_from_args(), router)
 }

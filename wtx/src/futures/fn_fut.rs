@@ -30,7 +30,7 @@ use core::marker::PhantomData;
 
 /// A wrapper for function/closures implementations.
 #[derive(Debug)]
-pub struct FnFutWrapper<A, F>(pub(crate) F, pub(crate) PhantomData<A>);
+pub struct FnFutWrapper<A, F>(pub(crate) F, pub(crate) PhantomData<fn() -> A>);
 
 impl<A, F> From<F> for FnFutWrapper<A, F> {
   #[inline]

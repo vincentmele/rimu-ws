@@ -28,22 +28,18 @@ mod route_match;
 mod state;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, feature = "io-uring", feature = "web-socket"))]
+mod uring_tests;
 mod verbatim_params;
 
 use crate::{
-  collections::ArrayVectorCopy,
   executor::{Executor, Runtime as _},
-  http::{
-    AutoStream, HttpRecvParams, ManualStream, MsgBufferString, OperationMode, Request, Response,
-    misc::on_accept_error, push_h2_alpn,
-  },
-  http2::{Http2, Http2Buffer, Http2ErrorCode, Http2RecvStatus, ServerStream},
-  net::{Stream, StreamReader, StreamWriter, TcpListener as _, TcpParams, TcpStream as _, Uri},
-  rng::{CryptoRng, CryptoSeedableRng, SeedableRng as _, Xorshift64},
+  http::{HttpRecvParams, push_h2_alpn},
+  net::TcpParams,
   sync::Arc,
-  tls::{TlsAcceptor, TlsConfig, TlsCtx, TlsCtxSk},
+  tls::TlsConfig,
 };
-use core::{mem, net::IpAddr, num::NonZeroUsize};
+use core::num::NonZeroUsize;
 pub use cors_middleware::{CorsMiddleware, OriginResponse};
 pub use dyn_params::DynParams;
 pub use endpoint::Endpoint;
@@ -70,13 +66,6 @@ pub use route_match::RouteMatch;
 pub use state::{State, StateClean, StateGeneric, StateTest};
 pub use verbatim_params::VerbatimParams;
 
-type ConnRsltTy<EX, TCX, ER> = Option<(
-  LocalStream<EX, TCX>,
-  Result<(ArrayVectorCopy<RouteMatch, 4>, Option<MsgBufferString>), ER>,
-)>;
-type LocalStream<EX, TCX> =
-  ServerStream<<<EX as Executor>::TcpStream as Stream>::WriteHalfOwned, TCX>;
-type WriteHalf<EX> = <<EX as Executor>::TcpStream as Stream>::WriteHalfOwned;
 
 /// HTTP/2 Server Framework
 #[derive(Debug)]
@@ -124,30 +113,6 @@ where
       tcp_params: TcpParams::default(),
       tls_config: tls_config.into(),
     })
-  }
-}
-
-#[cfg(feature = "tokio")]
-impl<ERR, TCX>
-  Http2ServerFramework<
-    (),
-    fn(ERR),
-    crate::executor::TokioExecutor,
-    fn() -> Result<<crate::executor::TokioExecutor as Executor>::LocalRuntime, ERR>,
-    crate::rng::ChaCha20,
-    TCX,
-  >
-where
-  ERR: From<crate::Error>,
-{
-  /// Calls [`Self::new`] using the elements provided by the tokio project
-  #[inline]
-  pub fn tokio(tls_config: TlsConfig<TCX>) -> crate::Result<Self> {
-    Self::new(
-      crate::executor::TokioExecutor::default(),
-      crate::rng::ChaCha20::from_std_random()?,
-      tls_config,
-    )
   }
 }
 
@@ -236,469 +201,286 @@ impl<DA, EC, EX, RC, RNG, TCX> Http2ServerFramework<DA, EC, EX, RC, RNG, TCX> {
   }
 }
 
-impl<DA, EC, ER, EX, RC, RNG, TCX> Http2ServerFramework<DA, EC, EX, RC, RNG, TCX>
-where
-  EC: Clone + Fn(ER) + 'static,
-  DA: Clone + 'static,
-  ER: From<crate::Error> + 'static,
-  EX: Clone + Executor + 'static,
-  RC: Clone + Fn() -> Result<EX::LocalRuntime, ER> + 'static,
-  RNG: CryptoRng + CryptoSeedableRng + 'static,
-  TCX: TlsCtxSk + 'static,
-{
-  /// Starts the server distributing connections across multiple tasks.
-  ///
-  /// You must call this method from within an existing async environment. Preferably, a
-  /// multi-thread environment.
-  #[inline]
-  pub async fn run<EN, M>(
-    mut self,
-    addr: &str,
-    hr: HttpRouter<DA, EN, ER, M, LocalStream<EX, TCX>>,
-  ) -> Result<(), ER>
+
+#[cfg(feature = "io-uring")]
+mod uring {
+  use crate::{
+    executor::{Executor as _, Runtime as _, UringExecutor, UringRuntime},
+    http::{
+      AutoStream, HttpRecvParams, ManualStream, MsgBufferString, OperationMode, Protocol, Request,
+      StatusCode,
+      http2_server_framework::{
+        Endpoint as _, EndpointNode, Http2ServerFramework, HttpRouter, Middleware,
+        conn_driver::{StreamDispatcher, drive_conn},
+      },
+      misc::on_accept_error,
+    },
+    http2::{ServerStream, conn::Http2Conn},
+    net::{TcpListener as _, TcpParams, Uri},
+    rng::{CryptoRng, CryptoSeedableRng, SeedableRng as _, Xorshift64},
+    sync::Arc,
+    tls::{TlsAcceptor, TlsConfig, TlsCtxSk},
+  };
+  use alloc::string::String;
+  use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+  impl<DA, EC, ER, RC, RNG, TCX> Http2ServerFramework<DA, EC, UringExecutor, RC, RNG, TCX>
   where
-    DA: Send + Sync,
-    EC: Send,
-    EX::SpawnFuture<()>: Send,
-    EN: EndpointNode<DA, ER, LocalStream<EX, TCX>, auto(..): Send, manual(..): Send>
-      + Send
-      + Sync
-      + 'static,
-    ER: Send,
-    EX: Send,
-    M: Middleware<DA, ER, req(..): Send, res(..): Send> + Send + Sync + 'static,
-    M::Aux: Send,
-    RNG: Send,
-    TCX: Send + Sync,
-    <EX as Executor>::TcpStream: Send,
-    <EX::TcpStream as Stream>::ReadHalfOwned: Send,
-    <EX::TcpStream as Stream>::WriteHalfOwned: Send,
-    <EX::TcpStream as StreamReader>::read(..): Send,
-    <EX::TcpStream as StreamWriter>::write_all(..): Send,
-    <EX::TcpStream as StreamWriter>::write_all_vectored(..): Send,
-    <<EX::TcpStream as Stream>::ReadHalfOwned as StreamReader>::read(..): Send,
-    <<EX::TcpStream as Stream>::WriteHalfOwned as StreamWriter>::write_all(..): Send,
-    <<EX::TcpStream as Stream>::WriteHalfOwned as StreamWriter>::write_all_vectored(..): Send,
+    EC: Clone + Fn(ER) + 'static,
+    DA: Clone + 'static,
+    ER: From<crate::Error> + 'static,
+    RC: Clone + Fn() -> Result<UringRuntime, ER> + 'static,
+    RNG: CryptoRng + CryptoSeedableRng + 'static,
+    TCX: TlsCtxSk + 'static,
   {
-    let http_router = Arc::new(hr);
-    let uri = Uri::new(addr);
-    let listener = EX::TcpListener::bind(uri.hostname_with_implied_port(), self.tcp_params).await?;
-    let xorshift = &mut Xorshift64::from_simple_seed()?;
-    loop {
-      let cp = match conn_params(
-        (&self.data, &self.error_cb, &self.executor, self.hrc),
-        (&mut self.rng, self.tcp_params, &self.tls_config),
-        (&http_router, &listener, xorshift),
-      )
-      .await
-      {
-        Ok(elem) => elem,
-        Err(err) => {
-          on_accept_error(&self.error_cb, err).await;
-          continue;
-        }
+    /// Starts the server with one io_uring runtime per thread, each with its own listener
+    /// (`SO_REUSEPORT`).
+    ///
+    /// Call it from the main thread: the first thread that ends with an error ends the call.
+    #[inline]
+    pub fn run_in_threads<EN, M>(
+      mut self,
+      addr: &str,
+      hr: HttpRouter<DA, EN, ER, M, ServerStream>,
+    ) -> Result<(), ER>
+    where
+      DA: Send,
+      EC: Send,
+      EN: EndpointNode<DA, ER, ServerStream> + Send + Sync + 'static,
+      ER: Send,
+      M: Middleware<DA, ER> + Send + Sync + 'static,
+      RC: Send,
+      RNG: Send,
+      TCX: Send + Sync,
+    {
+      let runtimes = if let Some(elem) = self.local_runtimes {
+        elem.get()
+      } else {
+        std::thread::available_parallelism().map_err(crate::Error::from)?.get()
       };
-      let conn_fut = async move {
-        let fut = http2::<EX, _, _>(cp.hrc, cp.rng, cp.stream, cp.tls_config, cp.xorshift);
-        let (frame_reader, http2, ip) = match fut.await {
-          Err(err) => {
-            (cp.error_cb)(err.into());
-            return;
-          }
-          Ok(elem) => elem,
+      let http_router = Arc::new(hr);
+      let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(), ER>>();
+      for _ in 0..runtimes {
+        let server = ThreadServer {
+          data: self.data.clone(),
+          error_cb: self.error_cb.clone(),
+          hrc: self.hrc,
+          http_router: http_router.clone(),
+          rng: RNG::from_crypto_rng(&mut self.rng)?,
+          tcp_params: self.tcp_params,
+          tls_config: self.tls_config.clone(),
         };
-        let _frame_reader_jh = cp.executor.spawn(frame_reader);
-        loop {
-          let (server_stream, headers_aux, opt) = match conn_rslt::<ER, EX, TCX>(
-            http2.stream(|req, _| stream_cb::<_, _, _, EX, _, _>(&cp.http_router, req)).await,
-          ) {
-            Ok(Some(el)) => el,
-            Ok(None) => break,
-            Err(err) => {
-              http2.send_go_away(Http2ErrorCode::NoError).await;
-              (cp.error_cb)(err);
-              break;
-            }
+        let local_runtime_cb = self.local_runtime_cb.clone();
+        let thread_addr = String::from(addr);
+        let thread_done = done_tx.clone();
+        let _jh = std::thread::spawn(move || {
+          let body = move || -> Result<(), ER> {
+            let runtime = Arc::new(local_runtime_cb()?);
+            runtime.block_on(server.serve(&thread_addr, runtime.clone()))
           };
-          let stream_data = cp.data.clone();
-          let stream_error_cb = cp.error_cb.clone();
-          let stream_http_router = cp.http_router.clone();
-          let _stream_jh = cp.executor.spawn(stream_fut::<DA, EC, EN, ER, EX, M, TCX>(
-            headers_aux,
-            ip,
-            opt,
-            server_stream,
-            stream_data,
-            stream_error_cb,
-            stream_http_router,
-          ));
+          let rslt = std::panic::catch_unwind(core::panic::AssertUnwindSafe(body))
+            .unwrap_or_else(|payload| Err(crate::Error::from(payload).into()));
+          let _rslt = thread_done.send(rslt);
+        });
+      }
+      drop(done_tx);
+      let mut ended = 0;
+      while let Ok(rslt) = done_rx.recv() {
+        rslt?;
+        ended += 1;
+        if ended == runtimes {
+          break;
         }
+      }
+      Ok(())
+    }
+
+    /// Starts the server on the current thread's io_uring runtime, `runtime`.
+    #[inline]
+    pub async fn run_local<EN, M>(
+      mut self,
+      addr: &str,
+      hr: HttpRouter<DA, EN, ER, M, ServerStream>,
+      runtime: Arc<UringRuntime>,
+    ) -> Result<(), ER>
+    where
+      EN: EndpointNode<DA, ER, ServerStream> + 'static,
+      M: Middleware<DA, ER> + 'static,
+    {
+      let server = ThreadServer {
+        data: self.data,
+        error_cb: self.error_cb,
+        hrc: self.hrc,
+        http_router: Arc::new(hr),
+        rng: RNG::from_crypto_rng(&mut self.rng)?,
+        tcp_params: self.tcp_params,
+        tls_config: self.tls_config,
       };
-      let _conn_jh = self.executor.spawn(conn_fut);
+      server.serve(addr, runtime).await
     }
   }
 
-  /// Starts the server using a runtime-per-thread architecture.
-  ///
-  /// Contrary to the other methods, this method internally creates a runtime according to the
-  /// specified `local_runtimes` value.
-  ///
-  /// You must call this method inside the main thread to allow the interruption of the remaining
-  /// threads once an error arises.
-  #[cfg(feature = "std")]
-  #[inline]
-  pub fn run_in_threads<EN, M>(
-    mut self,
-    addr: &str,
-    hr: HttpRouter<DA, EN, ER, M, LocalStream<EX, TCX>>,
-  ) -> Result<(), ER>
-  where
-    DA: Send,
-    EC: Send,
-    EN: EndpointNode<DA, ER, LocalStream<EX, TCX>> + Send + Sync + 'static,
-    ER: Send,
-    EX: Send,
-    M: Middleware<DA, ER> + Send + Sync + 'static,
-    M::Aux: Send,
-    RC: Send,
-    RNG: Send,
-    TCX: Send + Sync,
-  {
-    use crate::collections::VectorUsize;
-    use alloc::string::String;
-
-    let runtimes = if let Some(elem) = self.local_runtimes {
-      elem.get()
-    } else {
-      std::thread::available_parallelism().map_err(crate::Error::from)?.get()
-    };
-    let http_router = Arc::new(hr);
-    let mut join_handles = VectorUsize::<std::thread::JoinHandle<Result<(), ER>>>::new();
-    for _ in 0..runtimes {
-      let thread_data = self.data.clone();
-      let thread_error_cb = self.error_cb.clone();
-      let thread_executor = self.executor.clone();
-      let thread_hrc = self.hrc;
-      let thread_http_router = http_router.clone();
-      let thread_local_runtime_cb = self.local_runtime_cb.clone();
-      let mut thread_rng = RNG::from_crypto_rng(&mut self.rng)?;
-      let thread_tcp_params = self.tcp_params;
-      let thread_tls_config = self.tls_config.clone();
-      let thread_uri = Uri::new(String::from(addr));
-      join_handles.push(std::thread::spawn(move || {
-        let lc = Arc::new(thread_local_runtime_cb()?);
-        lc.block_on(async {
-          let hostname = thread_uri.hostname_with_implied_port();
-          let listener = EX::TcpListener::bind(hostname, thread_tcp_params).await?;
-          let xorshift = &mut Xorshift64::from_simple_seed()?;
-          loop {
-            let cp = match conn_params(
-              (&thread_data, &thread_error_cb, &thread_executor, thread_hrc),
-              (&mut thread_rng, thread_tcp_params, &thread_tls_config),
-              (&thread_http_router, &listener, xorshift),
-            )
-            .await
-            {
-              Ok(elem) => elem,
-              Err(err) => {
-                on_accept_error(&thread_error_cb, err).await;
-                continue;
-              }
-            };
-            let conn_runtime = lc.clone();
-            let _conn_jh = thread_executor.spawn_local(
-              async move {
-                let fut = http2::<EX, _, _>(cp.hrc, cp.rng, cp.stream, cp.tls_config, cp.xorshift);
-                let (frame_reader, http2, ip) = match fut.await {
-                  Err(err) => {
-                    (cp.error_cb)(err.into());
-                    return;
-                  }
-                  Ok(elem) => elem,
-                };
-                let _frame_reader_jh = cp.executor.spawn_local(frame_reader, &conn_runtime);
-                loop {
-                  let (server_stream, headers_aux, opt) = match conn_rslt::<ER, EX, TCX>(
-                    http2
-                      .stream(|req, _| stream_cb::<_, _, _, EX, _, _>(&cp.http_router, req))
-                      .await,
-                  ) {
-                    Ok(Some(el)) => el,
-                    Ok(None) => break,
-                    Err(err) => {
-                      http2.send_go_away(Http2ErrorCode::NoError).await;
-                      (cp.error_cb)(err);
-                      break;
-                    }
-                  };
-                  let stream_data = cp.data.clone();
-                  let stream_error_cb = cp.error_cb.clone();
-                  let stream_http_router = cp.http_router.clone();
-                  let _stream_jh = cp.executor.spawn_local(
-                    stream_fut::<DA, EC, EN, ER, EX, M, TCX>(
-                      headers_aux,
-                      ip,
-                      opt,
-                      server_stream,
-                      stream_data,
-                      stream_error_cb,
-                      stream_http_router,
-                    ),
-                    &conn_runtime,
-                  );
-                }
-              },
-              &lc,
-            );
-          }
-        })
-      }))?;
-    }
-    for join_handle in join_handles {
-      join_handle.join().map_err(crate::Error::from)??;
-    }
-    Ok(())
+  /// What one runtime thread serves.
+  struct ThreadServer<DA, EC, EN, ER, M, RNG, TCX> {
+    data: DA,
+    error_cb: EC,
+    hrc: HttpRecvParams,
+    http_router: Arc<HttpRouter<DA, EN, ER, M, ServerStream>>,
+    rng: RNG,
+    tcp_params: TcpParams,
+    tls_config: Arc<TlsConfig<TCX>>,
   }
 
-  /// Starts the server handling all connections on the current thread.
-  ///
-  /// You must call this method from within an existing async environment.
-  #[inline]
-  pub async fn run_local<EN, M>(
-    mut self,
-    addr: &str,
-    hr: HttpRouter<DA, EN, ER, M, LocalStream<EX, TCX>>,
-    lc: Arc<EX::LocalRuntime>,
-  ) -> Result<(), ER>
+  impl<DA, EC, EN, ER, M, RNG, TCX> ThreadServer<DA, EC, EN, ER, M, RNG, TCX>
   where
-    EN: EndpointNode<DA, ER, LocalStream<EX, TCX>> + 'static,
+    DA: Clone + 'static,
+    EC: Clone + Fn(ER) + 'static,
+    EN: EndpointNode<DA, ER, ServerStream> + 'static,
+    ER: From<crate::Error> + 'static,
     M: Middleware<DA, ER> + 'static,
+    RNG: CryptoRng + CryptoSeedableRng + 'static,
+    TCX: TlsCtxSk + 'static,
   {
-    let http_router = Arc::new(hr);
-    let uri = Uri::new(addr);
-    let listener = EX::TcpListener::bind(uri.hostname_with_implied_port(), self.tcp_params).await?;
-    let xorshift = &mut Xorshift64::from_simple_seed()?;
-    loop {
-      let cp = match conn_params(
-        (&self.data, &self.error_cb, &self.executor, self.hrc),
-        (&mut self.rng, self.tcp_params, &self.tls_config),
-        (&http_router, &listener, xorshift),
-      )
-      .await
-      {
-        Ok(elem) => elem,
-        Err(err) => {
-          on_accept_error(&self.error_cb, err).await;
-          continue;
-        }
-      };
-      let conn_lc = lc.clone();
-      let _conn_jh = self.executor.spawn_local(
-        async move {
-          let fut = http2::<EX, _, _>(cp.hrc, cp.rng, cp.stream, cp.tls_config, cp.xorshift);
-          let (frame_reader, http2, ip) = match fut.await {
-            Err(err) => {
-              (cp.error_cb)(err.into());
-              return;
-            }
-            Ok(elem) => elem,
-          };
-          let _frame_reader_jh = cp.executor.spawn_local(frame_reader, &conn_lc);
-          loop {
-            let (server_stream, headers_aux, opt) = match conn_rslt::<ER, EX, TCX>(
-              http2.stream(|req, _| stream_cb::<_, _, _, EX, _, _>(&cp.http_router, req)).await,
-            ) {
-              Ok(Some(el)) => el,
-              Ok(None) => break,
-              Err(err) => {
-                http2.send_go_away(Http2ErrorCode::NoError).await;
-                (cp.error_cb)(err);
-                break;
-              }
-            };
-            let stream_data = cp.data.clone();
-            let stream_error_cb = cp.error_cb.clone();
-            let stream_http_router = cp.http_router.clone();
-            let _stream_jh = cp.executor.spawn_local(
-              stream_fut::<DA, EC, EN, ER, EX, M, TCX>(
-                headers_aux,
-                ip,
-                opt,
-                server_stream,
-                stream_data,
-                stream_error_cb,
-                stream_http_router,
-              ),
-              &conn_lc,
-            );
-          }
-        },
-        &*lc,
-      );
-    }
-  }
-}
-
-struct ConnParams<DA, EC, EN, ER, EX, M, RNG, TCX>
-where
-  EX: Executor,
-{
-  data: DA,
-  error_cb: EC,
-  executor: EX,
-  hrc: HttpRecvParams,
-  http_router: Arc<HttpRouter<DA, EN, ER, M, LocalStream<EX, TCX>>>,
-  rng: RNG,
-  stream: EX::TcpStream,
-  tls_config: Arc<TlsConfig<TCX>>,
-  xorshift: Xorshift64,
-}
-
-#[inline]
-async fn conn_params<DA, EC, EN, ER, EX, M, RNG, TCX>(
-  (data, error_cb, executor, hrc): (&DA, &EC, &EX, HttpRecvParams),
-  (rng, tcp_params, tls_config): (&mut RNG, TcpParams, &Arc<TlsConfig<TCX>>),
-  (http_router, listener, xorshift): (
-    &Arc<HttpRouter<DA, EN, ER, M, LocalStream<EX, TCX>>>,
-    &EX::TcpListener,
-    &mut Xorshift64,
-  ),
-) -> crate::Result<ConnParams<DA, EC, EN, ER, EX, M, RNG, TCX>>
-where
-  EC: Clone,
-  DA: Clone,
-  EX: Clone + Executor,
-  RNG: CryptoRng + CryptoSeedableRng,
-  TCX: TlsCtx,
-{
-  Ok(ConnParams {
-    data: data.clone(),
-    error_cb: error_cb.clone(),
-    executor: executor.clone(),
-    hrc,
-    http_router: http_router.clone(),
-    rng: RNG::from_crypto_rng(rng)?,
-    stream: listener.accept(tcp_params).await?.0,
-    tls_config: tls_config.clone(),
-    xorshift: Xorshift64::from_rng(xorshift)?,
-  })
-}
-
-#[inline]
-fn conn_rslt<ER, EX, TCX>(
-  rslt: crate::Result<ConnRsltTy<EX, TCX, ER>>,
-) -> Result<
-  Option<(LocalStream<EX, TCX>, ArrayVectorCopy<RouteMatch, 4>, Option<MsgBufferString>)>,
-  ER,
->
-where
-  ER: From<crate::Error>,
-  EX: Executor,
-  TCX: TlsCtx,
-{
-  if let Some((server_stream, local_rslt)) = rslt.map_err(ER::from)? {
-    let (headers_aux, opt) = local_rslt?;
-    Ok(Some((server_stream, headers_aux, opt)))
-  } else {
-    Ok(None)
-  }
-}
-
-#[inline]
-async fn http2<EX, RNG, TCX>(
-  hrc: HttpRecvParams,
-  mut rng: RNG,
-  stream: EX::TcpStream,
-  tls_config: Arc<TlsConfig<TCX>>,
-  mut xorshift: Xorshift64,
-) -> crate::Result<(impl Future<Output = ()>, Http2<WriteHalf<EX>, TCX, false>, IpAddr)>
-where
-  EX: Executor,
-  RNG: CryptoRng,
-  TCX: TlsCtxSk,
-{
-  let ip = stream.peer_addr()?.ip();
-  let tar = TlsAcceptor::new(&*tls_config, &mut rng, stream).accept().await?;
-  let split = tar.tls_stream.into_split()?;
-  let tuple = Http2::accept(Http2Buffer::new(&mut xorshift), hrc, split).await?;
-  Ok((tuple.0, tuple.1, ip))
-}
-
-#[inline]
-fn log_req(_peer: &IpAddr, _req: &Request<MsgBufferString>) {
-  let _method = _req.method.strings().custom[0];
-  let _path = _req.msg_data.uri.path();
-  _debug!(r#"{_peer} "{_method} {_path}""#,);
-}
-
-#[expect(clippy::needless_pass_by_value, reason = "doesn't matter")]
-#[inline]
-fn stream_cb<DA, EN, ER, EX, M, TCX>(
-  http_router: &HttpRouter<DA, EN, ER, M, LocalStream<EX, TCX>>,
-  req: Request<&mut MsgBufferString>,
-) -> Result<(ArrayVectorCopy<RouteMatch, 4>, Option<MsgBufferString>), ER>
-where
-  ER: From<crate::Error>,
-  EX: Executor,
-{
-  let rslt = *http_router.router.find(req.msg_data.uri.path())?.data();
-  Ok(match rslt.1 {
-    OperationMode::Auto => (rslt.0, None),
-    OperationMode::Manual => (rslt.0, Some(mem::take(req.msg_data))),
-  })
-}
-
-#[inline]
-async fn stream_fut<DA, EC, EN, ER, EX, M, TCX>(
-  headers_aux: ArrayVectorCopy<RouteMatch, 4>,
-  ip: IpAddr,
-  opt: Option<MsgBufferString>,
-  mut server_stream: LocalStream<EX, TCX>,
-  stream_data: DA,
-  stream_error_cb: EC,
-  stream_http_router: Arc<HttpRouter<DA, EN, ER, M, LocalStream<EX, TCX>>>,
-) where
-  EC: Fn(ER),
-  EN: EndpointNode<DA, ER, LocalStream<EX, TCX>>,
-  ER: From<crate::Error>,
-  EX: Executor,
-  M: Middleware<DA, ER>,
-  TCX: TlsCtx,
-{
-  let stream_fun = async {
-    if let Some(local_rrb) = opt {
-      let req = Request::new(server_stream.method(), local_rrb);
-      log_req(&ip, &req);
-      let manual_stream = ManualStream {
-        data: stream_data,
-        peer: ip,
-        protocol: server_stream.protocol(),
-        req,
-        stream: server_stream.clone(),
-      };
-      stream_http_router.en.manual(manual_stream, (0, &headers_aux)).await?;
-      return Ok(());
-    }
-    let (hrs, local_rrb) = server_stream.recv_req().await?;
-    if let Http2RecvStatus::ClosedConnection | Http2RecvStatus::ClosedStream(_) = hrs {
-      return Ok(());
-    }
-    let req = local_rrb.into_request(server_stream.method());
-    log_req(&ip, &req);
-    let mut auto_stream = AutoStream::new(stream_data, ip, server_stream.protocol(), req);
-    let status = stream_http_router.auto(&mut auto_stream, (0, &headers_aux)).await?;
-    let enc_buffer = mem::take(&mut auto_stream.req.msg_data.uri).into_inner();
-    let _ = server_stream
-      .send_res(
-        &mut enc_buffer.into_bytes().try_into()?,
-        Response::new(auto_stream.req.msg_data, status),
+    async fn serve(mut self, addr: &str, runtime: Arc<UringRuntime>) -> Result<(), ER> {
+      let uri = Uri::new(addr);
+      let executor = UringExecutor::default();
+      let listener = <UringExecutor as crate::executor::Executor>::TcpListener::bind(
+        uri.hostname_with_implied_port(),
+        self.tcp_params,
       )
       .await?;
-    Ok::<_, ER>(())
-  };
-  let stream_fun_rslt = stream_fun.await;
-  let _rslt = server_stream.common().clear().await;
-  if let Err(err) = stream_fun_rslt {
-    stream_error_cb(err);
+      let mut xorshift = Xorshift64::from_simple_seed()?;
+      loop {
+        let (stream, peer) = match listener.accept(self.tcp_params).await {
+          Ok(elem) => elem,
+          Err(err) => {
+            on_accept_error(&self.error_cb, err).await;
+            continue;
+          }
+        };
+        let conn = ConnTask {
+          dispatcher: FwDispatcher {
+            data: self.data.clone(),
+            error_cb: self.error_cb.clone(),
+            peer: peer_ip(peer),
+            router: self.http_router.clone(),
+            runtime: runtime.clone(),
+          },
+          hrc: self.hrc,
+          rng: RNG::from_crypto_rng(&mut self.rng)?,
+          tls_config: self.tls_config.clone(),
+          xorshift: Xorshift64::from_rng(&mut xorshift)?,
+        };
+        let _jh = executor.spawn_local(conn.run(stream), &runtime);
+      }
+    }
+  }
+
+  /// The accepted address, or the unspecified one where the runtime does not report it (direct
+  /// descriptors).
+  fn peer_ip(addr: SocketAddr) -> IpAddr {
+    let ip = addr.ip();
+    if ip.is_unspecified() { IpAddr::V4(Ipv4Addr::UNSPECIFIED) } else { ip }
+  }
+
+  struct ConnTask<DA, EC, EN, ER, M, RNG, TCX> {
+    dispatcher: FwDispatcher<DA, EC, EN, ER, M>,
+    hrc: HttpRecvParams,
+    rng: RNG,
+    tls_config: Arc<TlsConfig<TCX>>,
+    xorshift: Xorshift64,
+  }
+
+  impl<DA, EC, EN, ER, M, RNG, TCX> ConnTask<DA, EC, EN, ER, M, RNG, TCX>
+  where
+    DA: Clone + 'static,
+    EC: Clone + Fn(ER) + 'static,
+    EN: EndpointNode<DA, ER, ServerStream> + 'static,
+    ER: From<crate::Error> + 'static,
+    M: Middleware<DA, ER> + 'static,
+    RNG: CryptoRng,
+    TCX: TlsCtxSk,
+  {
+    async fn run(mut self, stream: crate::executor::UringTcpStream) {
+      let error_cb = self.dispatcher.error_cb.clone();
+      let rslt = async {
+        // The stream is never split, so the kernel TLS switch can run once the handshake ends.
+        let accepted = TlsAcceptor::new(&*self.tls_config, &mut self.rng, stream).accept().await?;
+        let mut tls_stream = accepted.tls_stream;
+        let conn = Http2Conn::<false>::new(self.hrc, &mut self.xorshift);
+        let peer = self.dispatcher.peer;
+        drive_conn(&mut tls_stream, conn, &self.dispatcher, peer).await
+      }
+      .await;
+      if let Err(err) = rslt {
+        error_cb(err.into());
+      }
+    }
+  }
+
+  /// Routes the requests of one connection through the framework's router.
+  struct FwDispatcher<DA, EC, EN, ER, M> {
+    data: DA,
+    error_cb: EC,
+    peer: IpAddr,
+    router: Arc<HttpRouter<DA, EN, ER, M, ServerStream>>,
+    runtime: Arc<UringRuntime>,
+  }
+
+  impl<DA, EC, EN, ER, M> StreamDispatcher for FwDispatcher<DA, EC, EN, ER, M>
+  where
+    DA: Clone + 'static,
+    EC: Clone + Fn(ER) + 'static,
+    EN: EndpointNode<DA, ER, ServerStream> + 'static,
+    ER: From<crate::Error> + 'static,
+    M: Middleware<DA, ER> + 'static,
+  {
+    type AutoFut = impl Future<Output = (Request<MsgBufferString>, crate::Result<StatusCode>)>;
+
+    fn auto(&self, req: Request<MsgBufferString>, protocol: Option<Protocol>) -> Self::AutoFut {
+      let (data, error_cb, peer, router) =
+        (self.data.clone(), self.error_cb.clone(), self.peer, self.router.clone());
+      async move {
+        let Ok(found) = router.router.find(req.msg_data.uri.path()) else {
+          return (req, Ok(StatusCode::NotFound));
+        };
+        let matches = found.data().0;
+        let mut auto_stream = AutoStream::new(data, peer, protocol, req);
+        let rslt = router.auto(&mut auto_stream, (0, &matches)).await;
+        let status = match rslt {
+          Ok(elem) => Ok(elem),
+          Err(err) => {
+            error_cb(err);
+            Err(crate::Error::ClosedHttpConnection)
+          }
+        };
+        (auto_stream.req, status)
+      }
+    }
+
+    fn is_manual(&self, req: &Request<MsgBufferString>) -> bool {
+      self
+        .router
+        .router
+        .find(req.msg_data.uri.path())
+        .is_ok_and(|el| el.data().1 == OperationMode::Manual)
+    }
+
+    fn manual(&self, stream: ServerStream, req: Request<MsgBufferString>) {
+      let (data, error_cb, peer, router) =
+        (self.data.clone(), self.error_cb.clone(), self.peer, self.router.clone());
+      let fut = async move {
+        let Ok(found) = router.router.find(req.msg_data.uri.path()) else {
+          return;
+        };
+        let matches = found.data().0;
+        let protocol = stream.protocol();
+        let manual_stream = ManualStream::new(data, peer, protocol, req, stream);
+        if let Err(err) = router.manual(manual_stream, (0, &matches)).await {
+          error_cb(err);
+        }
+      };
+      let _jh = UringExecutor::default().spawn_local(fut, &self.runtime);
+    }
   }
 }

@@ -14,7 +14,7 @@ use rimu_ws::{
 };
 use rimu_ws_examples::{
   ROOT_CA,
-  grpc_bindings::rimu_ws::{GenericRequest, GenericResponse},
+  grpc_bindings::wtx::{GenericRequest, GenericResponse},
 };
 
 #[tokio::main]

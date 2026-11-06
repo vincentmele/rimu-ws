@@ -8,7 +8,7 @@ extern crate rimu_ws_examples;
 use std::borrow::Cow;
 use rimu_ws::{
   codec::format::QuickProtobuf,
-  executor::TokioExecutor,
+  executor::UringExecutor,
   grpc::{GrpcManager, GrpcMiddleware},
   http::{
     StatusCode,
@@ -19,7 +19,7 @@ use rimu_ws::{
 };
 use rimu_ws_examples::{
   PUBLIC_KEY, SECRET_KEY,
-  grpc_bindings::rimu_ws::{GenericRequest, GenericResponse},
+  grpc_bindings::wtx::{GenericRequest, GenericResponse},
   host_from_args,
 };
 
@@ -27,10 +27,10 @@ fn main() -> rimu_ws::Result<()> {
   let rng = ChaCha20::from_std_random()?;
   let tls_config = TlsConfig::from_keys_pem(PUBLIC_KEY, SECRET_KEY)?;
   let router = HttpRouter::new(
-    rimu_ws::paths!(("wtx.GenericService/generic_method", post(wtx_generic_service_generic_method))),
+    rimu_ws::paths!(("/wtx.GenericService/generic_method", post(wtx_generic_service_generic_method))),
     GrpcMiddleware,
   )?;
-  Http2ServerFramework::new(TokioExecutor::default(), rng, tls_config)?
+  Http2ServerFramework::new(UringExecutor::default(), rng, tls_config)?
     .set_data(GrpcManager::from_drsr(QuickProtobuf))
     .set_error_cb(|err| eprintln!("Error: {err}"))
     .run_in_threads(&host_from_args(), router)

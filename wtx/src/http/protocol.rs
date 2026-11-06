@@ -10,12 +10,13 @@ create_enum! {
 }
 
 impl Protocol {
-  /// A specialized `TryFrom` for the HTTP/2 wire protocol
+  /// A specialized `TryFrom` for the HTTP/2 wire protocol. RFC 8441 registers `websocket`; the
+  /// match ignores case.
   #[inline]
   pub fn from_canonical_bytes(bytes: &[u8]) -> crate::Result<Self> {
-    Ok(match bytes {
-      b"WEBSOCKET" => Self::WebSocket,
-      _ => return Err(HttpError::UnexpectedProtocol.into()),
-    })
+    if bytes.eq_ignore_ascii_case(b"websocket") {
+      return Ok(Self::WebSocket);
+    }
+    Err(HttpError::UnexpectedProtocol.into())
   }
 }

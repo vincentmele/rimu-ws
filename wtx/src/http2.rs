@@ -36,7 +36,7 @@ mod misc;
 mod ping_frame;
 mod process_receipt_frame_ty;
 mod reset_stream_frame;
-mod server_stream;
+pub(crate) mod server_stream;
 mod settings_frame;
 mod stream_receiver;
 mod stream_state;
@@ -50,7 +50,7 @@ mod write_functions;
 
 use crate::{
   collections::SingleTypeStorage,
-  http::{DEFAULT_INITIAL_WINDOW_LEN, HttpRecvParams, MsgBufferString, Protocol, Request, U31},
+  http::{DEFAULT_INITIAL_WINDOW_LEN, HttpRecvParams, U31},
   http2::settings_frame::SettingsFrame,
   misc::{Lease, LeaseMut, Usize},
   net::{ConnectionState, StreamReader, StreamWriter},
@@ -61,12 +61,7 @@ use crate::{
 };
 pub use client_stream::ClientStream;
 pub use common_stream::CommonStream;
-use core::{
-  future::poll_fn,
-  mem,
-  pin::pin,
-  task::{Poll, Waker},
-};
+use core::{mem, task::Waker};
 use hashbrown::HashMap;
 pub use http2_buffer::Http2Buffer;
 pub use http2_data::Http2Data;
@@ -162,90 +157,6 @@ where
       frame_reader::frame_reader(inner.clone(), max_frame_len, nrb, stream_bridge, stream_reader),
       Self { inner },
     ))
-  }
-}
-
-impl<SW, TCX> Http2<SW, TCX, false>
-where
-  SW: StreamWriter,
-  TCX: TlsCtx,
-{
-  /// Accepts an initial connection sending the local parameters to the remote peer.
-  #[inline]
-  pub async fn accept<SR>(
-    mut hb: Http2Buffer,
-    hrp: HttpRecvParams,
-    (stream_bridge, mut stream_reader, mut stream_writer): (
-      TlsStreamBridge<false>,
-      TlsStreamReader<SR, TCX, false>,
-      TlsStreamWriter<SW, TCX, false>,
-    ),
-  ) -> crate::Result<(impl Future<Output = ()>, Self)>
-  where
-    SR: StreamReader,
-  {
-    hb.clear();
-    let mut buffer = [0; PREFACE.len()];
-    let _read = stream_reader.read(buffer.as_mut_slice().into()).await?;
-    if buffer != PREFACE {
-      let _rslt = stream_writer
-        .write_all(
-          &go_away_frame::GoAwayFrame::new(Http2ErrorCode::ProtocolError, U31::ZERO).bytes(),
-        )
-        .await;
-      return Err(misc::protocol_err(Http2Error::NoPreface));
-    }
-    Self::manage_initial_params::<_, false>(hb, hrp, stream_bridge, stream_reader, stream_writer)
-      .await
-  }
-
-  /// Awaits for an initial header to create a stream.
-  ///
-  /// Returns [`None`] if the network connection has been closed, either locally or externally.
-  #[inline]
-  pub async fn stream<T>(
-    &self,
-    mut cb: impl FnMut(Request<&mut MsgBufferString>, Option<Protocol>) -> T,
-  ) -> crate::Result<Option<(ServerStream<SW, TCX>, T)>> {
-    let Self { inner } = self;
-    let mut is_registered = false;
-    let mut lock_pin = pin!(inner.hd.lock());
-    poll_fn(|cx| {
-      let mut guard = lock_pin!(cx, inner.hd, lock_pin);
-      let hdpm = guard.parts_mut();
-      let linger = hdpm.hp.linger();
-      if misc::connection_state(&inner.is_conn_open.connection_state).is_full_close() {
-        misc::frame_reader_rslt(hdpm.frame_reader_error)?;
-        return Poll::Ready(Ok(None));
-      }
-      let Some(lss) = hdpm.hb.initial_server_streams_remote.pop_front() else {
-        if is_registered {
-          misc::frame_reader_rslt(hdpm.frame_reader_error)?;
-          return Poll::Ready(Ok(None));
-        }
-        hdpm.hb.initial_server_streams_local.push_back(cx.waker().clone())?;
-        is_registered = true;
-        return Poll::Pending;
-      };
-      let Some(sorp) = hdpm.hb.sorps.get_mut(&lss.stream_id) else {
-        // For example, GO_AWAY was sent before receiving a new stream
-        misc::frame_reader_rslt(hdpm.frame_reader_error)?;
-        return Poll::Ready(Ok(None));
-      };
-      let (method, protocol, stream_id) = (lss.method, lss.protocol, lss.stream_id);
-      Poll::Ready(Ok(Some((
-        ServerStream::new(
-          inner.clone(),
-          linger,
-          method,
-          protocol,
-          _trace_span!("New server stream", stream_id = %stream_id),
-          stream_id,
-        ),
-        cb(Request::new(method, &mut sorp.msg_buffer), protocol),
-      ))))
-    })
-    .await
   }
 }
 

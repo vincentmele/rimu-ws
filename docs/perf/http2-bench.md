@@ -82,3 +82,22 @@ Notes:
   `arena-h2` with the 50 ms linger on): curl, nghttp and Go `net/http` all pass, over both h2c
   and TLS. The curl failure the audit saw needs linger off, which `arena-h2` has no switch for.
 - **Negative check:** against a closed port, every client's check fails.
+
+## After Task 9 (new batch driver, `ARENA_PARAMS=permissive`), 6 Nov 2026
+
+| profile | conns | best rps | old driver | h2load CPU % | server user cycles/req |
+|---|---|---|---|---|---|
+| baseline-h2c | 256 | 5,010k | 1,905k | 92.5 | 6,972 |
+| baseline-h2c | 1024 | 4,533k | 1,822k | 91.2 | 8,216 |
+| baseline-h2 (TLS, kTLS) | 256 | 4,616k | 1,738k | 93.7 | 7,098 |
+| json-h2c | 1024 | 542k | 582k | 25.1 | 71,998 |
+
+- **Baseline:** h2load is near its ceiling on colossus here; plod measured 5.1–5.4M under the same
+  load.
+- **json-h2c:** the handler path dominates it (about 72k user cycles per request), not the driver.
+  That is the next target.
+- **Panic isolation** (`catch_unwind` per handler poll): about 7,000 user cycles per request with
+  and without it. No measurable cost.
+- **Conformance:** h2spec (without `--max-header-length 800`) passes 139/139 in plaintext and over
+  TLS.
+- **Interop:** curl, nghttp and Go `net/http` all pass, over h2c and TLS.

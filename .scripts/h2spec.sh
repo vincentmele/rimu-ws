@@ -33,7 +33,7 @@ if [ "$TY" != "high" ]; then
 fi;
 
 cargo build --bin "h2spec-$TY" --features h2spec-$TY --release
-cargo run --bin "h2spec-$TY" --features h2spec-$TY --release &> "$OUT/h2spec.txt" &
+H2SPEC_TLS=$([ -n "$TLS" ] && echo 1 || echo 0) cargo run --bin "h2spec-$TY" --features h2spec-$TY --release &> "$OUT/h2spec.txt" &
 sleep 1
 
 $CONTAINER run \
@@ -41,7 +41,7 @@ $CONTAINER run \
 	--name h2spec \
 	--network host \
 	--rm \
-	docker.io/summerwind/h2spec:2.6.0 h2spec -j "/tmp/h2spec.xml" --max-header-length 800 -p 9000 $TLS -v \
+	docker.io/summerwind/h2spec:2.6.0 h2spec -j "/tmp/h2spec.xml" -p 9000 $TLS -v \
 		generic/1 \
 		generic/2 \
 		generic/3.1 \

@@ -1,7 +1,7 @@
 //! Different types of redirects.
 
 use rimu_ws::{
-  executor::TokioExecutor,
+  executor::UringExecutor,
   http::{
     StatusCode,
     http2_server_framework::{Http2ServerFramework, HttpRouter, Redirect, StateClean, get},
@@ -16,7 +16,7 @@ fn main() -> rimu_ws::Result<()> {
   let tls_config = TlsConfig::from_keys_pem(PUBLIC_KEY, SECRET_KEY)?;
   let router =
     HttpRouter::paths(rimu_ws::paths!(("/permanent", get(permanent)), ("/temporary", get(temporary))))?;
-  Http2ServerFramework::new(TokioExecutor::default(), rng, tls_config)?
+  Http2ServerFramework::new(UringExecutor::default(), rng, tls_config)?
     .set_error_cb(|err| eprintln!("Error: {err}"))
     .run_in_threads(&host_from_args(), router)
 }

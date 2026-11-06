@@ -1,54 +1,43 @@
-//! h2spec
+//! h2spec target: the HTTP/2 server framework on io_uring, port 9000. `H2SPEC_TLS=1` serves TLS
+//! with the repository's test certificate.
 
 #![expect(clippy::print_stderr, reason = "internal")]
 
-use core::mem;
-use tokio::net::TcpListener;
 use rimu_ws::{
-  collections::VectorUsize,
-  http::{HttpRecvParams, Response, StatusCode},
-  http2::{Http2, Http2Buffer, Http2ErrorCode, Http2RecvStatus},
-  net::Stream,
-  rng::{ChaCha20, CryptoSeedableRng, Xorshift64},
-  tls::{TlsAcceptor, TlsConfig},
+  executor::UringExecutor,
+  http::{
+    HttpRecvParams, StatusCode,
+    http2_server_framework::{Http2ServerFramework, HttpRouter, StateClean, VerbatimParams, get},
+  },
+  rng::{ChaCha20, CryptoSeedableRng as _},
+  tls::TlsConfig,
 };
 
-#[tokio::main]
-async fn main() -> rimu_ws::Result<()> {
-  let listener = TcpListener::bind("127.0.0.1:9000").await?;
-  loop {
-    let (stream, _) = listener.accept().await?;
-    let _conn_jh = tokio::spawn(async move {
-      let fun = async {
-        let rng = &mut ChaCha20::from_std_random().unwrap();
-        let http2_params = HttpRecvParams::with_default_params();
-        let http2_buffer = Http2Buffer::new(&mut Xorshift64::from_std_random()?);
-        let tls_stream =
-          TlsAcceptor::new(&TlsConfig::plaintext(), rng, stream).accept().await.unwrap().tls_stream;
-        let http2 = Http2::accept(http2_buffer, http2_params, tls_stream.into_split()?).await?;
-        let (frame_reader, http2) = http2;
-        let _frame_reader_jh = tokio::spawn(frame_reader);
-        loop {
-          let stream = match http2.stream(|req, _| mem::take(&mut req.msg_data.headers)).await? {
-            None => return rimu_ws::Result::Ok(()),
-            Some(elem) => elem,
-          };
-          let (mut http2_stream, headers) = stream;
-          let _stream_jh = tokio::spawn(async move {
-            let (hrs, _) = http2_stream.recv_req().await?;
-            if let Http2RecvStatus::ClosedConnection | Http2RecvStatus::ClosedStream(_) = hrs {
-              return Ok(());
-            }
-            let res = Response::new(("Hello", &headers), StatusCode::Ok);
-            let _ = http2_stream.send_res(&mut VectorUsize::new(), res).await?;
-            http2_stream.common().send_reset(Http2ErrorCode::NoError).await;
-            rimu_ws::Result::Ok(())
-          });
-        }
-      };
-      if let Err(err) = fun.await {
-        eprint!("{err}");
-      }
-    });
+const PUBLIC_KEY: &[u8] = include_bytes!("../../../.certs/cert.pem");
+const SECRET_KEY: &[u8] = include_bytes!("../../../.certs/key.pem");
+
+fn main() -> rimu_ws::Result<()> {
+  let tls = std::env::var("H2SPEC_TLS").is_ok_and(|el| el == "1");
+  macro_rules! run {
+    ($tls_config:expr) => {
+      Http2ServerFramework::<(), fn(rimu_ws::Error), UringExecutor, _, _, _>::new(
+        UringExecutor::default(),
+        ChaCha20::from_std_random()?,
+        $tls_config,
+      )?
+      .set_error_cb((|err: rimu_ws::Error| eprintln!("{err}")) as fn(rimu_ws::Error))
+      .set_http_recv_params(HttpRecvParams::with_default_params())
+      .set_local_runtimes(core::num::NonZeroUsize::new(1))
+      .run_in_threads(
+        "127.0.0.1:9000",
+        HttpRouter::paths(rimu_ws::paths!(("/", get(hello))))?,
+      )
+    };
   }
+  if tls { run!(TlsConfig::from_keys_pem(PUBLIC_KEY, SECRET_KEY)?) } else { run!(TlsConfig::plaintext()) }
+}
+
+async fn hello(state: StateClean<'_, ()>) -> rimu_ws::Result<VerbatimParams> {
+  state.req.msg_data.body.extend_from_copyable_slice(b"Hello")?;
+  Ok(VerbatimParams(StatusCode::Ok))
 }

@@ -17,7 +17,7 @@ pub(crate) mod tests;
 
 use crate::{
   collections::{ArrayVectorCopy, DequeUsize, VectorUsize},
-  http::{Header, Headers, HttpRecvParams, Method, MsgBuffer, MsgBufferString, MsgDataMut as _, StatusCode, U31},
+  http::{Header, Headers, HttpRecvParams, Protocol, Method, MsgBuffer, MsgBufferString, MsgDataMut as _, StatusCode, U31},
   http2::{
     Http2Error, Http2ErrorCode,
     common_flags::CommonFlags,
@@ -293,6 +293,16 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
   /// The request method of `stream_id` (server).
   pub(crate) fn method(&self, stream_id: U31) -> Option<Method> {
     self.streams.get(stream_id.u32())?.method
+  }
+
+  /// Whether the peer ended its side of `stream_id`; `None` when the stream is not open.
+  pub(crate) fn recv_closed(&self, stream_id: U31) -> Option<bool> {
+    self.streams.get(stream_id.u32()).map(|el| el.recv_closed)
+  }
+
+  /// The `:protocol` of `stream_id`, for an extended CONNECT (server).
+  pub(crate) fn protocol(&self, stream_id: U31) -> Option<Protocol> {
+    self.streams.get(stream_id.u32())?.protocol
   }
 
   /// The response status of `stream_id` (client).

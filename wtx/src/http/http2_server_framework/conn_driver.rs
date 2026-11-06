@@ -3,19 +3,25 @@
 //! produce leaves in one write.
 
 #[cfg(all(test, feature = "io-uring"))]
-mod tests;
+pub(crate) mod tests;
 
 use crate::{
   collections::{ArrayVectorCopy, VectorUsize},
   http::{
-    Header, KnownHeaderName, MsgBufferString, MsgDataMut as _, Request, StatusCode, U31,
+    Header, KnownHeaderName, MsgBufferString, MsgDataMut as _, Protocol, Request, StatusCode, U31,
     date_header::DateHeader,
     http2_server_framework::handler_slots::{HandlerSlots, SlotPoll},
   },
-  http2::conn::{ConnEvent, Http2Conn},
+  http2::{
+    ServerStream,
+    conn::{ConnEvent, Http2Conn},
+    server_stream::ConnShared,
+  },
   net::{StreamReader, StreamWriter, TryRead},
 };
+use alloc::rc::Rc;
 use core::{
+  cell::RefCell,
   future::poll_fn,
   mem,
   net::IpAddr,
@@ -23,7 +29,7 @@ use core::{
   task::Poll,
   time::Duration,
 };
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
 /// The read buffer grows in steps of this many bytes.
 const READ_CHUNK: usize = 16 * 1024;
@@ -34,15 +40,21 @@ pub(crate) trait StreamDispatcher {
   /// its buffers (headers and body) and the response status.
   type AutoFut: Future<Output = (Request<MsgBufferString>, crate::Result<StatusCode>)>;
 
-  /// The handler future of `req`.
-  fn auto(&self, req: Request<MsgBufferString>) -> Self::AutoFut;
+  /// The handler future of `req`, which arrived on a stream with this `:protocol`.
+  fn auto(&self, req: Request<MsgBufferString>, protocol: Option<Protocol>) -> Self::AutoFut;
+
+  /// Whether `req` (headers only, its body may still be arriving) goes to a manual-mode handler.
+  fn is_manual(&self, req: &Request<MsgBufferString>) -> bool;
+
+  /// Starts the manual-mode handler of `req` on its own task.
+  fn manual(&self, stream: ServerStream, req: Request<MsgBufferString>);
 }
 
 /// Serves one connection until it closes. `conn` has queued its opening SETTINGS; `peer` is the
 /// address `accept` returned.
 pub(crate) async fn drive_conn<S, D>(
   stream: &mut S,
-  mut conn: Http2Conn<false>,
+  conn: Http2Conn<false>,
   dispatcher: &D,
   peer: IpAddr,
 ) -> crate::Result<()>
@@ -51,17 +63,20 @@ where
   D: StreamDispatcher,
 {
   let _ = peer;
+  let shared = ConnShared::new(conn);
   let mut state = Driver {
     collecting: HashMap::new(),
+    manual: HashSet::new(),
+    shared: shared.clone(),
     date: DateHeader::new(),
     pool: VectorUsize::new(),
     rx: VectorUsize::new(),
     slots: HandlerSlots::new(),
     woken: VectorUsize::new(),
   };
-  let rslt = state.run(stream, &mut conn, dispatcher).await;
+  let rslt = state.run(stream, dispatcher).await;
   // Whatever the core queued last (a GOAWAY after an error) still goes out.
-  let _flush = write_output(stream, &mut conn).await;
+  let _flush = write_output(stream, &shared).await;
   rslt
 }
 
@@ -69,6 +84,9 @@ struct Driver<F> {
   /// Auto-mode streams whose body is still arriving, with the bytes already released.
   collecting: HashMap<u32, usize>,
   date: DateHeader,
+  /// Streams served by manual-mode handlers.
+  manual: HashSet<u32>,
+  shared: Rc<RefCell<ConnShared>>,
   /// Cleared request buffers, swapped into the core so a new stream reuses their capacity.
   pool: VectorUsize<MsgBufferString>,
   rx: VectorUsize<u8>,
@@ -80,28 +98,28 @@ impl<F> Driver<F>
 where
   F: Future<Output = (Request<MsgBufferString>, crate::Result<StatusCode>)>,
 {
-  async fn run<S, D>(
-    &mut self,
-    stream: &mut S,
-    conn: &mut Http2Conn<false>,
-    dispatcher: &D,
-  ) -> crate::Result<()>
+  async fn run<S, D>(&mut self, stream: &mut S, dispatcher: &D) -> crate::Result<()>
   where
     S: StreamReader + StreamWriter,
     D: StreamDispatcher<AutoFut = F>,
   {
+    let shared = self.shared.clone();
     loop {
       let closed = self.read_available(stream).await?;
-      if !self.rx.is_empty() {
-        let now = now();
-        let consumed = conn.feed_at(&self.rx, now)?;
-        self.consume(consumed);
+      {
+        let mut guard = shared.borrow_mut();
+        let state = &mut *guard;
+        state.dirty = false;
+        if !self.rx.is_empty() {
+          let consumed = state.conn.feed_at(&self.rx, now())?;
+          self.consume(consumed);
+        }
+        self.date.refresh();
+        self.handle_events(state, dispatcher)?;
+        self.poll_woken(&mut state.conn)?;
       }
-      self.date.refresh();
-      self.handle_events(conn, dispatcher)?;
-      self.poll_woken(conn)?;
-      write_output(stream, conn).await?;
-      if closed || conn.is_closed() {
+      write_output(stream, &shared).await?;
+      if closed || shared.borrow().conn.is_closed() {
         return Ok(());
       }
       self.wait(stream).await?;
@@ -156,20 +174,38 @@ where
     self.rx.truncate(len.wrapping_sub(consumed));
   }
 
-  fn handle_events<D>(&mut self, conn: &mut Http2Conn<false>, dispatcher: &D) -> crate::Result<()>
+  fn handle_events<D>(&mut self, state: &mut ConnShared, dispatcher: &D) -> crate::Result<()>
   where
     D: StreamDispatcher<AutoFut = F>,
   {
-    while let Some(event) = conn.poll_event() {
+    while let Some(event) = state.conn.poll_event() {
+      if let ConnEvent::Data { stream_id, .. }
+      | ConnEvent::Trailers { stream_id }
+      | ConnEvent::SendCapacity { stream_id }
+      | ConnEvent::Reset { stream_id, .. } = event
+        && self.manual.contains(&stream_id.u32())
+      {
+        if matches!(event, ConnEvent::Reset { .. }) {
+          let _ = self.manual.remove(&stream_id.u32());
+        }
+        state.wake_stream(stream_id.u32());
+        continue;
+      }
+      let conn = &mut state.conn;
       match event {
-        ConnEvent::Headers { end_stream: true, stream_id }
-        | ConnEvent::Data { end_stream: true, stream_id }
-        | ConnEvent::Trailers { stream_id } => {
+        ConnEvent::Headers { end_stream, stream_id } => {
+          if self.start_manual(state, dispatcher, stream_id)? {
+            continue;
+          }
+          if end_stream {
+            self.start(&mut state.conn, dispatcher, stream_id)?;
+          } else {
+            let _ = self.collecting.insert(stream_id.u32(), 0);
+          }
+        }
+        ConnEvent::Data { end_stream: true, stream_id } | ConnEvent::Trailers { stream_id } => {
           let _ = self.collecting.remove(&stream_id.u32());
           self.start(conn, dispatcher, stream_id)?;
-        }
-        ConnEvent::Headers { end_stream: false, stream_id } => {
-          let _ = self.collecting.insert(stream_id.u32(), 0);
         }
         ConnEvent::Data { end_stream: false, stream_id } => {
           let id = stream_id.u32();
@@ -203,13 +239,56 @@ where
     let Some(method) = conn.method(stream_id) else {
       return Ok(());
     };
+    let protocol = conn.protocol(stream_id);
     let Some(slot_msg) = conn.msg_mut(stream_id) else {
       return Ok(());
     };
     let mut msg = self.pool.pop().unwrap_or_default();
     mem::swap(slot_msg, &mut msg);
-    let idx = self.slots.insert(stream_id.u32(), dispatcher.auto(Request::new(method, msg)))?;
+    let fut = dispatcher.auto(Request::new(method, msg), protocol);
+    let idx = self.slots.insert(stream_id.u32(), fut)?;
     self.poll_slot(conn, idx)
+  }
+
+  /// Hands the stream to a manual-mode handler if its route asks for one. The request goes with
+  /// its headers; its body stays in the core for [`ServerStream::recv_data`].
+  fn start_manual<D>(
+    &mut self,
+    state: &mut ConnShared,
+    dispatcher: &D,
+    stream_id: U31,
+  ) -> crate::Result<bool>
+  where
+    D: StreamDispatcher<AutoFut = F>,
+  {
+    let conn = &mut state.conn;
+    let Some(method) = conn.method(stream_id) else {
+      return Ok(false);
+    };
+    let protocol = conn.protocol(stream_id);
+    let Some(slot_msg) = conn.msg_mut(stream_id) else {
+      return Ok(false);
+    };
+    let mut msg = self.pool.pop().unwrap_or_default();
+    mem::swap(slot_msg, &mut msg);
+    let req = Request::new(method, msg);
+    if !dispatcher.is_manual(&req) {
+      if let Some(slot_msg) = conn.msg_mut(stream_id) {
+        let mut msg = req.msg_data;
+        mem::swap(slot_msg, &mut msg);
+        let _ = self.pool.push(msg);
+      }
+      return Ok(false);
+    }
+    // Body bytes that arrived with the headers stay in the core, where `recv_data` finds them.
+    let mut req = req;
+    if let Some(slot_msg) = conn.msg_mut(stream_id) {
+      mem::swap(&mut slot_msg.body, &mut req.msg_data.body);
+    }
+    let _ = self.manual.insert(stream_id.u32());
+    let stream = ServerStream::new(self.shared.clone(), method, protocol, stream_id);
+    dispatcher.manual(stream, req);
+    Ok(true)
   }
 
   fn poll_woken(&mut self, conn: &mut Http2Conn<false>) -> crate::Result<()> {
@@ -280,9 +359,17 @@ where
     S: StreamReader,
   {
     let slots = &self.slots;
+    let shared = &self.shared;
     let mut readable = pin!(stream.readable());
     poll_fn(|cx| {
       slots.register_conn(cx.waker());
+      {
+        let mut state = shared.borrow_mut();
+        if state.dirty || state.conn.has_output() {
+          return Poll::Ready(Ok(()));
+        }
+        state.conn_waker = Some(cx.waker().clone());
+      }
       if slots.has_woken() {
         return Poll::Ready(Ok(()));
       }
@@ -293,21 +380,36 @@ where
 }
 
 /// Writes everything the core queued, in groups of at most 8 slices.
-async fn write_output<S>(stream: &mut S, conn: &mut Http2Conn<false>) -> crate::Result<()>
+async fn write_output<S>(stream: &mut S, shared: &RefCell<ConnShared>) -> crate::Result<()>
 where
   S: StreamWriter,
 {
-  while conn.has_output() {
-    let mut slices = ArrayVectorCopy::<&[u8], 16>::new();
-    conn.output(&mut slices);
-    let group = slices.get(..usize::from(slices.len()).min(8)).unwrap_or_default();
-    let len: usize = group.iter().map(|el| el.len()).sum();
-    if !stream.try_write_all_vectored(group)? {
-      stream.write_all_vectored(group).await?;
+  loop {
+    // The slices borrow the core; a write that must wait copies them out first, so no borrow is
+    // held across the await.
+    let written = {
+      let mut guard = shared.borrow_mut();
+      if !guard.conn.has_output() {
+        return Ok(());
+      }
+      let mut slices = ArrayVectorCopy::<&[u8], 16>::new();
+      guard.conn.output(&mut slices);
+      let group = slices.get(..usize::from(slices.len()).min(8)).unwrap_or_default();
+      let len: usize = group.iter().map(|el| el.len()).sum();
+      if stream.try_write_all_vectored(group)? {
+        guard.conn.advance_output(len);
+        None
+      } else {
+        let mut copy = VectorUsize::with_capacity(len)?;
+        let _ = copy.extend_from_copyable_slices(group.iter().copied())?;
+        Some((copy, len))
+      }
+    };
+    if let Some((copy, len)) = written {
+      stream.write_all(&copy).await?;
+      shared.borrow_mut().conn.advance_output(len);
     }
-    conn.advance_output(len);
   }
-  Ok(())
 }
 
 /// A forward-moving clock for the core's rate windows.

@@ -1,18 +1,19 @@
 use crate::{
   collections::VectorUsize,
-  executor::StdRuntime,
+  executor::{StdRuntime, UringExecutor},
   http::{
-    Header, Headers, HttpRecvParams, MsgBufferString, MsgData, MsgDataMut, ReqBuilder, Request,
-    StatusCode,
+    Header, Headers, HttpRecvParams, MsgBufferString, MsgData, MsgDataMut, ReqBuilder, StatusCode,
+    http2_server_framework::{Http2ServerFramework, HttpRouter, State, VerbatimParams, get},
   },
   http2::{Http2, Http2Buffer, Http2ErrorCode},
-  net::{Stream as _, UriRef, UriString},
+  net::{Stream as _, TcpParams, UriRef, UriString},
   rng::{ChaCha20, CryptoSeedableRng, SeedableRng, Xorshift64},
   tests::_uri,
-  tls::{PlaintextCtx, TlsAcceptor, TlsConfig, TlsConnectorBuilder},
+  tls::{PlaintextCtx, TlsConfig, TlsConnectorBuilder},
 };
-use core::time::Duration;
-use std::net::{TcpListener, TcpStream};
+use alloc::string::{String, ToString as _};
+use core::{num::NonZeroUsize, time::Duration};
+use std::net::TcpStream;
 
 // FIXME(MIRI): socket support
 #[cfg_attr(miri, ignore)]
@@ -71,55 +72,36 @@ async fn client(uri: &UriString, runtime: &StdRuntime) {
   crate::futures::Sleep::new(Duration::from_millis(100)).unwrap().await.unwrap();
 }
 
-fn server(uri: &UriString, runtime: &StdRuntime) {
-  let listener = TcpListener::bind(uri.hostname_with_implied_port()).unwrap();
-  let runtime_fut = runtime.clone();
-  let _server_jh = runtime
-    .spawn(async move {
-      let (stream, _) = listener.accept().unwrap();
-      let tls_stream =
-        TlsAcceptor::new(&TlsConfig::plaintext(), ChaCha20::from_std_random().unwrap(), stream)
-          .accept()
-          .await
-          .unwrap()
-          .tls_stream;
-      let (frame_header, mut http2) = Http2::accept(
-        Http2Buffer::new(&mut Xorshift64::from_simple_seed().unwrap()),
-        HttpRecvParams::with_optioned_params(),
-        tls_stream.into_split().unwrap(),
-      )
-      .await
-      .unwrap();
-      let _jh = runtime_fut.spawn(frame_header);
-      stream_server(&mut http2, |req| {
-        _0(req.msg_data.body(), req.msg_data.headers());
-      })
-      .await;
-      stream_server(&mut http2, |req| {
-        _1(req.msg_data.body(), req.msg_data.headers());
-      })
-      .await;
-      stream_server(&mut http2, |req| {
-        _2(req.msg_data.body(), req.msg_data.headers());
-      })
-      .await;
-      stream_server(&mut http2, |req| {
-        _3(req.msg_data.body(), req.msg_data.headers());
-      })
-      .await;
-    })
+/// The framework on an io_uring runtime in its own thread, echoing each request's headers and
+/// body.
+fn server(uri: &UriString, _runtime: &StdRuntime) {
+  async fn echo(_: State<'_, ()>) -> crate::Result<VerbatimParams> {
+    Ok(VerbatimParams(StatusCode::Ok))
+  }
+  let addr = String::from(uri.hostname_with_implied_port().0) + ":"
+    + &uri.port().unwrap_or(80).to_string();
+  let server_addr = addr.clone();
+  let _jh = std::thread::spawn(move || {
+    let router = HttpRouter::paths(crate::paths!(("/", get(echo)))).unwrap();
+    Http2ServerFramework::<(), fn(crate::Error), UringExecutor, _, _, _>::new(
+      UringExecutor::default(),
+      ChaCha20::from_std_random().unwrap(),
+      TlsConfig::plaintext(),
+    )
+    .unwrap()
+    .set_http_recv_params(HttpRecvParams::with_optioned_params())
+    .set_local_runtimes(NonZeroUsize::new(1))
+    .set_tcp_params(TcpParams::default().set_reuse_port(Some(false)))
+    .run_in_threads(&server_addr, router)
     .unwrap();
-}
-
-async fn stream_server(
-  server: &mut Http2<TcpStream, PlaintextCtx, false>,
-  mut cb: impl FnMut(Request<&mut MsgBufferString>),
-) {
-  let (mut stream, _) = server.stream(|_, _| {}).await.unwrap().unwrap();
-  let (_, mut req_rrb) = stream.recv_req().await.unwrap();
-  cb(req_rrb.as_request_mut(stream.method()));
-  let _ =
-    stream.send_res(&mut VectorUsize::new(), req_rrb.as_response(StatusCode::Ok)).await.unwrap();
+  });
+  for _ in 0..200 {
+    if TcpStream::connect(&addr).is_ok() {
+      return;
+    }
+    std::thread::sleep(Duration::from_millis(10));
+  }
+  panic!("the server did not start");
 }
 
 async fn stream_client(
@@ -133,19 +115,28 @@ async fn stream_client(
   stream.recv_res().await.unwrap().1
 }
 
+// The server echoes the request's fields and body, and adds `content-length` and `date`.
+fn has_echoed_field(headers: &Headers) -> bool {
+  headers.iter().any(|el| el.name == "123" && el.value == "456")
+}
+
 #[track_caller]
 fn _0(body: &[u8], headers: &Headers) {
-  assert_eq!((body.len(), headers.bytes_len(), headers.headers_len()), (0, 0, 0));
+  assert_eq!(body.len(), 0);
+  assert!(!has_echoed_field(headers));
 }
 #[track_caller]
 fn _1(body: &[u8], headers: &Headers) {
-  assert_eq!((body.len(), headers.bytes_len(), headers.headers_len()), (0, 6 + 5, 1));
+  assert_eq!(body.len(), 0);
+  assert!(has_echoed_field(headers));
 }
 #[track_caller]
 fn _2(body: &[u8], headers: &Headers) {
-  assert_eq!((body.len(), headers.bytes_len(), headers.headers_len()), (3, 0, 0));
+  assert_eq!(body.len(), 3);
+  assert!(!has_echoed_field(headers));
 }
 #[track_caller]
 fn _3(body: &[u8], headers: &Headers) {
-  assert_eq!((body.len(), headers.bytes_len(), headers.headers_len()), (3, 6 + 5, 1));
+  assert_eq!(body.len(), 3);
+  assert!(has_echoed_field(headers));
 }
