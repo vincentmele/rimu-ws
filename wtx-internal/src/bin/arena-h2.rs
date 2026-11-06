@@ -148,10 +148,10 @@ async fn endpoint_json(
   state: State<'_, ConnAux>,
   Path(count): Path<usize>,
 ) -> rimu_ws::Result<JsonReply> {
-  let mut m: f64 = 1.0;
+  let mut m: i64 = 1;
   for (key, value) in state.req.msg_data.uri.query_params() {
     if key == "m" {
-      m = f64::from(value.parse::<i32>()?);
+      m = value.parse()?;
       break;
     }
   }
@@ -162,12 +162,13 @@ async fn endpoint_json(
 }
 
 /// `{"items":[..],"count":n}` for the first `count` items, with `total = price * quantity * m`,
-/// serialized on every request.
+/// serialized on every request. The dataset's numbers are integers (HttpArena made them so to keep
+/// float formatting out of the test) and are written as such.
 fn write_json(
   buf: &mut VectorUsize<u8>,
   dataset: &[DatasetItem],
   count: usize,
-  m: f64,
+  m: i64,
 ) -> rimu_ws::Result<()> {
   let clamped = count.min(dataset.len());
   let mut w = JsonWriter::new(buf);
@@ -180,9 +181,9 @@ fn write_json(
     w.raw(b"\",\"category\":\"")?;
     w.str_contents(&el.category)?;
     w.raw(b"\",\"price\":")?;
-    w.f64(el.price)?;
+    w.i64(el.price)?;
     w.raw(b",\"quantity\":")?;
-    w.f64(el.quantity)?;
+    w.i64(el.quantity)?;
     w.raw(if el.active { b",\"active\":true,\"tags\":[" } else { b",\"active\":false,\"tags\":[" })?;
     for (tag_idx, tag) in el.tags.iter().enumerate() {
       w.raw(if tag_idx == 0 { b"\"" } else { b",\"" })?;
@@ -190,11 +191,11 @@ fn write_json(
       w.raw(b"\"")?;
     }
     w.raw(b"],\"rating\":{\"score\":")?;
-    w.f64(el.rating.score)?;
+    w.i64(el.rating.score)?;
     w.raw(b",\"count\":")?;
     w.i64(el.rating.count)?;
     w.raw(b"},\"total\":")?;
-    w.f64(el.price * el.quantity * m)?;
+    w.i64(el.price.wrapping_mul(el.quantity).wrapping_mul(m))?;
     w.raw(b"}")?;
   }
   w.raw(b"],\"count\":")?;
@@ -215,8 +216,8 @@ struct DatasetItem {
   id: i64,
   name: String,
   category: String,
-  price: f64,
-  quantity: f64,
+  price: i64,
+  quantity: i64,
   active: bool,
   tags: ArrayVectorU8<String, 6>,
   rating: Rating,
@@ -224,7 +225,7 @@ struct DatasetItem {
 
 #[derive(serde::Deserialize)]
 struct Rating {
-  score: f64,
+  score: i64,
   count: i64,
 }
 
@@ -237,7 +238,7 @@ mod tests {
   };
 
   /// The serde form the endpoint used before `JsonWriter`; the writer must give the same bytes.
-  fn serde_json_form(dataset: &[DatasetItem], count: usize, m: f64) -> Vec<u8> {
+  fn serde_json_form(dataset: &[DatasetItem], count: usize, m: i64) -> Vec<u8> {
     let clamped = count.min(dataset.len());
     let items = dataset.iter().take(clamped).map(move |el| {
       Ok(ProcessedItem {
@@ -249,7 +250,7 @@ mod tests {
         active: el.active,
         tags: ArrayVectorU8::from_iterator(el.tags.iter().map(|tag| tag.as_str()))?,
         rating: RatingOut { score: el.rating.score, count: el.rating.count },
-        total: el.price * el.quantity * m,
+        total: el.price.wrapping_mul(el.quantity).wrapping_mul(m),
       })
     });
     let resp = JsonResponse { count: clamped, items: Wrapper(core::cell::RefCell::new(items)) };
@@ -258,7 +259,7 @@ mod tests {
 
   fn check(dataset: &[DatasetItem]) {
     for count in [0, 1, 2, 7, 50, 1000] {
-      for m in [1.0, 3.0, -2.0, 0.0] {
+      for m in [1, 3, -2, 0, i64::MAX] {
         let mut buf = VectorUsize::new();
         write_json(&mut buf, dataset, count, m).unwrap();
         assert_eq!(
@@ -283,13 +284,33 @@ mod tests {
     check(&dataset);
   }
 
+  /// The dataset's numbers are integers and stay integers: the body sizes HttpArena computes for
+  /// its seven (count, m) pairs.
+  #[test]
+  fn json_has_the_reference_sizes() {
+    let path = std::env::var("DATASET_PATH")
+      .unwrap_or_else(|_| "/mnt/nvme1tb/claude-tmp/arena-main/data/dataset.json".into());
+    let Ok(text) = std::fs::read_to_string(&path) else {
+      eprintln!("no dataset at {path}: skipped");
+      return;
+    };
+    let dataset: VectorUsize<DatasetItem> = serde_json::from_str(&text).unwrap();
+    let pairs: [(usize, i32, usize); 7] =
+      [(1, 3, 203), (5, 7, 888), (10, 2, 1695), (15, 5, 2556), (25, 4, 4190), (40, 8, 6707), (50, 6, 8397)];
+    for (count, m, len) in pairs {
+      let mut buf = VectorUsize::new();
+      write_json(&mut buf, &dataset, count, m.into()).unwrap();
+      assert_eq!(buf.len(), len, "count {count}, m {m}");
+    }
+  }
+
   #[test]
   fn json_matches_serde_with_escapes() {
-    let text = r#"[{"id":-3,"name":"a \"quoted\" \\ name\n\u0001 é 東","category":"x/y\t","price":0.1,
-      "quantity":3.0,"active":true,"tags":["","t\"",  "long tag long tag long tag long tag long"],
-      "rating":{"score":4.25,"count":-7}},
-      {"id":9007199254740993,"name":"","category":"c","price":1e21,"quantity":1e-7,"active":false,
-      "tags":[],"rating":{"score":0.0,"count":0}}]"#;
+    let text = r#"[{"id":-3,"name":"a \"quoted\" \\ name\n\u0001 é 東","category":"x/y\t","price":1,
+      "quantity":3,"active":true,"tags":["","t\"",  "long tag long tag long tag long tag long"],
+      "rating":{"score":-4,"count":-7}},
+      {"id":9007199254740993,"name":"","category":"c","price":-9223372036854775808,"quantity":9223372036854775807,"active":false,
+      "tags":[],"rating":{"score":0,"count":0}}]"#;
     let dataset: VectorUsize<DatasetItem> = serde_json::from_str(text).unwrap();
     check(&dataset);
   }
@@ -310,17 +331,17 @@ mod tests {
     id: i64,
     name: &'any str,
     category: &'any str,
-    price: f64,
-    quantity: f64,
+    price: i64,
+    quantity: i64,
     active: bool,
     tags: ArrayVectorU8<&'any str, 6>,
     rating: RatingOut,
-    total: f64,
+    total: i64,
   }
 
   #[derive(serde::Serialize)]
   struct RatingOut {
-    score: f64,
+    score: i64,
     count: i64,
   }
 }
