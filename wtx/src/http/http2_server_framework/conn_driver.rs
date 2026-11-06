@@ -39,15 +39,33 @@ pub(crate) trait StreamDispatcher {
   /// Answers a request. It owns the request and gives it back with the response written into
   /// its buffers (headers and body) and the response status.
   type AutoFut: Future<Output = (Request<MsgBufferString>, crate::Result<StatusCode>)>;
+  /// What a route lookup found, handed back to `auto` or `manual` so a path is looked up once.
+  type Matches: Copy;
 
-  /// The handler future of `req`, which arrived on a stream with this `:protocol`.
-  fn auto(&self, req: Request<MsgBufferString>, protocol: Option<Protocol>) -> Self::AutoFut;
-
-  /// Whether `req` (headers only, its body may still be arriving) goes to a manual-mode handler.
-  fn is_manual(&self, req: &Request<MsgBufferString>) -> bool;
+  /// The handler future of `req`, which arrived on a stream with this `:protocol`; `matches` is
+  /// what [`Self::route`] found for its path, `None` for no route.
+  fn auto(
+    &self,
+    req: Request<MsgBufferString>,
+    protocol: Option<Protocol>,
+    matches: Option<Self::Matches>,
+  ) -> Self::AutoFut;
 
   /// Starts the manual-mode handler of `req` on its own task.
-  fn manual(&self, stream: ServerStream, req: Request<MsgBufferString>);
+  fn manual(&self, stream: ServerStream, req: Request<MsgBufferString>, matches: Self::Matches);
+
+  /// Looks `path` up, once per request, as soon as its headers arrive.
+  fn route(&self, path: &str) -> Route<Self::Matches>;
+}
+
+/// What [`StreamDispatcher::route`] found.
+pub(crate) enum Route<MT> {
+  /// An auto-mode endpoint.
+  Auto(MT),
+  /// A manual-mode endpoint.
+  Manual(MT),
+  /// No route: auto mode answers 404.
+  NotFound,
 }
 
 /// Serves one connection until it closes. `conn` has queued its opening SETTINGS; `peer` is the
@@ -80,9 +98,10 @@ where
   rslt
 }
 
-struct Driver<F> {
-  /// Auto-mode streams whose body is still arriving, with the bytes already released.
-  collecting: HashMap<u32, usize>,
+struct Driver<F, MT> {
+  /// Auto-mode streams whose body is still arriving, with the bytes already released and their
+  /// route.
+  collecting: HashMap<u32, (usize, Option<MT>)>,
   date: DateHeader,
   /// Streams served by manual-mode handlers.
   manual: HashSet<u32>,
@@ -94,14 +113,15 @@ struct Driver<F> {
   woken: VectorUsize<usize>,
 }
 
-impl<F> Driver<F>
+impl<F, MT> Driver<F, MT>
 where
   F: Future<Output = (Request<MsgBufferString>, crate::Result<StatusCode>)>,
+  MT: Copy,
 {
   async fn run<S, D>(&mut self, stream: &mut S, dispatcher: &D) -> crate::Result<()>
   where
     S: StreamReader + StreamWriter,
-    D: StreamDispatcher<AutoFut = F>,
+    D: StreamDispatcher<AutoFut = F, Matches = MT>,
   {
     let shared = self.shared.clone();
     loop {
@@ -176,7 +196,7 @@ where
 
   fn handle_events<D>(&mut self, state: &mut ConnShared, dispatcher: &D) -> crate::Result<()>
   where
-    D: StreamDispatcher<AutoFut = F>,
+    D: StreamDispatcher<AutoFut = F, Matches = MT>,
   {
     while let Some(event) = state.conn.poll_event() {
       if let ConnEvent::Data { stream_id, .. }
@@ -194,23 +214,31 @@ where
       let conn = &mut state.conn;
       match event {
         ConnEvent::Headers { end_stream, stream_id } => {
-          if self.start_manual(state, dispatcher, stream_id)? {
-            continue;
-          }
+          let route = conn
+            .msg_mut(stream_id)
+            .map_or(Route::NotFound, |el| dispatcher.route(el.uri.path()));
+          let matches = match route {
+            Route::Manual(elem) => {
+              self.start_manual(state, dispatcher, stream_id, elem)?;
+              continue;
+            }
+            Route::Auto(elem) => Some(elem),
+            Route::NotFound => None,
+          };
           if end_stream {
-            self.start(&mut state.conn, dispatcher, stream_id)?;
+            self.start(&mut state.conn, dispatcher, stream_id, matches)?;
           } else {
-            let _ = self.collecting.insert(stream_id.u32(), 0);
+            let _ = self.collecting.insert(stream_id.u32(), (0, matches));
           }
         }
         ConnEvent::Data { end_stream: true, stream_id } | ConnEvent::Trailers { stream_id } => {
-          let _ = self.collecting.remove(&stream_id.u32());
-          self.start(conn, dispatcher, stream_id)?;
+          let matches = self.collecting.remove(&stream_id.u32()).and_then(|el| el.1);
+          self.start(conn, dispatcher, stream_id, matches)?;
         }
         ConnEvent::Data { end_stream: false, stream_id } => {
           let id = stream_id.u32();
           let len = conn.msg_mut(stream_id).map_or(0, |el| el.body.len());
-          if let Some(released) = self.collecting.get_mut(&id) {
+          if let Some((released, _)) = self.collecting.get_mut(&id) {
             let n = len.saturating_sub(*released);
             *released = len;
             conn.release_capacity(stream_id, u32::try_from(n).unwrap_or(u32::MAX))?;
@@ -232,9 +260,10 @@ where
     conn: &mut Http2Conn<false>,
     dispatcher: &D,
     stream_id: U31,
+    matches: Option<MT>,
   ) -> crate::Result<()>
   where
-    D: StreamDispatcher<AutoFut = F>,
+    D: StreamDispatcher<AutoFut = F, Matches = MT>,
   {
     let Some(method) = conn.method(stream_id) else {
       return Ok(());
@@ -245,50 +274,45 @@ where
     };
     let mut msg = self.pool.pop().unwrap_or_default();
     mem::swap(slot_msg, &mut msg);
-    let fut = dispatcher.auto(Request::new(method, msg), protocol);
+    if msg.body.is_empty() {
+      // The response is written into the body buffer the last response on this thread released:
+      // still in cache, unlike this stream's own.
+      let own = mem::replace(&mut msg.body, body_pool_take());
+      body_pool_give(own);
+    }
+    let fut = dispatcher.auto(Request::new(method, msg), protocol, matches);
     let idx = self.slots.insert(stream_id.u32(), fut)?;
     self.poll_slot(conn, idx)
   }
 
-  /// Hands the stream to a manual-mode handler if its route asks for one. The request goes with
-  /// its headers; its body stays in the core for [`ServerStream::recv_data`].
+  /// Hands the stream to its manual-mode handler. The request goes with its headers; its body
+  /// stays in the core for [`ServerStream::recv_data`].
   fn start_manual<D>(
     &mut self,
     state: &mut ConnShared,
     dispatcher: &D,
     stream_id: U31,
-  ) -> crate::Result<bool>
+    matches: MT,
+  ) -> crate::Result<()>
   where
-    D: StreamDispatcher<AutoFut = F>,
+    D: StreamDispatcher<AutoFut = F, Matches = MT>,
   {
     let conn = &mut state.conn;
     let Some(method) = conn.method(stream_id) else {
-      return Ok(false);
+      return Ok(());
     };
     let protocol = conn.protocol(stream_id);
     let Some(slot_msg) = conn.msg_mut(stream_id) else {
-      return Ok(false);
+      return Ok(());
     };
     let mut msg = self.pool.pop().unwrap_or_default();
     mem::swap(slot_msg, &mut msg);
-    let req = Request::new(method, msg);
-    if !dispatcher.is_manual(&req) {
-      if let Some(slot_msg) = conn.msg_mut(stream_id) {
-        let mut msg = req.msg_data;
-        mem::swap(slot_msg, &mut msg);
-        let _ = self.pool.push(msg);
-      }
-      return Ok(false);
-    }
     // Body bytes that arrived with the headers stay in the core, where `recv_data` finds them.
-    let mut req = req;
-    if let Some(slot_msg) = conn.msg_mut(stream_id) {
-      mem::swap(&mut slot_msg.body, &mut req.msg_data.body);
-    }
+    mem::swap(&mut slot_msg.body, &mut msg.body);
     let _ = self.manual.insert(stream_id.u32());
     let stream = ServerStream::new(self.shared.clone(), method, protocol, stream_id);
-    dispatcher.manual(stream, req);
-    Ok(true)
+    dispatcher.manual(stream, Request::new(method, msg), matches);
+    Ok(())
   }
 
   fn poll_woken(&mut self, conn: &mut Http2Conn<false>) -> crate::Result<()> {
@@ -344,6 +368,7 @@ where
     msg.headers.push_from_iter(Header::from_name_and_value(date, [self.date.as_str()]))?;
     let rslt = conn.send_response(stream_id, status, &mut msg);
     msg.clear();
+    body_pool_give(mem::take(&mut msg.body));
     let _ = self.pool.push(msg);
     match rslt {
       Ok(()) => Ok(()),
@@ -377,6 +402,33 @@ where
     })
     .await
   }
+}
+
+/// Response body buffers released on this thread, most recent last, so the next handler writes
+/// into one that is still in cache. Buffers above `BODY_POOL_BUFFER_MAX` are freed.
+const BODY_POOL_MAX: usize = 64;
+const BODY_POOL_BUFFER_MAX: usize = 1 << 20;
+
+std::thread_local! {
+  static BODY_POOL: RefCell<Vec<VectorUsize<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+fn body_pool_take() -> VectorUsize<u8> {
+  BODY_POOL.with(|pool| pool.borrow_mut().pop()).unwrap_or_default()
+}
+
+fn body_pool_give(mut body: VectorUsize<u8>) {
+  let capacity = body.capacity();
+  if capacity == 0 || capacity > BODY_POOL_BUFFER_MAX {
+    return;
+  }
+  body.clear();
+  BODY_POOL.with(|pool| {
+    let mut pool = pool.borrow_mut();
+    if pool.len() < BODY_POOL_MAX {
+      pool.push(body);
+    }
+  });
 }
 
 /// Writes everything the core queued, in groups of at most 8 slices.

@@ -206,11 +206,12 @@ mod uring {
       AutoStream, HttpRecvParams, ManualStream, MsgBufferString, OperationMode, Protocol, Request,
       StatusCode,
       http2_server_framework::{
-        Endpoint as _, EndpointNode, Http2ServerFramework, HttpRouter, Middleware,
-        conn_driver::{StreamDispatcher, drive_conn},
+        Endpoint as _, EndpointNode, Http2ServerFramework, HttpRouter, Middleware, RouteMatch,
+        conn_driver::{Route, StreamDispatcher, drive_conn},
       },
       misc::on_accept_error,
     },
+    collections::ArrayVectorCopy,
     http2::{ServerStream, conn::Http2Conn},
     net::{TcpListener as _, TcpParams, Uri},
     rng::{CryptoRng, CryptoSeedableRng, SeedableRng as _, Xorshift64},
@@ -432,15 +433,20 @@ mod uring {
     M: Middleware<DA, ER> + 'static,
   {
     type AutoFut = impl Future<Output = (Request<MsgBufferString>, crate::Result<StatusCode>)>;
+    type Matches = ArrayVectorCopy<RouteMatch, 4>;
 
-    fn auto(&self, req: Request<MsgBufferString>, protocol: Option<Protocol>) -> Self::AutoFut {
+    fn auto(
+      &self,
+      req: Request<MsgBufferString>,
+      protocol: Option<Protocol>,
+      matches: Option<Self::Matches>,
+    ) -> Self::AutoFut {
       let (data, error_cb, peer, router) =
         (self.data.clone(), self.error_cb.clone(), self.peer, self.router.clone());
       async move {
-        let Ok(found) = router.router.find(req.msg_data.uri.path()) else {
+        let Some(matches) = matches else {
           return (req, Ok(StatusCode::NotFound));
         };
-        let matches = found.data().0;
         let mut auto_stream = AutoStream::new(data, peer, protocol, req);
         let rslt = router.auto(&mut auto_stream, (0, &matches)).await;
         let status = match rslt {
@@ -454,22 +460,10 @@ mod uring {
       }
     }
 
-    fn is_manual(&self, req: &Request<MsgBufferString>) -> bool {
-      self
-        .router
-        .router
-        .find(req.msg_data.uri.path())
-        .is_ok_and(|el| el.data().1 == OperationMode::Manual)
-    }
-
-    fn manual(&self, stream: ServerStream, req: Request<MsgBufferString>) {
+    fn manual(&self, stream: ServerStream, req: Request<MsgBufferString>, matches: Self::Matches) {
       let (data, error_cb, peer, router) =
         (self.data.clone(), self.error_cb.clone(), self.peer, self.router.clone());
       let fut = async move {
-        let Ok(found) = router.router.find(req.msg_data.uri.path()) else {
-          return;
-        };
-        let matches = found.data().0;
         let protocol = stream.protocol();
         let manual_stream = ManualStream::new(data, peer, protocol, req, stream);
         if let Err(err) = router.manual(manual_stream, (0, &matches)).await {
@@ -477,6 +471,16 @@ mod uring {
         }
       };
       let _jh = UringExecutor::default().spawn_local(fut, &self.runtime);
+    }
+
+    fn route(&self, path: &str) -> Route<Self::Matches> {
+      match self.router.router.find(path) {
+        Ok(found) => {
+          let (matches, om) = *found.data();
+          if om == OperationMode::Manual { Route::Manual(matches) } else { Route::Auto(matches) }
+        }
+        Err(_) => Route::NotFound,
+      }
     }
   }
 }

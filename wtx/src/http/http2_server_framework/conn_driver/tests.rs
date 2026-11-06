@@ -7,7 +7,7 @@ use crate::{
   futures::Sleep,
   http::{
     HttpRecvParams, MsgBufferString, Protocol, Request, StatusCode,
-    http2_server_framework::conn_driver::{StreamDispatcher, drive_conn},
+    http2_server_framework::conn_driver::{Route, StreamDispatcher, drive_conn},
   },
   http2::{
     ServerStream,
@@ -66,14 +66,15 @@ impl Drop for DropFlag {
 
 impl StreamDispatcher for TestDispatcher {
   type AutoFut = Pin<Box<dyn Future<Output = AutoOut>>>;
+  type Matches = ();
 
-  fn is_manual(&self, _: &Request<MsgBufferString>) -> bool {
-    false
+  fn route(&self, _: &str) -> Route<()> {
+    Route::Auto(())
   }
 
-  fn manual(&self, _: ServerStream, _: Request<MsgBufferString>) {}
+  fn manual(&self, _: ServerStream, _: Request<MsgBufferString>, (): ()) {}
 
-  fn auto(&self, mut req: Request<MsgBufferString>, _: Option<Protocol>) -> Self::AutoFut {
+  fn auto(&self, mut req: Request<MsgBufferString>, _: Option<Protocol>, _: Option<()>) -> Self::AutoFut {
     let dropped = self.dropped.clone();
     Box::pin(async move {
       let path = String::from(req.msg_data.uri.path());

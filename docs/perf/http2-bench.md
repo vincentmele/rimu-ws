@@ -183,3 +183,32 @@ its next output into the recycled buffer, which is warm in cache.
 | owned send | 863k | 38,776 | 5,342k / 5,636 | 5,048k / 5,639 |
 
 json-h2c: −20% cycles, +21% throughput. Baseline is unchanged within noise (h2load at 99% CPU).
+
+### Steps 2 (cont.), 4, 6 and 9: fast paths, a warm body buffer, one route lookup, `date` cached
+
+Cumulative builds, interleaved, native (json-h2c two rounds; baseline-h2c one, h2load at 100%):
+
+| build | json-h2c 1024 rps | cycles/req | baseline-h2c 256 rps | cycles/req |
+|---|---|---|---|---|
+| owned send (Step 3) | 861k, 859k | 38,935, 39,215 | 5,384k | 5,713 |
+| + JsonWriter fast paths | 876k, 864k | 37,785, 37,966 | 5,380k | 5,589 |
+| + warm response-body buffer | 1,127k, 1,125k | 27,659, 27,878 | 5,272k | 5,954 |
+| + one route lookup | 1,156k, 1,149k | 27,246, 27,238 | 5,415k | 5,325 |
+| + `date` in the cached header block | 1,160k, 1,151k | 26,864, 26,950 | 5,608k | 4,864 |
+
+- **JsonWriter fast paths.**
+  - A float with at most two decimals and below 10^13 is printed from its integer cents. It is
+    the double nearest to a decimal of at most 15 significant digits, so that decimal is its
+    shortest round-trip form. This was checked against `zmij` on all ±cents up to 20,000.00 and
+    on random values.
+  - A string of at most 32 bytes with nothing to escape is checked with overlapping 8-byte
+    words and copied once.
+- **Warm body buffer.** A handler writes its response into the body buffer the last response on
+  this thread released, from a per-thread pool (most recent first). Before, it was the stream
+  slot's own buffer, cold among 1024 connections. −27% cycles, +29% throughput: the largest
+  single item.
+- **One route lookup.** The driver looks the path up once, when the headers arrive, and hands
+  the match to the auto or manual handler. Before, `is_manual` swapped the message out and back
+  and looked the path up, then the auto future looked it up again.
+- **`date` in the cached header block.** The block changes once a second; within the second a
+  response's header block is one copy plus `content-length`.
