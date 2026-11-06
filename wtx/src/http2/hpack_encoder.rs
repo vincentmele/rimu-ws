@@ -281,6 +281,25 @@ impl HpackEncoder {
     huffman_encode(bytes.as_bytes(), buffer)?;
     let after_huffman = buffer.len();
     let len_usize = after_huffman.wrapping_sub(after_byte);
+    // The raw bytes, H bit clear, when Huffman would be longer (RFC 7541 §5.2); a tie stays
+    // Huffman, as upstream encodes.
+    if len_usize > bytes.len() {
+      buffer.truncate(before_byte);
+      let raw_len = bytes.len();
+      if let Ok(len @ 0..0x7F) = u8::try_from(raw_len) {
+        buffer.push(len)?;
+      } else {
+        buffer.push(0x7F)?;
+        let mut rest = raw_len.wrapping_sub(0x7F);
+        while rest >= 0x80 {
+          buffer.push(0x80 | u8::try_from(rest & 0x7F).unwrap_or_default())?;
+          rest >>= 7;
+        }
+        buffer.push(u8::try_from(rest).unwrap_or_default())?;
+      }
+      buffer.extend_from_copyable_slice(bytes.as_bytes())?;
+      return Ok(());
+    }
     let fits_in_1_byte = len_usize < 0b0111_1111;
     if let (true, Ok(len)) = (fits_in_1_byte, u8::try_from(len_usize)) {
       let Some(byte) = buffer.get_mut(before_byte) else {
@@ -677,8 +696,36 @@ mod tests {
       hpack_decoder::HpackDecoder, hpack_encoder::HpackEncoder, hpack_header::HpackHeaderBasic,
       hpack_static_headers::HpackStaticResponseHeaders,
     },
-    rng::{SeedableRng, Xorshift64},
+    rng::{Rng as _, SeedableRng, Xorshift64},
   };
+
+  // Strings Huffman would lengthen go raw (H bit clear), others Huffman-coded; both decode back,
+  // including raw lengths that need more than the 7-bit prefix.
+  #[test]
+  fn huffman_only_when_shorter() {
+    let mut rng = Xorshift64::from(21u64);
+    for value in [
+      string::String::from("text/plain"),
+      string::String::from("{}|~^\\<>"),
+      (0..200).map(|_| char::from(0x21 + rng.u8_4()[0] % 94)).collect::<string::String>(),
+      (0..300).map(|_| char::from(b"{}|~^<>"[usize::from(rng.u8_4()[0] % 7)])).collect::<string::String>(),
+    ] {
+      let mut buffer = VectorUsize::new();
+      let mut hpack_enc = HpackEncoder::new(&mut Xorshift64::from(3u64));
+      let field = crate::http::Header::new(false, false, "x-test", value.as_str());
+      hpack_enc.encode(&mut buffer, 0, [], [field]).unwrap();
+      let mut decoded: alloc::vec::Vec<(string::String, string::String)> = alloc::vec::Vec::new();
+      let mut dec = HpackDecoder::new();
+      dec.set_max_bytes(4096);
+      dec
+        .decode(&buffer, |(_, name, elem)| {
+          decoded.push((name.str().into(), elem.into()));
+          Ok(())
+        })
+        .unwrap();
+      assert_eq!(decoded, [("x-test".into(), value.clone())]);
+    }
+  }
 
   #[test]
   fn duplicated_is_indexed() {
