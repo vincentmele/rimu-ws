@@ -1,9 +1,28 @@
 //! The connection's open streams, in reusable slots.
 
 use crate::{
-  collections::VectorUsize,
-  http::{Method, MsgBufferString, MsgDataMut as _, Protocol},
+  collections::{DequeUsize, VectorUsize},
+  http::{Headers, Method, MsgBufferString, MsgDataMut as _, Protocol, StatusCode},
+  http2::conn::body::SharedBytes,
 };
+
+/// Body bytes queued on a stream until the windows let them go.
+#[derive(Debug)]
+pub(crate) enum SendItem {
+  /// The next `len` bytes of `Stream::owned`.
+  Owned(usize),
+  /// Shared bytes, sent by reference.
+  Shared(SharedBytes),
+}
+
+impl SendItem {
+  pub(crate) fn len(&self) -> usize {
+    match self {
+      Self::Owned(len) => *len,
+      Self::Shared(elem) => elem.len(),
+    }
+  }
+}
 use hashbrown::HashMap;
 
 /// One open stream.
@@ -31,6 +50,24 @@ pub(crate) struct Stream {
   pub(crate) send_headers: bool,
   /// Flow-control window for what we send. May go negative after a SETTINGS change.
   pub(crate) send_window: i32,
+  /// The stream is in the connection's list of streams waiting for window.
+  pub(crate) blocked: bool,
+  /// Send END_STREAM once the queue drains.
+  pub(crate) end_after_queue: bool,
+  /// Bytes of the front queue item already sent.
+  pub(crate) front_sent: usize,
+  /// Copies of borrowed bodies that could not be sent at once.
+  pub(crate) owned: VectorUsize<u8>,
+  /// Bytes of `owned` already sent.
+  pub(crate) owned_read: usize,
+  /// Capacity released by the application and not yet announced in a WINDOW_UPDATE.
+  pub(crate) recv_unacked: u32,
+  pub(crate) send_queue: DequeUsize<SendItem>,
+  /// The response status (client).
+  pub(crate) status: Option<StatusCode>,
+  /// Trailers to send once the queue drains, encoded only then so header blocks reach the peer in
+  /// the order they were encoded.
+  pub(crate) trailers: Option<Headers>,
 }
 
 impl Stream {
@@ -48,7 +85,21 @@ impl Stream {
       send_closed: false,
       send_headers: false,
       send_window: 0,
+      blocked: false,
+      end_after_queue: false,
+      front_sent: 0,
+      owned: VectorUsize::new(),
+      owned_read: 0,
+      recv_unacked: 0,
+      send_queue: DequeUsize::new(),
+      status: None,
+      trailers: None,
     }
+  }
+
+  /// Body bytes queued and not yet sent.
+  pub(crate) fn send_pending(&self) -> usize {
+    self.send_queue.iter().map(SendItem::len).sum::<usize>().saturating_sub(self.front_sent)
   }
 
   fn reset(&mut self, id: u32, recv_window: i32, send_window: i32) {
@@ -64,6 +115,15 @@ impl Stream {
     self.send_closed = false;
     self.send_headers = false;
     self.send_window = send_window;
+    self.blocked = false;
+    self.end_after_queue = false;
+    self.front_sent = 0;
+    self.owned.clear();
+    self.owned_read = 0;
+    self.recv_unacked = 0;
+    self.send_queue.clear();
+    self.status = None;
+    self.trailers = None;
   }
 }
 
@@ -125,6 +185,9 @@ impl StreamTable {
     };
     if let Some(stream) = self.slots.get_mut(idx) {
       stream.msg.clear();
+      stream.owned.clear();
+      stream.send_queue.clear();
+      stream.trailers = None;
     }
     let _rslt = self.free.push(idx);
     true

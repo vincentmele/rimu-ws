@@ -5,6 +5,7 @@
 //! happened as [`ConnEvent`]s. It does no I/O and holds no locks: the I/O loops of the server
 //! framework and of the client feed it what they read and write what it queued.
 
+pub(crate) mod body;
 pub(crate) mod output;
 pub(crate) mod scan;
 pub(crate) mod stream_table;
@@ -15,23 +16,26 @@ pub(crate) mod tests;
 
 use crate::{
   collections::{ArrayVectorCopy, DequeUsize, VectorUsize},
-  http::{HttpRecvParams, U31},
+  http::{Header, Headers, HttpRecvParams, Method, MsgBuffer, MsgBufferString, MsgDataMut as _, StatusCode, U31},
   http2::{
     Http2Error, Http2ErrorCode,
     common_flags::CommonFlags,
     conn::{
+      body::Body,
       output::Output,
       scan::{PREFACE, Preface, next_frame, strip_preface},
-      stream_table::StreamTable,
+      stream_table::{SendItem, StreamTable},
     },
     frame_init::{FrameInit, FrameInitTy},
     headers_frame::HeadersFrame,
     hpack_decoder::HpackDecoder,
     hpack_encoder::HpackEncoder,
+    hpack_static_headers::{HpackStaticRequestHeaders, HpackStaticResponseHeaders},
     misc::{protocol_err, trim_frame_pad},
     ping_frame::PingFrame,
     settings_frame::SettingsFrame,
   },
+  misc::Lease,
   rng::Rng,
 };
 use core::mem;
@@ -78,6 +82,12 @@ struct PendingBlock {
 pub(crate) struct Http2Conn<const IS_CLIENT: bool> {
   /// Bytes of a header block split over CONTINUATION frames.
   block: VectorUsize<u8>,
+  /// Streams with queued data that wait for window.
+  blocked: DequeUsize<u32>,
+  /// Scratch for encoding header blocks.
+  header_buf: VectorUsize<u8>,
+  /// Streams whose released capacity is not yet announced.
+  window_updates: DequeUsize<u32>,
   conn_recv: i32,
   conn_recv_unacked: u32,
   conn_send: i32,
@@ -112,6 +122,9 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     let initial = i32::try_from(hp.initial_window_len()).unwrap_or(i32::MAX);
     let mut this = Self {
       block: VectorUsize::new(),
+      blocked: DequeUsize::new(),
+      header_buf: VectorUsize::new(),
+      window_updates: DequeUsize::new(),
       conn_recv: DEFAULT_WINDOW.max(initial),
       conn_recv_unacked: 0,
       conn_send: DEFAULT_WINDOW,
@@ -205,6 +218,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
   /// Whether bytes are queued. Call it before [`Self::output`]: it queues what is still pending
   /// (window updates for released capacity).
   pub(crate) fn has_output(&mut self) -> bool {
+    self.flush_window_updates();
     !self.out.is_empty()
   }
 
@@ -228,6 +242,299 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
   /// Streams open now.
   pub(crate) fn open_streams(&self) -> u32 {
     u32::try_from(self.streams.len()).unwrap_or(u32::MAX)
+  }
+
+  /// The message being received on `stream_id`: the request (server) or the response (client).
+  pub(crate) fn msg_mut(&mut self, stream_id: U31) -> Option<&mut MsgBufferString> {
+    self.streams.get_mut(stream_id.u32()).map(|el| &mut el.msg)
+  }
+
+  /// The request method of `stream_id` (server).
+  pub(crate) fn method(&self, stream_id: U31) -> Option<Method> {
+    self.streams.get(stream_id.u32())?.method
+  }
+
+  /// The response status of `stream_id` (client).
+  pub(crate) fn status(&self, stream_id: U31) -> Option<StatusCode> {
+    self.streams.get(stream_id.u32())?.status
+  }
+
+  /// The application consumed `n` body bytes of `stream_id`: the peer may send that many more.
+  /// The WINDOW_UPDATE goes out, coalesced, with the next output.
+  pub(crate) fn release_capacity(&mut self, stream_id: U31, n: u32) -> crate::Result<()> {
+    let id = stream_id.u32();
+    let Some(stream) = self.streams.get_mut(id) else {
+      return Ok(());
+    };
+    if stream.recv_closed || n == 0 {
+      return Ok(());
+    }
+    if stream.recv_unacked == 0 {
+      self.window_updates.push_back(id)?;
+    }
+    stream.recv_unacked = stream.recv_unacked.saturating_add(n);
+    Ok(())
+  }
+
+  /// Queues HEADERS for `stream_id`: `:status` (server) and `headers`.
+  pub(crate) fn send_headers(
+    &mut self,
+    stream_id: U31,
+    status: Option<StatusCode>,
+    headers: &Headers,
+    end_stream: bool,
+  ) -> crate::Result<()> {
+    let id = stream_id.u32();
+    let Self { header_buf, hpack_enc, out, peer, streams, .. } = self;
+    let stream = streams.get_mut(id).ok_or(protocol_err(Http2Error::UnknownStreamReceiver))?;
+    if stream.send_headers || stream.send_closed {
+      return Err(protocol_err(Http2Error::InvalidSendStreamState));
+    }
+    stream.send_headers = true;
+    header_buf.clear();
+    let hsresph = HpackStaticResponseHeaders { status_code: status };
+    let hint = hsresph.bytes_len().wrapping_add(headers.bytes_len());
+    hpack_enc.encode(header_buf, hint, hsresph.iter(), headers.iter())?;
+    push_header_block(out, id, header_buf, end_stream, peer.max_frame_len)?;
+    if end_stream {
+      stream.send_closed = true;
+      self.after_send_closed(id);
+    }
+    Ok(())
+  }
+
+  /// Queues `body` on `stream_id` and sends as much of it as the windows allow; the rest goes out
+  /// as WINDOW_UPDATEs arrive. With `end_stream`, END_STREAM follows the last byte.
+  pub(crate) fn send_data(
+    &mut self,
+    stream_id: U31,
+    body: Body<'_>,
+    end_stream: bool,
+  ) -> crate::Result<()> {
+    let id = stream_id.u32();
+    let stream =
+      self.streams.get_mut(id).ok_or(protocol_err(Http2Error::UnknownStreamReceiver))?;
+    if stream.send_closed || stream.end_after_queue {
+      return Err(protocol_err(Http2Error::InvalidSendStreamState));
+    }
+    match body {
+      Body::Borrowed(bytes) => {
+        if !bytes.is_empty() {
+          stream.owned.extend_from_copyable_slice(bytes)?;
+          stream.send_queue.push_back(SendItem::Owned(bytes.len()))?;
+        }
+      }
+      Body::Shared(bytes) => {
+        if !bytes.is_empty() {
+          stream.send_queue.push_back(SendItem::Shared(bytes))?;
+        }
+      }
+    }
+    stream.end_after_queue = end_stream;
+    let _ = self.flush_stream(id)?;
+    Ok(())
+  }
+
+  /// Sends `trailers`, which end the stream, after the queued body.
+  pub(crate) fn send_trailers(&mut self, stream_id: U31, trailers: &Headers) -> crate::Result<()> {
+    let id = stream_id.u32();
+    let stream =
+      self.streams.get_mut(id).ok_or(protocol_err(Http2Error::UnknownStreamReceiver))?;
+    if stream.send_closed || stream.end_after_queue {
+      return Err(protocol_err(Http2Error::InvalidSendStreamState));
+    }
+    let mut copy = Headers::new();
+    for header in trailers.iter() {
+      copy.push_from_iter(Header::new(
+        header.is_sensitive,
+        header.is_trailer,
+        header.name,
+        [header.value],
+      ))?;
+    }
+    stream.trailers = Some(copy);
+    stream.end_after_queue = true;
+    let _ = self.flush_stream(id)?;
+    Ok(())
+  }
+
+  /// Resets `stream_id` with `code`. No event is reported: the caller knows.
+  pub(crate) fn send_reset(&mut self, stream_id: U31, code: Http2ErrorCode) {
+    let id = stream_id.u32();
+    if self.streams.close(id) {
+      push_reset(&mut self.out, id, code);
+    }
+  }
+
+  /// A whole response: HEADERS with `:status`, the headers of `msg` and `content-length`, then
+  /// `msg.body` (as the windows allow). `msg` is cleared for reuse.
+  pub(crate) fn send_response(
+    &mut self,
+    stream_id: U31,
+    status: StatusCode,
+    msg: &mut MsgBufferString,
+  ) -> crate::Result<()> {
+    let id = stream_id.u32();
+    let body_len = msg.body.len();
+    {
+      let Self { header_buf, hpack_enc, out, peer, streams, .. } = self;
+      let stream =
+        streams.get_mut(id).ok_or(protocol_err(Http2Error::UnknownStreamReceiver))?;
+      if stream.send_headers || stream.send_closed {
+        return Err(protocol_err(Http2Error::InvalidSendStreamState));
+      }
+      stream.send_headers = true;
+      header_buf.clear();
+      let hsresph = HpackStaticResponseHeaders { status_code: Some(status) };
+      let hint = hsresph.bytes_len().wrapping_add(msg.headers.bytes_len());
+      hpack_enc.encode(header_buf, hint, hsresph.iter(), msg.headers.iter())?;
+      push_content_length(header_buf, body_len)?;
+      push_header_block(out, id, header_buf, body_len == 0, peer.max_frame_len)?;
+      if body_len == 0 {
+        stream.send_closed = true;
+      }
+    }
+    if body_len == 0 {
+      self.after_send_closed(id);
+    } else {
+      self.send_data(stream_id, Body::Borrowed(&msg.body), true)?;
+    }
+    msg.clear();
+    Ok(())
+  }
+
+  /// Body bytes of `stream_id` queued and not yet sent.
+  pub(crate) fn stream_send_pending(&self, stream_id: U31) -> u32 {
+    self
+      .streams
+      .get(stream_id.u32())
+      .map_or(0, |el| u32::try_from(el.send_pending()).unwrap_or(u32::MAX))
+  }
+
+  /// Sends what the windows allow of the queue of `id`; reports whether anything moved.
+  fn flush_stream(&mut self, id: u32) -> crate::Result<bool> {
+    let Self { blocked, conn_send, header_buf, hpack_enc, out, peer, streams, .. } = self;
+    let Some(stream) = streams.get_mut(id) else {
+      return Ok(false);
+    };
+    let max_frame_len = i32::try_from(peer.max_frame_len).unwrap_or(i32::MAX);
+    let mut progressed = false;
+    loop {
+      let Some(item) = stream.send_queue.get(0) else {
+        break;
+      };
+      let remaining = item.len().wrapping_sub(stream.front_sent);
+      let avail = (*conn_send).min(stream.send_window).min(max_frame_len);
+      if avail <= 0 {
+        if !stream.blocked {
+          stream.blocked = true;
+          blocked.push_back(id)?;
+        }
+        break;
+      }
+      let n = remaining.min(usize::try_from(avail).unwrap_or(0));
+      let is_last = stream.send_queue.len() == 1 && n == remaining;
+      let eos = is_last && stream.end_after_queue && stream.trailers.is_none();
+      let mut cf = CommonFlags::empty();
+      if eos {
+        cf.set_eos();
+      }
+      let len = u32::try_from(n).unwrap_or(u32::MAX);
+      let fi = FrameInit::new(cf, len, U31::from_u32(id), FrameInitTy::Data);
+      match item {
+        SendItem::Owned(_) => {
+          let start = stream.owned_read;
+          let bytes = stream.owned.get(start..start.wrapping_add(n)).unwrap_or_default();
+          out.push_many(&[&fi.bytes(), bytes])?;
+          stream.owned_read = start.wrapping_add(n);
+        }
+        SendItem::Shared(elem) => {
+          let part = elem.slice(stream.front_sent, stream.front_sent.wrapping_add(n));
+          out.push(&fi.bytes())?;
+          out.push_shared(part)?;
+        }
+      }
+      let signed = i32::try_from(n).unwrap_or(i32::MAX);
+      *conn_send = conn_send.wrapping_sub(signed);
+      stream.send_window = stream.send_window.wrapping_sub(signed);
+      progressed = true;
+      if n == remaining {
+        let _ = stream.send_queue.pop_front();
+        stream.front_sent = 0;
+      } else {
+        stream.front_sent = stream.front_sent.wrapping_add(n);
+      }
+      if eos {
+        stream.send_closed = true;
+      }
+    }
+    if stream.send_queue.len() == 0 {
+      stream.owned.clear();
+      stream.owned_read = 0;
+      if stream.end_after_queue && !stream.send_closed {
+        if let Some(trailers) = stream.trailers.take() {
+          header_buf.clear();
+          hpack_enc.encode(header_buf, trailers.bytes_len(), [], trailers.iter())?;
+          push_header_block(out, id, header_buf, true, peer.max_frame_len)?;
+        } else {
+          let mut cf = CommonFlags::empty();
+          cf.set_eos();
+          out.push(&FrameInit::new(cf, 0, U31::from_u32(id), FrameInitTy::Data).bytes())?;
+        }
+        stream.send_closed = true;
+        progressed = true;
+      }
+    }
+    if stream.send_closed {
+      self.after_send_closed(id);
+    }
+    Ok(progressed)
+  }
+
+  /// Retries every stream that waits for window, reporting those that moved.
+  fn flush_blocked(&mut self) -> crate::Result<()> {
+    let mut left = self.blocked.len();
+    while left > 0 {
+      left = left.wrapping_sub(1);
+      let Some(id) = self.blocked.pop_front() else {
+        break;
+      };
+      if let Some(stream) = self.streams.get_mut(id) {
+        stream.blocked = false;
+      }
+      if self.flush_stream(id)? {
+        self.events.push_back(ConnEvent::SendCapacity { stream_id: U31::from_u32(id) })?;
+      }
+    }
+    Ok(())
+  }
+
+  /// The sending side of `id` ended: close the stream if the receiving side has too. A server
+  /// that answered before the request ended tells the client to stop sending (RFC 9113 §8.1).
+  fn after_send_closed(&mut self, id: u32) {
+    let Some(stream) = self.streams.get(id) else {
+      return;
+    };
+    if stream.recv_closed {
+      let _ = self.streams.close(id);
+    } else if !IS_CLIENT {
+      let _ = self.streams.close(id);
+      push_reset(&mut self.out, id, Http2ErrorCode::NoError);
+    }
+  }
+
+  fn flush_window_updates(&mut self) {
+    while let Some(id) = self.window_updates.pop_front() {
+      let Some(stream) = self.streams.get_mut(id) else {
+        continue;
+      };
+      let n = mem::take(&mut stream.recv_unacked);
+      if n == 0 || stream.recv_closed {
+        continue;
+      }
+      stream.recv_window = stream.recv_window.saturating_add(n.cast_signed());
+      push_window_update(&mut self.out, id, n);
+    }
   }
 
   /// Ends the sending side of a stream as if a response had been sent, so tests of the receiving
@@ -418,8 +725,20 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     }
     let len = u32::try_from(block.len()).unwrap_or(u32::MAX);
     let fi = FrameInit::new(cf, len, U31::from_u32(id), FrameInitTy::Headers);
-    if self.streams.contains(id) {
+    if let Some(stream) = self.streams.get(id) {
+      if IS_CLIENT && !stream.recv_headers {
+        return self.on_response_headers(fi, block);
+      }
       return self.on_trailers(fi, block);
+    }
+    if IS_CLIENT {
+      if id % 2 == 1 && id < self.next_local_id {
+        return Err(crate::Error::Http2ErrorGoAway(
+          Http2ErrorCode::StreamClosed,
+          Http2Error::UnexpectedStreamId,
+        ));
+      }
+      return Err(protocol_err(Http2Error::UnexpectedStreamId));
     }
     if !IS_CLIENT && (id % 2 == 0 || id <= self.highest_peer_id) {
       if id % 2 == 0 {
@@ -470,6 +789,44 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       return Ok(());
     }
     self.events.push_back(ConnEvent::Headers { end_stream, stream_id: U31::from_u32(id) })?;
+    Ok(())
+  }
+
+  fn on_response_headers(&mut self, fi: FrameInit, block: &[u8]) -> crate::Result<()> {
+    let id = fi.stream_id.u32();
+    let end_stream = fi.cf.has_eos();
+    let Some(stream) = self.streams.get_mut(id) else {
+      return Ok(());
+    };
+    let rslt = HeadersFrame::read::<IS_CLIENT, false>(
+      Some(block),
+      fi,
+      &self.hp,
+      &mut self.hpack_dec,
+      (&mut stream.msg, 0),
+    );
+    let (content_length, hf) = match rslt {
+      Ok(elem) => elem,
+      Err(err) => {
+        if is_malformed(&err) {
+          self.stream_error(id, Http2ErrorCode::ProtocolError);
+          return Ok(());
+        }
+        return Err(err);
+      }
+    };
+    let status = hf.hsresh().status_code;
+    // An informational (1xx) response comes before the final one.
+    if status.is_some_and(|el| u16::from(el) < 200) {
+      stream.msg.headers.clear();
+      return Ok(());
+    }
+    stream.content_length = content_length;
+    stream.status = status;
+    stream.recv_closed = end_stream;
+    stream.recv_headers = true;
+    // The stream stays open until the caller has read the response.
+    self.events.push_back(ConnEvent::Headers { end_stream, stream_id: fi.stream_id })?;
     Ok(())
   }
 
@@ -528,6 +885,9 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
           ));
         };
         stream.send_window = window;
+      }
+      if delta > 0 {
+        self.flush_blocked()?;
       }
     }
     let mut ack_buffer = [0; 45];
@@ -591,7 +951,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
           Http2Error::InvalidWindowUpdateSize,
         ),
       )?;
-      return Ok(());
+      return self.flush_blocked();
     }
     if self.is_idle(id) {
       return Err(protocol_err(Http2Error::UnknownStreamReceiver));
@@ -605,7 +965,13 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     }
     match stream.send_window.checked_add(increment) {
       Some(elem) => stream.send_window = elem,
-      None => self.stream_error(id, Http2ErrorCode::FlowControlError),
+      None => {
+        self.stream_error(id, Http2ErrorCode::FlowControlError);
+        return Ok(());
+      }
+    }
+    if self.flush_stream(id)? {
+      self.events.push_back(ConnEvent::SendCapacity { stream_id: U31::from_u32(id) })?;
     }
     Ok(())
   }
@@ -624,6 +990,124 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       let _rslt = self.events.push_back(ConnEvent::Reset { code, stream_id: U31::from_u32(id) });
     }
   }
+}
+
+impl Http2Conn<true> {
+  /// Opens the next client stream. Fails when the server's limit on concurrent streams is reached
+  /// or it sent GOAWAY.
+  pub(crate) fn open_stream(&mut self) -> crate::Result<U31> {
+    if self.go_away_recv.is_some() || self.fatal {
+      return Err(protocol_err(Http2Error::UnknownStreamReceiver));
+    }
+    if u32::try_from(self.streams.len()).unwrap_or(u32::MAX) >= self.peer.max_concurrent_streams {
+      return Err(protocol_err(Http2Error::ExceedAmountOfActiveConcurrentStreams));
+    }
+    let id = self.next_local_id;
+    self.next_local_id = id.wrapping_add(2);
+    let recv_window = i32::try_from(self.hp.initial_window_len()).unwrap_or(i32::MAX);
+    let send_window = self.peer.initial_window;
+    let _ = self.streams.open(id, recv_window, send_window)?;
+    Ok(U31::from_u32(id))
+  }
+
+  /// Queues the request HEADERS of `stream_id` (method, the URI of `msg`, its headers), then its
+  /// body, if any. With `end_stream` the request ends after that.
+  pub(crate) fn send_request<S>(
+    &mut self,
+    stream_id: U31,
+    method: Method,
+    msg: &MsgBuffer<S>,
+    end_stream: bool,
+  ) -> crate::Result<()>
+  where
+    S: Lease<str>,
+  {
+    let id = stream_id.u32();
+    let body = msg.body.as_slice();
+    let end_now = end_stream && body.is_empty();
+    {
+      let Self { header_buf, hpack_enc, out, peer, streams, .. } = self;
+      let stream =
+        streams.get_mut(id).ok_or(protocol_err(Http2Error::UnknownStreamReceiver))?;
+      if stream.send_headers {
+        return Err(protocol_err(Http2Error::InvalidSendStreamState));
+      }
+      stream.send_headers = true;
+      let uri = &msg.uri;
+      let hsreqh = HpackStaticRequestHeaders {
+        authority: uri.authority(),
+        method: Some(method),
+        path: uri.relative_reference_slash(),
+        protocol: None,
+        scheme: uri.scheme(),
+      };
+      header_buf.clear();
+      let hint = hsreqh.bytes_len().wrapping_add(msg.headers.bytes_len());
+      hpack_enc.encode(header_buf, hint, hsreqh.iter(), msg.headers.iter())?;
+      push_header_block(out, id, header_buf, end_now, peer.max_frame_len)?;
+      if end_now {
+        stream.send_closed = true;
+      }
+    }
+    if !body.is_empty() {
+      self.send_data(stream_id, Body::Borrowed(body), end_stream)?;
+    }
+    Ok(())
+  }
+}
+
+/// A header block as HEADERS plus as many CONTINUATIONs as `max_frame_len` requires.
+fn push_header_block(
+  out: &mut Output,
+  id: u32,
+  block: &[u8],
+  end_stream: bool,
+  max_frame_len: u32,
+) -> crate::Result<()> {
+  let max = usize::try_from(max_frame_len).unwrap_or(usize::MAX).max(1);
+  let mut chunks = block.chunks(max);
+  let first = chunks.next().unwrap_or_default();
+  let mut rest = chunks.peekable();
+  let mut cf = CommonFlags::empty();
+  if end_stream {
+    cf.set_eos();
+  }
+  if rest.peek().is_none() {
+    cf.set_eoh();
+  }
+  let len = u32::try_from(first.len()).unwrap_or(u32::MAX);
+  out.push_many(&[&FrameInit::new(cf, len, U31::from_u32(id), FrameInitTy::Headers).bytes(), first])?;
+  while let Some(chunk) = rest.next() {
+    let mut cf = CommonFlags::empty();
+    if rest.peek().is_none() {
+      cf.set_eoh();
+    }
+    let len = u32::try_from(chunk.len()).unwrap_or(u32::MAX);
+    let fi = FrameInit::new(cf, len, U31::from_u32(id), FrameInitTy::Continuation);
+    out.push_many(&[&fi.bytes(), chunk])?;
+  }
+  Ok(())
+}
+
+/// `content-length: <len>` as a literal without indexing, with the static table's name (index
+/// 28): a fresh value per response would only churn the dynamic table.
+fn push_content_length(block: &mut VectorUsize<u8>, len: usize) -> crate::Result<()> {
+  let mut digits = [0u8; 20];
+  let mut idx = digits.len();
+  let mut value = len;
+  loop {
+    idx = idx.wrapping_sub(1);
+    if let Some(elem) = digits.get_mut(idx) {
+      *elem = b'0'.wrapping_add(u8::try_from(value % 10).unwrap_or(0));
+    }
+    value /= 10;
+    if value == 0 {
+      break;
+    }
+  }
+  let text = digits.get(idx..).unwrap_or_default();
+  block.extend_from_copyable_slices([&[0x0F, 0x0D][..], &[u8::try_from(text.len()).unwrap_or(0)], text])?;
+  Ok(())
 }
 
 fn push_go_away(out: &mut Output, last_stream_id: u32, code: Http2ErrorCode) {

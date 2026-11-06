@@ -1,18 +1,24 @@
 //! The bytes a connection has queued for its peer, in order.
 
-use crate::collections::{ArrayVectorCopy, DequeUsize, VectorUsize};
+use crate::{
+  collections::{ArrayVectorCopy, DequeUsize, VectorUsize},
+  http2::conn::body::SharedBytes,
+};
 
 /// One run of queued bytes.
 #[derive(Debug)]
 enum Chunk {
   /// Encoded frames in `Output::bytes[start..end]`.
   Own { end: usize, start: usize },
+  /// Bytes sent by reference.
+  Shared(SharedBytes),
 }
 
 impl Chunk {
   fn len(&self) -> usize {
     match self {
       Self::Own { end, start } => end.wrapping_sub(*start),
+      Self::Shared(elem) => elem.len(),
     }
   }
 }
@@ -67,12 +73,23 @@ impl Output {
     Ok(())
   }
 
+  /// Queues `bytes` by reference.
+  pub(crate) fn push_shared(&mut self, bytes: SharedBytes) -> crate::Result<()> {
+    if bytes.is_empty() {
+      return Ok(());
+    }
+    self.pending = self.pending.wrapping_add(bytes.len());
+    self.chunks.push_back(Chunk::Shared(bytes))?;
+    Ok(())
+  }
+
   /// The queued bytes, front first, as many slices as fit in `out`.
   pub(crate) fn slices<'this>(&'this self, out: &mut ArrayVectorCopy<&'this [u8], 16>) {
     let mut skip = self.front_written;
     for chunk in self.chunks.iter() {
       let slice = match chunk {
         Chunk::Own { end, start } => self.bytes.get(start.wrapping_add(skip)..*end),
+        Chunk::Shared(elem) => elem.as_slice().get(skip..),
       };
       skip = 0;
       if let Some(elem) = slice {
