@@ -11,6 +11,7 @@ mod macros;
 mod client_stream;
 mod common_flags;
 mod common_stream;
+mod conn;
 mod continuation_frame;
 mod data_frame;
 mod frame_init;
