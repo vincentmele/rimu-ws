@@ -544,6 +544,16 @@ where
     self.try_seal_and_send(bytes)
   }
 
+  /// The stream's room: plaintext, kernel and user-space records all wait in its queue. A
+  /// connection that can't write any more can't tell: its writes take the awaited path.
+  #[inline]
+  async fn send_room(&mut self) -> crate::Result<bool> {
+    if self.connection_state.cannot_write() {
+      return Ok(false);
+    }
+    self.stream.send_room().await
+  }
+
   /// As [`Self::try_write_all_vectored`].
   #[inline]
   fn try_send_owned(&mut self, bytes: &mut Vec<u8>) -> crate::Result<bool> {

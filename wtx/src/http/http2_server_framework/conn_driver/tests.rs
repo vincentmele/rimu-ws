@@ -166,6 +166,10 @@ impl StreamWriter for Counting {
     }
     Ok(rslt)
   }
+
+  async fn send_room(&mut self) -> crate::Result<bool> {
+    self.inner.send_room().await
+  }
 }
 
 struct Served {

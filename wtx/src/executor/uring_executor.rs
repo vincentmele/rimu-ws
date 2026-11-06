@@ -728,6 +728,16 @@ impl StreamWriter for UringTcpStream {
     })
   }
 
+  #[inline]
+  async fn send_room(&mut self) -> crate::Result<bool> {
+    let conn = self.conn;
+    poll_fn(|cx| {
+      poll_own_reactor(conn.runtime, |reactor| reactor.poll_send_room(conn.idx, conn.generation, cx))
+    })
+    .await?;
+    Ok(true)
+  }
+
   #[cfg(feature = "tls")]
   #[inline]
   fn send_kernel_tls_alert(&mut self, level: u8, description: u8) -> crate::Result<()> {
@@ -869,6 +879,16 @@ impl StreamWriter for UringWriteHalf {
     with_own_reactor(conn.runtime, |reactor| {
       reactor.try_queue_send_with(conn.idx, conn.generation, len, write)
     })
+  }
+
+  #[inline]
+  async fn send_room(&mut self) -> crate::Result<bool> {
+    let conn = self.conn;
+    poll_fn(|cx| {
+      poll_own_reactor(conn.runtime, |reactor| reactor.poll_send_room(conn.idx, conn.generation, cx))
+    })
+    .await?;
+    Ok(true)
   }
 
   #[cfg(feature = "tls")]
@@ -2842,6 +2862,12 @@ impl Reactor {
           let room = len.saturating_add(self.params.tx_high_water);
           conn.tx_pending = Vec::with_capacity(room);
         }
+        // Grown once, to room for the whole window, rather than by doublings that copy it.
+        let want = conn.tx_pending.len().saturating_add(len);
+        if conn.tx_pending.capacity() < want {
+          let room = want.max(len.saturating_add(self.params.tx_high_water));
+          conn.tx_pending.reserve_exact(room.saturating_sub(conn.tx_pending.len()));
+        }
         let before = conn.tx_pending.len();
         if let Err(err) = write(&mut conn.tx_pending) {
           conn.tx_pending.truncate(before);
@@ -4568,6 +4594,46 @@ mod tests {
     });
     client.join().unwrap();
     assert!(largest <= 64 * 1024, "a free slot holds a {largest}-byte buffer");
+  }
+
+  // A write declined because the queue is full can wait for room instead of being copied into
+  // the queue: `send_room` resolves once the bytes queued fall back under the high-water mark.
+  #[test]
+  fn send_room_resolves_when_the_queue_drains() {
+    use crate::net::StreamWriter;
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let client = std::thread::spawn(move || {
+      let mut stream = connect(&client_addr);
+      // Let the server fill its queue before reading.
+      std::thread::sleep(core::time::Duration::from_millis(100));
+      let mut got = Vec::new();
+      let _len = stream.read_to_end(&mut got).unwrap();
+      got.len()
+    });
+    let params = crate::executor::UringParams::new().set_tx_high_water(64 * 1024);
+    let runtime = UringRuntime::with_params(params).unwrap();
+    let sent = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+      let mut sent = 0;
+      let mut declined = 0;
+      while sent < 8 << 20 {
+        let mut write = |buf: &mut Vec<u8>| {
+          buf.extend_from_slice(&[4; 32 * 1024]);
+          Ok(())
+        };
+        if stream.try_send_with(32 * 1024, &mut write).unwrap() {
+          sent += 32 * 1024;
+        } else {
+          declined += 1;
+          assert!(stream.send_room().await.unwrap(), "the stream can't tell when it has room");
+        }
+      }
+      assert!(declined > 0, "the queue never filled");
+      sent
+    });
+    assert_eq!(client.join().unwrap(), sent);
   }
 
   // A runtime left with no connection keeps no send buffers: the pool that let a busy turn reuse

@@ -567,9 +567,10 @@ where
   S: StreamWriter,
 {
   loop {
-    // The slices borrow the core; a write that must wait copies them out first, so no borrow is
-    // held across the await.
-    let written = {
+    // The slices borrow the core: a write the stream declined waits for room without a borrow
+    // held across the await, and is then tried again, or, if the stream can't tell when it has
+    // room, copied out and awaited.
+    let declined = {
       let mut guard = shared.borrow_mut();
       if !guard.conn.has_output() {
         return Ok(());
@@ -589,17 +590,26 @@ where
       let len: usize = group.iter().map(|el| el.len()).sum();
       if stream.try_write_all_vectored(group)? {
         guard.conn.advance_output(len);
-        None
+        false
       } else {
-        let mut copy = VectorUsize::with_capacity(len)?;
-        let _ = copy.extend_from_copyable_slices(group.iter().copied())?;
-        Some((copy, len))
+        true
       }
     };
-    if let Some((copy, len)) = written {
-      stream.write_all(&copy).await?;
-      shared.borrow_mut().conn.advance_output(len);
+    if !declined || stream.send_room().await? {
+      continue;
     }
+    let (copy, len) = {
+      let guard = shared.borrow();
+      let mut slices = ArrayVectorCopy::<&[u8], 16>::new();
+      guard.conn.output(&mut slices);
+      let group = slices.get(..usize::from(slices.len()).min(8)).unwrap_or_default();
+      let len: usize = group.iter().map(|el| el.len()).sum();
+      let mut copy = VectorUsize::with_capacity(len)?;
+      let _ = copy.extend_from_copyable_slices(group.iter().copied())?;
+      (copy, len)
+    };
+    stream.write_all(&copy).await?;
+    shared.borrow_mut().conn.advance_output(len);
   }
 }
 

@@ -44,6 +44,15 @@ pub trait StreamWriter: StreamCommon {
     Ok(false)
   }
 
+  /// Waits until [`Self::try_send_with`] (and the other non-waiting writes) would take bytes
+  /// again, so a caller that was declined can retry them instead of copying its bytes into an
+  /// awaited write. `false` when the stream can't tell, the default: the caller then writes with
+  /// [`Self::write_all_vectored`].
+  #[inline]
+  fn send_room(&mut self) -> impl Future<Output = crate::Result<bool>> {
+    async { Ok(false) }
+  }
+
   /// For kernel TLS: sends an alert record after what was written before it, which may be once
   /// those bytes are out. The default, for streams without kernel TLS, fails with `Unsupported`.
   #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
@@ -85,6 +94,11 @@ where
     write: &mut dyn FnMut(&mut alloc::vec::Vec<u8>) -> crate::Result<()>,
   ) -> crate::Result<bool> {
     (**self).try_send_with(len, write)
+  }
+
+  #[inline]
+  fn send_room(&mut self) -> impl Future<Output = crate::Result<bool>> {
+    (**self).send_room()
   }
 
   #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
