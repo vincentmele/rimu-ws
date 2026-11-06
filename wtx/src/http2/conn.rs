@@ -7,11 +7,14 @@
 
 pub(crate) mod body;
 mod decode_memo;
+#[cfg(any(test, feature = "_fuzz"))]
+#[doc(hidden)]
+pub mod differential;
 pub(crate) mod header_cache;
 pub(crate) mod output;
 pub(crate) mod scan;
 pub(crate) mod stream_table;
-#[cfg(test)]
+#[cfg(any(test, feature = "_fuzz"))]
 pub(crate) mod test_frames;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -80,6 +83,27 @@ struct PeerSettings {
   max_frame_len: u32,
 }
 
+/// The last stream ids this side reset. Late frames on them are ignored for as long as they are
+/// remembered, which RFC 9113 §5.1 allows to be limited.
+#[derive(Clone, Copy, Debug, Default)]
+struct RecentResets {
+  ids: [u32; 32],
+  next: usize,
+}
+
+impl RecentResets {
+  fn contains(&self, id: u32) -> bool {
+    id != 0 && self.ids.contains(&id)
+  }
+
+  fn push(&mut self, id: u32) {
+    if let Some(slot) = self.ids.get_mut(self.next) {
+      *slot = id;
+    }
+    self.next = self.next.wrapping_add(1) % self.ids.len();
+  }
+}
+
 /// Counts events in fixed windows of time.
 #[derive(Clone, Copy, Debug, Default)]
 struct RateWindow {
@@ -143,6 +167,8 @@ pub(crate) struct Http2Conn<const IS_CLIENT: bool> {
   /// The time of the bytes being fed.
   now: Duration,
   resets: RateWindow,
+  /// Streams this side reset lately, whose late frames are ignored (RFC 9113 §5.1).
+  reset_by_us: RecentResets,
   /// The server still expects the client's connection preface.
   wants_preface: bool,
   streams: StreamTable,
@@ -188,6 +214,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       pending_block: None,
       now: Duration::ZERO,
       resets: RateWindow::default(),
+      reset_by_us: RecentResets::default(),
       wants_preface: !IS_CLIENT,
       streams: StreamTable::new(),
     };
@@ -202,7 +229,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     this
   }
 
-  #[cfg(test)]
+  #[cfg(any(test, feature = "_fuzz"))]
   /// Parses every complete frame at the start of `input` and returns how many bytes it used.
   /// The caller keeps the rest and feeds it again with what it reads next.
   ///
@@ -519,7 +546,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
   pub(crate) fn send_reset(&mut self, stream_id: U31, code: Http2ErrorCode) {
     let id = stream_id.u32();
     if self.streams.close(id) {
-      push_reset(&mut self.out, id, code);
+      self.push_stream_reset(id, code);
     }
   }
 
@@ -740,7 +767,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       let _ = self.streams.close(id);
     } else {
       let _ = self.streams.close(id);
-      push_reset(&mut self.out, id, Http2ErrorCode::NoError);
+      self.push_stream_reset(id, Http2ErrorCode::NoError);
     }
   }
 
@@ -899,7 +926,11 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       if self.is_idle(id) {
         return Err(protocol_err(Http2Error::UnknownStreamReceiver));
       }
-      push_reset(&mut self.out, id, Http2ErrorCode::StreamClosed);
+      // Sent before our reset reached the peer: ignored, its bytes handed back to the connection
+      // window like any others.
+      if !self.reset_by_us.contains(id) {
+        self.push_stream_reset(id, Http2ErrorCode::StreamClosed);
+      }
       return Ok(());
     };
     if stream.recv_closed {
@@ -1013,6 +1044,9 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       if id.is_multiple_of(2) {
         return Err(protocol_err(Http2Error::UnexpectedStreamId));
       }
+      if self.reset_by_us.contains(id) {
+        return self.discard_header_block(fi, block);
+      }
       return Err(crate::Error::Http2ErrorGoAway(
         Http2ErrorCode::StreamClosed,
         Http2Error::UnexpectedStreamId,
@@ -1048,11 +1082,8 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
             return Err(err);
           }
         };
-        let decoded = Decoded {
-          content_length,
-          method: hf.hsreqh().method,
-          protocol: hf.hsreqh().protocol,
-        };
+        let decoded =
+          Decoded { content_length, method: hf.hsreqh().method, protocol: hf.hsreqh().protocol };
         // A block that left the table as it was decodes the same way while it stays so.
         if !hf.is_over_size() && self.hpack_dec.generation() == generation {
           self.decode_memo.insert(block, generation, &stream.msg, decoded)?;
@@ -1061,7 +1092,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       };
     if refuse {
       let _ = self.streams.close(id);
-      push_reset(&mut self.out, id, Http2ErrorCode::RefusedStream);
+      self.push_stream_reset(id, Http2ErrorCode::RefusedStream);
       return Ok(());
     }
     let content_length = decoded.content_length;
@@ -1282,9 +1313,33 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     if peer_initiated { id > self.highest_peer_id } else { id >= self.next_local_id }
   }
 
+  /// Decodes a header block that arrived on a stream this side reset, for the HPACK state it
+  /// changes, and drops it.
+  fn discard_header_block(&mut self, fi: FrameInit, block: &[u8]) -> crate::Result<()> {
+    let mut scratch = MsgBufferString::default();
+    let rslt = HeadersFrame::read::<IS_CLIENT, true>(
+      Some(block),
+      fi,
+      &self.hp,
+      &mut self.hpack_dec,
+      (&mut scratch, 0),
+    );
+    match rslt {
+      Err(err) if !is_malformed(&err) => Err(err),
+      _ => Ok(()),
+    }
+  }
+
+  /// Queues RST_STREAM for `id` and remembers it, so that the peer's frames already on the way
+  /// are ignored.
+  fn push_stream_reset(&mut self, id: u32, code: Http2ErrorCode) {
+    push_reset(&mut self.out, id, code);
+    self.reset_by_us.push(id);
+  }
+
   /// Resets stream `id` with `code` and reports it.
   fn stream_error(&mut self, id: u32, code: Http2ErrorCode) {
-    push_reset(&mut self.out, id, code);
+    self.push_stream_reset(id, code);
     if self.streams.close(id) {
       let _rslt = self.events.push_back(ConnEvent::Reset { code, stream_id: U31::from_u32(id) });
     }
@@ -1399,7 +1454,7 @@ impl Http2Conn<true> {
     };
     let ended = stream.recv_closed && stream.send_closed;
     if self.streams.close(id) && reset && !ended {
-      push_reset(&mut self.out, id, Http2ErrorCode::Cancel);
+      self.push_stream_reset(id, Http2ErrorCode::Cancel);
     }
   }
 }

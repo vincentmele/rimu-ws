@@ -17,6 +17,9 @@ mod client_stream;
 mod common_flags;
 mod common_stream;
 pub(crate) mod conn;
+#[cfg(any(test, feature = "_fuzz"))]
+#[doc(hidden)]
+pub use conn::differential;
 #[allow(
   dead_code,
   reason = "upstream's frame code, kept for merges; the connection core writes frames itself"

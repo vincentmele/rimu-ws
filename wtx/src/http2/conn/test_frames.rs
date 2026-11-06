@@ -45,6 +45,7 @@ pub(crate) fn headers_req(
 }
 
 /// A DATA frame.
+#[cfg_attr(not(test), expect(dead_code, reason = "the fuzz build uses the others"))]
 pub(crate) fn data(stream: u32, bytes: &[u8], end_stream: bool) -> Vec<u8> {
   frame(0, u8::from(end_stream), stream, bytes)
 }

@@ -19,6 +19,10 @@ name = "http"
 path = "http.rs"
 
 [[bin]]
+name = "http2_conn"
+path = "http2_conn.rs"
+
+[[bin]]
 name = "pem"
 path = "pem.rs"
 
@@ -48,7 +52,7 @@ path = "x509.rs"
 
 [dependencies]
 libfuzzer-sys = { version = "0.4" }
-rimu-ws = { default-features = false, features = ["_fuzz", "arbitrary", "asn1", "crypto-ring", "http-cookie", "std", "web-socket", "x509"], path = "../wtx" }
+rimu-ws = { default-features = false, features = ["_fuzz", "arbitrary", "asn1", "crypto-ring", "http-cookie", "http2", "std", "web-socket", "x509"], path = "../wtx" }
 
 [package]
 edition = "2024"

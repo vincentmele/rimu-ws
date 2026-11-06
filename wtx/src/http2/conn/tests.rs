@@ -697,7 +697,10 @@ fn conn_take_output_is_the_queued_bytes() {
   assert!(conn.has_output());
   let next = conn.take_output(Vec::new()).unwrap();
   assert!(next.capacity() >= 4096);
-  assert_eq!(parse_all(&next).iter().map(|el| (el.0, el.2)).collect::<Vec<_>>(), [(HEADERS, 3), (DATA, 3)]);
+  assert_eq!(
+    parse_all(&next).iter().map(|el| (el.0, el.2)).collect::<Vec<_>>(),
+    [(HEADERS, 3), (DATA, 3)]
+  );
 }
 
 // A request block repeated byte for byte replays its decode, with the same fields.
@@ -705,7 +708,10 @@ fn conn_take_output_is_the_queued_bytes() {
 fn conn_decode_memo_replays_identical_block() {
   let mut conn = ready_server(HttpRecvParams::with_default_params());
   // GET http://a/x with `user-agent: t`, all literal without indexing: the table never changes.
-  let block = [0x82, 0x86, 0x04, 0x02, b'/', b'x', 0x01, 0x01, b'a', 0x00, 0x0a, b'u', b's', b'e', b'r', b'-', b'a', b'g', b'e', b'n', b't', 0x01, b't'];
+  let block = [
+    0x82, 0x86, 0x04, 0x02, b'/', b'x', 0x01, 0x01, b'a', 0x00, 0x0a, b'u', b's', b'e', b'r', b'-',
+    b'a', b'g', b'e', b'n', b't', 0x01, b't',
+  ];
   let mut decoded = Vec::new();
   // The first block also applies the table size the SETTINGS announced, so it is not kept; the
   // second is, and the third replays it.
@@ -801,7 +807,9 @@ fn conn_shared_bodies_do_not_count_toward_the_send_queue() {
     for id in (1..20).step_by(2) {
       conn.feed(&headers_req(id, "GET", "/", &[], true)).unwrap();
       let mut msg = MsgBufferString::default();
-      conn.send_response_shared(U31::from_u32(id), StatusCode::Ok, &mut msg, shared.clone()).unwrap();
+      conn
+        .send_response_shared(U31::from_u32(id), StatusCode::Ok, &mut msg, shared.clone())
+        .unwrap();
     }
     assert!(conn.has_output());
     own_response(&mut conn, 21).unwrap();
@@ -810,4 +818,112 @@ fn conn_shared_bodies_do_not_count_toward_the_send_queue() {
       assert!(own_response(&mut conn, 23).is_err());
     }
   }
+}
+
+// RFC 9113 §5.1: frames on a stream this side reset may already have been on their way; they are
+// ignored, not answered with another RST_STREAM, and DATA still counts toward the connection
+// window, which is handed back.
+#[test]
+fn conn_frames_after_our_reset_are_ignored() {
+  let mut conn = ready_server(HttpRecvParams::with_default_params());
+  let _ = conn.feed(&headers_req(1, "POST", "/", &[], false)).unwrap();
+  let id = U31::from_u32(1);
+  // Answered before the request body ended: RST_STREAM(NO_ERROR) tells the client to stop.
+  let mut msg = MsgBufferString::default();
+  conn.send_response(id, StatusCode::Ok, &mut msg).unwrap();
+  let frames = take_frames(&mut conn);
+  assert_eq!(rst_code(&frames, 1), Some(0), "{frames:?}");
+  // The client's body was already on its way, and its trailers.
+  let mut input = data(1, &[7; 1000], false);
+  input.extend(frame(WINDOW_UPDATE, 0, 1, &100u32.to_be_bytes()));
+  input.extend(data(1, &[7; 1000], false));
+  input.extend(headers_req(1, "POST", "/", &[], true));
+  let _ = conn.feed(&input).unwrap();
+  let frames = take_frames(&mut conn);
+  assert_eq!(rst_code(&frames, 1), None, "{frames:?}");
+  assert!(!frames.iter().any(|el| el.0 == GOAWAY), "{frames:?}");
+  let returned: u32 = frames
+    .iter()
+    .filter(|el| el.0 == WINDOW_UPDATE && el.2 == 0)
+    .map(|el| u32::from_be_bytes(el.3[..4].try_into().unwrap()))
+    .sum();
+  assert!(returned >= 2000, "connection window handed back: {returned} {frames:?}");
+  // A stream the client itself ended still errors.
+  let _ = conn.feed(&headers_req(3, "GET", "/", &[], true)).unwrap();
+  let mut msg = MsgBufferString::default();
+  conn.send_response(U31::from_u32(3), StatusCode::Ok, &mut msg).unwrap();
+  let _ = take_frames(&mut conn);
+  let _ = conn.feed(&data(3, b"late", false)).unwrap();
+  let frames = take_frames(&mut conn);
+  assert_eq!(rst_code(&frames, 3), Some(5), "{frames:?}");
+}
+
+// A response header block larger than the peer's frame size goes out as HEADERS plus
+// CONTINUATIONs, each within the frame size, and decodes whole (cnetmod never splits).
+#[test]
+fn conn_large_response_headers_use_continuation() {
+  let mut conn = ready_server(HttpRecvParams::with_default_params());
+  let _ = conn.feed(&headers_req(1, "GET", "/", &[], true)).unwrap();
+  let big: String = (0..40_000u32).map(|el| char::from(b'a' + (el * 7 % 26) as u8)).collect();
+  let mut msg = MsgBufferString::default();
+  msg.headers.push_from_iter(Header::from_name_and_value("x-big", [big.as_str()])).unwrap();
+  conn.send_response(U31::from_u32(1), StatusCode::Ok, &mut msg).unwrap();
+  let frames = take_frames(&mut conn);
+  let block_frames: Vec<_> =
+    frames.iter().filter(|el| el.2 == 1 && (el.0 == HEADERS || el.0 == 9)).collect();
+  assert!(block_frames.len() >= 2, "{}", block_frames.len());
+  assert_eq!(block_frames[0].0, HEADERS);
+  assert!(block_frames[1..].iter().all(|el| el.0 == 9));
+  let (last, rest) = block_frames.split_last().unwrap();
+  assert_eq!(last.1 & 4, 4);
+  assert!(rest.iter().all(|el| el.1 & 4 == 0));
+  assert!(block_frames.iter().all(|el| el.3.len() <= 16_384));
+  let block: Vec<u8> = block_frames.iter().flat_map(|el| el.3.clone()).collect();
+  let fields = decode_block(&mut response_decoder(), &block);
+  assert!(fields.contains(&("x-big".into(), big)));
+}
+
+// A request header block split over HEADERS and two CONTINUATIONs, cut inside fields, decodes as
+// one block (zix decoded each fragment on its own).
+#[test]
+fn conn_header_block_split_mid_field() {
+  let mut conn = ready_server(HttpRecvParams::with_default_params());
+  let full = headers_req(1, "GET", "/split/path", &[("x-field", "a-value-that-gets-cut")], true);
+  let block = &full[9..];
+  let path_at = block.windows(6).position(|el| el == b"/split").unwrap() + 3;
+  let field_at = block.windows(7).position(|el| el == b"a-value").unwrap() + 4;
+  let mut input = frame(HEADERS, 1, 1, &block[..path_at]);
+  input.extend(frame(9, 0, 1, &block[path_at..field_at]));
+  input.extend(frame(9, 4, 1, &block[field_at..]));
+  conn.feed(&input).unwrap();
+  assert_eq!(
+    events(&mut conn),
+    [ConnEvent::Headers { end_stream: true, stream_id: U31::from_u32(1) }]
+  );
+  let msg = conn.msg_mut(U31::from_u32(1)).unwrap();
+  assert_eq!(msg.uri.path(), "/split/path");
+  assert_eq!(msg.headers.get_by_name(b"x-field").map(|el| el.value), Some("a-value-that-gets-cut"));
+}
+
+// Inserts into a full dynamic table evict the oldest entries, and indexed references afterwards
+// resolve against what is left (zix dropped the insert and fell out of step with the peer).
+#[test]
+fn hpack_decoder_evicts_when_full() {
+  let entry = |idx: usize| (alloc::format!("n{idx:03}"), alloc::format!("{idx:0>96}"));
+  let mut dec = HpackDecoder::new();
+  dec.set_max_bytes(4096);
+  let mut block = Vec::new();
+  for idx in 0..40 {
+    let (name, value) = entry(idx);
+    block.push(0x40);
+    block.push(u8::try_from(name.len()).unwrap());
+    block.extend(name.as_bytes());
+    block.push(u8::try_from(value.len()).unwrap());
+    block.extend(value.as_bytes());
+  }
+  assert_eq!(decode_block(&mut dec, &block).len(), 40);
+  // Each entry counts 4 + 96 + 32 = 132 bytes: 31 fit in 4096, entries 9 to 39. The newest is
+  // index 62, the oldest kept 92.
+  assert_eq!(decode_block(&mut dec, &[0x80 | 62, 0x80 | 92]), [entry(39), entry(9)]);
+  assert!(dec.decode(&[0x80 | 93], |_| Ok(())).is_err());
 }
