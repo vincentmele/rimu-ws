@@ -167,17 +167,42 @@ where
         TryRead::Closed => return Ok(true),
         TryRead::Pending => return Ok(false),
         TryRead::Unsupported => {
-          let (init, uninit) = self.rx.split_at_spare_mut();
-          let init_len = init.len();
-          return match stream.read(uninit.into()).await? {
-            Some(len) => {
-              // SAFETY: `read` initialized `len` bytes of the spare capacity
-              unsafe {
-                self.rx.set_len(init_len.wrapping_add(len.get()));
+          // A read that waits for the peer (user-space TLS) must not hold back what handlers do
+          // meanwhile: a parked handler that wakes, or a manual stream that queues output, ends
+          // the wait, and the read is dropped. The stream keeps the bytes of a partial record
+          // in its own buffers, so nothing read is lost.
+          let Self { rx, shared, slots, .. } = self;
+          let (init_len, rslt) = {
+            let (init, uninit) = rx.split_at_spare_mut();
+            let init_len = init.len();
+            let mut read = pin!(stream.read(uninit.into()));
+            let rslt = poll_fn(|cx| {
+              if let Poll::Ready(elem) = read.as_mut().poll(cx) {
+                return Poll::Ready(Some(elem));
               }
-              Ok(false)
-            }
-            None => Ok(true),
+              slots.register_conn(cx.waker());
+              let mut state = shared.borrow_mut();
+              if state.dirty || state.conn.has_output() || slots.has_woken() {
+                return Poll::Ready(None);
+              }
+              state.conn_waker = Some(cx.waker().clone());
+              Poll::Pending
+            })
+            .await;
+            (init_len, rslt)
+          };
+          return match rslt {
+            None => Ok(false),
+            Some(elem) => match elem? {
+              Some(len) => {
+                // SAFETY: `read` initialized `len` bytes of the spare capacity
+                unsafe {
+                  rx.set_len(init_len.wrapping_add(len.get()));
+                }
+                Ok(false)
+              }
+              None => Ok(true),
+            },
           };
         }
       }

@@ -480,3 +480,67 @@ fn server_tls_preface_with_finished_uses_ktls() {
   assert_eq!(client.join().unwrap(), 8);
   assert_eq!(kernel, offered, "kernel TLS offered: {offered}");
 }
+
+// With user-space TLS a read is a future that waits for the peer: a handler that parks and wakes
+// meanwhile must still get its response out, without the client sending anything more.
+#[test]
+fn server_userspace_tls_parked_handler_answers() {
+  use crate::{
+    executor::StdRuntime,
+    tests::{_PUBLIC_KEY, _ROOT_CA, _SECRET_KEY},
+    tls::{TlsAcceptor, TlsConfig, TlsConnectorBuilder},
+  };
+  let uri = _uri();
+  let (host, port) = uri.hostname_with_implied_port();
+  let addr = alloc::format!("{host}:{port}");
+  let client_uri = uri.clone();
+  let (done_tx, done_rx) = mpsc::channel();
+  let _client = std::thread::spawn(move || {
+    StdRuntime::new().block_on(async move {
+      let mut rng = <crate::rng::ChaCha20 as crate::rng::CryptoSeedableRng>::from_std_random().unwrap();
+      let mut config = TlsConfig::from_trust_anchors_pem([_ROOT_CA]).unwrap();
+      crate::http::push_h2_alpn(&mut config).unwrap();
+      let mut tls_stream = loop {
+        let connector = TlsConnectorBuilder::std(client_uri.clone()).build(&config, &mut rng).await;
+        if let Ok(elem) = connector {
+          break elem.connect().await.unwrap().tls_stream;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+      };
+      let mut opening = PREFACE.to_vec();
+      opening.extend(settings(&[]));
+      opening.extend(frame(4, 1, 0, &[]));
+      opening.extend(headers_req(1, "GET", "/slow", &[], true));
+      tls_stream.write_all(&opening).await.unwrap();
+      let mut got = Vec::new();
+      let mut buf = [0u8; 16 * 1024];
+      loop {
+        let len = tls_stream.read(buf.as_mut_slice().into()).await.unwrap().unwrap();
+        got.extend_from_slice(&buf[..len.get()]);
+        let complete = complete_len(&got);
+        if ended(&parse_all(&got[..complete])).contains(&1) {
+          break;
+        }
+      }
+      done_tx.send(()).unwrap();
+    });
+  });
+  let _server = std::thread::spawn(move || {
+    let runtime = UringRuntime::with_params(UringParams::default()).unwrap();
+    runtime.block_on(async {
+      let listener = UringTcpListener::bind(addr.as_str(), TcpParams::default().set_reuse_port(Some(false)))
+        .await
+        .unwrap();
+      let (stream, peer) = listener.accept(TcpParams::default()).await.unwrap();
+      let mut rng = <crate::rng::ChaCha20 as crate::rng::CryptoSeedableRng>::from_std_random().unwrap();
+      let mut config = TlsConfig::from_keys_pem(_PUBLIC_KEY, _SECRET_KEY).unwrap();
+      crate::http::push_h2_alpn(&mut config).unwrap();
+      *config.kernel_tls_mut() = false;
+      let mut tls_stream = TlsAcceptor::new(&config, &mut rng, stream).accept().await.unwrap().tls_stream;
+      let conn = Http2Conn::<false>::new(HttpRecvParams::with_default_params(), &mut Xorshift64::from(5u64));
+      let dispatcher = TestDispatcher { dropped: Arc::new(AtomicBool::new(false)) };
+      let _rslt = drive_conn(&mut tls_stream, conn, &dispatcher, peer.ip()).await;
+    });
+  });
+  assert!(done_rx.recv_timeout(Duration::from_secs(5)).is_ok(), "no response to the parked handler");
+}
