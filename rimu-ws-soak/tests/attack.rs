@@ -5,7 +5,7 @@ mod support;
 use rimu_ws_soak::{
   conn::ConnOpts,
   rng::rng,
-  scenario::{
+  scenario::{Proto, 
     Ctx, Limits, Outcome, Scenario, Weights,
     attack::{UpgradeCase, run_upgrade_case},
     parse_weights, profile,
@@ -32,6 +32,7 @@ fn ctx(addr: SocketAddr) -> Ctx {
       server_sndbuf: None,
     },
     opts: ConnOpts::default(),
+    proto: Proto::Ws,
   }
 }
 
@@ -154,9 +155,9 @@ fn close_linger_is_left_out_without_the_server_send_buffer() {
 #[test]
 fn every_profile_parses_and_untimed_needs_no_timeouts() {
   for name in ["baseline", "hostile", "attack", "storm", "untimed", "drip"] {
-    assert!(profile(name).is_some(), "{name}");
+    assert!(profile(name, Proto::Ws).is_some(), "{name}");
   }
-  let Weights(untimed) = profile("untimed").unwrap();
+  let Weights(untimed) = profile("untimed", Proto::Ws).unwrap();
   for timed in [
     Scenario::Slowloris,
     Scenario::IdlePre,

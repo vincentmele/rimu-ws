@@ -927,3 +927,22 @@ fn hpack_decoder_evicts_when_full() {
   assert_eq!(decode_block(&mut dec, &[0x80 | 62, 0x80 | 92]), [entry(39), entry(9)]);
   assert!(dec.decode(&[0x80 | 93], |_| Ok(())).is_err());
 }
+
+// A request whose content-length is already past `max_body_len` is answered 413 at its headers,
+// and reset with NO_ERROR so the client stops sending, instead of after its body has been
+// received up to the limit.
+#[test]
+fn conn_content_length_over_max_body_refused() {
+  let hp = HttpRecvParams::with_default_params().set_max_body_len(1000);
+  let mut conn = ready_server(hp);
+  let _ = conn.feed(&headers_req(1, "POST", "/", &[("content-length", "1001")], false)).unwrap();
+  let frames = take_frames(&mut conn);
+  let headers = frames.iter().find(|el| el.0 == HEADERS && el.2 == 1).expect("a response");
+  let fields = decode_block(&mut response_decoder(), &headers.3);
+  assert!(fields.contains(&(":status".into(), "413".into())), "{fields:?}");
+  assert_eq!(rst_code(&frames, 1), Some(0), "{frames:?}");
+  assert!(!events(&mut conn).iter().any(|el| matches!(el, ConnEvent::Headers { .. })));
+  // At the limit, it's taken.
+  let _ = conn.feed(&headers_req(3, "POST", "/", &[("content-length", "1000")], false)).unwrap();
+  assert_eq!(rst_code(&take_frames(&mut conn), 3), None);
+}

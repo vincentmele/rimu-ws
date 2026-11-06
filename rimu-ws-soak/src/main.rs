@@ -6,7 +6,7 @@ use rimu_ws_soak::{
   conn::ConnOpts,
   cycle::{self, CycleConfig, Extended, RecordMode},
   runner::{RunConfig, parse_replay, replay},
-  scenario::{Ctx, Limits, Weights, parse_weights, profile},
+  scenario::{Ctx, Limits, Proto, Weights, parse_weights, profile},
 };
 use std::{
   net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs as _},
@@ -33,9 +33,12 @@ enum Cmd {
 
 #[derive(clap::Args)]
 struct Common {
-  /// The server's WebSocket URL (plain `ws://` only).
+  /// The server's WebSocket URL (plain `ws://` only), or with `--proto h2` its `http://` URL.
   #[arg(long, default_value = "ws://127.0.0.1:9080/")]
   url: String,
+  /// The protocol the server speaks: WebSocket, or HTTP/2 without TLS (prior knowledge).
+  #[arg(long, value_enum, default_value_t = Proto::Ws)]
+  proto: Proto,
   /// Weighted mix: `baseline`, `hostile`, `storm`, `untimed`, `drip` or `deflate`. A comma
   /// list (`hostile,storm`) rotates them by cycle; replay with the failing cycle's profile.
   #[arg(long, default_value = "hostile")]
@@ -164,7 +167,9 @@ fn parse_ips(s: &str) -> Result<Vec<IpAddr>, String> {
 
 /// The context, the first profile's weights, and every profile when `--profile` lists several.
 fn ctx(common: &Common) -> Result<(Ctx, Weights, Vec<(String, Weights)>), String> {
-  let rest = common.url.strip_prefix("ws://").ok_or("only ws:// URLs are supported")?;
+  let scheme = if common.proto == Proto::H2 { "http://" } else { "ws://" };
+  let rest =
+    common.url.strip_prefix(scheme).ok_or_else(|| format!("only {scheme} URLs are supported"))?;
   let (authority, path) = rest.find('/').map_or((rest, "/"), |at| rest.split_at(at));
   let addr: SocketAddr = authority
     .to_socket_addrs()
@@ -176,7 +181,8 @@ fn ctx(common: &Common) -> Result<(Ctx, Weights, Vec<(String, Weights)>), String
     Some(spec) => parse_weights(spec)?,
     None => {
       for name in common.profile.split(',').map(str::trim) {
-        let weights = profile(name).ok_or_else(|| format!("unknown profile {name}"))?;
+        let weights =
+          profile(name, common.proto).ok_or_else(|| format!("unknown profile {name}"))?;
         rotation.push((name.to_owned(), weights));
       }
       let first = rotation.first().map(|el| el.1.clone()).ok_or("no profile")?;
@@ -204,7 +210,14 @@ fn ctx(common: &Common) -> Result<(Ctx, Weights, Vec<(String, Weights)>), String
     .collect::<Result<Vec<_>, String>>()?;
   let host = authority.to_owned();
   Ok((
-    Ctx { addr, host, path: path.to_owned(), limits, opts: ConnOpts::default() },
+    Ctx {
+      addr,
+      host,
+      path: path.to_owned(),
+      limits,
+      opts: ConnOpts::default(),
+      proto: common.proto,
+    },
     weights,
     rotation,
   ))

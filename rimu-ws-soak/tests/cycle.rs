@@ -5,7 +5,7 @@ use rimu_ws_soak::{
   cycle::{CycleConfig, Verdict, latency_verdict, run},
   probe::{ProbeStats, lag_exceeds},
   runner::RunConfig,
-  scenario::{Ctx, Limits, profile},
+  scenario::{Proto, Ctx, Limits, profile},
 };
 use std::{net::SocketAddr, time::Duration};
 use support::{Faults, spawn_fake};
@@ -23,13 +23,14 @@ fn cfg(addr: SocketAddr, pid: u32) -> CycleConfig {
     path: "/".into(),
     limits: Limits::default(),
     opts: ConnOpts::default(),
+    proto: Proto::Ws,
   };
   CycleConfig {
     run: RunConfig {
       global_seed: 1,
       slots: 20,
       duration: Duration::from_secs(2),
-      weights: profile("baseline").unwrap(),
+      weights: profile("baseline", Proto::Ws).unwrap(),
       ctx,
       source_ips: Vec::new(),
     },

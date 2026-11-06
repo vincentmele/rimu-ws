@@ -3183,13 +3183,19 @@ impl Reactor {
   }
 
   /// Strips the buffers of the free slots the next connections are unlikely to reuse soon: all but
-  /// as many as are open, and at least `WARM_FREE_MIN`. After a burst closes, memory then follows
+  /// as many as are open, and at least `WARM_FREE_MIN`; with no connection open, the send pool's
+  /// too. After a burst closes, memory then follows
   /// the connections open rather than the most ever open. The free list is a stack, so the
   /// stripped slots are a prefix at its bottom, which `cold_free` counts: each slot is stripped
   /// at most once per time it is freed.
   fn trim_free_slots(&self) {
     let free = self.free_conns.borrow();
     let mut conns = self.conns.borrow_mut();
+    // With no connection left, the send buffers kept for reuse would only hold the largest outputs
+    // of the last burst.
+    if free.len() == conns.len() {
+      self.send_pool.borrow_mut().clear();
+    }
     let keep = conns.len().wrapping_sub(free.len()).max(WARM_FREE_MIN);
     let mut cold = self.cold_free.get().min(free.len());
     while free.len().wrapping_sub(cold) > keep {
@@ -4562,6 +4568,51 @@ mod tests {
     });
     client.join().unwrap();
     assert!(largest <= 64 * 1024, "a free slot holds a {largest}-byte buffer");
+  }
+
+  // A runtime left with no connection keeps no send buffers: the pool that let a busy turn reuse
+  // them would otherwise hold the largest outputs of a burst for good.
+  #[test]
+  fn no_connection_left_keeps_no_send_buffers() {
+    use crate::net::StreamWriter;
+    const LEN: usize = 512 * 1024;
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let client = std::thread::spawn(move || {
+      let mut stream = connect(&client_addr);
+      let mut got = Vec::new();
+      let _len = stream.read_to_end(&mut got).unwrap();
+      assert_eq!(got.len(), 4 * LEN);
+    });
+    let runtime = UringRuntime::new().unwrap();
+    let (pooled_open, pooled_closed) = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+      for _ in 0..4 {
+        let mut owned = alloc::vec![9; LEN];
+        if !stream.try_send_owned(&mut owned).unwrap() {
+          stream.write_all(&alloc::vec![9; LEN]).await.unwrap();
+        }
+        for _ in 0..20 {
+          yield_once().await;
+        }
+      }
+      let pool_len = || super::with_reactor(|reactor| Ok(reactor.send_pool.borrow().len())).unwrap();
+      for _ in 0..100 {
+        yield_once().await;
+      }
+      let pooled_open = pool_len();
+      drop(stream);
+      while super::with_reactor(|reactor| Ok(reactor.conns.borrow().iter().any(|el| el.in_use)))
+        .unwrap()
+      {
+        yield_once().await;
+      }
+      (pooled_open, pool_len())
+    });
+    client.join().unwrap();
+    assert!(pooled_open > 0, "the test never filled the pool");
+    assert_eq!(pooled_closed, 0, "{pooled_closed} send buffers kept with no connection left");
   }
 
   // After a burst of connections closes, at most `WARM_FREE_MIN` free slots keep buffers: the rest

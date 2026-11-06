@@ -3,7 +3,7 @@ mod support;
 use rimu_ws_soak::{
   conn::ConnOpts,
   rng::rng,
-  scenario::{Ctx, Limits, Outcome, Scenario, run, slack},
+  scenario::{Proto, Ctx, Limits, Outcome, Scenario, run, slack},
 };
 use std::{net::SocketAddr, time::Duration};
 use support::{Faults, spawn_fake};
@@ -25,6 +25,7 @@ fn ctx(addr: SocketAddr) -> Ctx {
       server_sndbuf: None,
     },
     opts: ConnOpts::default(),
+    proto: Proto::Ws,
   }
 }
 

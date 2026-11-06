@@ -226,7 +226,11 @@ impl Conn {
   }
 
   /// Appends what one read returns to `buf`; 0 on EOF or reset.
-  async fn read_some(&mut self, buf: &mut Vec<u8>, deadline: Instant) -> Result<usize, ConnError> {
+  pub(crate) async fn read_some(
+    &mut self,
+    buf: &mut Vec<u8>,
+    deadline: Instant,
+  ) -> Result<usize, ConnError> {
     let mut chunk = vec![0; 65536];
     match timeout_at(deadline, self.stream.read(&mut chunk)).await {
       Err(_) => Err(ConnError::server("timed out")),

@@ -96,7 +96,7 @@ fn drained_leak_detected() {
 #[test]
 fn large_messages_in_flight_raise_the_rss_limit() {
   let base = Baseline { rss_kib: 1000, fds: 10 };
-  let budgets = Budgets { slots: 100, large_inflight: 10, max_payload: 1 << 20 };
+  let budgets = Budgets { slots: 100, large_inflight: 10, max_payload: 1 << 20, per_slot_kib: 0 };
   let limit_kib = 1000 + 256 * 100 + 65536 + 10 * 3 * 1024;
   let mut streak = 0;
   assert!(check_running(&base, &sample(10, limit_kib, 0), 0, &budgets, &mut streak).is_empty());
@@ -104,4 +104,17 @@ fn large_messages_in_flight_raise_the_rss_limit() {
     check_running(&base, &sample(10, limit_kib + 1, 0), 0, &budgets, &mut streak),
     [Violation::Rss { rss_kib: limit_kib + 1, limit_kib }]
   );
+}
+
+
+// The HTTP/2 server streaming large responses may hold more per connection than the WebSocket
+// server: the budget per slot follows the server.
+#[test]
+fn per_slot_budget_follows_the_server() {
+  let base = Baseline { rss_kib: 1000, fds: 10 };
+  let budgets = Budgets { slots: 100, per_slot_kib: 768, ..Budgets::default() };
+  let limit_kib = 1000 + 768 * 100 + 65536;
+  let mut streak = 0;
+  assert!(check_running(&base, &sample(10, limit_kib, 0), 0, &budgets, &mut streak).is_empty());
+  assert!(!check_running(&base, &sample(10, limit_kib + 1, 0), 0, &budgets, &mut streak).is_empty());
 }

@@ -2,10 +2,8 @@
 //! while the slots load it, and whose schedule lag shows when the harness itself is the bottleneck.
 
 use crate::{
-  codec::client_frame,
-  conn::{Conn, Next},
   rng::rng,
-  scenario::Ctx,
+  scenario::{Ctx, Ready},
 };
 use hdrhistogram::Histogram;
 use std::{
@@ -175,19 +173,14 @@ async fn probe(
     }
   };
   while !stop.load(Ordering::Relaxed) {
-    let mut conn = match Conn::connect(ctx.addr, &ctx.opts).await {
-      Ok(conn) => conn,
+    let mut ready = match Ready::open(&ctx, &mut rng).await {
+      Ok(ready) => ready,
       Err(_) => {
         failed(&hists);
         sleep(Duration::from_millis(100)).await;
         continue;
       }
     };
-    if conn.upgrade(&ctx.host, &ctx.path, &mut rng).await.is_err() {
-      failed(&hists);
-      sleep(Duration::from_millis(100)).await;
-      continue;
-    }
     let text = [b'p'; 32];
     // When an echo outlasts the period, the next send is due before the echo is back. That
     // lateness is the server's; lag counts only the timer's, from whichever came last.
@@ -204,13 +197,7 @@ async fn probe(
         // Fell behind by more than a period: skip the missed sends instead of bursting.
         next = start + period;
       }
-      let mut frame = Vec::new();
-      client_frame(true, 1, &text, rand::Rng::random(&mut rng), &mut frame);
-      let ok = conn.send(&frame).await.is_ok()
-        && matches!(
-          conn.next_frame(start + ECHO_TIMEOUT).await,
-          Ok(Next::Frame(echo)) if echo.opcode == 1 && echo.payload == text
-        );
+      let ok = ready.round_trip(&text, &mut rng, start + ECHO_TIMEOUT).await;
       if !ok {
         failed(&hists);
         break;

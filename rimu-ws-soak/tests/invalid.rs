@@ -3,7 +3,7 @@ mod support;
 use rimu_ws_soak::{
   conn::ConnOpts,
   rng::rng,
-  scenario::{
+  scenario::{Proto, 
     Ctx, Limits, Outcome, Scenario,
     invalid::{InvalidCase, expected_codes, run_case},
     run,
@@ -19,6 +19,7 @@ fn ctx(addr: SocketAddr) -> Ctx {
     path: "/".into(),
     limits: Limits::default(),
     opts: ConnOpts::default(),
+    proto: Proto::Ws,
   }
 }
 

@@ -3,11 +3,16 @@
 mod abuse;
 pub mod attack;
 mod echo;
+mod h2;
+
+pub use h2::warm_h2_caches;
 pub mod invalid;
 pub mod resource;
 
 use crate::{
-  conn::{Conn, ConnError, ConnOpts, Failure},
+  codec::client_frame,
+  conn::{Conn, ConnError, ConnOpts, Failure, Next},
+  h2codec::{DATA, END_STREAM, H2, frame, request},
   rng::Rng,
 };
 use rand::Rng as _;
@@ -44,6 +49,17 @@ pub enum Scenario {
   CloseLinger,
   PingNoRead,
   SlowReader,
+  H2Steady,
+  H2RapidReset,
+  H2ContinuationFlood,
+  H2SettingsFlood,
+  H2PingFlood,
+  H2SlowReader,
+  H2NeverRead,
+  H2WindowStarved,
+  H2HalfOpen,
+  H2OversizedHeaders,
+  H2OversizedBody,
 }
 
 /// Scenario runs holding a message of up to `max_payload` on the server, which the memory budget
@@ -111,7 +127,27 @@ impl Weights {
 /// - `storm`: connection churn.
 /// - `untimed`: `hostile` without the scenarios that need server timeouts.
 /// - `drip`: large messages trickled in fragments, for the memory budget.
-pub fn profile(name: &str) -> Option<Weights> {
+///
+/// With HTTP/2 (`proto`), `baseline`, `hostile`, `attack` and `storm` are HTTP/2 mixes.
+pub fn profile(name: &str, proto: Proto) -> Option<Weights> {
+  if proto == Proto::H2 {
+    let spec = match name {
+      "baseline" => "h2_steady=100",
+      "hostile" => {
+        "h2_steady=60,h2_rapid_reset=4,h2_continuation_flood=3,h2_settings_flood=3,h2_ping_flood=3,\
+         h2_slow_reader=4,h2_never_read=4,h2_window_starved=4,h2_half_open=5,h2_oversized_headers=5,\
+         h2_oversized_body=5"
+      }
+      "attack" => {
+        "h2_steady=10,h2_rapid_reset=15,h2_continuation_flood=15,h2_settings_flood=10,\
+         h2_ping_flood=10,h2_never_read=10,h2_window_starved=10,h2_oversized_headers=10,\
+         h2_oversized_body=10"
+      }
+      "storm" => "h2_half_open=40,h2_rapid_reset=30,h2_never_read=30",
+      _ => return None,
+    };
+    return parse_weights(spec).ok();
+  }
   let spec = match name {
     "baseline" => "echo=100",
     "hostile" => {
@@ -187,6 +223,16 @@ pub fn slack(limit: Duration) -> Duration {
   limit * 5 / 4 + Duration::from_millis(250)
 }
 
+/// Which protocol the server speaks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Proto {
+  /// WebSocket over HTTP/1.1.
+  #[default]
+  Ws,
+  /// HTTP/2 without TLS (prior knowledge).
+  H2,
+}
+
 /// Where and how a scenario connects.
 #[derive(Clone, Debug)]
 pub struct Ctx {
@@ -195,6 +241,65 @@ pub struct Ctx {
   pub path: String,
   pub limits: Limits,
   pub opts: ConnOpts,
+  pub proto: Proto,
+}
+
+/// A connection ready for round trips: an upgraded WebSocket, or HTTP/2 past its opening.
+#[derive(Debug)]
+pub enum Ready {
+  Ws(Conn),
+  H2 { h2: H2, next_id: u32 },
+}
+
+impl Ready {
+  /// Connects and upgrades, or sends the HTTP/2 opening.
+  pub async fn open(ctx: &Ctx, rng: &mut Rng) -> Result<Ready, ConnError> {
+    let mut conn = Conn::connect(ctx.addr, &ctx.opts).await?;
+    match ctx.proto {
+      Proto::Ws => {
+        conn.upgrade(&ctx.host, &ctx.path, rng).await?;
+        Ok(Ready::Ws(conn))
+      }
+      Proto::H2 => Ok(Ready::H2 { h2: H2::open(conn, None).await?, next_id: 1 }),
+    }
+  }
+
+  /// Sends `payload` and checks it comes back by `deadline`: a WebSocket text echo, or the body
+  /// of a `POST /echo`.
+  pub async fn round_trip(
+    &mut self,
+    payload: &[u8],
+    rng: &mut Rng,
+    deadline: tokio::time::Instant,
+  ) -> bool {
+    match self {
+      Ready::Ws(conn) => {
+        let mut bytes = Vec::new();
+        client_frame(true, 1, payload, rand::Rng::random(rng), &mut bytes);
+        conn.send(&bytes).await.is_ok()
+          && matches!(
+            conn.next_frame(deadline).await,
+            Ok(Next::Frame(echo)) if echo.opcode == 1 && echo.payload == payload
+          )
+      }
+      Ready::H2 { h2, next_id } => {
+        let id = *next_id;
+        *next_id += 2;
+        let mut bytes = request(id, "POST", "/echo", &[], false);
+        bytes.extend(frame(DATA, END_STREAM, id, payload));
+        if h2.conn.send(&bytes).await.is_err() {
+          return false;
+        }
+        match h2.collect(&[id], deadline).await {
+          Ok(got) => got
+            .responses
+            .get(&id)
+            .is_some_and(|el| el.ended && el.status == Some(200) && el.body == payload),
+          Err(_) => false,
+        }
+      }
+    }
+  }
 }
 
 /// How a scenario run went.
@@ -234,6 +339,17 @@ pub async fn run(scenario: Scenario, ctx: &Ctx, rng: &mut Rng) -> Outcome {
     Scenario::CloseLinger => Box::pin(resource::close_linger(ctx, rng)),
     Scenario::PingNoRead => Box::pin(resource::ping_no_read(ctx, rng)),
     Scenario::SlowReader => Box::pin(resource::slow_reader(ctx, rng)),
+    Scenario::H2Steady => Box::pin(h2::steady(ctx, rng)),
+    Scenario::H2RapidReset => Box::pin(h2::rapid_reset(ctx, rng)),
+    Scenario::H2ContinuationFlood => Box::pin(h2::continuation_flood(ctx, rng)),
+    Scenario::H2SettingsFlood => Box::pin(h2::settings_flood(ctx, rng)),
+    Scenario::H2PingFlood => Box::pin(h2::ping_flood(ctx, rng)),
+    Scenario::H2SlowReader => Box::pin(h2::slow_reader(ctx, rng)),
+    Scenario::H2NeverRead => Box::pin(h2::never_read(ctx, rng)),
+    Scenario::H2WindowStarved => Box::pin(h2::window_starved(ctx, rng)),
+    Scenario::H2HalfOpen => Box::pin(h2::half_open(ctx, rng)),
+    Scenario::H2OversizedHeaders => Box::pin(h2::oversized_headers(ctx, rng)),
+    Scenario::H2OversizedBody => Box::pin(h2::oversized_body(ctx, rng)),
   };
   fut.await
 }

@@ -562,6 +562,10 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
   }
 
   /// [`Self::send_response`] with `body`, sent by reference, in place of `msg.body`.
+  #[cfg_attr(
+    not(feature = "http2-server-framework"),
+    allow(dead_code, reason = "used by the server driver")
+  )]
   pub(crate) fn send_response_shared(
     &mut self,
     stream_id: U31,
@@ -1110,6 +1114,13 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     if end_stream && content_length.is_some_and(|el| el != 0) {
       self.stream_error(id, Http2ErrorCode::ProtocolError);
       return Ok(());
+    }
+    let max_body_len = usize::try_from(self.hp.max_body_len()).unwrap_or(usize::MAX);
+    if content_length.is_some_and(|el| el > max_body_len) {
+      // Refused before any of the body arrives; the reset that follows the answer stops it.
+      stream.msg.clear();
+      let status = Some(StatusCode::PayloadTooLarge);
+      return self.send_headers(U31::from_u32(id), status, &Headers::new(), true);
     }
     self.events.push_back(ConnEvent::Headers { end_stream, stream_id: U31::from_u32(id) })?;
     Ok(())

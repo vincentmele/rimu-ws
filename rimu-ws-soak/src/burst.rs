@@ -2,11 +2,9 @@
 //! still be upgraded and echoed in time.
 
 use crate::{
-  codec::client_frame,
-  conn::{Conn, Next},
   monitor::Violation,
   rng::rng,
-  scenario::Ctx,
+  scenario::{Ctx, Ready},
 };
 use std::{net::IpAddr, time::Duration};
 use tokio::time::{Instant, timeout};
@@ -28,16 +26,9 @@ pub async fn burst(
     }
     let _ = opens.spawn(async move {
       let attempt = async {
-        let mut conn = Conn::connect(ctx.addr, &ctx.opts).await.ok()?;
         let mut rng = rng(u64::from(idx));
-        conn.upgrade(&ctx.host, &ctx.path, &mut rng).await.ok()?;
-        let mut frame = Vec::new();
-        client_frame(true, 1, b"burst", rand::Rng::random(&mut rng), &mut frame);
-        conn.send(&frame).await.ok()?;
-        match conn.next_frame(deadline).await {
-          Ok(Next::Frame(echo)) if echo.payload == b"burst" => Some(conn),
-          _ => None,
-        }
+        let mut ready = Ready::open(&ctx, &mut rng).await.ok()?;
+        ready.round_trip(b"burst", &mut rng, deadline).await.then_some(ready)
       };
       timeout(within, attempt).await.ok().flatten()
     });

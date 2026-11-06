@@ -2,15 +2,13 @@
 //! probes judging the server throughout.
 
 use crate::{
-  codec::client_frame,
-  conn::{Conn, Next},
   monitor::{
     Baseline, Budgets, Monitor, MonitorError, Sample, Violation, check_drained, check_running,
   },
   probe::{ProbeStats, ProbeTotals, Probes, lag_exceeds},
   rng::rng,
   runner::{Record, RunConfig, run_slots},
-  scenario::{Ctx, Weights},
+  scenario::{Ctx, Proto, Ready, Weights},
 };
 use std::{
   io::Write,
@@ -321,6 +319,10 @@ pub async fn run(cfg: CycleConfig, out: &mut dyn Write) -> Summary {
       break;
     }
     state.summary.cycles = cycle + 1;
+    if cycle == 0 && cfg.run.ctx.proto == Proto::H2 {
+      // The baseline includes caches filled once and kept: the static files on every thread.
+      crate::scenario::warm_h2_caches(&cfg.run.ctx).await;
+    }
     sleep(cfg.warmup).await;
     let warm = probes.as_ref().map(Probes::snapshot).unwrap_or_default();
     let Some(sample) = state.sample(cycle).await else { break };
@@ -433,6 +435,7 @@ async fn mix(
     slots: cfg.run.slots,
     large_inflight: 0,
     max_payload: cfg.run.ctx.limits.max_payload,
+    per_slot_kib: if cfg.run.ctx.proto == Proto::H2 { 768 } else { 256 },
   };
   let (mut streak, mut saturated, mut alive) = (0, false, true);
   // Whether the last second's probes showed the harness saturated.
@@ -516,14 +519,11 @@ async fn mix(
 async fn recovery(ctx: &Ctx, within: Duration) -> Result<(), String> {
   let attempt = async {
     let mut rng = rng(0);
-    let mut conn = Conn::connect(ctx.addr, &ctx.opts).await.map_err(|err| format!("{err:?}"))?;
-    conn.upgrade(&ctx.host, &ctx.path, &mut rng).await.map_err(|err| format!("{err:?}"))?;
-    let mut frame = Vec::new();
-    client_frame(true, 1, b"recovery", [1, 2, 3, 4], &mut frame);
-    conn.send(&frame).await.map_err(|err| format!("{err:?}"))?;
-    match conn.next_frame(Instant::now() + within).await {
-      Ok(Next::Frame(echo)) if echo.payload == b"recovery" => Ok(()),
-      other => Err(format!("no echo: {other:?}")),
+    let mut ready = Ready::open(ctx, &mut rng).await.map_err(|err| format!("{err:?}"))?;
+    if ready.round_trip(b"recovery", &mut rng, Instant::now() + within).await {
+      Ok(())
+    } else {
+      Err("no echo".to_owned())
     }
   };
   timeout(within, attempt).await.unwrap_or_else(|_| Err(format!("not within {within:?}")))

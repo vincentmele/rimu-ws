@@ -145,6 +145,9 @@ pub struct Budgets {
   /// Connections holding a message of up to `max_payload` on the server.
   pub large_inflight: u32,
   pub max_payload: u64,
+  /// Memory a connection may cost the server, in KiB: 256 for the WebSocket server; the HTTP/2
+  /// server streaming a large response holds up to about three times its 256 KiB send threshold.
+  pub per_slot_kib: u64,
 }
 
 /// A broken invariant.
@@ -205,7 +208,8 @@ pub fn check_running(
   }
   // A large message costs the server the message, its buffer's doubling, and the echo.
   let large_kib = u64::from(budgets.large_inflight) * 3 * budgets.max_payload.div_ceil(1024);
-  let rss_limit = base.rss_kib + 256 * u64::from(budgets.slots) + 65536 + large_kib;
+  let per_slot_kib = if budgets.per_slot_kib == 0 { 256 } else { budgets.per_slot_kib };
+  let rss_limit = base.rss_kib + per_slot_kib * u64::from(budgets.slots) + 65536 + large_kib;
   if s.rss_kib > rss_limit {
     found.push(Violation::Rss { rss_kib: s.rss_kib, limit_kib: rss_limit });
   }

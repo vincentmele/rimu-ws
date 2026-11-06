@@ -4,7 +4,7 @@ use rimu_ws_soak::{
   conn::ConnOpts,
   rng::{rng, seed_for},
   runner::{Record, RunConfig, replay, replay_id, run_slots},
-  scenario::{Ctx, Limits, Outcome, Scenario, Weights, parse_weights, profile, run},
+  scenario::{Proto, Ctx, Limits, Outcome, Scenario, Weights, parse_weights, profile, run},
 };
 use std::{
   net::SocketAddr,
@@ -26,12 +26,13 @@ pub fn ctx(addr: SocketAddr) -> Ctx {
       ..Limits::default()
     },
     opts: ConnOpts::default(),
+    proto: Proto::Ws,
   }
 }
 
 #[test]
 fn weights_pick_matches_profile() {
-  let weights = profile("hostile").unwrap();
+  let weights = profile("hostile", Proto::Ws).unwrap();
   let mut rng = rng(5);
   let echo = (0..100_000).filter(|_| weights.pick(&mut rng) == Scenario::Echo).count();
   let share = echo as f64 / 100_000.0;
@@ -39,7 +40,7 @@ fn weights_pick_matches_profile() {
   let want =
     f64::from(weights.0.iter().find(|el| el.0 == Scenario::Echo).unwrap().1) / f64::from(total);
   assert!((share - want).abs() < 0.01, "{share} vs {want}");
-  assert!(profile("baseline").is_some() && profile("storm").is_some() && profile("x").is_none());
+  assert!(profile("baseline", Proto::Ws).is_some() && profile("storm", Proto::Ws).is_some() && profile("x", Proto::Ws).is_none());
 }
 
 #[test]
@@ -132,4 +133,14 @@ async fn replay_reproduces_scenario_and_bytes() {
   assert_eq!(logs[0].len(), 1);
   assert!(!logs[0][0].is_empty());
   assert_eq!(logs[0], logs[1]);
+}
+
+// With HTTP/2, the profile names pick HTTP/2 mixes.
+#[test]
+fn h2_profiles() {
+  for name in ["baseline", "hostile", "attack", "storm"] {
+    let weights = profile(name, Proto::H2).unwrap();
+    assert!(weights.0.iter().all(|el| format!("{:?}", el.0).starts_with("H2")), "{name}");
+  }
+  assert!(profile("drip", Proto::H2).is_none());
 }

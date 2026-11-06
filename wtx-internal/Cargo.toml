@@ -74,6 +74,11 @@ path = "src/bin/soak-server-tokio.rs"
 required-features = ["soak-server-tokio"]
 
 [[bin]]
+name = "soak-server-h2"
+path = "src/bin/soak-server-h2.rs"
+required-features = ["soak-server-h2"]
+
+[[bin]]
 name = "soak-server-uring"
 path = "src/bin/soak-server-uring.rs"
 required-features = ["soak-server-uring"]
@@ -92,6 +97,7 @@ autobahn-server = ["tokio", "rimu-ws/tokio", "rimu-ws/web-socket-server-framewor
 autobahn-server-drain = ["tokio", "rimu-ws/tokio", "rimu-ws/web-socket-server-framework", "rimu-ws/zlib-rs"]
 autobahn-server-uring = ["rimu-ws/crypto-ring", "rimu-ws/io-uring", "rimu-ws/web-socket-server-framework", "rimu-ws/zlib-rs"]
 soak-server-tokio = ["tokio", "rimu-ws/crypto-ring", "rimu-ws/tokio", "rimu-ws/web-socket-server-framework", "rimu-ws/zlib-rs"]
+soak-server-h2 = ["rimu-ws/crypto-ring", "rimu-ws/http2-server-framework", "rimu-ws/io-uring", "rimu-ws/macros"]
 soak-server-uring = ["rimu-ws/crypto-ring", "rimu-ws/io-uring", "rimu-ws/web-socket-server-framework", "rimu-ws/zlib-rs"]
 boringssl = ["tokio", "rimu-ws/tls", "rimu-ws/tokio", "rimu-ws/_tracing-tree", "rimu-ws/x509"]
 boringssl-config = ["serde/derive", "serde_json/std", "rimu-ws/hashbrown", "rimu-ws/serde"]

@@ -9,7 +9,7 @@ use rimu_ws_soak::{
   cycle::{CycleConfig, Extended, RecordMode, run, trend_violation},
   monitor::Violation,
   runner::RunConfig,
-  scenario::{Ctx, Limits, parse_weights, profile},
+  scenario::{Proto, Ctx, Limits, parse_weights, profile},
 };
 use std::{net::SocketAddr, time::Duration};
 use support::{Faults, spawn_fake};
@@ -25,13 +25,14 @@ fn config(addr: SocketAddr, pid: u32) -> CycleConfig {
     path: "/".into(),
     limits: Limits::default(),
     opts: ConnOpts::default(),
+    proto: Proto::Ws,
   };
   CycleConfig {
     run: RunConfig {
       global_seed: 1,
       slots: 10,
       duration: Duration::from_secs(2),
-      weights: profile("baseline").unwrap(),
+      weights: profile("baseline", Proto::Ws).unwrap(),
       ctx,
       source_ips: Vec::new(),
     },

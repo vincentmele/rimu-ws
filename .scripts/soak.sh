@@ -12,6 +12,9 @@
 #   soak.sh fd-direct       a descriptor flood against a 256-slot direct descriptor table
 #
 # Environment:
+#   SOAK_PROTO=ws|h2         the protocol (default ws). h2 runs soak-server-h2 (the HTTP/2 server
+#                            framework) on 127.0.0.1:9081 and the harness with --proto h2, whose
+#                            profiles are HTTP/2 mixes; SOAK_SERVER and SOAK_SNDBUF don't apply.
 #   SOAK_SERVER=uring|tokio  the server (default uring). tokio has no server timeouts: run it with
 #                            --profile untimed.
 #   SOAK_SNDBUF=BYTES        the server's SO_SNDBUF, passed to the harness too so close_linger runs
@@ -40,11 +43,27 @@ uring | tokio) ;;
 	exit 3
 	;;
 esac
+port=9080
+url=ws://127.0.0.1:9080/
+proto_args=()
+case ${SOAK_PROTO:-ws} in
+ws) ;;
+h2)
+	server_name=h2
+	port=9081
+	url=http://127.0.0.1:9081/
+	proto_args=(--proto h2)
+	;;
+*)
+	echo "SOAK_PROTO must be ws or h2" >&2
+	exit 3
+	;;
+esac
 cargo build -q --release -p rimu-ws-internal --bin "soak-server-$server_name" --features "soak-server-$server_name"
 cargo build -q --release -p rimu-ws-soak
 mkdir -p /mnt/nvme1tb/claude-tmp/soak
-if ss -ltn | grep -q ':9080 '; then
-	echo "port 9080 is busy" >&2
+if ss -ltn | grep -q ":$port "; then
+	echo "port $port is busy" >&2
 	exit 1
 fi
 
@@ -54,7 +73,9 @@ if [[ ${SOAK_MALLOC:-1} != 0 ]]; then
 fi
 harness_args=()
 sndbuf=${SOAK_SNDBUF:-}
-if [[ $mode == long && -z $sndbuf ]]; then
+if [[ $server_name == h2 ]]; then
+	sndbuf=
+elif [[ $mode == long && -z $sndbuf ]]; then
 	sndbuf=16384
 fi
 if [[ -n $sndbuf ]]; then
@@ -91,10 +112,10 @@ trap 'kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 for _ in $(seq 100); do
-	ss -ltn | grep -q ':9080 ' && break
+	ss -ltn | grep -q ":$port " && break
 	sleep 0.1
 done
 set +e
-taskset -c 6-11,18-23 ./target/release/rimu-ws-soak run --url ws://127.0.0.1:9080/ --pid "$pid" "${harness_args[@]}" "$@"
+taskset -c 6-11,18-23 ./target/release/rimu-ws-soak run --url "$url" "${proto_args[@]}" --pid "$pid" "${harness_args[@]}" "$@"
 rc=$?
 exit $rc
