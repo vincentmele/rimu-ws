@@ -159,6 +159,7 @@ where
     shared: shared.clone(),
     date: DateHeader::new(),
     pool: VectorUsize::new(),
+    reads_async: false,
     rx: VectorUsize::new(),
     slots: HandlerSlots::new(),
     woken: VectorUsize::new(),
@@ -188,6 +189,9 @@ struct Driver<F, MT> {
   shared: Rc<RefCell<ConnShared>>,
   /// Cleared request buffers, swapped into the core so a new stream reuses their capacity.
   pool: VectorUsize<MsgBufferString>,
+  /// The stream's reads are awaited (it can't read without waiting): `rx` stays with the
+  /// connection, which waits with it.
+  reads_async: bool,
   rx: VectorUsize<u8>,
   slots: HandlerSlots<F>,
   woken: VectorUsize<usize>,
@@ -205,6 +209,12 @@ where
   {
     let shared = self.shared.clone();
     loop {
+      if !self.reads_async
+        && self.rx.capacity() == 0
+        && let Some(buffer) = rx_pool_take()
+      {
+        self.rx = buffer;
+      }
       let closed = self.read_available(stream).await?;
       {
         let mut guard = shared.borrow_mut();
@@ -231,6 +241,9 @@ where
           self.handle_events(state, dispatcher)?;
         }
         self.consume(offset);
+        if self.rx.is_empty() && !self.reads_async {
+          rx_pool_give(mem::take(&mut self.rx));
+        }
         if self.handshake.is_some() && state.conn.peer_settings_seen() {
           self.handshake = None;
         }
@@ -270,6 +283,7 @@ where
         TryRead::Closed => return Ok(true),
         TryRead::Pending => return Ok(false),
         TryRead::Unsupported => {
+          self.reads_async = true;
           // A read that waits for the peer (user-space TLS) must not hold back what handlers do
           // meanwhile: a parked handler that wakes, or a manual stream that queues output, ends
           // the wait, and the read is dropped. The stream keeps the bytes of a partial record
@@ -605,6 +619,35 @@ fn output_pool_give(buffer: Vec<u8>) {
       pool.push(buffer);
     }
   });
+}
+
+// Read buffers of connections with nothing left to decode, most recent last; see
+// `OUTPUT_POOL`. Only for streams that read without waiting: one whose read is awaited holds its
+// buffer while it waits.
+std::thread_local! {
+  static RX_POOL: RefCell<Vec<VectorUsize<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+fn rx_pool_take() -> Option<VectorUsize<u8>> {
+  RX_POOL.with(|pool| pool.borrow_mut().pop())
+}
+
+fn rx_pool_give(buffer: VectorUsize<u8>) {
+  let capacity = buffer.capacity();
+  if capacity == 0 || capacity > OUTPUT_POOL_BUFFER_MAX {
+    return;
+  }
+  RX_POOL.with(|pool| {
+    let mut pool = pool.borrow_mut();
+    if pool.len() < OUTPUT_POOL_MAX {
+      pool.push(buffer);
+    }
+  });
+}
+
+#[cfg(test)]
+fn rx_pool_len() -> usize {
+  RX_POOL.with(|pool| pool.borrow().len())
 }
 
 #[cfg(test)]

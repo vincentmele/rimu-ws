@@ -704,10 +704,11 @@ fn userspace_tls_readable_reports_buffered_records() {
   assert_eq!(second, b"two");
 }
 
-// An idle connection holds no output buffer: once its output is written the driver puts the
-// buffer in the thread's pool, so thousands of idle connections don't each keep one.
+// An idle connection holds no output or read buffer: once its output is written and its input
+// decoded, the driver puts the buffers in the thread's pools, so thousands of idle connections
+// don't each keep them.
 #[test]
-fn idle_connection_returns_its_output_buffer() {
+fn idle_connection_returns_its_buffers() {
   let uri = _uri();
   let addr = String::from(uri.hostname_with_implied_port().0) + ":" + &uri.port().unwrap().to_string();
   let (ready_tx, ready_rx) = mpsc::channel();
@@ -730,7 +731,7 @@ fn idle_connection_returns_its_output_buffer() {
           while !server_check.load(Ordering::SeqCst) {
             Sleep::new(Duration::from_millis(5)).unwrap().await.unwrap();
           }
-          pool_tx.send(super::output_pool_len()).unwrap();
+          pool_tx.send((super::output_pool_len(), super::rx_pool_len())).unwrap();
         },
         rt,
       );
@@ -745,6 +746,7 @@ fn idle_connection_returns_its_output_buffer() {
   let frames = client.read_until(Duration::from_secs(5), |frames| ended(frames).len() == 1);
   assert_eq!(ended(&frames), [1]);
   check.store(true, Ordering::SeqCst);
-  let pooled = pool_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-  assert!(pooled >= 1, "{pooled} output buffers pooled while the connection is idle");
+  let (output, rx) = pool_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+  assert!(output >= 1, "{output} output buffers pooled while the connection is idle");
+  assert!(rx >= 1, "{rx} read buffers pooled while the connection is idle");
 }
