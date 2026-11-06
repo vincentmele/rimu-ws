@@ -6,6 +6,7 @@
 //! framework and of the client feed it what they read and write what it queued.
 
 pub(crate) mod body;
+pub(crate) mod header_cache;
 pub(crate) mod output;
 pub(crate) mod scan;
 pub(crate) mod stream_table;
@@ -22,6 +23,7 @@ use crate::{
     common_flags::CommonFlags,
     conn::{
       body::Body,
+      header_cache::HeaderCache,
       output::Output,
       scan::{PREFACE, Preface, next_frame, strip_preface},
       stream_table::{SendItem, StreamTable},
@@ -43,6 +45,8 @@ use core::mem;
 /// The window every stream and the connection start with (RFC 9113 §6.9.2).
 const DEFAULT_WINDOW: i32 = 65_535;
 const DEFAULT_MAX_FRAME_LEN: u32 = 16_384;
+/// The HPACK table size a decoder allows before its SETTINGS say otherwise (RFC 9113 §6.5.2).
+const DEFAULT_HEADER_TABLE_SIZE: u32 = 4096;
 
 /// What a [`Http2Conn::feed`] call found.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,6 +90,7 @@ pub(crate) struct Http2Conn<const IS_CLIENT: bool> {
   blocked: DequeUsize<u32>,
   /// Scratch for encoding header blocks.
   header_buf: VectorUsize<u8>,
+  header_cache: HeaderCache,
   /// Streams whose released capacity is not yet announced.
   window_updates: DequeUsize<u32>,
   conn_recv: i32,
@@ -119,11 +124,13 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     hpack_dec.set_max_bytes(hp.max_hpack_len().0);
     let mut hpack_enc = HpackEncoder::new(rng);
     hpack_enc.set_max_dyn_super_bytes(hp.max_hpack_len().1);
+    hpack_enc.set_initial_dyn_bytes(DEFAULT_HEADER_TABLE_SIZE);
     let initial = i32::try_from(hp.initial_window_len()).unwrap_or(i32::MAX);
     let mut this = Self {
       block: VectorUsize::new(),
       blocked: DequeUsize::new(),
       header_buf: VectorUsize::new(),
+      header_cache: HeaderCache::new(),
       window_updates: DequeUsize::new(),
       conn_recv: DEFAULT_WINDOW.max(initial),
       conn_recv_unacked: 0,
@@ -377,7 +384,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     let id = stream_id.u32();
     let body_len = msg.body.len();
     {
-      let Self { header_buf, hpack_enc, out, peer, streams, .. } = self;
+      let Self { header_buf, header_cache, hpack_enc, out, peer, streams, .. } = self;
       let stream =
         streams.get_mut(id).ok_or(protocol_err(Http2Error::UnknownStreamReceiver))?;
       if stream.send_headers || stream.send_closed {
@@ -385,9 +392,20 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       }
       stream.send_headers = true;
       header_buf.clear();
-      let hsresph = HpackStaticResponseHeaders { status_code: Some(status) };
-      let hint = hsresph.bytes_len().wrapping_add(msg.headers.bytes_len());
-      hpack_enc.encode(header_buf, hint, hsresph.iter(), msg.headers.iter())?;
+      let generation = hpack_enc.generation();
+      if let Some(block) = header_cache.get(status, &msg.headers, generation)? {
+        header_buf.extend_from_copyable_slice(block)?;
+      } else {
+        let hsresph = HpackStaticResponseHeaders { status_code: Some(status) };
+        let hint = hsresph.bytes_len().wrapping_add(msg.headers.bytes_len());
+        let fields = msg.headers.iter().filter(HeaderCache::is_cached_field);
+        hpack_enc.encode(header_buf, hint, hsresph.iter(), fields)?;
+        if hpack_enc.generation() == generation {
+          header_cache.insert(status, header_buf, generation)?;
+        }
+      }
+      let rest = msg.headers.iter().filter(|el| !HeaderCache::is_cached_field(el));
+      hpack_enc.encode(header_buf, 0, [], rest)?;
       push_content_length(header_buf, body_len)?;
       push_header_block(out, id, header_buf, body_len == 0, peer.max_frame_len)?;
       if body_len == 0 {
@@ -535,6 +553,18 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       stream.recv_window = stream.recv_window.saturating_add(n.cast_signed());
       push_window_update(&mut self.out, id, n);
     }
+  }
+
+  /// The HPACK encoder's generation, which changes with its dynamic table.
+  #[cfg(test)]
+  pub(crate) const fn hpack_generation(&self) -> u64 {
+    self.hpack_enc.generation()
+  }
+
+  /// Responses whose header block came from the cache.
+  #[cfg(test)]
+  pub(crate) const fn header_cache_hits(&self) -> u64 {
+    self.header_cache.hits()
   }
 
   /// Ends the sending side of a stream as if a response had been sent, so tests of the receiving

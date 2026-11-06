@@ -31,6 +31,9 @@ const DYN_IDX_OFFSET: u32 = 61;
 #[derive(Debug, Default)]
 pub(crate) struct HpackEncoder {
   dyn_headers: HpackHeaders<Metadata>,
+  // Bumped whenever the dynamic table, or a pending size update, changes: an encoding is only
+  // reusable while it stays the same.
+  generation: u64,
   idx: u32,
   indcs: HashMap<u64, u32>,
   // Defined by external actors.
@@ -47,6 +50,7 @@ impl HpackEncoder {
   {
     Self {
       dyn_headers: HpackHeaders::new(0),
+      generation: 0,
       idx: 0,
       indcs: HashMap::new(),
       max_dyn_sub_bytes: None,
@@ -55,8 +59,15 @@ impl HpackEncoder {
     }
   }
 
+  /// Changes whenever the dynamic table or a pending size update does.
+  pub(crate) const fn generation(&self) -> u64 {
+    self.generation
+  }
+
   pub(crate) fn clear(&mut self) {
-    let Self { dyn_headers, idx, indcs, max_dyn_sub_bytes, max_dyn_super_bytes: _, rs: _ } = self;
+    let Self { dyn_headers, generation, idx, indcs, max_dyn_sub_bytes, max_dyn_super_bytes: _, rs: _ } =
+      self;
+    *generation = generation.wrapping_add(1);
     dyn_headers.clear();
     *idx = 0;
     indcs.clear();
@@ -104,6 +115,7 @@ impl HpackEncoder {
 
   // It is not possible to lower the initial set value
   pub(crate) fn set_max_dyn_sub_bytes(&mut self, max_dyn_sub_bytes: u32) -> crate::Result<()> {
+    self.generation = self.generation.wrapping_add(1);
     if max_dyn_sub_bytes > self.max_dyn_super_bytes {
       return Err(crate::Error::UnboundedNumber {
         expected: 0..=self.max_dyn_super_bytes.try_into().unwrap_or(i32::MAX),
@@ -127,7 +139,15 @@ impl HpackEncoder {
     Ok(())
   }
 
+  /// Sizes the dynamic table to `max_bytes` without emitting a size update: for the start of a
+  /// connection, where the peer's decoder already allows 4096 bytes (RFC 9113 §6.5.2).
+  pub(crate) fn set_initial_dyn_bytes(&mut self, max_bytes: u32) {
+    self.generation = self.generation.wrapping_add(1);
+    self.dyn_headers.set_max_bytes(max_bytes.min(self.max_dyn_super_bytes), |_| {});
+  }
+
   pub(crate) const fn set_max_dyn_super_bytes(&mut self, max_dyn_super_bytes: u32) {
+    self.generation = self.generation.wrapping_add(1);
     self.max_dyn_sub_bytes = None;
     self.max_dyn_super_bytes = max_dyn_super_bytes;
   }
@@ -388,6 +408,9 @@ impl HpackEncoder {
   }
 
   fn manage_size_update(&mut self, buffer: &mut VectorUsize<u8>) -> crate::Result<()> {
+    if self.max_dyn_sub_bytes.is_some() {
+      self.generation = self.generation.wrapping_add(1);
+    }
     match self.max_dyn_sub_bytes.take() {
       Some((lower, None)) => {
         self.dyn_headers.set_max_bytes(lower, |metadata| {
@@ -421,6 +444,7 @@ impl HpackEncoder {
     (name_hash, pair_hash): (Option<u64>, u64),
   ) -> crate::Result<()> {
     self.idx = self.idx.wrapping_add(1);
+    self.generation = self.generation.wrapping_add(1);
     self.dyn_headers.push_front(
       is_sensitive,
       Metadata { name_hash, pair_hash },

@@ -1,6 +1,6 @@
 use crate::{
   collections::{ArrayVectorCopy, VectorUsize},
-  http::{Headers, HttpRecvParams, Method, MsgBufferStr, MsgBufferString, StatusCode, U31},
+  http::{Header, Headers, HttpRecvParams, Method, MsgBufferStr, MsgBufferString, StatusCode, U31},
   http2::{
     Http2ErrorCode,
     conn::{
@@ -395,4 +395,66 @@ fn conn_client_request_response() {
     ]
   );
   assert_eq!(client.msg_mut(id).unwrap().body.as_slice(), b"ok");
+}
+
+/// A server whose peer allows a 4096-byte HPACK table, so responses index their fields.
+fn indexing_server() -> Http2Conn<false> {
+  let mut conn = ready_server(HttpRecvParams::with_default_params());
+  let _ = conn.feed(&settings(&[(1, 4096)])).unwrap();
+  let _ = take_output(&mut conn);
+  conn
+}
+
+fn plain_response(conn: &mut Http2Conn<false>, stream: u32) -> Vec<u8> {
+  let _ = conn.feed(&headers_req(stream, "GET", "/", &[], true)).unwrap();
+  let _ = events(conn);
+  let mut msg = MsgBufferString::default();
+  msg.headers.push_from_iter(Header::from_name_and_value("content-type", ["text/plain"])).unwrap();
+  msg.headers.push_from_iter(Header::from_name_and_value("server", ["rimu-ws"])).unwrap();
+  msg.body.extend_from_copyable_slice(b"2").unwrap();
+  conn.send_response(U31::from_u32(stream), StatusCode::Ok, &mut msg).unwrap();
+  let frames = take_frames(conn);
+  frames.into_iter().find(|el| el.0 == HEADERS).unwrap().3
+}
+
+#[test]
+fn conn_header_cache_hit_same_bytes() {
+  let mut conn = indexing_server();
+  let first = plain_response(&mut conn, 1);
+  let second = plain_response(&mut conn, 3);
+  let generation = conn.hpack_generation();
+  let third = plain_response(&mut conn, 5);
+  assert_ne!(first, second, "the first response indexes its fields, the second refers to them");
+  assert_eq!(second, third);
+  assert_eq!(conn.hpack_generation(), generation);
+  assert_eq!(conn.header_cache_hits(), 1);
+  let mut dec = response_decoder();
+  for block in [&first, &second, &third] {
+    let fields = decode_block(&mut dec, block);
+    assert!(fields.contains(&("content-type".into(), "text/plain".into())), "{fields:?}");
+    assert!(fields.contains(&("content-length".into(), "1".into())), "{fields:?}");
+  }
+}
+
+#[test]
+fn conn_header_cache_invalid_after_table_size_change() {
+  let mut conn = indexing_server();
+  let mut blocks = vec![
+    plain_response(&mut conn, 1),
+    plain_response(&mut conn, 3),
+    plain_response(&mut conn, 5),
+  ];
+  assert_eq!(conn.header_cache_hits(), 1);
+  let _ = conn.feed(&settings(&[(1, 0)])).unwrap();
+  let _ = take_output(&mut conn);
+  let after = plain_response(&mut conn, 7);
+  assert_eq!(after[0], 0x20, "a dynamic table size update to 0 comes first: {after:?}");
+  blocks.push(after);
+  blocks.push(plain_response(&mut conn, 9));
+  let mut dec = response_decoder();
+  for block in &blocks {
+    let fields = decode_block(&mut dec, block);
+    assert!(fields.contains(&(":status".into(), "200".into())), "{fields:?}");
+    assert!(fields.contains(&("server".into(), "rimu-ws".into())), "{fields:?}");
+  }
 }
