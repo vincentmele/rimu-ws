@@ -7,7 +7,7 @@ use crate::{
   futures::Sleep,
   http::{
     HttpRecvParams, MsgBufferString, Protocol, Request, StatusCode,
-    http2_server_framework::conn_driver::{Route, StreamDispatcher, drive_conn},
+    http2_server_framework::conn_driver::{DriveParams, Route, StreamDispatcher, drive_conn},
   },
   http2::{
     ServerStream,
@@ -197,7 +197,7 @@ fn serve(hp: HttpRecvParams) -> Served {
       let mut counting = Counting { inner: stream, writes: writes.clone() };
       let conn = Http2Conn::<false>::new(hp, &mut Xorshift64::from(9u64));
       let dispatcher = TestDispatcher { dropped: server_dropped };
-      let rslt = drive_conn(&mut counting, conn, &dispatcher, peer.ip()).await;
+      let rslt = drive_conn(&mut counting, conn, &dispatcher, peer.ip(), DriveParams::default()).await;
       tx.send((rslt, writes.get())).unwrap();
     });
   });
@@ -486,7 +486,7 @@ fn server_tls_preface_with_finished_uses_ktls() {
     let mut tls_stream = TlsAcceptor::new(&config, &mut rng, stream).accept().await.unwrap().tls_stream;
     let conn = Http2Conn::<false>::new(HttpRecvParams::with_default_params(), &mut Xorshift64::from(5u64));
     let dispatcher = TestDispatcher { dropped: Arc::new(AtomicBool::new(false)) };
-    let _rslt = drive_conn(&mut tls_stream, conn, &dispatcher, peer.ip()).await;
+    let _rslt = drive_conn(&mut tls_stream, conn, &dispatcher, peer.ip(), DriveParams::default()).await;
     tls_stream.is_kernel_tls()
   });
   assert_eq!(client.join().unwrap(), 8);
@@ -551,7 +551,7 @@ fn server_userspace_tls_parked_handler_answers() {
       let mut tls_stream = TlsAcceptor::new(&config, &mut rng, stream).accept().await.unwrap().tls_stream;
       let conn = Http2Conn::<false>::new(HttpRecvParams::with_default_params(), &mut Xorshift64::from(5u64));
       let dispatcher = TestDispatcher { dropped: Arc::new(AtomicBool::new(false)) };
-      let _rslt = drive_conn(&mut tls_stream, conn, &dispatcher, peer.ip()).await;
+      let _rslt = drive_conn(&mut tls_stream, conn, &dispatcher, peer.ip(), DriveParams::default()).await;
     });
   });
   assert!(done_rx.recv_timeout(Duration::from_secs(5)).is_ok(), "no response to the parked handler");

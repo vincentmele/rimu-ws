@@ -26,6 +26,8 @@ mod route_match;
 mod state;
 #[cfg(feature = "std")]
 mod static_files;
+#[cfg(all(test, feature = "io-uring"))]
+mod fw_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(all(test, feature = "io-uring", feature = "web-socket"))]
@@ -34,12 +36,12 @@ mod verbatim_params;
 
 use crate::{
   executor::{Executor, Runtime as _},
-  http::{HttpRecvParams, push_h2_alpn},
+  http::{HttpRecvParams, ShutdownSignal, push_h2_alpn},
   net::TcpParams,
   sync::Arc,
   tls::TlsConfig,
 };
-use core::num::NonZeroUsize;
+use core::{num::NonZeroUsize, time::Duration};
 pub use cors_middleware::{CorsMiddleware, OriginResponse};
 pub use dyn_params::DynParams;
 pub use endpoint::Endpoint;
@@ -74,10 +76,14 @@ pub struct Http2ServerFramework<DA, EC, EX, RC, RNG, TCX> {
   data: DA,
   error_cb: EC,
   executor: EX,
+  handshake_timeout: Option<Duration>,
   hrc: HttpRecvParams,
+  idle_timeout: Option<Duration>,
   local_runtime_cb: RC,
   local_runtimes: Option<NonZeroUsize>,
+  max_connections: Option<NonZeroUsize>,
   rng: RNG,
+  shutdown: Option<(ShutdownSignal, Duration)>,
   tcp_params: TcpParams,
   tls_config: Arc<TlsConfig<TCX>>,
 }
@@ -107,10 +113,14 @@ where
       data: (),
       error_cb,
       executor,
+      handshake_timeout: Some(Duration::from_secs(10)),
       hrc: HttpRecvParams::with_optioned_params(),
+      idle_timeout: Some(Duration::from_secs(300)),
       local_runtime_cb,
       local_runtimes: None,
+      max_connections: None,
       rng,
+      shutdown: None,
       tcp_params: TcpParams::default(),
       tls_config: tls_config.into(),
     })
@@ -131,10 +141,14 @@ impl<DA, EC, EX, RC, RNG, TCX> Http2ServerFramework<DA, EC, EX, RC, RNG, TCX> {
       data: value,
       error_cb: self.error_cb,
       executor: self.executor,
+      handshake_timeout: self.handshake_timeout,
       hrc: self.hrc,
+      idle_timeout: self.idle_timeout,
       local_runtime_cb: self.local_runtime_cb,
       local_runtimes: self.local_runtimes,
+      max_connections: self.max_connections,
       rng: self.rng,
+      shutdown: self.shutdown,
       tcp_params: self.tcp_params,
       tls_config: self.tls_config,
     }
@@ -147,10 +161,14 @@ impl<DA, EC, EX, RC, RNG, TCX> Http2ServerFramework<DA, EC, EX, RC, RNG, TCX> {
       data: self.data,
       error_cb: value,
       executor: self.executor,
+      handshake_timeout: self.handshake_timeout,
       hrc: self.hrc,
+      idle_timeout: self.idle_timeout,
       local_runtime_cb: self.local_runtime_cb,
       local_runtimes: self.local_runtimes,
+      max_connections: self.max_connections,
       rng: self.rng,
+      shutdown: self.shutdown,
       tcp_params: self.tcp_params,
       tls_config: self.tls_config,
     }
@@ -174,10 +192,14 @@ impl<DA, EC, EX, RC, RNG, TCX> Http2ServerFramework<DA, EC, EX, RC, RNG, TCX> {
       data: self.data,
       error_cb: self.error_cb,
       executor: self.executor,
+      handshake_timeout: self.handshake_timeout,
       hrc: self.hrc,
+      idle_timeout: self.idle_timeout,
       local_runtime_cb: value,
       local_runtimes: self.local_runtimes,
+      max_connections: self.max_connections,
       rng: self.rng,
+      shutdown: self.shutdown,
       tcp_params: self.tcp_params,
       tls_config: self.tls_config,
     }
@@ -190,6 +212,46 @@ impl<DA, EC, EX, RC, RNG, TCX> Http2ServerFramework<DA, EC, EX, RC, RNG, TCX> {
   #[must_use = must_use_itself_doc!()]
   pub const fn set_local_runtimes(mut self, value: Option<NonZeroUsize>) -> Self {
     self.local_runtimes = value;
+    self
+  }
+
+  /// How long a client has to complete the TLS handshake (if any) and send its preface and first
+  /// SETTINGS once accepted. Past that, the connection is closed and the error callback receives
+  /// [`crate::Error::ExpiredFuture`]. Defaults to 10 s; `None` waits for as long as it takes.
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub const fn set_handshake_timeout(mut self, value: Option<Duration>) -> Self {
+    self.handshake_timeout = value;
+    self
+  }
+
+  /// How long a connection may go with no open stream and nothing received. Past that, it is sent
+  /// GOAWAY (`NO_ERROR`) and closed. Defaults to 300 s; `None` keeps idle connections open.
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub const fn set_idle_timeout(mut self, value: Option<Duration>) -> Self {
+    self.idle_timeout = value;
+    self
+  }
+
+  /// How many connections the server serves at once, across all of its runtimes. A connection
+  /// accepted past that is closed at once, and the error callback receives
+  /// [`crate::Error::TooManyConnections`]. Defaults to `None`: no limit beyond the process's
+  /// descriptors.
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub const fn set_max_connections(mut self, value: Option<NonZeroUsize>) -> Self {
+    self.max_connections = value;
+    self
+  }
+
+  /// Stops the server when `signal` is triggered: it stops accepting, sends every connection
+  /// GOAWAY (`NO_ERROR`), lets the streams already open finish within `drain`, and then returns
+  /// `Ok`. Connections still open after `drain` are closed with their runtime.
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub fn set_shutdown(mut self, signal: ShutdownSignal, drain: Duration) -> Self {
+    self.shutdown = Some((signal, drain));
     self
   }
 
@@ -209,21 +271,31 @@ mod uring {
     http::{
       AutoStream, HttpRecvParams, ManualStream, MsgBufferString, OperationMode, Protocol, Request,
       StatusCode,
+      ShutdownSignal,
       http2_server_framework::{
         Endpoint as _, EndpointNode, Http2ServerFramework, HttpRouter, Middleware, RouteMatch,
-        conn_driver::{AutoOutput, Route, StreamDispatcher, drive_conn},
+        conn_driver::{
+          AutoOutput, DriveParams, Route, StreamDispatcher, drive_conn, go_away_local_conns,
+          reset_going_away,
+        },
       },
-      misc::on_accept_error,
+      misc::{
+        accept_or_shutdown, admit, counter, drain_connections, on_accept_error, tracked, within,
+      },
     },
     collections::ArrayVectorCopy,
     http2::{ServerStream, conn::Http2Conn},
     net::{TcpListener as _, TcpParams, Uri},
     rng::{CryptoRng, CryptoSeedableRng, SeedableRng as _, Xorshift64},
-    sync::Arc,
+    sync::{Arc, AtomicUsize},
     tls::{TlsAcceptor, TlsConfig, TlsCtxSk},
   };
   use alloc::string::String;
-  use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+  use core::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    num::NonZeroUsize,
+    time::Duration,
+  };
 
   impl<DA, EC, ER, RC, RNG, TCX> Http2ServerFramework<DA, EC, UringExecutor, RC, RNG, TCX>
   where
@@ -261,13 +333,19 @@ mod uring {
       };
       let http_router = Arc::new(hr);
       let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(), ER>>();
+      // One count for every runtime, so that the limit is the server's
+      let active = counter(self.shutdown.as_ref(), self.max_connections);
       for _ in 0..runtimes {
         let server = ThreadServer {
+          active: active.clone(),
           data: self.data.clone(),
+          drive_params: self.drive_params(),
           error_cb: self.error_cb.clone(),
           hrc: self.hrc,
           http_router: http_router.clone(),
+          max_connections: self.max_connections,
           rng: RNG::from_crypto_rng(&mut self.rng)?,
+          shutdown: self.shutdown.clone(),
           tcp_params: self.tcp_params,
           tls_config: self.tls_config.clone(),
         };
@@ -309,25 +387,38 @@ mod uring {
       M: Middleware<DA, ER> + 'static,
     {
       let server = ThreadServer {
+        active: counter(self.shutdown.as_ref(), self.max_connections),
+        drive_params: self.drive_params(),
         data: self.data,
         error_cb: self.error_cb,
         hrc: self.hrc,
         http_router: Arc::new(hr),
+        max_connections: self.max_connections,
         rng: RNG::from_crypto_rng(&mut self.rng)?,
+        shutdown: self.shutdown,
         tcp_params: self.tcp_params,
         tls_config: self.tls_config,
       };
       server.serve(addr, runtime).await
     }
+
+    fn drive_params(&self) -> DriveParams {
+      DriveParams { handshake: self.handshake_timeout, idle: self.idle_timeout }
+    }
   }
 
   /// What one runtime thread serves.
   struct ThreadServer<DA, EC, EN, ER, M, RNG, TCX> {
+    /// Open connections across the server's runtimes, when a limit or a shutdown needs them.
+    active: Option<Arc<AtomicUsize>>,
     data: DA,
+    drive_params: DriveParams,
     error_cb: EC,
     hrc: HttpRecvParams,
     http_router: Arc<HttpRouter<DA, EN, ER, M, ServerStream>>,
+    max_connections: Option<NonZeroUsize>,
     rng: RNG,
+    shutdown: Option<(ShutdownSignal, Duration)>,
     tcp_params: TcpParams,
     tls_config: Arc<TlsConfig<TCX>>,
   }
@@ -351,14 +442,27 @@ mod uring {
       )
       .await?;
       let mut xorshift = Xorshift64::from_simple_seed()?;
+      reset_going_away();
       loop {
-        let (stream, peer) = match listener.accept(self.tcp_params).await {
+        let accept = listener.accept(self.tcp_params);
+        let Some(rslt) = accept_or_shutdown(accept, self.shutdown.as_ref().map(|el| &el.0)).await
+        else {
+          break;
+        };
+        let (stream, peer) = match rslt {
           Ok(elem) => elem,
           Err(err) => {
             on_accept_error(&self.error_cb, err).await;
             continue;
           }
         };
+        if let Some(active) = &self.active
+          && !admit(active, self.max_connections)
+        {
+          drop(stream);
+          (self.error_cb)(crate::Error::TooManyConnections.into());
+          continue;
+        }
         let conn = ConnTask {
           dispatcher: FwDispatcher {
             data: self.data.clone(),
@@ -367,13 +471,24 @@ mod uring {
             router: self.http_router.clone(),
             runtime: runtime.clone(),
           },
+          drive_params: self.drive_params,
           hrc: self.hrc,
           rng: RNG::from_crypto_rng(&mut self.rng)?,
           tls_config: self.tls_config.clone(),
           xorshift: Xorshift64::from_rng(&mut xorshift)?,
         };
-        let _jh = executor.spawn_local(conn.run(stream), &runtime);
+        if let Some(active) = &self.active {
+          let _jh = executor.spawn_local(tracked(conn.run(stream), active.clone()), &runtime);
+        } else {
+          let _jh = executor.spawn_local(conn.run(stream), &runtime);
+        }
       }
+      drop(listener);
+      go_away_local_conns();
+      if let (Some((_, drain)), Some(active)) = (&self.shutdown, &self.active) {
+        drain_connections(active, *drain).await;
+      }
+      Ok(())
     }
   }
 
@@ -386,6 +501,7 @@ mod uring {
 
   struct ConnTask<DA, EC, EN, ER, M, RNG, TCX> {
     dispatcher: FwDispatcher<DA, EC, EN, ER, M>,
+    drive_params: DriveParams,
     hrc: HttpRecvParams,
     rng: RNG,
     tls_config: Arc<TlsConfig<TCX>>,
@@ -405,12 +521,18 @@ mod uring {
     async fn run(mut self, stream: crate::executor::UringTcpStream) {
       let error_cb = self.dispatcher.error_cb.clone();
       let rslt = async {
+        let begin = crate::calendar::Instant::new();
         // The stream is never split, so the kernel TLS switch can run once the handshake ends.
-        let accepted = TlsAcceptor::new(&*self.tls_config, &mut self.rng, stream).accept().await?;
+        let accept = TlsAcceptor::new(&*self.tls_config, &mut self.rng, stream).accept();
+        let accepted = within(accept, self.drive_params.handshake).await?;
         let mut tls_stream = accepted.tls_stream;
         let conn = Http2Conn::<false>::new(self.hrc, &mut self.xorshift);
         let peer = self.dispatcher.peer;
-        drive_conn(&mut tls_stream, conn, &self.dispatcher, peer).await
+        // What is left of the handshake deadline covers the preface and the first SETTINGS.
+        let mut params = self.drive_params;
+        let spent = |el: Duration| el.saturating_sub(begin.elapsed().unwrap_or(el));
+        params.handshake = params.handshake.map(spent);
+        drive_conn(&mut tls_stream, conn, &self.dispatcher, peer, params).await
       }
       .await;
       if let Err(err) = rslt {

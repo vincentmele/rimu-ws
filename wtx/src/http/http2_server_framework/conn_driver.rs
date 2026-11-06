@@ -7,27 +7,31 @@ pub(crate) mod tests;
 
 use crate::{
   collections::{ArrayVectorCopy, VectorUsize},
+  futures::Sleep,
   http::{
     Header, KnownHeaderName, MsgBufferString, MsgDataMut as _, Protocol, Request, StatusCode, U31,
     date_header::DateHeader,
     http2_server_framework::handler_slots::{HandlerSlots, SlotPoll},
   },
   http2::{
-    ServerStream,
+    Http2ErrorCode, ServerStream,
     conn::{ConnEvent, Http2Conn},
     server_stream::ConnShared,
   },
   misc::SharedBytes,
   net::{StreamReader, StreamWriter, TryRead},
 };
-use alloc::{rc::Rc, vec::Vec};
+use alloc::{
+  rc::{Rc, Weak},
+  vec::Vec,
+};
 use core::{
-  cell::RefCell,
+  cell::{Cell, RefCell},
   future::poll_fn,
   mem,
   net::IpAddr,
-  pin::pin,
-  task::Poll,
+  pin::{Pin, pin},
+  task::{Context, Poll},
   time::Duration,
 };
 use hashbrown::{HashMap, HashSet};
@@ -73,22 +77,84 @@ pub(crate) enum Route<MT> {
   NotFound,
 }
 
+/// The limits a connection is driven under.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DriveParams {
+  /// The peer's preface and first SETTINGS must arrive within this.
+  pub(crate) handshake: Option<Duration>,
+  /// No open stream and nothing received for this long: GOAWAY (`NO_ERROR`), then close.
+  pub(crate) idle: Option<Duration>,
+}
+
+std::thread_local! {
+  /// The connections this thread drives, for a shutdown to reach.
+  static LIVE: RefCell<Vec<Weak<RefCell<ConnShared>>>> = const { RefCell::new(Vec::new()) };
+  /// This thread's server is shutting down: connections go away as they start.
+  static GOING_AWAY: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Starts a graceful shutdown of every connection this thread drives, and of those it starts from
+/// now on: GOAWAY (`NO_ERROR`), and the streams already open finish.
+pub(crate) fn go_away_local_conns() {
+  GOING_AWAY.set(true);
+  LIVE.with_borrow_mut(|live| {
+    live.retain(|el| {
+      let Some(shared) = el.upgrade() else {
+        return false;
+      };
+      if let Ok(mut state) = shared.try_borrow_mut() {
+        state.conn.go_away(Http2ErrorCode::NoError);
+        state.dirty = true;
+        if let Some(waker) = state.conn_waker.take() {
+          waker.wake();
+        }
+      }
+      true
+    });
+  });
+}
+
+/// Undoes [`go_away_local_conns`] for a server starting on this thread.
+pub(crate) fn reset_going_away() {
+  GOING_AWAY.set(false);
+}
+
 /// Serves one connection until it closes. `conn` has queued its opening SETTINGS; `peer` is the
 /// address `accept` returned.
 pub(crate) async fn drive_conn<S, D>(
   stream: &mut S,
-  conn: Http2Conn<false>,
+  mut conn: Http2Conn<false>,
   dispatcher: &D,
   peer: IpAddr,
+  params: DriveParams,
 ) -> crate::Result<()>
 where
   S: StreamReader + StreamWriter,
   D: StreamDispatcher,
 {
   let _ = peer;
+  if GOING_AWAY.get() {
+    conn.go_away(Http2ErrorCode::NoError);
+  }
   let shared = ConnShared::new(conn);
+  LIVE.with_borrow_mut(|live| {
+    // Pruned as it doubles, so it follows the connections open.
+    if live.len() >= 64 && live.len().is_power_of_two() {
+      live.retain(|el| el.strong_count() > 0);
+    }
+    live.push(Rc::downgrade(&shared));
+  });
+  let handshake = match params.handshake {
+    Some(elem) => Some(Sleep::new(elem)?),
+    None => None,
+  };
   let mut state = Driver {
     collecting: HashMap::new(),
+    handshake,
+    idle: params.idle,
+    idle_expired: false,
+    idle_sleep: None,
+    last_rx: now(),
     manual: HashSet::new(),
     shared: shared.clone(),
     date: DateHeader::new(),
@@ -108,6 +174,15 @@ struct Driver<F, MT> {
   /// route.
   collecting: HashMap<u32, (usize, Option<MT>)>,
   date: DateHeader,
+  /// Until the peer's first SETTINGS: fires at the handshake deadline.
+  handshake: Option<Sleep>,
+  idle: Option<Duration>,
+  /// The idle timeout passed: the next turn sends GOAWAY.
+  idle_expired: bool,
+  /// Armed once the connection is first idle, and re-armed for what is left when it fires early.
+  idle_sleep: Option<Sleep>,
+  /// When bytes last arrived.
+  last_rx: Duration,
   /// Streams served by manual-mode handlers.
   manual: HashSet<u32>,
   shared: Rc<RefCell<ConnShared>>,
@@ -139,6 +214,12 @@ where
           let consumed = state.conn.feed_at(&self.rx, now())?;
           self.consume(consumed);
         }
+        if self.handshake.is_some() && state.conn.peer_settings_seen() {
+          self.handshake = None;
+        }
+        if self.idle_expired || GOING_AWAY.get() {
+          state.conn.go_away(Http2ErrorCode::NoError);
+        }
         self.date.refresh();
         self.handle_events(state, dispatcher)?;
         self.poll_woken(&mut state.conn)?;
@@ -168,6 +249,7 @@ where
           unsafe {
             self.rx.set_len(init_len.wrapping_add(len.get()));
           }
+          self.last_rx = now();
         }
         TryRead::Closed => return Ok(true),
         TryRead::Pending => return Ok(false),
@@ -176,7 +258,7 @@ where
           // meanwhile: a parked handler that wakes, or a manual stream that queues output, ends
           // the wait, and the read is dropped. The stream keeps the bytes of a partial record
           // in its own buffers, so nothing read is lost.
-          let Self { rx, shared, slots, .. } = self;
+          let Self { last_rx, rx, shared, slots, .. } = self;
           let (init_len, rslt) = {
             let (init, uninit) = rx.split_at_spare_mut();
             let init_len = init.len();
@@ -204,6 +286,7 @@ where
                 unsafe {
                   rx.set_len(init_len.wrapping_add(len.get()));
                 }
+                *last_rx = now();
                 Ok(false)
               }
               None => Ok(true),
@@ -419,8 +502,7 @@ where
   where
     S: StreamReader,
   {
-    let slots = &self.slots;
-    let shared = &self.shared;
+    let Self { handshake, idle, idle_expired, idle_sleep, last_rx, shared, slots, .. } = self;
     let mut readable = pin!(stream.readable());
     poll_fn(|cx| {
       slots.register_conn(cx.waker());
@@ -430,6 +512,18 @@ where
           return Poll::Ready(Ok(()));
         }
         state.conn_waker = Some(cx.waker().clone());
+        if let Some(sleep) = handshake
+          && Pin::new(sleep).poll(cx).is_ready()
+        {
+          return Poll::Ready(Err(crate::Error::ExpiredFuture));
+        }
+        if let Some(timeout) = *idle
+          && state.conn.open_streams() == 0
+          && poll_idle(timeout, idle_sleep, *last_rx, cx)?.is_ready()
+        {
+          *idle_expired = true;
+          return Poll::Ready(Ok(()));
+        }
       }
       if slots.has_woken() {
         return Poll::Ready(Ok(()));
@@ -506,6 +600,32 @@ where
       stream.write_all(&copy).await?;
       shared.borrow_mut().conn.advance_output(len);
     }
+  }
+}
+
+/// Whether `timeout` has passed since `last_rx`, waking `cx` when it may have. The timer is armed
+/// once and kept while the connection works, so a busy connection pays for one timer per
+/// `timeout`, not one per wait: when it fires early, it is re-armed for what is left.
+fn poll_idle(
+  timeout: Duration,
+  idle_sleep: &mut Option<Sleep>,
+  last_rx: Duration,
+  cx: &mut Context<'_>,
+) -> crate::Result<Poll<()>> {
+  loop {
+    let sleep = match idle_sleep {
+      Some(elem) => elem,
+      None => idle_sleep.insert(Sleep::new(timeout)?),
+    };
+    if Pin::new(sleep).poll(cx)?.is_pending() {
+      return Ok(Poll::Pending);
+    }
+    let quiet = now().saturating_sub(last_rx);
+    if quiet >= timeout {
+      *idle_sleep = None;
+      return Ok(Poll::Ready(()));
+    }
+    *idle_sleep = Some(Sleep::new(timeout.saturating_sub(quiet))?);
   }
 }
 

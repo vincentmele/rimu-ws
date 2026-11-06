@@ -318,14 +318,20 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     !self.fatal && !self.go_away_sent && self.go_away_recv.is_none()
   }
 
-  #[cfg(test)]
   /// The peer's first SETTINGS frame arrived.
+  #[cfg_attr(
+    not(feature = "http2-server-framework"),
+    allow(dead_code, reason = "used by the server driver")
+  )]
   pub(crate) const fn peer_settings_seen(&self) -> bool {
     self.peer_settings_seen
   }
 
-  #[cfg(test)]
   /// Streams open now.
+  #[cfg_attr(
+    not(feature = "http2-server-framework"),
+    allow(dead_code, reason = "used by the server driver")
+  )]
   pub(crate) fn open_streams(&self) -> u32 {
     u32::try_from(self.streams.len()).unwrap_or(u32::MAX)
   }

@@ -1,17 +1,17 @@
 use crate::{
   executor::{Executor, Runtime as _},
-  futures::Sleep,
-  http::{Router, ShutdownSignal, misc::on_accept_error},
+  http::{
+    Router, ShutdownSignal,
+    misc::{accept_or_shutdown, admit, counter, drain_connections, on_accept_error, tracked, within},
+  },
   net::{StreamReader, StreamWriter, TcpListener as _, TcpParams, Uri},
   rng::{CryptoRng, CryptoSeedableRng},
-  sync::{Arc, AtomicUsize},
+  sync::Arc,
   tls::{TlsAcceptor, TlsConfig, TlsCtxSk},
   web_socket::{WebSocket, WebSocketAcceptor, WsCompression},
 };
 use alloc::{boxed::Box, string::String};
-use core::{
-  future::poll_fn, num::NonZeroUsize, pin::pin, sync::atomic::Ordering, task::Poll, time::Duration,
-};
+use core::{num::NonZeroUsize, time::Duration};
 
 type LocalWebSocket<CO, EX, TCX> = WebSocket<
   <CO as WsCompression<false>>::NegotiatedCompression,
@@ -588,87 +588,6 @@ where
     if let Err(err) = web_socket_router.call(&router, path, web_socket).await {
       error_cb(err);
     }
-  }
-}
-
-/// The next accepted connection, or `None` once `shutdown` is triggered.
-async fn accept_or_shutdown<T>(
-  accept: impl Future<Output = T>,
-  shutdown: Option<&ShutdownSignal>,
-) -> Option<T> {
-  let Some(signal) = shutdown else {
-    return Some(accept.await);
-  };
-  let mut accept = pin!(accept);
-  poll_fn(|cx| {
-    if signal.poll_triggered(cx).is_ready() {
-      return Poll::Ready(None);
-    }
-    accept.as_mut().poll(cx).map(Some)
-  })
-  .await
-}
-
-/// `fut`'s output, or [`crate::Error::ExpiredFuture`] if `timeout` passes first.
-async fn within<T>(
-  fut: impl Future<Output = crate::Result<T>>,
-  timeout: Option<Duration>,
-) -> crate::Result<T> {
-  let Some(duration) = timeout else {
-    return fut.await;
-  };
-  let mut fut = pin!(fut);
-  let mut sleep = pin!(Sleep::new(duration)?);
-  poll_fn(|cx| {
-    if let Poll::Ready(elem) = fut.as_mut().poll(cx) {
-      return Poll::Ready(elem);
-    }
-    sleep.as_mut().poll(cx).map(|elem| elem.and(Err(crate::Error::ExpiredFuture)))
-  })
-  .await
-}
-
-/// The count of open connections, when a shutdown has to wait for them or a limit caps them.
-fn counter(
-  shutdown: Option<&(ShutdownSignal, Duration)>,
-  max_connections: Option<NonZeroUsize>,
-) -> Option<Arc<AtomicUsize>> {
-  (shutdown.is_some() || max_connections.is_some()).then(|| Arc::new(AtomicUsize::new(0)))
-}
-
-/// Counts a new connection in `active`, unless that would take it past `max`. Counted first and
-/// then checked, so that runtimes accepting at the same time can't together pass the limit.
-fn admit(active: &AtomicUsize, max: Option<NonZeroUsize>) -> bool {
-  let prev = active.fetch_add(1, Ordering::AcqRel);
-  if max.is_some_and(|el| prev >= el.get()) {
-    let _prev = active.fetch_sub(1, Ordering::AcqRel);
-    return false;
-  }
-  true
-}
-
-/// A connection's task, counted in `active` while it runs.
-async fn tracked(fut: impl Future<Output = ()>, active: Arc<AtomicUsize>) {
-  struct Guard(Arc<AtomicUsize>);
-
-  impl Drop for Guard {
-    fn drop(&mut self) {
-      let _prev = self.0.fetch_sub(1, Ordering::AcqRel);
-    }
-  }
-
-  let _guard = Guard(active);
-  fut.await;
-}
-
-/// Waits until no connection is left, or `drain` has passed.
-async fn drain_connections(active: &AtomicUsize, drain: Duration) {
-  let begin = crate::calendar::Instant::new();
-  while active.load(Ordering::Acquire) > 0 && begin.elapsed().is_ok_and(|el| el < drain) {
-    let Ok(sleep) = Sleep::new(Duration::from_millis(10)) else {
-      break;
-    };
-    let _rslt = sleep.await;
   }
 }
 

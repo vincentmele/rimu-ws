@@ -34,7 +34,7 @@ mod status_code;
 mod u31;
 mod version;
 pub mod web_authn;
-#[cfg(feature = "web-socket-server-framework")]
+#[cfg(any(feature = "http2-server-framework", feature = "web-socket-server-framework"))]
 mod shutdown_signal;
 #[cfg(feature = "web-socket-server-framework")]
 mod web_socket_server_framework;
@@ -64,7 +64,7 @@ pub use session::*;
 pub use status_code::StatusCode;
 pub use u31::U31;
 pub use version::Version;
-#[cfg(feature = "web-socket-server-framework")]
+#[cfg(any(feature = "http2-server-framework", feature = "web-socket-server-framework"))]
 pub use shutdown_signal::ShutdownSignal;
 #[cfg(feature = "web-socket-server-framework")]
 pub use web_socket_server_framework::{WebSocketRouter, WebSocketServerFramework};
