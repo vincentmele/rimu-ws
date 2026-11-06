@@ -61,12 +61,12 @@ impl Output {
       return Ok(());
     }
     let end = self.bytes.len();
-    if let Some(Chunk::Own { end: last_end, .. }) = self.chunks.last_mut() {
-      if *last_end == start {
-        *last_end = end;
-        self.pending = self.pending.wrapping_add(added);
-        return Ok(());
-      }
+    if let Some(Chunk::Own { end: last_end, .. }) = self.chunks.last_mut()
+      && *last_end == start
+    {
+      *last_end = end;
+      self.pending = self.pending.wrapping_add(added);
+      return Ok(());
     }
     self.chunks.push_back(Chunk::Own { end, start })?;
     self.pending = self.pending.wrapping_add(added);
@@ -92,10 +92,11 @@ impl Output {
         Chunk::Shared(elem) => elem.as_slice().get(skip..),
       };
       skip = 0;
-      if let Some(elem) = slice {
-        if !elem.is_empty() && out.push(elem).is_err() {
-          return;
-        }
+      if let Some(elem) = slice
+        && !elem.is_empty()
+        && out.push(elem).is_err()
+      {
+        return;
       }
     }
   }

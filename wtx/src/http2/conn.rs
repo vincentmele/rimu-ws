@@ -482,10 +482,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     let max_frame_len = i32::try_from(peer.max_frame_len).unwrap_or(i32::MAX);
     let mut progressed = false;
     let mut queued_sent: usize = 0;
-    loop {
-      let Some(item) = stream.send_queue.get(0) else {
-        break;
-      };
+    while let Some(item) = stream.send_queue.get(0) {
       let remaining = item.len().wrapping_sub(stream.front_sent);
       let avail = (*conn_send).min(stream.send_window).min(max_frame_len);
       if avail <= 0 {
@@ -872,8 +869,8 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       }
       return Err(protocol_err(Http2Error::UnexpectedStreamId));
     }
-    if !IS_CLIENT && (id % 2 == 0 || id <= self.highest_peer_id) {
-      if id % 2 == 0 {
+    if !IS_CLIENT && (id.is_multiple_of(2) || id <= self.highest_peer_id) {
+      if id.is_multiple_of(2) {
         return Err(protocol_err(Http2Error::UnexpectedStreamId));
       }
       return Err(crate::Error::Http2ErrorGoAway(

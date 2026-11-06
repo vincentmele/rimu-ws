@@ -5,11 +5,15 @@
 #[macro_use]
 mod macros;
 
+#[cfg(feature = "std")]
+pub(crate) mod conn_driver;
 mod cors_middleware;
 mod dyn_params;
 mod endpoint;
 mod endpoint_node;
 mod form_data;
+#[cfg(feature = "std")]
+mod handler_slots;
 mod http2_server_framework_error;
 mod http_router;
 mod json_reply;

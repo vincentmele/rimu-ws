@@ -2,6 +2,8 @@
 
 #[cfg(feature = "http-cookie")]
 pub mod cookie;
+#[cfg(all(feature = "http2-server-framework", feature = "std"))]
+mod date_header;
 mod generic_header;
 mod generic_request;
 mod generic_response;

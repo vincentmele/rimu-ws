@@ -1,0 +1,394 @@
+//! The driver against a raw-frame client: a std socket in a thread, the server on an io_uring
+//! runtime.
+
+use crate::{
+  collections::VectorUsize,
+  executor::{Runtime as _, UringParams, UringRuntime, UringTcpListener, UringTcpStream},
+  futures::Sleep,
+  http::{
+    HttpRecvParams, MsgBufferString, Request, StatusCode,
+    http2_server_framework::conn_driver::{StreamDispatcher, drive_conn},
+  },
+  http2::conn::{
+    Http2Conn,
+    scan::PREFACE,
+    test_frames::{data, frame, headers_req, parse_all, settings},
+  },
+  net::{StreamCommon, StreamReader, StreamWriter, TcpListener as _, TcpParams},
+  rng::Xorshift64,
+  sync::Arc,
+  tests::_uri,
+};
+use alloc::{
+  boxed::Box,
+  rc::Rc,
+  string::{String, ToString as _},
+  vec,
+  vec::Vec,
+};
+use core::{
+  cell::Cell,
+  pin::Pin,
+  sync::atomic::{AtomicBool, Ordering},
+  time::Duration,
+};
+use std::{
+  net::TcpStream,
+  sync::mpsc,
+  time::Instant,
+};
+
+type Frames = Vec<(u8, u8, u32, Vec<u8>)>;
+type AutoOut = (Request<MsgBufferString>, crate::Result<StatusCode>);
+
+const DATA: u8 = 0;
+const HEADERS: u8 = 1;
+const RST_STREAM: u8 = 3;
+const WINDOW_UPDATE: u8 = 8;
+
+/// Handlers by path: `/` answers `ok`, `/slow` sleeps 20 ms, `/park` never finishes (and sets
+/// `dropped` when dropped), `/panic` panics, `/echo` answers the length of the request body,
+/// `/big` answers 1 MiB.
+struct TestDispatcher {
+  dropped: Arc<AtomicBool>,
+}
+
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+  fn drop(&mut self) {
+    self.0.store(true, Ordering::SeqCst);
+  }
+}
+
+impl StreamDispatcher for TestDispatcher {
+  type AutoFut = Pin<Box<dyn Future<Output = AutoOut>>>;
+
+  fn auto(&self, mut req: Request<MsgBufferString>) -> Self::AutoFut {
+    let dropped = self.dropped.clone();
+    Box::pin(async move {
+      let path = String::from(req.msg_data.uri.path());
+      let body: Vec<u8> = match path.as_str() {
+        "/slow" => {
+          Sleep::new(Duration::from_millis(20)).unwrap().await.unwrap();
+          b"slow".to_vec()
+        }
+        "/park" => {
+          let _flag = DropFlag(dropped);
+          core::future::pending::<()>().await;
+          Vec::new()
+        }
+        "/panic" => panic!("handler panic"),
+        "/echo" => req.msg_data.body.len().to_string().into_bytes(),
+        "/big" => vec![7; 1 << 20],
+        _ => b"ok".to_vec(),
+      };
+      req.msg_data.body.clear();
+      req.msg_data.body.extend_from_copyable_slice(&body).unwrap();
+      (req, Ok(StatusCode::Ok))
+    })
+  }
+}
+
+/// A stream that counts its writes.
+struct Counting {
+  inner: UringTcpStream,
+  writes: Rc<Cell<usize>>,
+}
+
+impl StreamCommon for Counting {}
+
+impl StreamReader for Counting {
+  async fn read(
+    &mut self,
+    bytes: crate::collections::MaybeUninitSlice<'_, u8>,
+  ) -> crate::Result<Option<core::num::NonZeroUsize>> {
+    self.inner.read(bytes).await
+  }
+
+  fn try_read(
+    &mut self,
+    bytes: crate::collections::MaybeUninitSlice<'_, u8>,
+  ) -> crate::Result<crate::net::TryRead> {
+    self.inner.try_read(bytes)
+  }
+
+  async fn readable(&mut self) -> crate::Result<()> {
+    self.inner.readable().await
+  }
+}
+
+impl StreamWriter for Counting {
+  async fn write_all(&mut self, bytes: &[u8]) -> crate::Result<()> {
+    self.writes.set(self.writes.get() + 1);
+    self.inner.write_all(bytes).await
+  }
+
+  async fn write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<()> {
+    self.writes.set(self.writes.get() + 1);
+    self.inner.write_all_vectored(bytes).await
+  }
+
+  fn try_write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<bool> {
+    let rslt = self.inner.try_write_all_vectored(bytes)?;
+    if rslt {
+      self.writes.set(self.writes.get() + 1);
+    }
+    Ok(rslt)
+  }
+}
+
+struct Served {
+  addr: String,
+  dropped: Arc<AtomicBool>,
+  /// The driver's result and the number of writes it made.
+  done: mpsc::Receiver<(crate::Result<()>, usize)>,
+}
+
+/// One connection served by `drive_conn` on a fresh runtime in its own thread.
+fn serve(hp: HttpRecvParams) -> Served {
+  let uri = _uri();
+  let addr = String::from(uri.hostname_with_implied_port().0) + ":" + &uri.port().unwrap().to_string();
+  let dropped = Arc::new(AtomicBool::new(false));
+  let (tx, done) = mpsc::channel();
+  let (ready_tx, ready_rx) = mpsc::channel();
+  let server_addr = addr.clone();
+  let server_dropped = dropped.clone();
+  let _jh = std::thread::spawn(move || {
+    let runtime = UringRuntime::with_params(UringParams::default()).unwrap();
+    runtime.block_on(async move {
+      let listener =
+        UringTcpListener::bind(server_addr.as_str(), TcpParams::default().set_reuse_port(Some(false)))
+          .await
+          .unwrap();
+      ready_tx.send(()).unwrap();
+      let (stream, peer) = listener.accept(TcpParams::default()).await.unwrap();
+      let writes = Rc::new(Cell::new(0));
+      let mut counting = Counting { inner: stream, writes: writes.clone() };
+      let conn = Http2Conn::<false>::new(hp, &mut Xorshift64::from(9u64));
+      let dispatcher = TestDispatcher { dropped: server_dropped };
+      let rslt = drive_conn(&mut counting, conn, &dispatcher, peer.ip()).await;
+      tx.send((rslt, writes.get())).unwrap();
+    });
+  });
+  ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+  Served { addr, dropped, done }
+}
+
+/// A raw-frame HTTP/2 client.
+struct Client {
+  buffer: Vec<u8>,
+  stream: TcpStream,
+}
+
+impl Client {
+  fn connect(addr: &str, extra_settings: &[(u16, u32)]) -> Self {
+    let stream = TcpStream::connect(addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+    let mut this = Self { buffer: Vec::new(), stream };
+    let mut opening = PREFACE.to_vec();
+    opening.extend(settings(extra_settings));
+    this.send(&opening);
+    this
+  }
+
+  fn send(&mut self, bytes: &[u8]) {
+    std::io::Write::write_all(&mut self.stream, bytes).unwrap();
+  }
+
+  /// Every frame that arrives until `done` holds of all of them, or `timeout` passes.
+  fn read_until(&mut self, timeout: Duration, mut done: impl FnMut(&Frames) -> bool) -> Frames {
+    let deadline = Instant::now() + timeout;
+    let mut frames = Frames::new();
+    let mut chunk = [0; 65_536];
+    while !done(&frames) && Instant::now() < deadline {
+      match std::io::Read::read(&mut self.stream, &mut chunk) {
+        Ok(0) => break,
+        Ok(n) => {
+          self.buffer.extend_from_slice(&chunk[..n]);
+          let complete = complete_len(&self.buffer);
+          frames.extend(parse_all(&self.buffer[..complete]));
+          let _ = self.buffer.drain(..complete);
+        }
+        Err(err)
+          if matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+        Err(_) => break,
+      }
+    }
+    frames
+  }
+}
+
+/// Bytes of whole frames at the start of `bytes`.
+fn complete_len(bytes: &[u8]) -> usize {
+  let mut idx = 0;
+  while let Some(header) = bytes.get(idx..idx + 9) {
+    let len = usize::try_from(u32::from_be_bytes([0, header[0], header[1], header[2]])).unwrap();
+    if bytes.len() < idx + 9 + len {
+      break;
+    }
+    idx += 9 + len;
+  }
+  idx
+}
+
+/// Streams whose response ended, in the order they ended.
+fn ended(frames: &Frames) -> Vec<u32> {
+  frames
+    .iter()
+    .filter(|el| (el.0 == DATA || el.0 == HEADERS) && el.1 & 1 == 1)
+    .map(|el| el.2)
+    .collect()
+}
+
+fn body_of(frames: &Frames, stream: u32) -> Vec<u8> {
+  frames.iter().filter(|el| el.0 == DATA && el.2 == stream).flat_map(|el| el.3.clone()).collect()
+}
+
+fn status_of(frames: &Frames, stream: u32) -> Option<u8> {
+  // `:status` comes first, as a static-table index: 0x88 is 200, 0x8e is 500.
+  frames.iter().find(|el| el.0 == HEADERS && el.2 == stream).map(|el| el.3[0])
+}
+
+#[test]
+fn server_inline_ready_one_write() {
+  let served = serve(HttpRecvParams::with_default_params().set_max_concurrent_streams_num(128));
+  let mut client = Client::connect(&served.addr, &[]);
+  let mut batch = Vec::new();
+  for idx in 0..100u32 {
+    batch.extend(headers_req(2 * idx + 1, "GET", "/", &[], true));
+  }
+  client.send(&batch);
+  let frames = client.read_until(Duration::from_secs(5), |frames| ended(frames).len() == 100);
+  assert_eq!(ended(&frames).len(), 100);
+  assert!(frames.iter().filter(|el| el.0 == DATA).all(|el| el.3 == b"ok"));
+  drop(client);
+  let (rslt, writes) = served.done.recv_timeout(Duration::from_secs(5)).unwrap();
+  assert!(rslt.is_ok(), "{rslt:?}");
+  // The SETTINGS of the first turn, the 100 responses, and at most one more if the requests
+  // arrived in two reads.
+  assert!(writes <= 3, "{writes} writes for 100 responses");
+}
+
+#[test]
+fn server_parked_handler_answered_later() {
+  let served = serve(HttpRecvParams::with_default_params());
+  let mut client = Client::connect(&served.addr, &[]);
+  let mut batch = headers_req(1, "GET", "/slow", &[], true);
+  for idx in 1..=10u32 {
+    batch.extend(headers_req(2 * idx + 1, "GET", "/", &[], true));
+  }
+  client.send(&batch);
+  let frames = client.read_until(Duration::from_secs(5), |frames| ended(frames).len() == 11);
+  let order = ended(&frames);
+  assert_eq!(order.len(), 11, "{order:?}");
+  assert_eq!(*order.last().unwrap(), 1, "the slow handler finishes last: {order:?}");
+  assert_eq!(body_of(&frames, 1), b"slow");
+}
+
+#[test]
+fn server_reset_drops_parked_handler() {
+  let served = serve(HttpRecvParams::with_default_params());
+  let mut client = Client::connect(&served.addr, &[]);
+  client.send(&headers_req(1, "GET", "/park", &[], true));
+  let _ = client.read_until(Duration::from_millis(200), |_| false);
+  assert!(!served.dropped.load(Ordering::SeqCst));
+  let mut input = frame(RST_STREAM, 0, 1, &8u32.to_be_bytes());
+  input.extend(headers_req(3, "GET", "/", &[], true));
+  client.send(&input);
+  let frames = client.read_until(Duration::from_secs(5), |frames| ended(frames).contains(&3));
+  assert!(served.dropped.load(Ordering::SeqCst), "the parked future was not dropped");
+  assert!(frames.iter().all(|el| el.2 != 1), "{frames:?}");
+}
+
+#[test]
+fn server_handler_panic_isolated() {
+  let served = serve(HttpRecvParams::with_default_params());
+  let mut client = Client::connect(&served.addr, &[]);
+  let mut batch = headers_req(1, "GET", "/panic", &[], true);
+  for idx in 1..=9u32 {
+    batch.extend(headers_req(2 * idx + 1, "GET", "/", &[], true));
+  }
+  client.send(&batch);
+  let frames = client.read_until(Duration::from_secs(5), |frames| ended(frames).len() == 10);
+  assert_eq!(ended(&frames).len(), 10);
+  assert_eq!(status_of(&frames, 1), Some(0x8e), "500 for the panicking stream");
+  for idx in 1..=9u32 {
+    assert_eq!(status_of(&frames, 2 * idx + 1), Some(0x88));
+  }
+  client.send(&headers_req(21, "GET", "/", &[], true));
+  let frames = client.read_until(Duration::from_secs(5), |frames| ended(frames).contains(&21));
+  assert_eq!(body_of(&frames, 21), b"ok");
+}
+
+#[test]
+fn server_auto_body_larger_than_window() {
+  let served = serve(HttpRecvParams::with_default_params().set_initial_window_len(65_535));
+  let mut client = Client::connect(&served.addr, &[]);
+  client.send(&headers_req(1, "POST", "/echo", &[], false));
+  let body = vec![1u8; 200 * 1024];
+  let (mut sent, mut conn_window, mut stream_window) = (0usize, 65_535i64, 65_535i64);
+  let mut frames = Frames::new();
+  let deadline = Instant::now() + Duration::from_secs(5);
+  while sent < body.len() {
+    assert!(Instant::now() < deadline, "the server stopped opening its window at {sent} bytes");
+    let room = usize::try_from(conn_window.min(stream_window).min(16_384)).unwrap_or(0);
+    if room == 0 {
+      let got = client.read_until(Duration::from_millis(100), |frames| {
+        frames.iter().any(|el| el.0 == WINDOW_UPDATE)
+      });
+      for el in &got {
+        if el.0 == WINDOW_UPDATE {
+          let increment = i64::from(u32::from_be_bytes(el.3[..4].try_into().unwrap()));
+          if el.2 == 0 { conn_window += increment } else { stream_window += increment }
+        }
+      }
+      frames.extend(got);
+      continue;
+    }
+    let n = room.min(body.len() - sent);
+    let end = sent + n == body.len();
+    client.send(&data(1, &body[sent..sent + n], end));
+    sent += n;
+    conn_window -= n as i64;
+    stream_window -= n as i64;
+  }
+  frames.extend(client.read_until(Duration::from_secs(5), |frames| ended(frames).contains(&1)));
+  assert_eq!(body_of(&frames, 1), b"204800");
+}
+
+#[test]
+fn limit_send_queue_closes() {
+  let hp = HttpRecvParams::with_default_params().set_max_send_queue_len(4 << 20);
+  let served = serve(hp);
+  // A window large enough that only the queue cap stops the server, and a client that never
+  // reads.
+  let mut client = Client::connect(&served.addr, &[(4, 0x7FFF_FFFF)]);
+  let mut batch = frame(WINDOW_UPDATE, 0, 0, &0x7FFF_0000u32.to_be_bytes());
+  for idx in 0..32u32 {
+    batch.extend(headers_req(2 * idx + 1, "GET", "/big", &[], true));
+  }
+  client.send(&batch);
+  let (rslt, _) = served.done.recv_timeout(Duration::from_secs(10)).expect("the server closed");
+  assert!(rslt.is_err(), "{rslt:?}");
+  drop(client);
+}
+
+#[test]
+fn date_header_on_responses() {
+  let served = serve(HttpRecvParams::with_default_params());
+  let mut client = Client::connect(&served.addr, &[]);
+  client.send(&headers_req(1, "GET", "/", &[], true));
+  let frames = client.read_until(Duration::from_secs(5), |frames| ended(frames).contains(&1));
+  let block = frames.iter().find(|el| el.0 == HEADERS).unwrap().3.clone();
+  let mut dec = crate::http2::hpack_decoder::HpackDecoder::new();
+  dec.set_max_bytes(4096);
+  let mut names = VectorUsize::<String>::new();
+  dec
+    .decode(&block, |(_, name, _)| {
+      names.push(String::from(name.str())).unwrap();
+      Ok(())
+    })
+    .unwrap();
+  assert!(names.iter().any(|el| el == "date"), "{:?}", names.as_slice());
+}
