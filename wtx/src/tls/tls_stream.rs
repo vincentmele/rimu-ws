@@ -10,7 +10,7 @@ use crate::{
     key_schedule::{KeySchedule, KeyScheduleWrite},
     misc::{
       manage_err_ad, manage_key_update, manage_user_canceled, read_after_handshake_data,
-      write_payloads,
+      seal_payloads, sealed_len, write_payloads,
     },
     protocol::{
       alert::Alert,
@@ -21,7 +21,7 @@ use crate::{
     tls_stream_common::TlsStreamCommon,
   },
 };
-use alloc::boxed::Box;
+use alloc::{boxed::Box, vec::Vec};
 use core::{
   future::poll_fn,
   hint::cold_path,
@@ -530,7 +530,8 @@ where
     Ok(())
   }
 
-  /// Plaintext forwards to the stream; records always go through [`Self::write_all_vectored`].
+  /// Plaintext and kernel TLS forward to the stream. User-space records are sealed straight into
+  /// the buffer the stream sends them from (see [`StreamWriter::try_send_with`]).
   #[inline]
   fn try_write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<bool> {
     #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
@@ -540,12 +541,12 @@ where
     if TCX::TY.is_plain_text() || (self.kernel_tls && !self.connection_state.cannot_write()) {
       return self.stream.try_write_all_vectored(bytes);
     }
-    Ok(false)
+    self.try_seal_and_send(bytes)
   }
 
-  /// Plaintext and kernel TLS forward to the stream, as [`Self::try_write_all_vectored`].
+  /// As [`Self::try_write_all_vectored`].
   #[inline]
-  fn try_send_owned(&mut self, bytes: &mut alloc::vec::Vec<u8>) -> crate::Result<bool> {
+  fn try_send_owned(&mut self, bytes: &mut Vec<u8>) -> crate::Result<bool> {
     #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
     if self.kernel_tls_tries > 0 {
       self.try_kernel_tls()?;
@@ -553,7 +554,37 @@ where
     if TCX::TY.is_plain_text() || (self.kernel_tls && !self.connection_state.cannot_write()) {
       return self.stream.try_send_owned(bytes);
     }
+    if self.try_seal_and_send(&[bytes.as_slice()])? {
+      bytes.clear();
+      return Ok(true);
+    }
     Ok(false)
+  }
+}
+
+impl<S, TCX, const IS_CLIENT: bool> TlsStream<S, TCX, IS_CLIENT>
+where
+  S: StreamWriter,
+  TCX: TlsCtx,
+{
+  /// Seals `bytes` into records written straight into the stream's send buffer, if the stream
+  /// can take them now. `false` seals nothing.
+  fn try_seal_and_send(&mut self, bytes: &[&[u8]]) -> crate::Result<bool> {
+    if self.kernel_tls || self.connection_state.cannot_write() {
+      return Ok(false);
+    }
+    let total_len = bytes.iter().map(|el| el.len()).sum();
+    let len = sealed_len(total_len, self.max_fragment_length_send);
+    let Self { key_schedule, max_fragment_length_send, stream, .. } = self;
+    let ksw = key_schedule.write_mut();
+    let sent = stream.try_send_with(len, &mut |records| {
+      let ty = RecordContentTy::ApplicationData;
+      seal_payloads(ty, ksw, *max_fragment_length_send, bytes, records)
+    })?;
+    if sent {
+      self.can_reply_key_update = true;
+    }
+    Ok(sent)
   }
 }
 

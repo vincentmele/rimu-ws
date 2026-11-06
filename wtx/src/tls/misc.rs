@@ -25,6 +25,7 @@ use crate::{
     tls_cc_wrappers::TlsDecodeWrapper,
   },
 };
+use alloc::vec::Vec;
 use core::{hint::cold_path, num::NonZeroUsize, ops::Range};
 
 const UNEXPECTED_AFTER_HANDSHAKE_INNER_RECORD: crate::Error = crate::Error::TlsErrorReply(
@@ -507,19 +508,45 @@ pub(crate) async fn write_payloads<SW>(
 where
   SW: StreamWriter,
 {
+  // Records go after what the caller already put in the buffer (a plaintext handshake record).
+  let mut records = core::mem::take(writer_buffer).into_vec();
+  seal_payloads(inner_ty, ksw, max_fragment_length_send, payloads, &mut records)?;
+  stream_writer.write_all(&records).await?;
+  records.clear();
+  *writer_buffer = VectorUsize::from_vec(records)?;
+  Ok(())
+}
+
+/// Bytes of the records [`seal_payloads`] makes of `len` plaintext bytes.
+pub(crate) fn sealed_len(len: usize, max_fragment_length_send: u16) -> usize {
+  let max_len = usize::from(max_fragment_length_send).max(1);
+  let overhead = RECORD_HEADER_LEN.wrapping_add(1).wrapping_add(AEAD_TAG_LEN);
+  len.wrapping_add(len.div_ceil(max_len).wrapping_mul(overhead))
+}
+
+/// Appends `payloads` to `records` as records of at most `max_fragment_length_send` plaintext
+/// bytes: each byte is copied once, into its place in `records`, and encrypted there.
+pub(crate) fn seal_payloads(
+  inner_ty: RecordContentTy,
+  ksw: &mut KeyScheduleWrite,
+  max_fragment_length_send: u16,
+  payloads: &[&[u8]],
+  records: &mut Vec<u8>,
+) -> crate::Result<()> {
   let total_len: usize = payloads.iter().map(|slice| slice.len()).sum();
+  let max_len = usize::from(max_fragment_length_send).max(1);
+  records.reserve(sealed_len(total_len, max_fragment_length_send));
   let mut total_unwritten = total_len;
-  writer_buffer.reserve(total_len)?;
   let mut payloads_iter = payloads.iter().copied();
   let mut current_slice = payloads_iter.next().unwrap_or_default();
   while total_unwritten > 0 {
-    let record_data_len = total_unwritten.min(max_fragment_length_send.into());
+    let record_data_len = total_unwritten.min(max_len);
     total_unwritten = total_unwritten.wrapping_sub(record_data_len);
     let len_usize = record_data_len.wrapping_add(1).wrapping_add(AEAD_TAG_LEN);
     let len = len_usize.try_into().unwrap_or_default();
     let header = build_header(RecordContentTy::ApplicationData, len);
-    let plaintext_begin_idx = writer_buffer.len().wrapping_add(header.len());
-    writer_buffer.extend_from_copyable_slice(header.as_slice())?;
+    records.extend_from_slice(&header);
+    let plaintext_begin_idx = records.len();
     let mut needed = record_data_len;
     while needed > 0 {
       if current_slice.is_empty() {
@@ -529,27 +556,19 @@ where
       let Some((data, rest)) = current_slice.split_at_checked(take) else {
         break;
       };
-      writer_buffer.extend_from_copyable_slice(data)?;
+      records.extend_from_slice(data);
       current_slice = rest;
       needed = needed.wrapping_sub(take);
     }
-    let array = [&[inner_ty.into()][..], &[0; AEAD_TAG_LEN]];
-    let _ = writer_buffer.extend_from_copyable_slices(array)?;
-    let plaintext_len = record_data_len.wrapping_add(1);
-    let plaintext = writer_buffer
-      .get_mut(plaintext_begin_idx..plaintext_begin_idx.wrapping_add(plaintext_len))
-      .unwrap_or_default();
+    records.push(inner_ty.into());
+    let plaintext = records.get_mut(plaintext_begin_idx..).unwrap_or_default();
     let ksw_state = ksw.state_mut();
     let nonce = ksw_state.nonce();
     let secret = ksw_state.cipher_key();
     let tag = ksw_state.cipher_suite().aes_encrypt(&header, plaintext, nonce, secret)?;
-    if let Some(buffer_tag) = writer_buffer.last_chunk_mut::<AEAD_TAG_LEN>() {
-      buffer_tag.copy_from_slice(&tag);
-    }
+    records.extend_from_slice(&tag);
     ksw_state.increment_counter();
   }
-  stream_writer.write_all(writer_buffer).await?;
-  writer_buffer.clear();
   Ok(())
 }
 

@@ -154,6 +154,18 @@ impl StreamWriter for Counting {
     }
     Ok(rslt)
   }
+
+  fn try_send_with(
+    &mut self,
+    len: usize,
+    write: &mut dyn FnMut(&mut Vec<u8>) -> crate::Result<()>,
+  ) -> crate::Result<bool> {
+    let rslt = self.inner.try_send_with(len, write)?;
+    if rslt {
+      self.writes.set(self.writes.get() + 1);
+    }
+    Ok(rslt)
+  }
 }
 
 struct Served {
@@ -543,6 +555,85 @@ fn server_userspace_tls_parked_handler_answers() {
     });
   });
   assert!(done_rx.recv_timeout(Duration::from_secs(5)).is_ok(), "no response to the parked handler");
+}
+
+// User-space TLS seals what the driver hands it straight into a buffer the reactor takes as the
+// send: `try_write_all_vectored` and `try_send_owned` take bytes without waiting, decline when the
+// reactor's queue is full (sealing nothing, so a later write still decrypts in order), and the
+// peer gets every byte.
+#[test]
+fn server_userspace_tls_seals_into_owned_sends() {
+  use crate::{
+    executor::StdRuntime,
+    tests::{_PUBLIC_KEY, _ROOT_CA, _SECRET_KEY},
+    tls::{TlsAcceptor, TlsConfig, TlsConnectorBuilder},
+  };
+  const PIECE: usize = 40_000;
+  let uri = _uri();
+  let (host, port) = uri.hostname_with_implied_port();
+  let addr = alloc::format!("{host}:{port}");
+  let client_uri = uri.clone();
+  let expected: Vec<u8> = (0..3 * 1024 * 1024 + 7).map(|el: usize| (el % 251) as u8).collect();
+  let total = expected.len();
+  let client = std::thread::spawn(move || {
+    StdRuntime::new().block_on(async move {
+      let mut rng = <crate::rng::ChaCha20 as crate::rng::CryptoSeedableRng>::from_std_random().unwrap();
+      let config = TlsConfig::from_trust_anchors_pem([_ROOT_CA]).unwrap();
+      let mut tls_stream = loop {
+        let connector = TlsConnectorBuilder::std(client_uri.clone()).build(&config, &mut rng).await;
+        if let Ok(elem) = connector {
+          break elem.connect().await.unwrap().tls_stream;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+      };
+      let mut got = Vec::new();
+      let mut buf = [0u8; 16 * 1024];
+      while got.len() < total {
+        let len = tls_stream.read(buf.as_mut_slice().into()).await.unwrap().unwrap();
+        got.extend_from_slice(&buf[..len.get()]);
+      }
+      tls_stream.write_all(b"done").await.unwrap();
+      got
+    })
+  });
+  let params = UringParams::default().set_tx_high_water(64 * 1024);
+  let runtime = UringRuntime::with_params(params).unwrap();
+  let (taken, declined) = runtime.block_on(async {
+    let listener = UringTcpListener::bind(addr.as_str(), TcpParams::default().set_reuse_port(Some(false)))
+      .await
+      .unwrap();
+    let (stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+    let mut rng = <crate::rng::ChaCha20 as crate::rng::CryptoSeedableRng>::from_std_random().unwrap();
+    let mut config = TlsConfig::from_keys_pem(_PUBLIC_KEY, _SECRET_KEY).unwrap();
+    *config.kernel_tls_mut() = false;
+    let mut tls_stream = TlsAcceptor::new(&config, &mut rng, stream).accept().await.unwrap().tls_stream;
+    let (mut taken, mut declined) = (0, 0);
+    for (idx, piece) in expected.chunks(PIECE).enumerate() {
+      let third = piece.len() / 3;
+      let took = if idx % 2 == 0 {
+        tls_stream
+          .try_write_all_vectored(&[&piece[..third], &piece[third..2 * third], &piece[2 * third..]])
+          .unwrap()
+      } else {
+        let mut owned = piece.to_vec();
+        let took = tls_stream.try_send_owned(&mut owned).unwrap();
+        assert!(!took || owned.is_empty());
+        took
+      };
+      if took {
+        taken += 1;
+      } else {
+        declined += 1;
+        tls_stream.write_all(piece).await.unwrap();
+      }
+    }
+    let mut buf = [0u8; 16];
+    let _ = tls_stream.read(buf.as_mut_slice().into()).await.unwrap();
+    (taken, declined)
+  });
+  assert!(client.join().unwrap() == expected, "the peer got other bytes");
+  assert!(taken > 0, "nothing was sealed without waiting");
+  assert!(declined > 0, "the queue never filled: the test doesn't cover declining");
 }
 
 // User-space TLS reads one record per `read`: records that arrived together wait in the stream's

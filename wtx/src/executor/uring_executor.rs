@@ -716,6 +716,18 @@ impl StreamWriter for UringTcpStream {
     try_send_owned(self.conn, bytes)
   }
 
+  #[inline]
+  fn try_send_with(
+    &mut self,
+    len: usize,
+    write: &mut dyn FnMut(&mut Vec<u8>) -> crate::Result<()>,
+  ) -> crate::Result<bool> {
+    let conn = self.conn;
+    with_own_reactor(conn.runtime, |reactor| {
+      reactor.try_queue_send_with(conn.idx, conn.generation, len, write)
+    })
+  }
+
   #[cfg(feature = "tls")]
   #[inline]
   fn send_kernel_tls_alert(&mut self, level: u8, description: u8) -> crate::Result<()> {
@@ -845,6 +857,18 @@ impl StreamWriter for UringWriteHalf {
   #[inline]
   fn try_send_owned(&mut self, bytes: &mut Vec<u8>) -> crate::Result<bool> {
     try_send_owned(self.conn, bytes)
+  }
+
+  #[inline]
+  fn try_send_with(
+    &mut self,
+    len: usize,
+    write: &mut dyn FnMut(&mut Vec<u8>) -> crate::Result<()>,
+  ) -> crate::Result<bool> {
+    let conn = self.conn;
+    with_own_reactor(conn.runtime, |reactor| {
+      reactor.try_queue_send_with(conn.idx, conn.generation, len, write)
+    })
   }
 
   #[cfg(feature = "tls")]
@@ -2787,6 +2811,67 @@ impl Reactor {
       }
     }
     self.queue_send(idx, generation, bytes)?;
+    Ok(true)
+  }
+
+  /// [`Self::try_queue_send_owned`] for bytes `write` makes in place, written once, into the
+  /// buffer they are sent from: a recycled one from `send_pool` (still in the cache), which
+  /// becomes the send, or behind a send in flight `tx_pending`. An empty `tx_pending` too small
+  /// for them is replaced by one with room for everything a connection may have waiting, rather
+  /// than grown by a copy as the writes come. `false` calls nothing.
+  fn try_queue_send_with(
+    &self,
+    idx: u32,
+    generation: u32,
+    len: usize,
+    write: &mut dyn FnMut(&mut Vec<u8>) -> crate::Result<()>,
+  ) -> crate::Result<bool> {
+    let (sqe, sent) = {
+      let mut conns = self.conns.borrow_mut();
+      let Some(conn) = conns.get_mut(idx as usize).filter(|el| el.generation == generation) else {
+        return Err(io_err(libc::EBADF));
+      };
+      if conn.tx_err != 0 {
+        return Err(io_err(conn.tx_err.into()));
+      }
+      if conn.sending || !conn.tx_pending.is_empty() {
+        if conn.tx_pending.len() >= self.params.tx_high_water {
+          return Ok(false);
+        }
+        if conn.tx_pending.is_empty() && conn.tx_pending.capacity() < len {
+          let room = len.saturating_add(self.params.tx_high_water);
+          conn.tx_pending = Vec::with_capacity(room);
+        }
+        let before = conn.tx_pending.len();
+        if let Err(err) = write(&mut conn.tx_pending) {
+          conn.tx_pending.truncate(before);
+          return Err(err);
+        }
+        return Ok(true);
+      }
+      // A buffer too small would be grown by a copy of its whole capacity: start a new one.
+      let mut buffer = self.send_pool.borrow_mut().pop().unwrap_or_default();
+      if buffer.capacity() < len {
+        buffer = Vec::with_capacity(len);
+      }
+      if let Err(err) = write(&mut buffer) {
+        self.recycle_send_buffer(buffer);
+        return Err(err);
+      }
+      if buffer.is_empty() {
+        self.recycle_send_buffer(buffer);
+        return Ok(true);
+      }
+      let idle = core::mem::replace(&mut conn.tx_inflight, buffer);
+      self.recycle_send_buffer(idle);
+      conn.activity |= TX_OWNED;
+      conn.tx_done = 0;
+      conn.sending = true;
+      let sqe = send_sqe(conn, &conn.tx_inflight).user_data(user_data(KIND_SEND, generation, idx));
+      (sqe, conn.tx_inflight.len())
+    };
+    self.push_sqe(&sqe);
+    self.count_queued_send(sent);
     Ok(true)
   }
 

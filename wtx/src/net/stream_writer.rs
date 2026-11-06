@@ -29,6 +29,21 @@ pub trait StreamWriter: StreamCommon {
     Ok(false)
   }
 
+  /// Queues what `write` appends to the buffer it is given, about `len` bytes, without awaiting:
+  /// the bytes are written once, straight into the buffer they are sent from, which suits bytes
+  /// made as they are written (encrypted ones, say). `false`, calling nothing, when they would
+  /// have to wait. An error from `write` is returned with nothing of its bytes queued. The
+  /// default never queues.
+  #[inline]
+  fn try_send_with(
+    &mut self,
+    len: usize,
+    write: &mut dyn FnMut(&mut alloc::vec::Vec<u8>) -> crate::Result<()>,
+  ) -> crate::Result<bool> {
+    let _ = (len, write);
+    Ok(false)
+  }
+
   /// For kernel TLS: sends an alert record after what was written before it, which may be once
   /// those bytes are out. The default, for streams without kernel TLS, fails with `Unsupported`.
   #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
@@ -61,6 +76,15 @@ where
   #[inline]
   fn try_send_owned(&mut self, bytes: &mut alloc::vec::Vec<u8>) -> crate::Result<bool> {
     (**self).try_send_owned(bytes)
+  }
+
+  #[inline]
+  fn try_send_with(
+    &mut self,
+    len: usize,
+    write: &mut dyn FnMut(&mut alloc::vec::Vec<u8>) -> crate::Result<()>,
+  ) -> crate::Result<bool> {
+    (**self).try_send_with(len, write)
   }
 
   #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
