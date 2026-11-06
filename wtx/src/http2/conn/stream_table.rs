@@ -177,10 +177,6 @@ impl StreamTable {
     self.ids.len()
   }
 
-  pub(crate) fn contains(&self, id: u32) -> bool {
-    self.ids.contains_key(&id)
-  }
-
   pub(crate) fn get(&self, id: u32) -> Option<&Stream> {
     let idx = *self.ids.get(&id)?;
     self.slots.get(idx)
@@ -225,6 +221,12 @@ impl StreamTable {
     }
     let _rslt = self.free.push(idx);
     true
+  }
+
+  /// Every open stream.
+  pub(crate) fn iter(&self) -> impl Iterator<Item = &Stream> {
+    let ids = &self.ids;
+    self.slots.iter().filter(move |el| ids.get(&el.id).is_some())
   }
 
   /// Every open stream.

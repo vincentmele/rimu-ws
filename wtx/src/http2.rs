@@ -8,80 +8,124 @@
 #[macro_use]
 mod macros;
 
+mod client_conn;
 mod client_stream;
+#[allow(
+  dead_code,
+  reason = "upstream's frame code, kept for merges; the connection core writes frames itself"
+)]
 mod common_flags;
 mod common_stream;
 pub(crate) mod conn;
+#[allow(
+  dead_code,
+  reason = "upstream's frame code, kept for merges; the connection core writes frames itself"
+)]
 mod continuation_frame;
+#[allow(
+  dead_code,
+  reason = "upstream's frame code, kept for merges; the connection core writes frames itself"
+)]
 mod data_frame;
 mod frame_init;
-mod frame_reader;
+#[allow(
+  dead_code,
+  reason = "upstream's frame code, kept for merges; the connection core writes frames itself"
+)]
 mod go_away_frame;
+#[allow(
+  dead_code,
+  reason = "upstream's frame code, kept for merges; the connection core writes frames itself"
+)]
 mod headers_frame;
+#[allow(
+  dead_code,
+  reason = "upstream's frame code, kept for merges; the connection core writes frames itself"
+)]
 pub(crate) mod hpack_decoder;
+#[allow(
+  dead_code,
+  reason = "upstream's frame code, kept for merges; the connection core writes frames itself"
+)]
 mod hpack_encoder;
 mod hpack_header;
 mod hpack_headers;
+#[allow(
+  dead_code,
+  reason = "upstream's frame code, kept for merges; the connection core writes frames itself"
+)]
 mod hpack_static_headers;
 mod http2_buffer;
-mod http2_data;
 mod http2_error;
 mod http2_error_code;
 mod http2_status;
-mod http_send_params;
 mod huffman;
 mod huffman_tables;
-mod initial_server_stream_remote;
 mod misc;
 mod ping_frame;
-mod process_receipt_frame_ty;
+#[allow(
+  dead_code,
+  reason = "upstream's frame code, kept for merges; the connection core writes frames itself"
+)]
 mod reset_stream_frame;
 pub(crate) mod server_stream;
+#[allow(
+  dead_code,
+  reason = "upstream's frame code, kept for merges; the connection core writes frames itself"
+)]
 mod settings_frame;
-mod stream_receiver;
-mod stream_state;
 #[cfg(test)]
 mod tests;
 #[cfg(feature = "web-socket")]
 mod web_socket_over_stream;
-mod window;
+#[allow(
+  dead_code,
+  reason = "upstream's frame code, kept for merges; the connection core writes frames itself"
+)]
 mod window_update_frame;
-mod write_functions;
 
 use crate::{
   collections::SingleTypeStorage,
-  http::{DEFAULT_INITIAL_WINDOW_LEN, HttpRecvParams, U31},
-  http2::settings_frame::SettingsFrame,
-  misc::{Lease, LeaseMut, Usize},
+  http::HttpRecvParams,
+  http2::{client_conn::ClientShared, conn::Http2Conn},
+  misc::{Lease, LeaseMut},
   net::{ConnectionState, StreamReader, StreamWriter},
-  sync::{Arc, AsyncMutex},
-  tls::{
-    TlsCtx, TlsStreamBridge, TlsStreamReader, TlsStreamWriter, tls_stream_common::TlsStreamCommon,
-  },
+  sync::Arc,
+  tls::{TlsCtx, TlsStreamBridge, TlsStreamReader, TlsStreamWriter},
 };
 pub use client_stream::ClientStream;
 pub use common_stream::CommonStream;
-use core::{mem, task::Waker};
-use hashbrown::HashMap;
+use core::{future::poll_fn, task::Poll};
 pub use http2_buffer::Http2Buffer;
-pub use http2_data::Http2Data;
 pub use http2_error::Http2Error;
 pub use http2_error_code::Http2ErrorCode;
 pub use http2_status::{Http2RecvStatus, Http2SendStatus};
 pub use server_stream::ServerStream;
 #[cfg(feature = "web-socket")]
 pub use web_socket_over_stream::WebSocketOverStream;
-pub use window::{Window, Windows};
 
-const PREFACE: [u8; 24] = *b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-
-pub(crate) type Scorp = HashMap<U31, stream_receiver::StreamControlRecvParams>;
-pub(crate) type Sovrp = HashMap<U31, stream_receiver::StreamOverallRecvParams>;
-
-/// Negotiates initial "handshakes" or connections and also manages the creation of streams.
+/// A client connection: opens streams. The connection itself runs in the task [`Self::connect`]
+/// returns.
+///
+/// `SW` and `TCX` are the writing half and the TLS context of the connection; `IS_CLIENT` is
+/// always `true`.
 #[derive(Debug)]
 pub struct Http2<SW, TCX, const IS_CLIENT: bool> {
-  inner: Arc<Http2Inner<SW, TCX, IS_CLIENT>>,
+  shared: Arc<ClientShared<SW, TCX>>,
+}
+
+impl<SW, TCX, const IS_CLIENT: bool> Http2<SW, TCX, IS_CLIENT> {
+  /// Closes the connection at once: the task stops and every waiting stream wakes.
+  #[cfg(feature = "http2-client-pool")]
+  pub(crate) fn close_abruptly(&self) {
+    self.shared.state.lock().close_abruptly();
+  }
+
+  /// See [`ConnectionState`].
+  #[inline]
+  pub fn connection_state(&self) -> ConnectionState {
+    self.shared.state.lock().connection_state()
+  }
 }
 
 impl<SW, TCX, const IS_CLIENT: bool> Http2<SW, TCX, IS_CLIENT>
@@ -89,75 +133,7 @@ where
   SW: StreamWriter,
   TCX: TlsCtx,
 {
-  /// See [`ConnectionState`].
-  #[inline]
-  pub fn connection_state(&self) -> ConnectionState {
-    misc::connection_state(&self.inner.is_conn_open.connection_state)
-  }
-
   send_go_away_method!();
-
-  #[cfg(all(feature = "http2-client-pool", feature = "tls"))]
-  pub(crate) async fn swap_buffers(&mut self, hb: &mut Http2Buffer) {
-    mem::swap(hb, self.inner.hd.lock().await.parts_mut().hb);
-  }
-
-  #[cfg(feature = "http2-client-pool")]
-  pub(crate) fn close_abruptly(&self, hb: &mut Http2Buffer) {
-    self
-      .inner
-      .is_conn_open
-      .connection_state
-      .store(ConnectionState::ClosedAbruptly.into(), core::sync::atomic::Ordering::Relaxed);
-    self.inner.is_conn_open.reader_waker.wake();
-    hb.drain_and_wake();
-  }
-
-  async fn manage_initial_params<SR, const HAS_PREFACE: bool>(
-    mut hb: Http2Buffer,
-    hrp: HttpRecvParams,
-    stream_bridge: TlsStreamBridge<IS_CLIENT>,
-    stream_reader: TlsStreamReader<SR, TCX, IS_CLIENT>,
-    mut stream_writer: TlsStreamWriter<SW, TCX, IS_CLIENT>,
-  ) -> crate::Result<(impl Future<Output = ()>, Self)>
-  where
-    SR: StreamReader,
-  {
-    let sf = SettingsFrame::from_hrp(hrp);
-    let sf_buffer = &mut [0; 45];
-    let sf_bytes = sf.bytes(sf_buffer);
-    if hrp.initial_window_len() == DEFAULT_INITIAL_WINDOW_LEN {
-      if HAS_PREFACE {
-        misc::write_array([&PREFACE, sf_bytes], &mut stream_writer).await?;
-      } else {
-        misc::write_array([sf_bytes], &mut stream_writer).await?;
-      }
-    } else {
-      let wuf = window_update_frame::WindowUpdateFrame::new(
-        hrp.initial_window_len().wrapping_sub(DEFAULT_INITIAL_WINDOW_LEN).into(),
-        U31::ZERO,
-      )?;
-      if HAS_PREFACE {
-        let array = [&PREFACE, sf_bytes, &wuf.bytes()];
-        misc::write_array(array, &mut stream_writer).await?;
-      } else {
-        misc::write_array([sf_bytes, &wuf.bytes()], &mut stream_writer).await?;
-      }
-    }
-    hb.hpack_dec.set_max_bytes(hrp.max_hpack_len().0);
-    hb.hpack_enc.set_max_dyn_super_bytes(hrp.max_hpack_len().1);
-    let nrb = mem::take(&mut hb.nrb);
-    let max_frame_len = hrp.max_frame_len();
-    let inner = Arc::new(Http2Inner {
-      hd: AsyncMutex::new(Http2Data::new(hb, hrp)),
-      is_conn_open: stream_reader.common().clone(),
-      wd: AsyncMutex::new(stream_writer),
-    });
-    Ok((
-      frame_reader::frame_reader(inner.clone(), max_frame_len, nrb, stream_bridge, stream_reader),
-      Self { inner },
-    ))
-  }
 }
 
 impl<SW, TCX> Http2<SW, TCX, true>
@@ -165,11 +141,12 @@ where
   SW: StreamWriter,
   TCX: TlsCtx,
 {
-  /// Tries to connect to a server sending the local parameters.
+  /// Starts a connection to a server: the returned future is the connection task, which the
+  /// caller spawns. It sends the preface and the local SETTINGS first.
   #[inline]
   pub async fn connect<SR>(
-    mut hb: Http2Buffer,
-    mut hrp: HttpRecvParams,
+    hb: Http2Buffer,
+    hrp: HttpRecvParams,
     (stream_bridge, stream_reader, stream_writer): (
       TlsStreamBridge<true>,
       TlsStreamReader<SR, TCX, true>,
@@ -179,39 +156,33 @@ where
   where
     SR: StreamReader,
   {
-    hb.clear();
-    hrp = hrp.set_enable_connect_protocol(false);
-    Self::manage_initial_params::<_, true>(hb, hrp, stream_bridge, stream_reader, stream_writer)
-      .await
+    let Http2Buffer { mut rng, mut rx } = hb;
+    rx.clear();
+    let conn = Http2Conn::<true>::new(hrp.set_enable_connect_protocol(false), &mut rng);
+    let shared = Arc::new(ClientShared::new(conn, stream_writer));
+    let task = client_conn::conn_task(shared.clone(), rx, stream_bridge, stream_reader);
+    Ok((task, Self { shared }))
   }
 
-  /// Opens a local stream.
+  /// Opens a local stream. Waits for the server's first SETTINGS, and while its limit on
+  /// concurrent streams is reached.
   #[inline]
   pub async fn stream(&self) -> crate::Result<ClientStream<SW, TCX>> {
-    let Self { inner } = self;
-    let mut hd_guard = inner.hd.lock().await;
-    let hdpm = hd_guard.parts_mut();
-    let linger = hdpm.hp.linger();
-    if hdpm.hb.sorps.len() >= *Usize::from(hdpm.hp.max_concurrent_streams_num()) {
-      drop(hd_guard);
-      let err = misc::protocol_err(Http2Error::ExceedAmountOfActiveConcurrentStreams);
-      misc::process_higher_operation_err(&err, inner).await;
-      return Err(err);
-    }
-    let stream_id = *hdpm.last_stream_id;
-    let span = _trace_span!("New client stream", stream_id = %stream_id);
-    drop(hdpm.hb.scrps.insert(
-      stream_id,
-      stream_receiver::StreamControlRecvParams {
-        is_stream_open: true,
-        stream_state: stream_state::StreamState::Idle,
-        waker: Waker::noop().clone(),
-        windows: Windows::initial(hdpm.hp, hdpm.hps),
-      },
-    ));
-    *hdpm.last_stream_id = hdpm.last_stream_id.wrapping_add(U31::TWO);
-    drop(hd_guard);
-    Ok(ClientStream::new(inner.clone(), linger, span, stream_id))
+    let stream_id = poll_fn(|cx| {
+      let mut state = self.shared.state.lock();
+      if state.is_ended() || !state.conn.accepts_streams() {
+        return Poll::Ready(Err(crate::Error::ClosedHttpConnection));
+      }
+      if !state.conn.can_open_stream() {
+        state.wait_open(cx.waker())?;
+        return Poll::Pending;
+      }
+      let stream_id = state.conn.open_stream()?;
+      let _ = state.streams.insert(stream_id.u32(), client_conn::StreamSlot::default());
+      Poll::Ready(Ok(stream_id))
+    })
+    .await?;
+    Ok(ClientStream::new(self.shared.clone(), stream_id))
   }
 }
 
@@ -240,13 +211,6 @@ impl<SW, TCX, const IS_CLIENT: bool> SingleTypeStorage for Http2<SW, TCX, IS_CLI
 impl<SW, TCX, const IS_CLIENT: bool> Clone for Http2<SW, TCX, IS_CLIENT> {
   #[inline]
   fn clone(&self) -> Self {
-    Self { inner: self.inner.clone() }
+    Self { shared: self.shared.clone() }
   }
-}
-
-#[derive(Debug)]
-pub(crate) struct Http2Inner<SW, TCX, const IS_CLIENT: bool> {
-  pub(crate) hd: AsyncMutex<Http2Data<IS_CLIENT>>,
-  pub(crate) is_conn_open: Arc<TlsStreamCommon>,
-  pub(crate) wd: AsyncMutex<TlsStreamWriter<SW, TCX, IS_CLIENT>>,
 }

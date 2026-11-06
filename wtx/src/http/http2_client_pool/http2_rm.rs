@@ -81,11 +81,10 @@ where
     resource: &mut Self::Resource,
   ) -> Result<(), Self::Error> {
     let tls_stream = self.tls_stream(aux).await?;
-    let mut hb = Http2Buffer::default();
-    resource.client.swap_buffers(&mut hb).await;
-    resource.client.close_abruptly(&mut hb);
-    let (frame_reader, http2) = Http2::connect(hb, self.hrp, tls_stream.into_split()?).await?;
-    let _jh = self.executor.spawn(frame_reader);
+    resource.client.close_abruptly();
+    let (conn_task, http2) =
+      Http2::connect(Http2Buffer::default(), self.hrp, tls_stream.into_split()?).await?;
+    let _jh = self.executor.spawn(conn_task);
     resource.client = http2;
     Ok(())
   }

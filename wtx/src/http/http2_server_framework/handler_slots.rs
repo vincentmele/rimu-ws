@@ -91,11 +91,6 @@ where
     }
   }
 
-  /// Futures not finished yet.
-  pub(crate) const fn len(&self) -> usize {
-    self.len
-  }
-
   /// Pins `fut`, for stream `stream_id`, into a free slot and returns the slot.
   pub(crate) fn insert(&mut self, stream_id: u32, fut: F) -> crate::Result<usize> {
     let idx = if let Some(idx) = self.free.pop() {
@@ -151,10 +146,7 @@ where
 
   /// Drops the future of `stream_id`, if one waits.
   pub(crate) fn remove_stream(&mut self, stream_id: u32) -> bool {
-    let found = self
-      .slots
-      .iter()
-      .position(|el| el.fut.is_some() && el.stream_id == stream_id);
+    let found = self.slots.iter().position(|el| el.fut.is_some() && el.stream_id == stream_id);
     if let Some(idx) = found {
       self.release(idx);
       return true;

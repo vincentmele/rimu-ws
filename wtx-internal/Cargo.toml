@@ -96,9 +96,9 @@ soak-server-uring = ["rimu-ws/crypto-ring", "rimu-ws/io-uring", "rimu-ws/web-soc
 boringssl = ["tokio", "rimu-ws/tls", "rimu-ws/tokio", "rimu-ws/_tracing-tree", "rimu-ws/x509"]
 boringssl-config = ["serde/derive", "serde_json/std", "rimu-ws/hashbrown", "rimu-ws/serde"]
 ccadb = ["tokio", "rimu-ws/ccadb", "rimu-ws/hashbrown", "rimu-ws/http2-client-pool", "rimu-ws/http2", "rimu-ws/tokio"]
-h2load = ["tokio", "rimu-ws/http2-server-framework", "rimu-ws/tokio"]
+h2load = ["rimu-ws/crypto-ring", "rimu-ws/http2-server-framework", "rimu-ws/io-uring", "rimu-ws/macros"]
 h2spec-high = ["rimu-ws/crypto-ring", "rimu-ws/http2-server-framework", "rimu-ws/io-uring", "rimu-ws/macros"]
-h2spec-low = ["tokio", "rimu-ws/http2", "rimu-ws/tokio"]
+h2spec-low = ["rimu-ws/crypto-ring", "rimu-ws/http2-server-framework", "rimu-ws/io-uring", "rimu-ws/macros"]
 testssl = ["tokio", "rimu-ws/http2-server-framework", "rimu-ws/tokio"]
 x509-limbo = ["rimu-ws/serde", "serde/derive", "serde_json/std", "rimu-ws/x509"]
 

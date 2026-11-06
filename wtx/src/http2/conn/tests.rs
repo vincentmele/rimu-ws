@@ -17,12 +17,12 @@ use crate::{
   rng::Xorshift64,
   sync::Arc,
 };
-use core::time::Duration;
 use alloc::{
   string::{String, ToString as _},
   vec,
   vec::Vec,
 };
+use core::time::Duration;
 
 type Frames = Vec<(u8, u8, u32, Vec<u8>)>;
 
@@ -440,11 +440,8 @@ fn conn_header_cache_hit_same_bytes() {
 #[test]
 fn conn_header_cache_invalid_after_table_size_change() {
   let mut conn = indexing_server();
-  let mut blocks = vec![
-    plain_response(&mut conn, 1),
-    plain_response(&mut conn, 3),
-    plain_response(&mut conn, 5),
-  ];
+  let mut blocks =
+    vec![plain_response(&mut conn, 1), plain_response(&mut conn, 3), plain_response(&mut conn, 5)];
   assert_eq!(conn.header_cache_hits(), 1);
   let _ = conn.feed(&settings(&[(1, 0)])).unwrap();
   let _ = take_output(&mut conn);
@@ -558,7 +555,10 @@ fn limit_body_len() {
   let frames = take_frames(&mut conn);
   assert_eq!(rst_code(&frames, 1), Some(8), "{frames:?}");
   assert_eq!(go_away_code(&frames), None);
-  assert!(events(&mut conn).contains(&ConnEvent::Headers { end_stream: true, stream_id: U31::from_u32(3) }));
+  assert!(
+    events(&mut conn)
+      .contains(&ConnEvent::Headers { end_stream: true, stream_id: U31::from_u32(3) })
+  );
 }
 
 #[test]
@@ -608,4 +608,54 @@ fn limit_concurrent_streams() {
   let frames = take_frames(&mut conn);
   assert_eq!(rst_code(&frames, 5), Some(7), "{frames:?}");
   assert_eq!(conn.open_streams(), 2);
+}
+
+// A client stream stays in the table after both sides end, until the handle finishes it; it no
+// longer counts against the server's limit. Finishing an unended stream resets it.
+#[test]
+fn conn_client_finish_stream() {
+  let mut client =
+    Http2Conn::<true>::new(HttpRecvParams::with_default_params(), &mut Xorshift64::from(3u64));
+  assert!(!client.peer_settings_seen());
+  let mut input = settings(&[]);
+  input.extend(frame(SETTINGS, 1, 0, &[]));
+  let _ = client.feed(&input).unwrap();
+  assert!(client.peer_settings_seen());
+  let _ = take_output(&mut client);
+  let done = client.open_stream().unwrap();
+  let msg = MsgBufferStr::from_uri(Uri::new("http://localhost/x"));
+  client.send_request(done, Method::Get, &msg, true).unwrap();
+  let open = client.open_stream().unwrap();
+  client.send_request(open, Method::Get, &msg, false).unwrap();
+  let _ = take_output(&mut client);
+  let mut enc = HpackEncoder::new(&mut Xorshift64::from(5u64));
+  let mut block = VectorUsize::new();
+  enc.encode(&mut block, 3, [(HpackHeaderBasic::StatusCode(StatusCode::Ok), "200")], []).unwrap();
+  let _ = client.feed(&frame(HEADERS, 0b101, 1, &block)).unwrap();
+  let _ = events(&mut client);
+  assert_eq!((client.open_streams(), client.active_streams()), (2, 1));
+  assert_eq!(client.status(done), Some(StatusCode::Ok));
+  client.finish_stream(done, true);
+  assert!(take_frames(&mut client).is_empty());
+  client.finish_stream(open, true);
+  let frames = take_frames(&mut client);
+  assert_eq!(
+    (frames[0].0, frames[0].2, frames[0].3.as_slice()),
+    (RST_STREAM, 3, &8u32.to_be_bytes()[..])
+  );
+  assert_eq!((client.open_streams(), client.active_streams()), (0, 0));
+}
+
+// A client's GOAWAY does not end the server's side: it keeps answering until the client closes,
+// so no unread frame makes the close a TCP reset.
+#[test]
+fn conn_peer_go_away_keeps_serving() {
+  let mut conn = ready_server(HttpRecvParams::with_default_params());
+  let mut input = frame(GOAWAY, 0, 0, &[0, 0, 0, 0, 0, 0, 0, 0]);
+  input.extend(frame(PING, 0, 0, b"h2spec\0\0"));
+  let _ = conn.feed(&input).unwrap();
+  let _ = events(&mut conn);
+  let frames = take_frames(&mut conn);
+  assert_eq!((frames[0].0, frames[0].1), (PING, 1));
+  assert!(!conn.is_closed());
 }

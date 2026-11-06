@@ -3,14 +3,18 @@
 
 use crate::{
   collections::VectorUsize,
-  http::{Headers, Method, Protocol, StatusCode, U31},
+  http::{Headers, Method, MsgBufferString, Protocol, StatusCode, U31},
   http2::{
     Http2ErrorCode, Http2RecvStatus, Http2SendStatus,
     conn::{Http2Conn, body::Body},
   },
 };
 use alloc::rc::Rc;
-use core::{cell::RefCell, future::poll_fn, task::Poll, task::Waker};
+use core::{
+  cell::RefCell,
+  future::poll_fn,
+  task::{Poll, Waker},
+};
 use hashbrown::HashMap;
 
 /// Above this many bytes queued on a stream, [`ServerStream::send_data`] waits for the peer to
@@ -31,11 +35,19 @@ pub(crate) struct ConnShared {
 }
 
 impl ConnShared {
+  #[cfg_attr(
+    not(feature = "http2-server-framework"),
+    allow(dead_code, reason = "used by the server driver")
+  )]
   pub(crate) fn new(conn: Http2Conn<false>) -> Rc<RefCell<Self>> {
     Rc::new(RefCell::new(Self { conn, conn_waker: None, dirty: false, wakers: HashMap::new() }))
   }
 
   /// Wakes the stream `id` waits on, if any.
+  #[cfg_attr(
+    not(feature = "http2-server-framework"),
+    allow(dead_code, reason = "used by the server driver")
+  )]
   pub(crate) fn wake_stream(&mut self, id: u32) {
     if let Some(waker) = self.wakers.remove(&id) {
       waker.wake();
@@ -52,11 +64,13 @@ impl ConnShared {
 
 /// A stream of a server connection, handed to manual-mode handlers.
 ///
-/// It lives on the connection's thread. Dropping it before the stream ended resets the stream
+/// It lives on the connection's thread. Dropping it before the stream ended answers `500` if no
+/// response was started (a handler that failed, as in auto mode), and otherwise resets the stream
 /// with `CANCEL`.
 #[derive(Debug)]
 pub struct ServerStream {
   finished: bool,
+  headers_sent: bool,
   method: Method,
   protocol: Option<Protocol>,
   shared: Rc<RefCell<ConnShared>>,
@@ -64,13 +78,17 @@ pub struct ServerStream {
 }
 
 impl ServerStream {
+  #[cfg_attr(
+    not(feature = "http2-server-framework"),
+    allow(dead_code, reason = "used by the server driver")
+  )]
   pub(crate) const fn new(
     shared: Rc<RefCell<ConnShared>>,
     method: Method,
     protocol: Option<Protocol>,
     stream_id: U31,
   ) -> Self {
-    Self { finished: false, method, protocol, shared, stream_id }
+    Self { finished: false, headers_sent: false, method, protocol, shared, stream_id }
   }
 
   /// Request method.
@@ -140,13 +158,18 @@ impl ServerStream {
     }
     shared.conn.send_headers(self.stream_id, Some(status), headers, end_stream)?;
     shared.queued();
+    self.headers_sent = true;
     self.finished |= end_stream;
     Ok(Http2SendStatus::Ok)
   }
 
   /// Queues `data`, waiting while more than 256 KiB of this stream wait for the peer's window.
   #[inline]
-  pub async fn send_data(&mut self, data: &[u8], end_stream: bool) -> crate::Result<Http2SendStatus> {
+  pub async fn send_data(
+    &mut self,
+    data: &[u8],
+    end_stream: bool,
+  ) -> crate::Result<Http2SendStatus> {
     {
       let mut shared = self.shared.borrow_mut();
       if shared.conn.msg_mut(self.stream_id).is_none() {
@@ -159,7 +182,8 @@ impl ServerStream {
     let id = self.stream_id;
     poll_fn(|cx| {
       let mut shared = self.shared.borrow_mut();
-      if shared.conn.msg_mut(id).is_none() || shared.conn.stream_send_pending(id) <= SEND_HIGH_WATER {
+      if shared.conn.msg_mut(id).is_none() || shared.conn.stream_send_pending(id) <= SEND_HIGH_WATER
+      {
         return Poll::Ready(Ok(Http2SendStatus::Ok));
       }
       let _ = shared.wakers.insert(id.u32(), cx.waker().clone());
@@ -208,7 +232,18 @@ impl Drop for ServerStream {
     if let Ok(mut shared) = self.shared.try_borrow_mut()
       && shared.conn.msg_mut(self.stream_id).is_some()
     {
-      shared.conn.send_reset(self.stream_id, Http2ErrorCode::Cancel);
+      let answered = !self.headers_sent
+        && shared
+          .conn
+          .send_response(
+            self.stream_id,
+            StatusCode::InternalServerError,
+            &mut MsgBufferString::default(),
+          )
+          .is_ok();
+      if !answered {
+        shared.conn.send_reset(self.stream_id, Http2ErrorCode::Cancel);
+      }
       shared.queued();
     }
   }

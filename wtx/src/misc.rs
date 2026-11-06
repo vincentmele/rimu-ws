@@ -5,6 +5,7 @@ pub(crate) mod bytes_transfer;
 #[cfg(any(feature = "postgres", feature = "tls"))]
 pub(crate) mod counter_writer;
 #[cfg(feature = "http2")]
+#[allow(dead_code, reason = "upstream's tracing span helper, kept for merges")]
 pub(crate) mod span;
 
 mod ascii;

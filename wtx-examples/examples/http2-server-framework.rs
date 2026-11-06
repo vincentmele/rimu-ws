@@ -1,17 +1,15 @@
 //! An HTTP/2 server framework showcasing nested routes, middlewares, manual streams, dynamic routes,
 //! PostgreSQL connections and JSON deserialization/serialization.
 
-extern crate serde;
-extern crate serde_json;
-extern crate tokio;
 extern crate rimu_ws;
 extern crate rimu_ws_examples;
+extern crate serde;
+extern crate serde_json;
 
 use core::{fmt::Write, ops::ControlFlow};
-use tokio::net::tcp::OwnedWriteHalf;
 use rimu_ws::{
   database::{DbClient, Record},
-  executor::TokioExecutor,
+  executor::{Runtime as _, UringExecutor, UringParams, UringRuntime},
   http::{
     ManualStream, Method, MsgBufferString, MsgDataMut, Request, Response, StatusCode,
     http2_server_framework::{
@@ -23,17 +21,19 @@ use rimu_ws::{
   pool::{PostgresRMDefault, SimplePool},
   rng::{ChaCha20, CryptoSeedableRng},
   secret::SecretStr,
-  tls::{SkCtx, TlsConfig, TrustedCtx},
+  sync::Arc,
+  tls::{TlsConfig, TrustedCtx},
 };
 use rimu_ws_examples::{PUBLIC_KEY, ROOT_CA, SECRET_KEY, host_from_args};
 
-type LocalPool = SimplePool<PostgresRMDefault<rimu_ws::Error, TokioExecutor, TrustedCtx>>;
+type LocalPool = SimplePool<PostgresRMDefault<rimu_ws::Error, UringExecutor, TrustedCtx>>;
 
 fn main() -> rimu_ws::Result<()> {
   let mut rng = ChaCha20::from_std_random()?;
   let db_pool = LocalPool::new(
     4,
-    PostgresRMDefault::tokio(
+    PostgresRMDefault::new(
+      UringExecutor::default(),
       ChaCha20::from_crypto_rng(&mut rng)?,
       TlsConfig::from_trust_anchors_pem([ROOT_CA])?,
       SecretStr::new(String::from("postgres://USER:PASSWORD@localhost/DB_NAME").as_mut_str())?,
@@ -52,10 +52,15 @@ fn main() -> rimu_ws::Result<()> {
     ),
     ("/stream", get(stream)),
   ))?;
-  Http2ServerFramework::new(TokioExecutor::default(), rng, tls_config)?
-    .set_data(db_pool)
-    .set_error_cb(|err| eprintln!("Error: {err}"))
-    .run_in_threads(&host_from_args(), router)
+  // The pool's connections belong to the io_uring runtime that opened them, so the server runs
+  // on this thread's runtime alone.
+  let runtime = Arc::new(UringRuntime::with_params(UringParams::default())?);
+  runtime.block_on(
+    Http2ServerFramework::new(UringExecutor::default(), rng, tls_config)?
+      .set_data(db_pool)
+      .set_error_cb(|err| eprintln!("Error: {err}"))
+      .run_local(&host_from_args(), router, runtime.clone()),
+  )
 }
 
 async fn db(
@@ -85,10 +90,8 @@ async fn hello() -> &'static str {
   "hello"
 }
 
-async fn stream(
-  mut manual_stream: ManualStream<LocalPool, ServerStream<OwnedWriteHalf, SkCtx>>,
-) -> rimu_ws::Result<()> {
-  manual_stream.stream.common().send_go_away(Http2ErrorCode::NoError).await;
+async fn stream(mut manual_stream: ManualStream<LocalPool, ServerStream>) -> rimu_ws::Result<()> {
+  manual_stream.stream.send_go_away(Http2ErrorCode::NoError).await;
   Ok(())
 }
 

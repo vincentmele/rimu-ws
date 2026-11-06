@@ -1,41 +1,32 @@
 use crate::{
   collections::VectorUsize,
   http::{MsgBufferString, MsgData, Request, StatusCode, U31},
-  http2::{
-    CommonStream, Http2Inner, Http2RecvStatus, Http2SendStatus,
-    hpack_static_headers::{HpackStaticRequestHeaders, HpackStaticResponseHeaders},
-    misc::{manage_recurrent_receiving_of_overall_stream, process_higher_operation_err},
-    stream_receiver::StreamOverallRecvParams,
-    stream_state::StreamState,
-    window::Windows,
-    write_functions::send_msg,
-  },
-  misc::{Lease, span::Span},
+  http2::{CommonStream, Http2RecvStatus, Http2SendStatus, client_conn::ClientShared},
+  misc::Lease,
   net::StreamWriter,
   sync::Arc,
   tls::TlsCtx,
 };
-use core::{future::poll_fn, pin::pin, task::Waker};
+use core::{future::poll_fn, mem, task::Poll};
 
 /// Groups the methods used by clients that connect to servers.
+///
+/// Dropping it frees the stream; one that has not ended is reset with `CANCEL`.
 #[derive(Debug)]
 pub struct ClientStream<SW, TCX> {
-  inner: Arc<Http2Inner<SW, TCX, true>>,
-  linger: bool,
-  span: Span,
-  stream_id: U31,
-  // Used after the initial sending
-  windows: Windows,
+  pub(crate) shared: Arc<ClientShared<SW, TCX>>,
+  pub(crate) stream_id: U31,
 }
 
 impl<SW, TCX> ClientStream<SW, TCX> {
-  pub(crate) const fn new(
-    inner: Arc<Http2Inner<SW, TCX, true>>,
-    linger: bool,
-    span: Span,
-    stream_id: U31,
-  ) -> Self {
-    Self { inner, linger, span, stream_id, windows: Windows::new() }
+  pub(crate) const fn new(shared: Arc<ClientShared<SW, TCX>>, stream_id: U31) -> Self {
+    Self { shared, stream_id }
+  }
+
+  /// See [`CommonStream`].
+  #[inline]
+  pub fn common(&mut self) -> CommonStream<'_, SW, TCX, true> {
+    CommonStream::new(&self.shared, self.stream_id)
   }
 }
 
@@ -44,56 +35,59 @@ where
   SW: StreamWriter,
   TCX: TlsCtx,
 {
-  /// See [`CommonStream`].
-  #[inline]
-  pub const fn common(&mut self) -> CommonStream<'_, SW, TCX, true> {
-    let Self { inner, linger, span, stream_id, windows: _ } = self;
-    CommonStream { inner, linger: *linger, span, stream_id: *stream_id }
-  }
-
   /// Receive response
   ///
   /// High-level operation that awaits for the data necessary to build a response and then closes the
   /// stream.
   ///
-  /// Returns [`Option::None`] if the network/stream connection has been closed, either locally
-  /// or externally.
+  /// Returns [`Http2RecvStatus::ClosedStream`] if the server reset the stream and
+  /// [`Http2RecvStatus::ClosedConnection`] if the connection closed first.
   ///
   /// Should be called after [`Self::send_req`] or any other low level methods that send data
-  /// are successfully executed. More specifically, should only be called in a half-closed stream
-  /// state.
+  /// are successfully executed.
   #[inline]
   pub async fn recv_res(
     &mut self,
   ) -> crate::Result<(Http2RecvStatus<StatusCode, ()>, MsgBufferString)> {
-    let Self { inner, linger: _, span, stream_id, windows: _ } = self;
-    let _e = span.enter();
-    _trace!("Receiving response");
-    let mut lock_pin = pin!(inner.hd.lock());
-    let rslt = poll_fn(|cx| {
-      let mut lock = lock_pin!(cx, inner.hd, lock_pin);
-      let hdpm = lock.parts_mut();
-      manage_recurrent_receiving_of_overall_stream(
-        cx,
-        hdpm,
-        &inner.is_conn_open.connection_state,
-        *stream_id,
-        |_, status_code, _, _| status_code,
-      )
+    let Self { shared, stream_id, .. } = self;
+    let id = *stream_id;
+    poll_fn(|cx| {
+      let mut guard = shared.state.lock();
+      let state = &mut *guard;
+      let Some(slot) = state.streams.get(&id.u32()) else {
+        return Poll::Ready(Ok((
+          Http2RecvStatus::ClosedStream(StatusCode::InternalServerError),
+          MsgBufferString::default(),
+        )));
+      };
+      if slot.reset.is_some() {
+        let status = slot.status.unwrap_or(StatusCode::InternalServerError);
+        return Poll::Ready(Ok((
+          Http2RecvStatus::ClosedStream(status),
+          MsgBufferString::default(),
+        )));
+      }
+      if state.conn.recv_closed(id) == Some(true) {
+        let status = state.conn.status(id).unwrap_or(StatusCode::InternalServerError);
+        let msg = state.conn.msg_mut(id).map(mem::take).unwrap_or_default();
+        state.finish(id);
+        return Poll::Ready(Ok((Http2RecvStatus::Eos(status), msg)));
+      }
+      if state.is_ended() {
+        return Poll::Ready(Ok((Http2RecvStatus::ClosedConnection, MsgBufferString::default())));
+      }
+      if let Some(slot) = state.streams.get_mut(&id.u32()) {
+        slot.wait(cx.waker())?;
+      }
+      Poll::Pending
     })
-    .await;
-    if let Err(err) = &rslt {
-      process_higher_operation_err(err, inner).await;
-    }
-    rslt
+    .await
   }
 
   /// Send Request
   ///
-  /// Sends all data related to a request.
-  ///
-  /// Returns [`Option::None`] if the network/stream connection has been closed, either locally
-  /// or externally.
+  /// Sends all data related to a request. `enc_buffer` is no longer used: the connection encodes
+  /// into its own buffer.
   ///
   /// Shouldn't be called more than once.
   #[inline]
@@ -106,49 +100,36 @@ where
     MD: MsgData,
     MD::Body: Lease<[u8]>,
   {
-    let Self { inner, linger: _, span, stream_id, windows } = self;
-    let _e = span.enter();
-    _trace!("Sending request");
-    let uri = req.msg_data.uri();
-    send_msg::<_, _, true>(
-      req.msg_data.body().lease(),
-      enc_buffer,
-      req.msg_data.headers(),
-      inner,
-      (
-        HpackStaticRequestHeaders {
-          authority: uri.authority(),
-          method: Some(req.method),
-          path: uri.relative_reference_slash(),
-          protocol: None,
-          scheme: uri.scheme(),
-        },
-        HpackStaticResponseHeaders::EMPTY,
-      ),
-      *stream_id,
-      |hdpm| {
-        if let Some(scrp) = hdpm.hb.scrps.remove(stream_id) {
-          *windows = scrp.windows;
-        }
-        drop(hdpm.hb.sorps.insert(
-          *stream_id,
-          StreamOverallRecvParams {
-            body_len: 0,
-            content_length: None,
-            has_initial_header: false,
-            has_one_or_more_data_frames: false,
-            is_stream_open: true,
-            msg_buffer: MsgBufferString::default(),
-            status_code: StatusCode::Ok,
-            stream_state: StreamState::HalfClosedLocal,
-            // The possible future invocation of this waker by the reading task won't be a problem
-            // because users will manually call `recv_res`.
-            waker: Waker::noop().clone(),
-            windows: *windows,
-          },
-        ));
-      },
-    )
-    .await
+    let _ = enc_buffer;
+    let body = req.msg_data.body().lease();
+    {
+      let mut state = self.shared.state.lock();
+      if let Some(status) = CommonStream::<SW, TCX, true>::send_status(&state, self.stream_id) {
+        return Ok(status);
+      }
+      let uri = req.msg_data.uri();
+      state.conn.send_request_head(
+        self.stream_id,
+        req.method,
+        &uri,
+        req.msg_data.headers(),
+        body.is_empty(),
+      )?;
+    }
+    self.shared.flush().await?;
+    if body.is_empty() {
+      return Ok(Http2SendStatus::Ok);
+    }
+    self.common().send_data(body, true).await
+  }
+}
+
+impl<SW, TCX> Drop for ClientStream<SW, TCX> {
+  #[inline]
+  fn drop(&mut self) {
+    let mut state = self.shared.state.lock();
+    if state.streams.contains_key(&self.stream_id.u32()) {
+      state.finish(self.stream_id);
+    }
   }
 }

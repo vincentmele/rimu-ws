@@ -36,6 +36,7 @@ impl HeaderCache {
   }
 
   /// Cache hits so far.
+  #[cfg(test)]
   pub(crate) const fn hits(&self) -> u64 {
     self.hits
   }
@@ -59,10 +60,9 @@ impl HeaderCache {
     self.make_key(headers)?;
     self.uses = self.uses.wrapping_add(1);
     let Self { entries, hits, key, uses } = self;
-    let Some(entry) = entries
-      .iter_mut()
-      .find(|el| el.status == status && el.generation == generation && el.key.as_slice() == key.as_slice())
-    else {
+    let Some(entry) = entries.iter_mut().find(|el| {
+      el.status == status && el.generation == generation && el.key.as_slice() == key.as_slice()
+    }) else {
       return Ok(None);
     };
     entry.last_use = *uses;

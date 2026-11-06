@@ -1,45 +1,49 @@
-//! Low-level HTTP/2 server that servers a single response.
+//! A low-level HTTP/2 server: one manual-mode endpoint that drives its stream itself, reading the
+//! request body and answering with a teapot.
+//!
+//! The server runs on io_uring. For a router of ordinary endpoints, see the
+//! `http2-server-framework` examples.
 
-extern crate tokio;
 extern crate rimu_ws;
 extern crate rimu_ws_examples;
 
-use tokio::net::TcpListener;
 use rimu_ws::{
   collections::VectorUsize,
-  http::{HttpRecvParams, Response, StatusCode},
-  http2::{Http2, Http2Buffer, Http2ErrorCode, Http2RecvStatus},
-  net::{Stream, Uri},
+  executor::UringExecutor,
+  http::{
+    Headers, ManualStream, StatusCode,
+    http2_server_framework::{Http2ServerFramework, HttpRouter, get},
+  },
+  http2::{Http2RecvStatus, ServerStream},
   rng::{ChaCha20, CryptoSeedableRng},
-  tls::{TlsAcceptor, TlsConfig},
+  tls::TlsConfig,
 };
 use rimu_ws_examples::{PUBLIC_KEY, SECRET_KEY, host_from_args};
 
-#[tokio::main]
-async fn main() -> rimu_ws::Result<()> {
-  let uri = Uri::new(host_from_args());
-  let listener = TcpListener::bind(uri.hostname_with_implied_port()).await?;
-  let (stream, _) = listener.accept().await?;
-  let mut rng = ChaCha20::from_std_random()?;
-  let hb = Http2Buffer::new(&mut rng);
-  let tls_config = TlsConfig::from_keys_pem(PUBLIC_KEY, SECRET_KEY)?;
-  let tls_stream = TlsAcceptor::new(tls_config, rng, stream).accept().await?.tls_stream;
-  let hrp = HttpRecvParams::with_optioned_params();
-  let (frame_reader, http2) = Http2::accept(hb, hrp, tls_stream.into_split()?).await?;
-  let _jh = tokio::spawn(frame_reader);
-  let Some((mut stream, _)) = http2.stream(|_, _| {}).await? else {
-    println!("Connection closed!");
-    return Ok(());
-  };
-  let (hrs, msg) = stream.recv_req().await?;
-  if let Http2RecvStatus::ClosedConnection | Http2RecvStatus::ClosedStream(_) = hrs {
-    println!("Connection or stream closed!");
-    return Ok(());
+fn main() -> rimu_ws::Result<()> {
+  let router = HttpRouter::paths(rimu_ws::paths!(("/", get(teapot))))?;
+  Http2ServerFramework::<(), fn(rimu_ws::Error), UringExecutor, _, _, _>::new(
+    UringExecutor::default(),
+    ChaCha20::from_std_random()?,
+    TlsConfig::from_keys_pem(PUBLIC_KEY, SECRET_KEY)?,
+  )?
+  .set_error_cb(|err| eprintln!("Error: {err}"))
+  .run_in_threads(&host_from_args(), router)
+}
+
+async fn teapot(mut manual_stream: ManualStream<(), ServerStream>) -> rimu_ws::Result<()> {
+  println!("An arbitrary request has been received: {:#?}", manual_stream.req);
+  let mut body = VectorUsize::new();
+  loop {
+    match manual_stream.stream.recv_data(&mut body).await? {
+      Http2RecvStatus::Ongoing(()) => {}
+      Http2RecvStatus::Eos(()) => break,
+      Http2RecvStatus::ClosedConnection | Http2RecvStatus::ClosedStream(()) => return Ok(()),
+    }
   }
-  println!("An arbitrary request has been received: {msg:#?}");
-  let _ = stream
-    .send_res(&mut VectorUsize::new(), Response::new(b"By tea, for tea\n", StatusCode::ImATeapot))
-    .await?;
-  http2.send_go_away(Http2ErrorCode::NoError).await;
+  println!("With a body of {} bytes", body.len());
+  let stream = &mut manual_stream.stream;
+  let _ = stream.send_headers(&Headers::new(), false, StatusCode::ImATeapot).await?;
+  let _ = stream.send_data(b"By tea, for tea\n", true).await?;
   Ok(())
 }

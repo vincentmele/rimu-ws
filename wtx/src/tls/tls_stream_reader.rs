@@ -103,7 +103,7 @@ impl<SR, TCX, const IS_CLIENT: bool> TlsStreamReader<SR, TCX, IS_CLIENT> {
     Ok(())
   }
 
-  #[cfg(any(feature = "http2", feature = "web-socket"))]
+  #[cfg(feature = "web-socket")]
   #[inline]
   pub(crate) const fn common(&self) -> &Arc<TlsStreamCommon> {
     &self.common

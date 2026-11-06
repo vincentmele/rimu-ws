@@ -25,7 +25,7 @@
 use rimu_ws::{
   collections::VectorUsize,
   database::{DbClient, Record},
-  executor::TokioExecutor,
+  executor::{Executor as _, Runtime as _, UringExecutor, UringParams, UringRuntime},
   http::{
     MsgData, SessionManager, SessionMiddleware, SessionState, StatusCode,
     http2_server_framework::{
@@ -36,18 +36,20 @@ use rimu_ws::{
   pool::{PostgresRMDefault, SimplePool},
   rng::{ChaCha20, CryptoSeedableRng},
   secret::SecretStr,
+  sync::Arc,
   tls::{TlsConfig, TrustedCtx},
 };
 use rimu_ws_examples::{PUBLIC_KEY, ROOT_CA, SECRET_KEY, host_from_args};
 
-type DbPool = SimplePool<PostgresRMDefault<rimu_ws::Error, TokioExecutor, TrustedCtx>>;
+type DbPool = SimplePool<PostgresRMDefault<rimu_ws::Error, UringExecutor, TrustedCtx>>;
 type LocalSessionManager = SessionManager<u32, rimu_ws::Error>;
 
 fn main() -> rimu_ws::Result<()> {
   let mut rng = ChaCha20::from_std_random()?;
   let db_pool = DbPool::new(
     4,
-    PostgresRMDefault::tokio(
+    PostgresRMDefault::new(
+      UringExecutor::default(),
       ChaCha20::from_crypto_rng(&mut rng)?,
       TlsConfig::from_trust_anchors_pem([ROOT_CA])?,
       SecretStr::new(String::from("postgres://USER:PASSWORD@localhost/DB_NAME").as_mut_str())?,
@@ -55,20 +57,26 @@ fn main() -> rimu_ws::Result<()> {
   );
   let (cleaner, session_manager) =
     LocalSessionManager::builder().build_generating_key(&mut rng, db_pool.clone())?;
-  tokio::spawn(async move {
-    if let Err(err) = cleaner.await {
-      eprintln!("{err}");
-    }
-  });
   let tls_config = TlsConfig::from_keys_pem(PUBLIC_KEY, SECRET_KEY)?;
   let router = HttpRouter::new(
     rimu_ws::paths!(("/login", post(login)), ("/logout", get(logout))),
     SessionMiddleware::new(VectorUsize::new(), session_manager.clone(), db_pool.clone()),
   )?;
-  Http2ServerFramework::new(TokioExecutor::default(), rng, tls_config)?
+  // The pool's connections belong to the io_uring runtime that opened them, so the server and
+  // the session cleaner run on this thread's runtime alone.
+  let runtime = Arc::new(UringRuntime::with_params(UringParams::default())?);
+  let server = Http2ServerFramework::new(UringExecutor::default(), rng, tls_config)?
     .set_data(Data { db_pool, session_manager, session_state: None })
-    .set_error_cb(|err| eprintln!("Error: {err}"))
-    .run_in_threads(&host_from_args(), router)
+    .set_error_cb(|err| eprintln!("Error: {err}"));
+  runtime.block_on(async {
+    let cleaner = async move {
+      if let Err(err) = cleaner.await {
+        eprintln!("{err}");
+      }
+    };
+    let _jh = UringExecutor::default().spawn_local(cleaner, &runtime);
+    server.run_local(&host_from_args(), router, runtime.clone()).await
+  })
 }
 
 async fn login(State { data, req }: State<'_, Data>) -> rimu_ws::Result<DynParams> {

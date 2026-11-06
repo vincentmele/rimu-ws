@@ -15,12 +15,14 @@ pub(crate) struct SharedBytes {
 
 impl SharedBytes {
   /// All of `bytes`.
+  #[allow(dead_code, reason = "static files (plan Task 11) send shared bodies")]
   pub(crate) fn new(bytes: Arc<[u8]>) -> Self {
     let end = bytes.len();
     Self { bytes, end, start: 0 }
   }
 
   /// Copies `bytes` into a new shared buffer.
+  #[allow(dead_code, reason = "static files (plan Task 11) send shared bodies")]
   pub(crate) fn from_slice(bytes: &[u8]) -> Self {
     Self::new(Arc::from(Box::<[u8]>::from(bytes)))
   }
@@ -51,5 +53,6 @@ pub(crate) enum Body<'any> {
   /// Copied into the connection's buffers.
   Borrowed(&'any [u8]),
   /// Queued by reference.
+  #[allow(dead_code, reason = "static files (plan Task 11) send shared bodies")]
   Shared(SharedBytes),
 }

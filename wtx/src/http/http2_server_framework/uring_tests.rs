@@ -6,8 +6,9 @@ use crate::{
   http::{
     Headers, HttpRecvParams, ManualStream, StatusCode,
     http2_server_framework::{
-      Http2ServerFramework, HttpRouter, conn_driver::tests::{Client, body_of, ended}, post,
-      web_socket,
+      Http2ServerFramework, HttpRouter,
+      conn_driver::tests::{Client, body_of, ended, status_of},
+      post, web_socket,
     },
   },
   http2::{
@@ -27,7 +28,10 @@ use alloc::{
 use core::{num::NonZeroUsize, time::Duration};
 
 /// Starts `router` on one io_uring runtime in its own thread; returns `host:port`.
-fn start<EN>(hrc: HttpRecvParams, router: HttpRouter<(), EN, crate::Error, (), ServerStream>) -> String
+fn start<EN>(
+  hrc: HttpRecvParams,
+  router: HttpRouter<(), EN, crate::Error, (), ServerStream>,
+) -> String
 where
   EN: crate::http::http2_server_framework::EndpointNode<(), crate::Error, ServerStream>
     + Send
@@ -35,7 +39,8 @@ where
     + 'static,
 {
   let uri = _uri();
-  let addr = String::from(uri.hostname_with_implied_port().0) + ":" + &uri.port().unwrap().to_string();
+  let addr =
+    String::from(uri.hostname_with_implied_port().0) + ":" + &uri.port().unwrap().to_string();
   let server_addr = addr.clone();
   let _jh = std::thread::spawn(move || {
     Http2ServerFramework::<(), fn(crate::Error), UringExecutor, _, _, _>::new(
@@ -44,7 +49,9 @@ where
       TlsConfig::plaintext(),
     )
     .unwrap()
-    .set_error_cb((|err: crate::Error| std::eprintln!("uring_tests server: {err:?}")) as fn(crate::Error))
+    .set_error_cb(
+      (|err: crate::Error| std::eprintln!("uring_tests server: {err:?}")) as fn(crate::Error),
+    )
     .set_http_recv_params(hrc)
     .set_local_runtimes(NonZeroUsize::new(1))
     .set_tcp_params(TcpParams::default().set_reuse_port(Some(false)))
@@ -93,8 +100,8 @@ fn framework_manual_stream_echo() {
 #[test]
 fn framework_web_socket_over_h2() {
   async fn ws(ms: ManualStream<(), ServerStream>) -> crate::Result<()> {
-    let mut ws = WebSocketOverStream::new(&Headers::new(), false, Xorshift64::from(1u64), ms.stream)
-      .await?;
+    let mut ws =
+      WebSocketOverStream::new(&Headers::new(), false, Xorshift64::from(1u64), ms.stream).await?;
     let mut buffer = VectorUsize::new();
     let frame = ws.read_frame(&mut buffer).await?;
     let mut payload: VectorUsize<u8> = VectorUsize::from_copyable_slice(&frame.payload()[..])?;
@@ -102,7 +109,8 @@ fn framework_web_socket_over_h2() {
     Ok(())
   }
   let router = HttpRouter::paths(crate::paths!(("/ws", web_socket(ws)))).unwrap();
-  let addr = start(HttpRecvParams::with_optioned_params().set_enable_connect_protocol(true), router);
+  let addr =
+    start(HttpRecvParams::with_optioned_params().set_enable_connect_protocol(true), router);
   let mut client = Client::connect(&addr, &[]);
   let headers = headers_req(
     1,
@@ -124,4 +132,19 @@ fn framework_web_socket_over_h2() {
   let body = body_of(&frames, 1);
   assert_eq!(&body[..2], &[0x81, 4], "{body:?}");
   assert_eq!(&body[2..6], b"ping");
+}
+
+// A manual endpoint that fails before it answers gets a 500, as an auto endpoint does; here the
+// method does not match (`post` hit with GET).
+#[test]
+fn framework_manual_error_answers_500() {
+  async fn never(_: ManualStream<(), ServerStream>) -> crate::Result<()> {
+    Ok(())
+  }
+  let router = HttpRouter::paths(crate::paths!(("/m", post(never)))).unwrap();
+  let addr = start(HttpRecvParams::with_optioned_params(), router);
+  let mut client = Client::connect(&addr, &[]);
+  client.send(&headers_req(1, "GET", "/m", &[], true));
+  let frames = client.read_until(Duration::from_secs(5), |frames| ended(frames).contains(&1));
+  assert_eq!(status_of(&frames, 1), Some(0x8e), "{frames:?}");
 }

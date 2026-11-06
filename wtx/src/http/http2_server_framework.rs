@@ -1,7 +1,5 @@
 //! Tools and libraries that make it easier to write, maintain, and scale web applications.
 
-#![expect(clippy::infinite_loop, reason = "expected behavior of a server")]
-
 #[macro_use]
 mod macros;
 
@@ -65,7 +63,6 @@ pub use res_finalizer::ResFinalizer;
 pub use route_match::RouteMatch;
 pub use state::{State, StateClean, StateGeneric, StateTest};
 pub use verbatim_params::VerbatimParams;
-
 
 /// HTTP/2 Server Framework
 #[derive(Debug)]
@@ -200,7 +197,6 @@ impl<DA, EC, EX, RC, RNG, TCX> Http2ServerFramework<DA, EC, EX, RC, RNG, TCX> {
     self
   }
 }
-
 
 #[cfg(feature = "io-uring")]
 mod uring {

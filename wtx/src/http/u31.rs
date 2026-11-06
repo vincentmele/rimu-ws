@@ -12,8 +12,10 @@ pub struct U31(u32);
 impl U31 {
   pub(crate) const MAX: Self = Self(2_147_483_647);
   #[cfg(feature = "http2")]
+  #[allow(dead_code, reason = "upstream's, kept for merges")]
   pub(crate) const ONE: Self = Self(1);
   #[cfg(feature = "http2")]
+  #[allow(dead_code, reason = "upstream's, kept for merges")]
   pub(crate) const TWO: Self = Self(2);
   #[cfg(feature = "http2")]
   pub(crate) const ZERO: Self = Self(0);
@@ -49,11 +51,13 @@ impl U31 {
   }
 
   #[cfg(feature = "http2")]
+  #[allow(dead_code, reason = "upstream's, kept for merges")]
   pub(crate) const fn wrapping_add(self, other: Self) -> Self {
     Self(self.0.wrapping_add(other.0))
   }
 
   #[cfg(feature = "http2")]
+  #[allow(dead_code, reason = "upstream's, kept for merges")]
   pub(crate) const fn wrapping_sub(self, other: Self) -> Self {
     Self(self.0.wrapping_sub(other.0))
   }

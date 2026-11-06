@@ -17,7 +17,10 @@ pub(crate) mod tests;
 
 use crate::{
   collections::{ArrayVectorCopy, DequeUsize, VectorUsize},
-  http::{Header, Headers, HttpRecvParams, Protocol, Method, MsgBuffer, MsgBufferString, MsgDataMut as _, StatusCode, U31},
+  http::{
+    Header, Headers, HttpRecvParams, Method, MsgBufferString, MsgDataMut as _, Protocol,
+    StatusCode, U31,
+  },
   http2::{
     Http2Error, Http2ErrorCode,
     common_flags::CommonFlags,
@@ -38,7 +41,7 @@ use crate::{
     settings_frame::SettingsFrame,
   },
   misc::Lease,
-  calendar::Instant,
+  net::Uri,
   rng::Rng,
 };
 use core::{mem, time::Duration};
@@ -193,13 +196,14 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     this
   }
 
+  #[cfg(test)]
   /// Parses every complete frame at the start of `input` and returns how many bytes it used.
   /// The caller keeps the rest and feeds it again with what it reads next.
   ///
   /// A connection error queues GOAWAY and returns `Err`; the caller writes the output and
   /// closes.
   pub(crate) fn feed(&mut self, input: &[u8]) -> crate::Result<usize> {
-    self.feed_at(input, Instant::now_timestamp().unwrap_or_default())
+    self.feed_at(input, crate::calendar::Instant::now_timestamp().unwrap_or_default())
   }
 
   /// [`Self::feed`] with the time the bytes arrived, which the rate limits count against. Any
@@ -272,14 +276,32 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     }
   }
 
-  /// Nothing more will happen on this connection: a fatal error, or GOAWAY with no stream left
-  /// open. Either way the output has been written.
+  /// Nothing more will happen on this connection: a fatal error, or GOAWAY sent (on a client,
+  /// sent or received) with no stream left open. Either way the output has been written.
+  #[cfg_attr(
+    not(feature = "http2-server-framework"),
+    allow(dead_code, reason = "used by the server driver")
+  )]
   pub(crate) fn is_closed(&self) -> bool {
-    let ending =
-      self.fatal || ((self.go_away_sent || self.go_away_recv.is_some()) && self.streams.len() == 0);
+    // A server keeps reading after the client's GOAWAY until the client closes: closing first
+    // with frames unread would make the close a TCP reset.
+    let peer_ended = IS_CLIENT && self.go_away_recv.is_some();
+    let ending = self.fatal || ((self.go_away_sent || peer_ended) && self.streams.len() == 0);
     ending && self.out.is_empty()
   }
 
+  /// No GOAWAY was sent or received and no connection error happened: new streams may open.
+  pub(crate) const fn accepts_streams(&self) -> bool {
+    !self.fatal && !self.go_away_sent && self.go_away_recv.is_none()
+  }
+
+  #[cfg(test)]
+  /// The peer's first SETTINGS frame arrived.
+  pub(crate) const fn peer_settings_seen(&self) -> bool {
+    self.peer_settings_seen
+  }
+
+  #[cfg(test)]
   /// Streams open now.
   pub(crate) fn open_streams(&self) -> u32 {
     u32::try_from(self.streams.len()).unwrap_or(u32::MAX)
@@ -291,6 +313,10 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
   }
 
   /// The request method of `stream_id` (server).
+  #[cfg_attr(
+    not(feature = "http2-server-framework"),
+    allow(dead_code, reason = "used by the server driver")
+  )]
   pub(crate) fn method(&self, stream_id: U31) -> Option<Method> {
     self.streams.get(stream_id.u32())?.method
   }
@@ -301,6 +327,10 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
   }
 
   /// The `:protocol` of `stream_id`, for an extended CONNECT (server).
+  #[cfg_attr(
+    not(feature = "http2-server-framework"),
+    allow(dead_code, reason = "used by the server driver")
+  )]
   pub(crate) fn protocol(&self, stream_id: U31) -> Option<Protocol> {
     self.streams.get(stream_id.u32())?.protocol
   }
@@ -368,8 +398,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       Body::Shared(elem) => elem.len(),
     };
     self.check_send_queue(body_len)?;
-    let stream =
-      self.streams.get_mut(id).ok_or(protocol_err(Http2Error::UnknownStreamReceiver))?;
+    let stream = self.streams.get_mut(id).ok_or(protocol_err(Http2Error::UnknownStreamReceiver))?;
     if stream.send_closed || stream.end_after_queue {
       return Err(protocol_err(Http2Error::InvalidSendStreamState));
     }
@@ -398,8 +427,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
   /// Sends `trailers`, which end the stream, after the queued body.
   pub(crate) fn send_trailers(&mut self, stream_id: U31, trailers: &Headers) -> crate::Result<()> {
     let id = stream_id.u32();
-    let stream =
-      self.streams.get_mut(id).ok_or(protocol_err(Http2Error::UnknownStreamReceiver))?;
+    let stream = self.streams.get_mut(id).ok_or(protocol_err(Http2Error::UnknownStreamReceiver))?;
     if stream.send_closed || stream.end_after_queue {
       return Err(protocol_err(Http2Error::InvalidSendStreamState));
     }
@@ -439,8 +467,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     self.check_send_queue(body_len)?;
     {
       let Self { header_buf, header_cache, hpack_enc, out, peer, streams, .. } = self;
-      let stream =
-        streams.get_mut(id).ok_or(protocol_err(Http2Error::UnknownStreamReceiver))?;
+      let stream = streams.get_mut(id).ok_or(protocol_err(Http2Error::UnknownStreamReceiver))?;
       if stream.send_headers || stream.send_closed {
         return Err(protocol_err(Http2Error::InvalidSendStreamState));
       }
@@ -612,9 +639,11 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     let Some(stream) = self.streams.get(id) else {
       return;
     };
-    if stream.recv_closed {
+    if IS_CLIENT {
+      // The handle still reads the response; it finishes the stream (`finish_stream`).
+    } else if stream.recv_closed {
       let _ = self.streams.close(id);
-    } else if !IS_CLIENT {
+    } else {
       let _ = self.streams.close(id);
       push_reset(&mut self.out, id, Http2ErrorCode::NoError);
     }
@@ -673,8 +702,9 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
 
   fn on_frame(&mut self, fi: Option<FrameInit>, payload: &[u8]) -> crate::Result<()> {
     if let Some(block) = self.pending_block {
-      let is_continuation =
-        fi.is_some_and(|el| el.ty == FrameInitTy::Continuation && el.stream_id.u32() == block.stream_id);
+      let is_continuation = fi.is_some_and(|el| {
+        el.ty == FrameInitTy::Continuation && el.stream_id.u32() == block.stream_id
+      });
       if !is_continuation {
         return Err(protocol_err(Http2Error::InvalidContinuationFrame));
       }
@@ -799,9 +829,9 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     let Some(stream) = self.streams.get_mut(id) else {
       return Ok(());
     };
-    let over_length = stream.content_length.is_some_and(|el| {
-      stream.recv_body_len > el || (end_stream && stream.recv_body_len != el)
-    });
+    let over_length = stream
+      .content_length
+      .is_some_and(|el| stream.recv_body_len > el || (end_stream && stream.recv_body_len != el));
     if over_length {
       self.stream_error(id, Http2ErrorCode::ProtocolError);
       return Ok(());
@@ -822,9 +852,8 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       ));
     };
     let last_stream_id = U31::from_u32(u32::from_be_bytes([*b0, *b1, *b2, *b3]));
-    let code = u32::from_be_bytes([*b4, *b5, *b6, *b7])
-      .try_into()
-      .unwrap_or(Http2ErrorCode::InternalError);
+    let code =
+      u32::from_be_bytes([*b4, *b5, *b6, *b7]).try_into().unwrap_or(Http2ErrorCode::InternalError);
     self.go_away_recv = Some(last_stream_id);
     self.events.push_back(ConnEvent::GoAway { code, last_stream_id })?;
     Ok(())
@@ -995,8 +1024,9 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       ));
     }
     if self.streams.close(id) {
-      let code =
-        u32::from_be_bytes([*b0, *b1, *b2, *b3]).try_into().unwrap_or(Http2ErrorCode::InternalError);
+      let code = u32::from_be_bytes([*b0, *b1, *b2, *b3])
+        .try_into()
+        .unwrap_or(Http2ErrorCode::InternalError);
       self.events.push_back(ConnEvent::Reset { code, stream_id: U31::from_u32(id) })?;
     }
     Ok(())
@@ -1097,12 +1127,11 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       if increment == 0 {
         return Err(protocol_err(Http2Error::InvalidWindowUpdateZeroIncrement));
       }
-      self.conn_send = self.conn_send.checked_add(increment).ok_or(
-        crate::Error::Http2ErrorGoAway(
+      self.conn_send =
+        self.conn_send.checked_add(increment).ok_or(crate::Error::Http2ErrorGoAway(
           Http2ErrorCode::FlowControlError,
           Http2Error::InvalidWindowUpdateSize,
-        ),
-      )?;
+        ))?;
       return self.flush_blocked();
     }
     if self.is_idle(id) {
@@ -1151,7 +1180,7 @@ impl Http2Conn<true> {
     if self.go_away_recv.is_some() || self.fatal {
       return Err(protocol_err(Http2Error::UnknownStreamReceiver));
     }
-    if u32::try_from(self.streams.len()).unwrap_or(u32::MAX) >= self.peer.max_concurrent_streams {
+    if !self.can_open_stream() {
       return Err(protocol_err(Http2Error::ExceedAmountOfActiveConcurrentStreams));
     }
     let id = self.next_local_id;
@@ -1164,47 +1193,96 @@ impl Http2Conn<true> {
 
   /// Queues the request HEADERS of `stream_id` (method, the URI of `msg`, its headers), then its
   /// body, if any. With `end_stream` the request ends after that.
+  #[cfg(test)]
   pub(crate) fn send_request<S>(
     &mut self,
     stream_id: U31,
     method: Method,
-    msg: &MsgBuffer<S>,
+    msg: &crate::http::MsgBuffer<S>,
+    end_stream: bool,
+  ) -> crate::Result<()>
+  where
+    S: Lease<str>,
+  {
+    let body = msg.body.as_slice();
+    self.send_request_head(
+      stream_id,
+      method,
+      &msg.uri,
+      &msg.headers,
+      end_stream && body.is_empty(),
+    )?;
+    if !body.is_empty() {
+      self.send_data(stream_id, Body::Borrowed(body), end_stream)?;
+    }
+    Ok(())
+  }
+
+  /// Queues the request HEADERS of `stream_id`: `method`, the pseudo-headers of `uri` and
+  /// `headers`. With `end_stream` the request has no body.
+  pub(crate) fn send_request_head<S>(
+    &mut self,
+    stream_id: U31,
+    method: Method,
+    uri: &Uri<S>,
+    headers: &Headers,
     end_stream: bool,
   ) -> crate::Result<()>
   where
     S: Lease<str>,
   {
     let id = stream_id.u32();
-    let body = msg.body.as_slice();
-    let end_now = end_stream && body.is_empty();
-    {
-      let Self { header_buf, hpack_enc, out, peer, streams, .. } = self;
-      let stream =
-        streams.get_mut(id).ok_or(protocol_err(Http2Error::UnknownStreamReceiver))?;
-      if stream.send_headers {
-        return Err(protocol_err(Http2Error::InvalidSendStreamState));
-      }
-      stream.send_headers = true;
-      let uri = &msg.uri;
-      let hsreqh = HpackStaticRequestHeaders {
-        authority: uri.authority(),
-        method: Some(method),
-        path: uri.relative_reference_slash(),
-        protocol: None,
-        scheme: uri.scheme(),
-      };
-      header_buf.clear();
-      let hint = hsreqh.bytes_len().wrapping_add(msg.headers.bytes_len());
-      hpack_enc.encode(header_buf, hint, hsreqh.iter(), msg.headers.iter())?;
-      push_header_block(out, id, header_buf, end_now, peer.max_frame_len)?;
-      if end_now {
-        stream.send_closed = true;
-      }
+    let Self { header_buf, hpack_enc, out, peer, streams, .. } = self;
+    let stream = streams.get_mut(id).ok_or(protocol_err(Http2Error::UnknownStreamReceiver))?;
+    if stream.send_headers {
+      return Err(protocol_err(Http2Error::InvalidSendStreamState));
     }
-    if !body.is_empty() {
-      self.send_data(stream_id, Body::Borrowed(body), end_stream)?;
+    stream.send_headers = true;
+    let hsreqh = HpackStaticRequestHeaders {
+      authority: uri.authority(),
+      method: Some(method),
+      path: uri.relative_reference_slash(),
+      protocol: None,
+      scheme: uri.scheme(),
+    };
+    header_buf.clear();
+    let hint = hsreqh.bytes_len().wrapping_add(headers.bytes_len());
+    hpack_enc.encode(header_buf, hint, hsreqh.iter(), headers.iter())?;
+    push_header_block(out, id, header_buf, end_stream, peer.max_frame_len)?;
+    if end_stream {
+      stream.send_closed = true;
     }
     Ok(())
+  }
+
+  /// Streams that have not ended in both directions: those the server counts against its
+  /// limit.
+  pub(crate) fn active_streams(&self) -> u32 {
+    let ids = self.streams.iter().filter(|el| !(el.recv_closed && el.send_closed)).count();
+    u32::try_from(ids).unwrap_or(u32::MAX)
+  }
+
+  /// Whether a stream can open now: the server's SETTINGS arrived, it did not send GOAWAY and its
+  /// limit on concurrent streams leaves room.
+  pub(crate) fn can_open_stream(&self) -> bool {
+    self.peer_settings_seen
+      && self.go_away_recv.is_none()
+      && !self.fatal
+      && self.active_streams() < self.peer.max_concurrent_streams
+  }
+
+  /// The handle of `stream_id` is done with it: its slot is freed. With `reset`, a stream that
+  /// has not ended in both directions is reset with CANCEL; without, it is dropped silently
+  /// (streams the server's GOAWAY did not process).
+  pub(crate) fn finish_stream(&mut self, stream_id: U31, reset: bool) {
+    let id = stream_id.u32();
+    let Some(stream) = self.streams.get(id) else {
+      return;
+    };
+    let ended = stream.recv_closed && stream.send_closed;
+    if self.streams.close(id) && reset && !ended {
+      push_reset(&mut self.out, id, Http2ErrorCode::Cancel);
+    }
   }
 }
 
@@ -1228,7 +1306,10 @@ fn push_header_block(
     cf.set_eoh();
   }
   let len = u32::try_from(first.len()).unwrap_or(u32::MAX);
-  out.push_many(&[&FrameInit::new(cf, len, U31::from_u32(id), FrameInitTy::Headers).bytes(), first])?;
+  out.push_many(&[
+    &FrameInit::new(cf, len, U31::from_u32(id), FrameInitTy::Headers).bytes(),
+    first,
+  ])?;
   while let Some(chunk) = rest.next() {
     let mut cf = CommonFlags::empty();
     if rest.peek().is_none() {
@@ -1258,7 +1339,11 @@ fn push_content_length(block: &mut VectorUsize<u8>, len: usize) -> crate::Result
     }
   }
   let text = digits.get(idx..).unwrap_or_default();
-  block.extend_from_copyable_slices([&[0x0F, 0x0D][..], &[u8::try_from(text.len()).unwrap_or(0)], text])?;
+  block.extend_from_copyable_slices([
+    &[0x0F, 0x0D][..],
+    &[u8::try_from(text.len()).unwrap_or(0)],
+    text,
+  ])?;
   Ok(())
 }
 
