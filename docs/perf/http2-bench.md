@@ -322,3 +322,172 @@ baseline-h2 256 5,528k → 5,513k and baseline-h2c 4096 4,197k → 4,251k, all h
 
 What is left on json-h2c 1024: page zeroing is still 13.5% of samples against plod's 5.8%, for
 the same number of pages, and `write_json` with the body copy into the output about 35%.
+
+## Task 11: static files, and TLS on 16 KiB records, 6 Nov 2026
+
+`StaticFiles` serves `/static/{*file}` from a per-thread cache that follows the disk (stat at most
+once a second per entry), with the `.br`/`.gz` twins and bodies sent by reference. First
+static-h2 256: 275k req/s, all 2xx, against plod's 380k. The causes, measured with per-request
+counters (`segcmp/run-static.sh`: cycles on the server and load CPUs, TCP segments, socket bytes):
+
+| static-h2 256 | rps | server user/kern cycles per req | h2load user/kern | TCP segs out per req |
+|---|---|---|---|---|
+| plod | 379k–380k | 53k / 57k | 44k–49k / 37k | 0.36 |
+| rimu, default (kTLS on ~40 of 256 conns) | 276k–283k | 53k–75k / 89k–125k | 51k–54k / 61k–74k | 0.68–1.80 |
+| rimu, kTLS off | 292k–296k | 80k / 77k | 44k–47k / 58k–60k | 0.36 |
+
+- **Kernel TLS on 16 KiB records loses.** The kernel pushes each record as its own TCP segment
+  (one segment per 16 KiB instead of up to 64 KiB) and allocates pages twice (plaintext, then
+  ciphertext): three times the segments, twice the kernel cycles on both ends. This matches
+  plod, which retired kTLS for the same reason (−44% on 16 KiB responses).
+- **Few connections switch anyway.** The switch to kTLS needs a quiet moment (nothing in flight,
+  nothing buffered, an empty completion queue). Under static-h2 that rarely comes, and after 32
+  tries a connection stays in user space: about 40 of 256 switched. The run-to-run spread in the
+  default row is how many did.
+- **User-space TLS stalled on records that arrived together** (fixed in c8023f28). A `read`
+  decrypts one record; the rest waited in the stream's buffer, invisible to the socket's
+  readiness. h2spec with user-space TLS failed 8 (low) and 16–20 (high) cases on timeouts; now
+  139/139 in all six modes (plain, kTLS, user-space TLS; low and high).
+- **Page allocations.** All of ours and plod's 32 KiB page allocations come from the TCP copy
+  (`sk_page_frag_refill`), but we take 0.53 per request against plod's 0.30 for the same bytes:
+  plod's thread finds its current page free again (the receiver has released it) about 40% of
+  the time, ours never does, since a turn's sends are submitted back to back. Zeroing those
+  pages (`init_on_alloc`) costs about 24k cycles per request, most of our kernel gap.
+
+### Closing the static-h2 gap (after Task 16), 6 Nov 2026 evening
+
+Measured per server process (`h2bench/measure.sh`: the server's own cycles and page allocations
+per request), because another job loaded the box (four processes at 100%, on the server CPUs too):
+throughput below is low in absolute terms, but rimu and plod ran alternately under the same load.
+
+| change | static-h2 256 rps | cycles/req |
+|---|---|---|
+| start (user-space TLS, three copies) | 293k | ~136k |
+| seal in place (8f027779) | 292k–299k | ~137k |
+| wait for send room instead of copying (53570d0b) | 325k–327k | ~123k |
+| kernel TLS off in the HTTP/2 framework (27c705f9) | (default now) | |
+| `tx_high_water` 16 KiB, buffer size classes (95c0017b) | 411k–415k | ~81k |
+| `send_submit_bytes` 16 KiB (781c00d9) | 460k | ~70k |
+
+Send threshold sweep (static-h2 256): 256 KiB 326k, 128 KiB 336k, 64 KiB 354k, 32 KiB 377k,
+16 KiB 394k. Submit threshold sweep (static-h2 1024): 512 KiB 284k, 128 KiB 332k, 64 KiB 349k,
+32 KiB 376k, 16 KiB 408k, 8 KiB 446k, 4 KiB 443k, every send 452k; 8 KiB and below cost json-h2c
+4096 about 7%, so 16 KiB. Smaller SO_SNDBUF (64/128 KiB): slower (kernel +3k–11k cycles/req).
+
+Head to head with plod, best of 3 as HttpArena runs it, alternating, same load:
+
+| profile | conns | rimu | plod | |
+|---|---|---|---|---|
+| baseline-h2 | 256 | 4891k | 4158k | +17.6% |
+| baseline-h2 | 1024 | 4280k | 3927k | +9.0% |
+| baseline-h2c | 256 | 5237k | 4429k | +18.2% |
+| baseline-h2c | 1024 | 4764k | 4308k | +10.6% |
+| baseline-h2c | 4096 | 4110k | 4062k | +1.2% |
+| static-h2 | 256 | 455k | 335k | +35.9% |
+| static-h2 | 1024 | 410k | 319k | +28.7% |
+| json-h2c | 1024 | 1408k | 1353k | +4.1% |
+| json-h2c | 4096 | 1265k | 1281k | −1.3% |
+
+(The baseline rows predate the submit-threshold change, which left baseline unchanged.)
+
+Output buffers pooled per thread (4b423e58): a connection held its last output's buffer between
+turns, so 4096 connections kept 4096 cold buffers. Measured per server process, alternating with
+the commit before, under the same load:
+
+| profile | conns | rps before | rps after | cycles/req before | after | RSS before | after |
+|---|---|---|---|---|---|---|---|
+| json-h2c | 4096 | 1.34M | 1.55M | 31.6k | 21.1k | 774 MiB | ~335 MiB |
+| json-h2c | 1024 | 1.46M | 1.94M | 29.3k | 19.7k | 218 MiB | ~134 MiB |
+| static-h2 | 256, 1024 | | unchanged | | | | |
+| baseline-h2, baseline-h2c | 1024, 4096 | | unchanged | | | | |
+
+json-h2c against plod after it, best of 3, alternating: 4096 rimu 1533k / 1513k, plod 1321k /
+1352k (+14%); 1024 rimu 1950k / 1969k, plod 1375k / 1382k (+42%). h2load ran at ~100% CPU against
+rimu and ~80% against plod: the load generator may now bound rimu's numbers.
+
+### baseline-h2c 4096: what the load generator pays
+
+plod led baseline-h2c 4096 by ~9% (4.52M against 4.14M) with h2load at ~100% CPU against both, so
+the race was decided by what each server costs h2load. Measured on the load CPUs (nstat, perf):
+syscalls and TCP segments per request were equal (~30 requests a segment), but h2load spent
+~17% more cycles per request against rimu, spread evenly over its own code (libnghttp2 +25%,
+jemalloc +22%), the signature of memory latency rather than extra protocol work. The server and
+h2load sit on different CCDs (separate L3s) but share DRAM: rimu took ~100M DRAM fills in 2 s
+against plod's ~20M (RSS 370 MiB against 113 MiB), and h2load's own DRAM fills doubled with it.
+
+- `content-length` indexed when it repeats (11784605): the steady-state header block was 8 bytes
+  against plod's 5; now 5. +1.7%.
+- Four requests decoded at a time (e1f4440b): the driver fed a whole read (~50 requests) before
+  answering any, so each turn opened ~50 stream slots that were cold. DRAM-fill sampling put
+  `on_header_block`, the event queue's `push_back` and `StreamTable::open` at the top. Feeding
+  stops after 4 events and the answered streams' slots are reused while hot:
+
+| profile | conns | rps unlimited | rps 4 | cycles/req unlimited | 4 | RSS unlimited | 4 |
+|---|---|---|---|---|---|---|---|
+| baseline-h2c | 4096 | 4.29M | 4.80M | 5.19k | 4.35k | 380 MiB | 200 MiB |
+| baseline-h2c | 256 | 5.66M | 5.83M | 4.09k | 4.10k | 55 MiB | 43 MiB |
+| baseline-h2 | 1024 | 4.58M | 4.85M | 4.83k | 4.29k | 122 MiB | 72 MiB |
+| json-h2c | 4096 | 1.56M | 1.63M | 22.1k | 19.6k | 307 MiB | 253 MiB |
+| json-h2c | 1024 | 1.96M | 2.01M | 19.7k | 18.2k | 138 MiB | 100 MiB |
+| static-h2 | 256 | 481k | 492k | 75.5k | 72.0k | 96 MiB | 91 MiB |
+
+A budget of 1 matched 4 on baseline-h2c 4096 (4.80M, 4.53k cycles); 16 was lower everywhere.
+
+Head to head with plod at e1f4440b, best of 3, alternating, same load (box loaded by other work,
+load average ~15):
+
+| profile | conns | rimu | plod | |
+|---|---|---|---|---|
+| baseline-h2 | 256 | 5313k | 4641k | +14.5% |
+| baseline-h2 | 1024 | 4775k | 4324k | +10.4% |
+| static-h2 | 256 | 458k | 344k | +33.0% |
+| static-h2 | 1024 | 426k | 347k | +23.0% |
+| baseline-h2c | 256 | 5832k | 4806k | +21.4% |
+| baseline-h2c | 1024 | 5237k | 4690k | +11.7% |
+| baseline-h2c | 4096 | 4735k | 4500k | +5.2% |
+| json-h2c | 1024 | 2017k | 1391k | +45.0% |
+| json-h2c | 4096 | 1564k | 1336k | +17.0% |
+
+## Task 13: defaults
+
+### HTTP/2 receive settings and read buffers (7 Nov, 02fb9907)
+
+Per server process (`measure.sh`), one run per setting, box loaded (load average 3–21). The arena
+entry starts from `HttpRecvParams::with_default_params()` (64 KiB window, 128 streams). rps:
+
+| setting | baseline-h2 256 | baseline-h2c 1024 | json-h2c 1024 | static-h2 256 |
+|---|---|---|---|---|
+| defaults | 5439k | 5167k | 2015k | 483k |
+| initial window 1 MiB | 5379k | 5219k | 2005k | 488k |
+| initial window 4 MiB | 5348k | 5258k | 2021k | 488k |
+| 256 concurrent streams | 5407k | 5230k | 2040k | 489k |
+| read chunk 4 KiB | 5409k | 5264k | 2015k | 485k |
+| read chunk 64 KiB | 5315k | 5277k | 2029k | 492k |
+| receive ring 1024 × 4 KiB | 5446k | 5190k | 2047k | 503k |
+| receive ring 512 × 16 KiB | 5355k | 5257k | 2008k | 495k |
+
+All within about 2% of the defaults, and cycles per request moved by no more than that. The four
+profiles are GETs without bodies: the receive windows only bound what clients upload, and h2load
+keeps at most 100 streams open (-m 100, -m 32 for json and static), under either stream limit.
+The 1024-buffer ring's static-h2 run (503k, −2.6% cycles) did not repeat in two alternated pairs
+(487k/495k against 492k/489k) and costs 23 MiB more RSS; on baseline-h2c 4096 it was level
+(4.85M/4.89M against 4.86M/4.90M). No HTTP/2 default changes on these grounds; the guide keeps the
+values and says when to change each.
+
+### WebSocket entry knobs (7 Nov, 02fb9907; fork-uring entry built against this branch)
+
+`ab2.sh` (wsload, 512 connections, p=1 and p=16) and `ablim.sh` (gcannon -r 10), two alternated
+pairs each, entry default (spin 20 µs, rings 4096/16384, direct 16384, defer accept, nodelay)
+against one knob off:
+
+| knob off | p=1 fr/s | p=16 fr/s | limited fr/s | decision |
+|---|---|---|---|---|
+| spin 0 | 518k/526k vs 519k/541k | 8116k/8064k vs 8328k/7924k | 334k/316k vs 370k/328k | guide: dedicated cores |
+| rings 1024/4096 | 516k/540k vs 517k/479k | 7951k/8078k vs 8103k/7910k | 311k/329k vs 319k/315k | dropped: level, more locked memory |
+| direct 0 | 537k/538k vs 531k/536k | 7665k/8128k vs 7944k/8019k | 325k/315k vs 324k/317k | guide (level here) |
+| defer accept 0 | 479k/537k vs 525k/510k | 8294k/7371k vs 8311k/8333k | 323k/328k vs 330k/334k | guide: clients speak first |
+| nodelay 0 | 537k/545k vs 506k/543k | 8033k/7520k vs 7771k/7834k | 336k/328k vs 318k/315k | default stays on (Nagle holds writes behind unacked bytes) |
+
+Spin's limited gain comes with ~1,000 more user cycles per frame (3828/4279 against 2782/2733).
+None of the knobs becomes a default: each either needs a deployment shape (dedicated cores, clients
+that speak first) or measured level.

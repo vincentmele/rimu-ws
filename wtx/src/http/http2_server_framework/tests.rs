@@ -148,6 +148,33 @@ fn nested_middlewares() {
   });
 }
 
+// Every setting a deployment may change is in the production guide: each `set_` of
+// `HttpRecvParams`, `UringParams` and `TcpParams` appears in `docs/production.md`.
+#[cfg(feature = "std")]
+#[test]
+fn defaults_are_documented() {
+  let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+  let guide = std::fs::read_to_string(alloc::format!("{root}/docs/production.md")).unwrap();
+  let mut missing = alloc::vec::Vec::new();
+  for source in [
+    "wtx/src/http/http_recv_params.rs",
+    "wtx/src/executor/uring_executor.rs",
+    "wtx/src/net/tcp_params.rs",
+  ] {
+    let text = std::fs::read_to_string(alloc::format!("{root}/{source}")).unwrap();
+    for line in text.lines() {
+      let Some((_, rest)) = line.split_once("pub const fn set_") else {
+        continue;
+      };
+      let name = alloc::format!("set_{}", rest.split('(').next().unwrap());
+      if !guide.contains(&name) {
+        missing.push(name);
+      }
+    }
+  }
+  assert!(missing.is_empty(), "not in docs/production.md: {missing:?}");
+}
+
 // HTTP/2 connections seal their records in user space: kernel TLS measured slower on small
 // (baseline) and 16 KiB (static) records alike.
 #[cfg(feature = "io-uring")]
