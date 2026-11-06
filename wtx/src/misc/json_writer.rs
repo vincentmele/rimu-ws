@@ -79,6 +79,23 @@ impl<'buf> JsonWriter<'buf> {
     self.ensure(32)?;
     let magnitude = value.abs();
     if magnitude < 1e13 {
+      // Whole numbers, the commonest case, need no scaling: `N.0`.
+      let int = magnitude as u64;
+      if int as f64 == magnitude {
+        // SAFETY: 32 bytes of spare capacity were ensured; the longest output is 16 bytes.
+        unsafe {
+          let len = self.buf.len();
+          let dst = self.buf.as_ptr_mut().add(len);
+          let mut out = usize::from(value.is_sign_negative());
+          if out == 1 {
+            *dst = b'-';
+          }
+          out = out.wrapping_add(write_u64(int, dst.add(out)));
+          ptr::copy_nonoverlapping(b".0".as_ptr(), dst.add(out), 2);
+          self.buf.set_len(len.wrapping_add(out).wrapping_add(2));
+        }
+        return Ok(());
+      }
       let cents = (magnitude * 100.0).round();
       if cents / 100.0 == magnitude {
         // SAFETY: 32 bytes of spare capacity were ensured; the longest output is
@@ -162,26 +179,11 @@ impl<'buf> JsonWriter<'buf> {
   #[inline]
   pub fn u64(&mut self, value: u64) -> crate::Result<()> {
     self.ensure(20)?;
-    let digits = value.checked_ilog10().map_or(1, |el| el.wrapping_add(1)) as usize;
     // SAFETY: 20 bytes of spare capacity were ensured and `u64` has at most 20 digits.
     unsafe {
       let len = self.buf.len();
-      let dst = self.buf.as_ptr_mut().add(len);
-      let mut end = dst.add(digits);
-      let mut rest = value;
-      while rest >= 100 {
-        let pair = usize::try_from(rest % 100).unwrap_or_default().wrapping_mul(2);
-        rest /= 100;
-        end = end.sub(2);
-        ptr::copy_nonoverlapping(PAIRS.as_ptr().add(pair), end, 2);
-      }
-      if rest >= 10 {
-        let pair = usize::try_from(rest).unwrap_or_default().wrapping_mul(2);
-        ptr::copy_nonoverlapping(PAIRS.as_ptr().add(pair), end.sub(2), 2);
-      } else {
-        *end.sub(1) = b'0'.wrapping_add(u8::try_from(rest).unwrap_or_default());
-      }
-      self.buf.set_len(len.wrapping_add(digits));
+      let written = write_u64(value, self.buf.as_ptr_mut().add(len));
+      self.buf.set_len(len.wrapping_add(written));
     }
     Ok(())
   }
@@ -201,6 +203,34 @@ impl<'buf> JsonWriter<'buf> {
   }
 }
 
+/// Writes `value` in decimal at `dst`, two digits a step from [`PAIRS`], and returns its length.
+///
+/// # Safety
+///
+/// `dst` is writable for 20 bytes.
+#[inline(always)]
+unsafe fn write_u64(value: u64, dst: *mut u8) -> usize {
+  let digits = value.checked_ilog10().map_or(1, |el| el.wrapping_add(1)) as usize;
+  // SAFETY: `digits <= 20` bytes are written, right to left from `dst + digits`.
+  unsafe {
+    let mut end = dst.add(digits);
+    let mut rest = value;
+    while rest >= 100 {
+      let pair = usize::try_from(rest % 100).unwrap_or_default().wrapping_mul(2);
+      rest /= 100;
+      end = end.sub(2);
+      ptr::copy_nonoverlapping(PAIRS.as_ptr().add(pair), end, 2);
+    }
+    if rest >= 10 {
+      let pair = usize::try_from(rest).unwrap_or_default().wrapping_mul(2);
+      ptr::copy_nonoverlapping(PAIRS.as_ptr().add(pair), end.sub(2), 2);
+    } else {
+      *end.sub(1) = b'0'.wrapping_add(u8::try_from(rest).unwrap_or_default());
+    }
+  }
+  digits
+}
+
 /// Writes `cents / 100` as `serde_json` would: `-`, the integer part, `.`, then the decimals with
 /// trailing zeros dropped but at least one (`3.0`, `4.5`, `49.99`). Returns the length.
 ///
@@ -209,44 +239,19 @@ impl<'buf> JsonWriter<'buf> {
 /// `dst` is writable for 17 bytes and `cents < 10^15`.
 #[inline]
 unsafe fn write_cents(negative: bool, cents: u64, dst: *mut u8) -> usize {
-  let mut digits = [0u8; 20];
-  let int = cents / 100;
-  let frac = usize::try_from(cents % 100).unwrap_or_default();
-  let mut start = digits.len();
-  let mut rest = int;
-  loop {
-    start = start.wrapping_sub(1);
-    if let Some(elem) = digits.get_mut(start) {
-      *elem = b'0'.wrapping_add(u8::try_from(rest % 10).unwrap_or_default());
-    }
-    rest /= 10;
-    if rest == 0 {
-      break;
-    }
-  }
-  let int_digits = digits.get(start..).unwrap_or_default();
-  let mut out: usize = 0;
+  let frac = usize::try_from(cents % 100).unwrap_or_default().wrapping_mul(2);
   // SAFETY: at most 1 + 13 + 1 + 2 bytes are written.
   unsafe {
+    let mut out = usize::from(negative);
     if negative {
       *dst = b'-';
-      out = 1;
     }
-    ptr::copy_nonoverlapping(int_digits.as_ptr(), dst.add(out), int_digits.len());
-    out = out.wrapping_add(int_digits.len());
+    out = out.wrapping_add(write_u64(cents / 100, dst.add(out)));
     *dst.add(out) = b'.';
-    let pair = PAIRS.get(frac.wrapping_mul(2)..frac.wrapping_mul(2).wrapping_add(2)).unwrap_or_default();
-    if let [tens, ones] = pair {
-      *dst.add(out.wrapping_add(1)) = *tens;
-      if *ones == b'0' {
-        out = out.wrapping_add(2);
-      } else {
-        *dst.add(out.wrapping_add(2)) = *ones;
-        out = out.wrapping_add(3);
-      }
-    }
+    ptr::copy_nonoverlapping(PAIRS.as_ptr().add(frac), dst.add(out.wrapping_add(1)), 2);
+    // `x.50` is `x.5`: drop a trailing zero decimal.
+    if *PAIRS.get_unchecked(frac.wrapping_add(1)) == b'0' { out.wrapping_add(2) } else { out.wrapping_add(3) }
   }
-  out
 }
 
 /// Whether a string of at most 32 bytes has a byte JSON escapes: overlapping 8-byte words for
