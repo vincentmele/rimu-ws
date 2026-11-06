@@ -113,6 +113,34 @@ impl HpackEncoder {
     Ok(())
   }
 
+  /// `content-length: value`, by index when the dynamic table has it. Otherwise added to the
+  /// table when `index`, else a literal without indexing, with the static table's name (index
+  /// 28): a fresh value per response would only churn the table.
+  pub(crate) fn encode_content_length(
+    &mut self,
+    buffer: &mut VectorUsize<u8>,
+    value: &str,
+    index: bool,
+  ) -> crate::Result<()> {
+    let name: &str = KnownHeaderName::ContentLength.into();
+    let pair_hash = self.rs.hash_one((name, value));
+    if let Some(pair_idx) = self.indcs.get(&pair_hash).copied() {
+      let local_idx = self.idx_to_encode_idx(pair_idx);
+      return Self::manage_encode(buffer, (name, value), EncodeIdx::RefNameRefValue(local_idx));
+    }
+    if index && !self.header_is_very_large(HpackHeaderBasic::Field, name, value) {
+      self.adjust_indices(1);
+      let idx = self.store_header_with_ref_name::<true>((name, value, false), 28, pair_hash)?;
+      return Self::manage_encode(buffer, (name, value), idx);
+    }
+    buffer.extend_from_copyable_slices([
+      &[0x0F, 0x0D][..],
+      &[u8::try_from(value.len()).unwrap_or(0)],
+      value.as_bytes(),
+    ])?;
+    Ok(())
+  }
+
   // It is not possible to lower the initial set value
   pub(crate) fn set_max_dyn_sub_bytes(&mut self, max_dyn_sub_bytes: u32) -> crate::Result<()> {
     self.generation = self.generation.wrapping_add(1);

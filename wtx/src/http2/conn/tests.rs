@@ -407,30 +407,68 @@ fn indexing_server() -> Http2Conn<false> {
 }
 
 fn plain_response(conn: &mut Http2Conn<false>, stream: u32) -> Vec<u8> {
+  sized_response(conn, stream, 1)
+}
+
+/// The header block of a `text/plain` response of `len` bytes.
+fn sized_response(conn: &mut Http2Conn<false>, stream: u32, len: usize) -> Vec<u8> {
   let _ = conn.feed(&headers_req(stream, "GET", "/", &[], true)).unwrap();
   let _ = events(conn);
   let mut msg = MsgBufferString::default();
   msg.headers.push_from_iter(Header::from_name_and_value("content-type", ["text/plain"])).unwrap();
   msg.headers.push_from_iter(Header::from_name_and_value("server", ["rimu-ws"])).unwrap();
-  msg.body.extend_from_copyable_slice(b"2").unwrap();
+  msg.body.extend_from_copyable_slice(&vec![b'2'; len]).unwrap();
   conn.send_response(U31::from_u32(stream), StatusCode::Ok, &mut msg).unwrap();
   let frames = take_frames(conn);
   frames.into_iter().find(|el| el.0 == HEADERS).unwrap().3
+}
+
+// A content-length that repeats the previous one goes into the dynamic table, so a server
+// answering with one length (a fixed body) sends it as one index byte from then on.
+#[test]
+fn conn_repeated_content_length_indexed() {
+  let mut conn = indexing_server();
+  let blocks: Vec<_> = [1, 3, 5, 7].into_iter().map(|el| plain_response(&mut conn, el)).collect();
+  assert!(blocks[0].ends_with(&[0x0F, 0x0D, 1, b'1']), "{:x?}", blocks[0]);
+  // After the three fields by index: the repeat, added to the table (static name 28).
+  assert_eq!(blocks[1].get(3), Some(&0x5C), "{:x?}", blocks[1]);
+  assert_eq!(blocks[2], blocks[3]);
+  assert_eq!(blocks[3].len(), 4, ":status, content-type, server and content-length, by index");
+  let mut dec = response_decoder();
+  for block in &blocks {
+    let fields = decode_block(&mut dec, block);
+    assert!(fields.contains(&("content-length".into(), "1".into())), "{fields:?}");
+  }
+}
+
+// Lengths that change from one response to the next stay out of the dynamic table.
+#[test]
+fn conn_changing_content_length_not_indexed() {
+  let mut conn = indexing_server();
+  let _ = sized_response(&mut conn, 1, 1);
+  let generation = conn.hpack_generation();
+  for (idx, len) in [2, 1, 2, 1, 2].into_iter().enumerate() {
+    let block = sized_response(&mut conn, 3 + 2 * u32::try_from(idx).unwrap(), len);
+    assert!(block.ends_with(&[0x0F, 0x0D, 1, b'0' + len as u8]), "{block:x?}");
+  }
+  assert_eq!(conn.hpack_generation(), generation);
 }
 
 #[test]
 fn conn_header_cache_hit_same_bytes() {
   let mut conn = indexing_server();
   let first = plain_response(&mut conn, 1);
+  // Refers to the first's fields and adds the repeated content-length to the table.
   let second = plain_response(&mut conn, 3);
-  let generation = conn.hpack_generation();
   let third = plain_response(&mut conn, 5);
+  let generation = conn.hpack_generation();
+  let fourth = plain_response(&mut conn, 7);
   assert_ne!(first, second, "the first response indexes its fields, the second refers to them");
-  assert_eq!(second, third);
+  assert_eq!(third, fourth);
   assert_eq!(conn.hpack_generation(), generation);
   assert_eq!(conn.header_cache_hits(), 1);
   let mut dec = response_decoder();
-  for block in [&first, &second, &third] {
+  for block in [&first, &second, &third, &fourth] {
     let fields = decode_block(&mut dec, block);
     assert!(fields.contains(&("content-type".into(), "text/plain".into())), "{fields:?}");
     assert!(fields.contains(&("content-length".into(), "1".into())), "{fields:?}");
@@ -440,15 +478,14 @@ fn conn_header_cache_hit_same_bytes() {
 #[test]
 fn conn_header_cache_invalid_after_table_size_change() {
   let mut conn = indexing_server();
-  let mut blocks =
-    vec![plain_response(&mut conn, 1), plain_response(&mut conn, 3), plain_response(&mut conn, 5)];
+  let mut blocks: Vec<_> = [1, 3, 5, 7].into_iter().map(|el| plain_response(&mut conn, el)).collect();
   assert_eq!(conn.header_cache_hits(), 1);
   let _ = conn.feed(&settings(&[(1, 0)])).unwrap();
   let _ = take_output(&mut conn);
-  let after = plain_response(&mut conn, 7);
+  let after = plain_response(&mut conn, 9);
   assert_eq!(after[0], 0x20, "a dynamic table size update to 0 comes first: {after:?}");
   blocks.push(after);
-  blocks.push(plain_response(&mut conn, 9));
+  blocks.push(plain_response(&mut conn, 11));
   let mut dec = response_decoder();
   for block in &blocks {
     let fields = decode_block(&mut dec, block);
@@ -972,3 +1009,4 @@ fn conn_idle_output_buffer_taken_back() {
   conn.output(&mut slices);
   assert_eq!(slices[0].as_ptr(), ptr);
 }
+

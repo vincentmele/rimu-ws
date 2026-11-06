@@ -141,6 +141,8 @@ pub(crate) struct Http2Conn<const IS_CLIENT: bool> {
   /// Scratch for encoding header blocks.
   header_buf: VectorUsize<u8>,
   header_cache: HeaderCache,
+  /// The `content-length` of the last response sent.
+  last_content_length: Option<usize>,
   /// Request blocks seen lately (server).
   decode_memo: DecodeMemo,
   /// Streams whose released capacity is not yet announced.
@@ -189,6 +191,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       blocked: DequeUsize::new(),
       header_buf: VectorUsize::new(),
       header_cache: HeaderCache::new(),
+      last_content_length: None,
       decode_memo: DecodeMemo::new(),
       window_updates: DequeUsize::new(),
       conn_recv: DEFAULT_WINDOW.max(initial),
@@ -608,7 +611,8 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       self.check_send_queue(body_len)?;
     }
     {
-      let Self { header_buf, header_cache, hpack_enc, out, peer, streams, .. } = self;
+      let Self { header_buf, header_cache, hpack_enc, last_content_length, out, peer, streams, .. } =
+        self;
       let stream = streams.get_mut(id).ok_or(protocol_err(Http2Error::UnknownStreamReceiver))?;
       if stream.send_headers || stream.send_closed {
         return Err(protocol_err(Http2Error::InvalidSendStreamState));
@@ -629,7 +633,9 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       }
       let rest = msg.headers.iter().filter(|el| !HeaderCache::is_cached_field(el));
       hpack_enc.encode(header_buf, 0, [], rest)?;
-      push_content_length(header_buf, body_len)?;
+      let repeat = *last_content_length == Some(body_len);
+      *last_content_length = Some(body_len);
+      push_content_length(hpack_enc, header_buf, body_len, repeat)?;
       push_header_block(out, id, header_buf, body_len == 0, peer.max_frame_len)?;
       if body_len == 0 {
         stream.send_closed = true;
@@ -1525,9 +1531,14 @@ fn push_header_block(
   Ok(())
 }
 
-/// `content-length: <len>` as a literal without indexing, with the static table's name (index
-/// 28): a fresh value per response would only churn the dynamic table.
-fn push_content_length(block: &mut VectorUsize<u8>, len: usize) -> crate::Result<()> {
+/// `content-length: <len>`; see [`HpackEncoder::encode_content_length`]. `repeat`: the last
+/// response had the same length, so the next ones likely will too, and it is worth indexing.
+fn push_content_length(
+  hpack_enc: &mut HpackEncoder,
+  block: &mut VectorUsize<u8>,
+  len: usize,
+  repeat: bool,
+) -> crate::Result<()> {
   let mut digits = [0u8; 20];
   let mut idx = digits.len();
   let mut value = len;
@@ -1542,12 +1553,7 @@ fn push_content_length(block: &mut VectorUsize<u8>, len: usize) -> crate::Result
     }
   }
   let text = digits.get(idx..).unwrap_or_default();
-  block.extend_from_copyable_slices([
-    &[0x0F, 0x0D][..],
-    &[u8::try_from(text.len()).unwrap_or(0)],
-    text,
-  ])?;
-  Ok(())
+  hpack_enc.encode_content_length(block, core::str::from_utf8(text).unwrap_or_default(), repeat)
 }
 
 fn push_go_away(out: &mut Output, last_stream_id: u32, code: Http2ErrorCode) {
