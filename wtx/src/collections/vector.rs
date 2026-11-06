@@ -984,6 +984,10 @@ where
   fn reserve(&mut self, additional: Self::Len) -> crate::Result<()> {
     let additional_usize = additional.usize();
     let len_usize = self.len().usize();
+    // Most calls (every `extend`) fit in the spare capacity: skip the round trip through `Vec`.
+    if self.cap.usize().wrapping_sub(len_usize) >= additional_usize {
+      return Ok(());
+    }
     self.to_vec_mut(|vec| {
       vec.try_reserve(additional_usize).map_err(|_err| VectorError::ReserveOverflow {
         additional: additional_usize.try_into().unwrap_or(u16::MAX),
@@ -998,6 +1002,9 @@ where
   fn reserve_exact(&mut self, additional: Self::Len) -> crate::Result<()> {
     let additional_usize = additional.usize();
     let len_usize = self.len().usize();
+    if self.cap.usize().wrapping_sub(len_usize) >= additional_usize {
+      return Ok(());
+    }
     self.to_vec_mut(|vec| {
       vec.try_reserve_exact(additional_usize).map_err(|_err| VectorError::ReserveOverflow {
         additional: additional_usize.try_into().unwrap_or(u16::MAX),

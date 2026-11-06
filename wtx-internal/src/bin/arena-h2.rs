@@ -17,7 +17,7 @@ use rimu_ws::{
       Http2ServerFramework, HttpRouter, JsonReply, Middleware, Path, State, VerbatimParams, get,
     },
   },
-  misc::Wrapper,
+  misc::JsonWriter,
   rng::{ChaCha20, CryptoSeedableRng as _},
   sync::Arc,
   tls::TlsConfig,
@@ -155,24 +155,51 @@ async fn endpoint_json(
       break;
     }
   }
-  let clamped = count.min(state.data.dataset.len());
+  let dataset = &state.data.dataset;
   state.req.msg_data.clear();
-  let items = state.data.dataset.iter().take(clamped).map(move |el| {
-    Ok(ProcessedItem {
-      id: el.id,
-      name: &el.name,
-      category: &el.category,
-      price: el.price,
-      quantity: el.quantity,
-      active: el.active,
-      tags: ArrayVectorU8::from_iterator(el.tags.iter().map(|tag| tag.as_str()))?,
-      rating: RatingOut { score: el.rating.score, count: el.rating.count },
-      total: el.price * el.quantity * m,
-    })
-  });
-  let resp = JsonResponse { count: clamped, items: Wrapper(core::cell::RefCell::new(items)) };
-  serde_json::to_writer(&mut state.req.msg_data.body, &resp)?;
+  write_json(&mut state.req.msg_data.body, dataset, count, m)?;
   Ok(JsonReply(StatusCode::Ok))
+}
+
+/// `{"items":[..],"count":n}` for the first `count` items, with `total = price * quantity * m`,
+/// serialized on every request.
+fn write_json(
+  buf: &mut VectorUsize<u8>,
+  dataset: &[DatasetItem],
+  count: usize,
+  m: f64,
+) -> rimu_ws::Result<()> {
+  let clamped = count.min(dataset.len());
+  let mut w = JsonWriter::new(buf);
+  w.raw(b"{\"items\":[")?;
+  for (idx, el) in dataset.iter().take(clamped).enumerate() {
+    w.raw(if idx == 0 { b"{\"id\":" } else { b",{\"id\":" })?;
+    w.i64(el.id)?;
+    w.raw(b",\"name\":\"")?;
+    w.str_contents(&el.name)?;
+    w.raw(b"\",\"category\":\"")?;
+    w.str_contents(&el.category)?;
+    w.raw(b"\",\"price\":")?;
+    w.f64(el.price)?;
+    w.raw(b",\"quantity\":")?;
+    w.f64(el.quantity)?;
+    w.raw(if el.active { b",\"active\":true,\"tags\":[" } else { b",\"active\":false,\"tags\":[" })?;
+    for (tag_idx, tag) in el.tags.iter().enumerate() {
+      w.raw(if tag_idx == 0 { b"\"" } else { b",\"" })?;
+      w.str_contents(tag)?;
+      w.raw(b"\"")?;
+    }
+    w.raw(b"],\"rating\":{\"score\":")?;
+    w.f64(el.rating.score)?;
+    w.raw(b",\"count\":")?;
+    w.i64(el.rating.count)?;
+    w.raw(b"},\"total\":")?;
+    w.f64(el.price * el.quantity * m)?;
+    w.raw(b"}")?;
+  }
+  w.raw(b"],\"count\":")?;
+  w.u64(u64::try_from(clamped).unwrap_or(u64::MAX))?;
+  w.raw(b"}")
 }
 
 fn load_dataset() -> Arc<VectorUsize<DatasetItem>> {
@@ -201,32 +228,99 @@ struct Rating {
   count: i64,
 }
 
-#[derive(serde::Serialize)]
-#[serde(bound = "E: serde::Serialize")]
-struct JsonResponse<E, I>
-where
-  I: Iterator<Item = rimu_ws::Result<E>>,
-  E: serde::Serialize,
-{
-  items: Wrapper<core::cell::RefCell<I>>,
-  count: usize,
-}
+#[cfg(test)]
+mod tests {
+  use super::{DatasetItem, write_json};
+  use rimu_ws::{
+    collections::{ArrayVectorU8, VectorUsize},
+    misc::Wrapper,
+  };
 
-#[derive(serde::Serialize)]
-struct ProcessedItem<'any> {
-  id: i64,
-  name: &'any str,
-  category: &'any str,
-  price: f64,
-  quantity: f64,
-  active: bool,
-  tags: ArrayVectorU8<&'any str, 6>,
-  rating: RatingOut,
-  total: f64,
-}
+  /// The serde form the endpoint used before `JsonWriter`; the writer must give the same bytes.
+  fn serde_json_form(dataset: &[DatasetItem], count: usize, m: f64) -> Vec<u8> {
+    let clamped = count.min(dataset.len());
+    let items = dataset.iter().take(clamped).map(move |el| {
+      Ok(ProcessedItem {
+        id: el.id,
+        name: &el.name,
+        category: &el.category,
+        price: el.price,
+        quantity: el.quantity,
+        active: el.active,
+        tags: ArrayVectorU8::from_iterator(el.tags.iter().map(|tag| tag.as_str()))?,
+        rating: RatingOut { score: el.rating.score, count: el.rating.count },
+        total: el.price * el.quantity * m,
+      })
+    });
+    let resp = JsonResponse { count: clamped, items: Wrapper(core::cell::RefCell::new(items)) };
+    serde_json::to_vec(&resp).unwrap()
+  }
 
-#[derive(serde::Serialize)]
-struct RatingOut {
-  score: f64,
-  count: i64,
+  fn check(dataset: &[DatasetItem]) {
+    for count in [0, 1, 2, 7, 50, 1000] {
+      for m in [1.0, 3.0, -2.0, 0.0] {
+        let mut buf = VectorUsize::new();
+        write_json(&mut buf, dataset, count, m).unwrap();
+        assert_eq!(
+          String::from_utf8_lossy(buf.as_slice()),
+          String::from_utf8_lossy(&serde_json_form(dataset, count, m)),
+          "count {count}, m {m}"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn json_matches_serde_on_the_dataset() {
+    let path = std::env::var("DATASET_PATH")
+      .unwrap_or_else(|_| "/mnt/nvme1tb/claude-tmp/arena-main/data/dataset.json".into());
+    let Ok(text) = std::fs::read_to_string(&path) else {
+      eprintln!("no dataset at {path}: skipped");
+      return;
+    };
+    let dataset: VectorUsize<DatasetItem> = serde_json::from_str(&text).unwrap();
+    assert!(dataset.len() >= 50);
+    check(&dataset);
+  }
+
+  #[test]
+  fn json_matches_serde_with_escapes() {
+    let text = r#"[{"id":-3,"name":"a \"quoted\" \\ name\n\u0001 é 東","category":"x/y\t","price":0.1,
+      "quantity":3.0,"active":true,"tags":["","t\"",  "long tag long tag long tag long tag long"],
+      "rating":{"score":4.25,"count":-7}},
+      {"id":9007199254740993,"name":"","category":"c","price":1e21,"quantity":1e-7,"active":false,
+      "tags":[],"rating":{"score":0.0,"count":0}}]"#;
+    let dataset: VectorUsize<DatasetItem> = serde_json::from_str(text).unwrap();
+    check(&dataset);
+  }
+
+  #[derive(serde::Serialize)]
+  #[serde(bound = "E: serde::Serialize")]
+  struct JsonResponse<E, I>
+  where
+    I: Iterator<Item = rimu_ws::Result<E>>,
+    E: serde::Serialize,
+  {
+    items: Wrapper<core::cell::RefCell<I>>,
+    count: usize,
+  }
+
+  #[derive(serde::Serialize)]
+  struct ProcessedItem<'any> {
+    id: i64,
+    name: &'any str,
+    category: &'any str,
+    price: f64,
+    quantity: f64,
+    active: bool,
+    tags: ArrayVectorU8<&'any str, 6>,
+    rating: RatingOut,
+    total: f64,
+  }
+
+  #[derive(serde::Serialize)]
+  struct RatingOut {
+    score: f64,
+    count: i64,
+  }
 }

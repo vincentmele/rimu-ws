@@ -30,6 +30,7 @@ uuid = { default-features = false, optional = true, version = "1.0" }
 rimu-ws-macros = { default-features = false, optional = true, path = "../wtx-macros", version = "0.12.1" }
 zip = { default-features = false, optional = true, version = "9.0" }
 zlib-rs = { default-features = false, optional = true, version = "0.6" }
+zmij = { default-features = false, optional = true, version = "1.0" }
 
 # Rust Crypto and its extravagant set of associated dependencies
 aead = { default-features = false, optional = true, version = "0.6" }
@@ -137,6 +138,7 @@ http-cookie-secure = ["crypto", "http-cookie"]
 http-session = ["http-cookie-secure", "secret", "serde_json"]
 httparse = ["dep:httparse"]
 io-uring = ["dep:io-uring", "libc", "socket2", "std"]
+json-writer = ["dep:zmij"]
 libc = ["dep:libc"]
 macros = ["dep:rimu-ws-macros"]
 memchr = ["dep:memchr"]

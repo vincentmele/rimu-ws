@@ -121,3 +121,35 @@ Each item is an A/B on server user cycles per request plus throughput, on librar
 
 - With 32 streams the defaults failed `-m 100` outright (`ExceedAmountOfOpenedStreams`); with 128
   they match the permissive settings.
+
+### Step 2: the json-h2c handler path
+
+From here the benches build `arena-h2` with `-C target-cpu=native`, as the HttpArena entry's
+Dockerfile does (`.scripts/h2-bench.sh` defaults to `target-h2-native`).
+
+- **`Vector::reserve` fast path.** Every `extend` called `reserve`, which round-tripped the buffer
+  through a `Vec` (`to_vec_mut`) even when the spare capacity was enough. It now returns at once
+  when the room is there. baseline-h2c 256: 7,056 → 6,160 cycles/req (−13%), 4.99M → 5.24M rps
+  (h2load at 99% CPU); json-h2c 1024: 71,350 → 68,578.
+- **`misc::JsonWriter`** (feature `json-writer`), in the spirit of xtrader's order writer and
+  Polymarket scanner. Keys and punctuation are literals fused into a single copy each. Strings are
+  escaped while they are copied, 32 bytes a step with AVX2 or 8 with word tricks, into space
+  reserved for the worst case once per string. Integers are written in place from a two-digit
+  table. Floats use `zmij`, the formatter `serde_json` uses. Short variable copies are two
+  overlapping fixed-size moves. The output is byte for byte `serde_json`'s: the library tests
+  compare strings, integers and floats, and `arena-h2`'s tests compare whole responses on the
+  real dataset. JSON is still serialized on every request.
+
+  A/B, both native, json-h2c 1024, two rounds interleaved:
+
+  | endpoint | best rps | cycles/req |
+  |---|---|---|
+  | serde_json | 550k, 560k | 67,865, 68,222 |
+  | JsonWriter | 588k, 589k | 61,191, 62,053 |
+
+- **What is left.** The profile is now led by `memmove` (22%) and the kernel's send copy and
+  page allocation (13%). Each response body goes through three per-connection buffers (the
+  message, the stream queue, the output, then the reactor's send buffer). With 1024 connections
+  that working set is hundreds of megabytes, so every copy misses cache. Steps 3 and 4 remove
+  those copies. Floats (`zmij`, about 37 cycles each, 200 a response) and string escaping are
+  next after that.
