@@ -3,7 +3,10 @@
 
 use crate::{
   collections::VectorUsize,
-  executor::{Runtime as _, UringParams, UringRuntime, UringTcpListener, UringTcpStream},
+  executor::{
+    Executor as _, Runtime as _, UringExecutor, UringParams, UringRuntime, UringTcpListener,
+    UringTcpStream,
+  },
   futures::Sleep,
   http::{
     HttpRecvParams, MsgBufferString, Protocol, Request, StatusCode,
@@ -699,4 +702,49 @@ fn userspace_tls_readable_reports_buffered_records() {
   assert_eq!(first, b"one", "the first read took both records: the test doesn't cover buffering");
   assert!(ready, "a buffered record wasn't reported readable");
   assert_eq!(second, b"two");
+}
+
+// An idle connection holds no output buffer: once its output is written the driver puts the
+// buffer in the thread's pool, so thousands of idle connections don't each keep one.
+#[test]
+fn idle_connection_returns_its_output_buffer() {
+  let uri = _uri();
+  let addr = String::from(uri.hostname_with_implied_port().0) + ":" + &uri.port().unwrap().to_string();
+  let (ready_tx, ready_rx) = mpsc::channel();
+  let (pool_tx, pool_rx) = mpsc::channel();
+  let check = Arc::new(AtomicBool::new(false));
+  let server_addr = addr.clone();
+  let server_check = check.clone();
+  let _jh = std::thread::spawn(move || {
+    let runtime = UringRuntime::with_params(UringParams::default()).unwrap();
+    let rt = &runtime;
+    runtime.block_on(async move {
+      let listener =
+        UringTcpListener::bind(server_addr.as_str(), TcpParams::default().set_reuse_port(Some(false)))
+          .await
+          .unwrap();
+      ready_tx.send(()).unwrap();
+      let (mut stream, peer) = listener.accept(TcpParams::default()).await.unwrap();
+      let _watcher = UringExecutor::default().spawn_local(
+        async move {
+          while !server_check.load(Ordering::SeqCst) {
+            Sleep::new(Duration::from_millis(5)).unwrap().await.unwrap();
+          }
+          pool_tx.send(super::output_pool_len()).unwrap();
+        },
+        rt,
+      );
+      let conn = Http2Conn::<false>::new(HttpRecvParams::with_default_params(), &mut Xorshift64::from(9u64));
+      let dispatcher = TestDispatcher { dropped: Arc::new(AtomicBool::new(false)) };
+      let _rslt = drive_conn(&mut stream, conn, &dispatcher, peer.ip(), DriveParams::default()).await;
+    });
+  });
+  ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+  let mut client = Client::connect(&addr, &[]);
+  client.send(&headers_req(1, "GET", "/", &[], true));
+  let frames = client.read_until(Duration::from_secs(5), |frames| ended(frames).len() == 1);
+  assert_eq!(ended(&frames), [1]);
+  check.store(true, Ordering::SeqCst);
+  let pooled = pool_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+  assert!(pooled >= 1, "{pooled} output buffers pooled while the connection is idle");
 }

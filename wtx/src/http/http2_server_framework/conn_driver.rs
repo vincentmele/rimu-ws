@@ -210,6 +210,11 @@ where
         let mut guard = shared.borrow_mut();
         let state = &mut *guard;
         state.dirty = false;
+        if !state.conn.has_output_buffer()
+          && let Some(buffer) = output_pool_take()
+        {
+          state.conn.give_output_buffer(buffer);
+        }
         if !self.rx.is_empty() {
           let consumed = state.conn.feed_at(&self.rx, now())?;
           self.consume(consumed);
@@ -561,6 +566,37 @@ fn body_pool_give(mut body: VectorUsize<u8>) {
   });
 }
 
+/// Output buffers of connections with nothing to send, most recent last: a connection holds one
+/// only while it has output, so idle connections don't each keep the last output's buffer.
+/// Buffers above `OUTPUT_POOL_BUFFER_MAX` are freed.
+const OUTPUT_POOL_MAX: usize = 64;
+const OUTPUT_POOL_BUFFER_MAX: usize = 1 << 20;
+
+std::thread_local! {
+  static OUTPUT_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+fn output_pool_take() -> Option<Vec<u8>> {
+  OUTPUT_POOL.with(|pool| pool.borrow_mut().pop())
+}
+
+fn output_pool_give(buffer: Vec<u8>) {
+  if buffer.capacity() > OUTPUT_POOL_BUFFER_MAX {
+    return;
+  }
+  OUTPUT_POOL.with(|pool| {
+    let mut pool = pool.borrow_mut();
+    if pool.len() < OUTPUT_POOL_MAX {
+      pool.push(buffer);
+    }
+  });
+}
+
+#[cfg(test)]
+fn output_pool_len() -> usize {
+  OUTPUT_POOL.with(|pool| pool.borrow().len())
+}
+
 /// Writes everything the core queued, in groups of at most 8 slices.
 async fn write_output<S>(stream: &mut S, shared: &RefCell<ConnShared>) -> crate::Result<()>
 where
@@ -573,6 +609,9 @@ where
     let declined = {
       let mut guard = shared.borrow_mut();
       if !guard.conn.has_output() {
+        if let Some(buffer) = guard.conn.take_idle_output_buffer() {
+          output_pool_give(buffer);
+        }
         return Ok(());
       }
       // The usual case: the output is one run of bytes, handed to the stream without a copy;

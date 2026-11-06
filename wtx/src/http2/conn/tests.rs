@@ -946,3 +946,29 @@ fn conn_content_length_over_max_body_refused() {
   let _ = conn.feed(&headers_req(3, "POST", "/", &[("content-length", "1000")], false)).unwrap();
   assert_eq!(rst_code(&take_frames(&mut conn), 3), None);
 }
+
+// A connection between turns holds no output buffer: the driver takes it back once the output is
+// written, so thousands of idle connections don't each keep the last output's buffer.
+#[test]
+fn conn_idle_output_buffer_taken_back() {
+  let mut conn = ready_server(HttpRecvParams::with_default_params());
+  let _ = conn.feed(&headers_req(1, "GET", "/", &[], true)).unwrap();
+  let mut msg = MsgBufferString::default();
+  msg.body.extend_from_copyable_slice(&[1; 1000]).unwrap();
+  // Output pending: nothing to take back.
+  conn.send_response(U31::from_u32(1), StatusCode::Ok, &mut msg).unwrap();
+  assert!(conn.take_idle_output_buffer().is_none());
+  let _ = take_output(&mut conn);
+  let buffer = conn.take_idle_output_buffer().expect("the written output's buffer");
+  assert!(buffer.capacity() >= 1000 && buffer.is_empty());
+  assert!(conn.take_idle_output_buffer().is_none());
+  // A buffer given back is used for the next output.
+  let ptr = buffer.as_ptr();
+  conn.give_output_buffer(buffer);
+  let _ = conn.feed(&headers_req(3, "GET", "/", &[], true)).unwrap();
+  let mut msg = MsgBufferString::default();
+  conn.send_response(U31::from_u32(3), StatusCode::Ok, &mut msg).unwrap();
+  let mut slices = ArrayVectorCopy::<&[u8], 16>::new();
+  conn.output(&mut slices);
+  assert_eq!(slices[0].as_ptr(), ptr);
+}

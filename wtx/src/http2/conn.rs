@@ -305,6 +305,25 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     self.out.give_buffer(buffer);
   }
 
+  /// The output buffer, when nothing is queued, so an idle connection holds none; see
+  /// [`Self::give_output_buffer`].
+  #[cfg_attr(
+    not(feature = "http2-server-framework"),
+    allow(dead_code, reason = "used by the server driver")
+  )]
+  pub(crate) fn take_idle_output_buffer(&mut self) -> Option<Vec<u8>> {
+    self.out.take_idle_buffer()
+  }
+
+  /// Whether the output holds a buffer to queue into.
+  #[cfg_attr(
+    not(feature = "http2-server-framework"),
+    allow(dead_code, reason = "used by the server driver")
+  )]
+  pub(crate) fn has_output_buffer(&self) -> bool {
+    self.out.has_buffer()
+  }
+
   /// Marks the first `n` queued bytes as written.
   pub(crate) fn advance_output(&mut self, n: usize) {
     self.out.advance(n);

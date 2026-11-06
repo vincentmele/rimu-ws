@@ -161,6 +161,23 @@ impl Output {
     }
   }
 
+  /// The buffer, empty, when nothing is queued: an idle connection need not hold one.
+  pub(crate) fn take_idle_buffer(&mut self) -> Option<Vec<u8>> {
+    if self.pending != 0 || self.bytes.capacity() == 0 {
+      return None;
+    }
+    let mut buffer = mem::take(&mut self.bytes).into_vec();
+    buffer.clear();
+    self.chunks.clear();
+    self.front_written = 0;
+    Some(buffer)
+  }
+
+  /// Whether output would go into a buffer the output already holds.
+  pub(crate) fn has_buffer(&self) -> bool {
+    self.bytes.capacity() != 0
+  }
+
   /// Marks the first `n` queued bytes as written.
   pub(crate) fn advance(&mut self, mut n: usize) {
     n = n.min(self.pending);
