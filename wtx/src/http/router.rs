@@ -183,11 +183,6 @@ impl<T, const MC: usize, const MD: usize> Router<T, MC, MD> {
           return CheckSearchRowRslt::Mismatch;
         }
       }
-      #[expect(
-        clippy::as_conversions,
-        clippy::cast_possible_truncation,
-        reason = "full routes are limited by 255, subroutes are smaller"
-      )]
       RowTy::Param => {
         // For some reason `memchr` degrades the performance if `target-cpu=native`.
         let (param, rest) = if let Some(param_end_idx) = bytes_pos1(*curr_route, b'/') {
@@ -204,22 +199,47 @@ impl<T, const MC: usize, const MD: usize> Router<T, MC, MD> {
           }
           (*curr_route, &[][..])
         };
-        let begin_idx = route_len.wrapping_sub(curr_route.len() as u8);
-        let end_idx = begin_idx.wrapping_add(param.len() as u8);
-        // SAFETY: The Drop implementation of `MatcherBuilder` guarantees that `MD` will never
-        //         be lesser than the maximum depth of this instance.
-        unsafe {
-          path_rows
-            .push(RouterMatchParamIndices::new((begin_idx..end_idx).into(), row_idx))
-            .unwrap_unchecked();
-        }
+        Self::push_param(path_rows, route_len, curr_route, param, row_idx);
         *curr_route = rest;
+      }
+      RowTy::CatchAll => {
+        if curr_route.is_empty() {
+          cold_path();
+          return CheckSearchRowRslt::Mismatch;
+        }
+        let param = *curr_route;
+        Self::push_param(path_rows, route_len, curr_route, param, row_idx);
+        *curr_route = &[];
       }
     }
     if let ([], Some(value)) = (curr_route, &row.value) {
       return CheckSearchRowRslt::CompleteMatch(value);
     }
     CheckSearchRowRslt::IncompleteMatch(&row.edges)
+  }
+
+  #[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "full routes are limited by 255, subroutes are smaller"
+  )]
+  #[inline(always)]
+  fn push_param(
+    path_rows: &mut ArrayVectorCopy<RouterMatchParamIndices, MD>,
+    route_len: u8,
+    curr_route: &[u8],
+    param: &[u8],
+    row_idx: u8,
+  ) {
+    let begin_idx = route_len.wrapping_sub(curr_route.len() as u8);
+    let end_idx = begin_idx.wrapping_add(param.len() as u8);
+    // SAFETY: The Drop implementation of `MatcherBuilder` guarantees that `MD` will never
+    //         be lesser than the maximum depth of this instance.
+    unsafe {
+      path_rows
+        .push(RouterMatchParamIndices::new((begin_idx..end_idx).into(), row_idx))
+        .unwrap_unchecked();
+    }
   }
 }
 
@@ -381,7 +401,7 @@ impl<T, const MC: usize, const MD: usize> RouterBuilder<'_, T, MC, MD> {
 
   #[inline]
   fn compare_row(route: &mut &[u8], row: &Row<T, MC>) -> crate::Result<CompareRowRslt<MC>> {
-    if row.ty == RowTy::Param {
+    if row.ty != RowTy::Literal {
       if route.first() == Some(&b'{')
         && let Some(idx) = bytes_pos1(*route, b'}')
         && let Some((lhs, rhs)) = route.split_at_checked(idx.wrapping_add(1))
@@ -438,10 +458,15 @@ impl<T, const MC: usize, const MD: usize> RouterBuilder<'_, T, MC, MD> {
               if next.is_some() && next != Some(b'/') {
                 return Err(RouterError::AddErrParamSuffix.into());
               }
+              let is_catch_all = rest.first() == Some(&b'*');
+              if is_catch_all && next.is_some() {
+                return Err(RouterError::AddErrParamSuffix.into());
+              }
               route_end_idx = route_end_idx.checked_add(1).ok_or(RouterError::AddErrOverflow)?;
               *curr_bytes_idx = curr_bytes_idx.wrapping_add(route_end_idx.into());
               let route = bytes.get(..*curr_bytes_idx).unwrap_or_default();
-              return Ok((route, RowTy::Param));
+              let ty = if is_catch_all { RowTy::CatchAll } else { RowTy::Param };
+              return Ok((route, ty));
             }
             other => {
               if !other.is_ascii_graphic() {
@@ -486,7 +511,7 @@ impl<T, const MC: usize, const MD: usize> Drop for RouterBuilder<'_, T, MC, MD> 
           let Some(curr_depth) = depths.get(idx) else {
             continue;
           };
-          if row.ty == RowTy::Param { curr_depth.saturating_add(1) } else { *curr_depth }
+          if row.ty == RowTy::Literal { *curr_depth } else { curr_depth.saturating_add(1) }
         };
         if next_depth > max_depth {
           max_depth = next_depth;
@@ -519,7 +544,7 @@ impl<T, const MC: usize, const MD: usize> Drop for RouterBuilder<'_, T, MC, MD> 
             };
             let first = match target_row.ty {
               RowTy::Literal => target_row.route.as_bytes().first().copied(),
-              RowTy::Param => None,
+              RowTy::CatchAll | RowTy::Param => None,
             };
             let _rslt = first_bytes.push(first);
           }
@@ -612,8 +637,9 @@ impl<T, const MC: usize, const MD: usize> RouterMatch<'_, T, MC, MD> {
       let row = rows.get(usize::from(*row_idx))?;
       let name = match row.ty {
         RowTy::Literal => return None,
-        RowTy::Param => {
+        RowTy::CatchAll | RowTy::Param => {
           if let [_, name @ .., _] = row.route.as_bytes() {
+            let name = name.strip_prefix(b"*").unwrap_or(name);
             // SAFETY: all routes are graphic ASCII
             unsafe { str::from_utf8_unchecked(name) }
           } else {
@@ -666,6 +692,8 @@ enum CompareRowRslt<const MC: usize = DEFAULT_MAX_CHILDREN> {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum RowTy {
+  /// `{*name}`: the rest of the path, which can hold slashes. Ends a route.
+  CatchAll,
   Literal,
   Param,
 }

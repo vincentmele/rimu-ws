@@ -100,6 +100,18 @@ impl Stream {
   }
 
   /// Body bytes queued and not yet sent.
+  /// Of [`Self::send_pending`], the bytes the stream holds itself (not shared ones).
+  pub(crate) fn send_pending_owned(&self) -> usize {
+    let mut sum: usize = 0;
+    for (idx, item) in self.send_queue.iter().enumerate() {
+      if let SendItem::Owned(len) = item {
+        let sent = if idx == 0 { self.front_sent } else { 0 };
+        sum = sum.wrapping_add(len.saturating_sub(sent));
+      }
+    }
+    sum
+  }
+
   pub(crate) fn send_pending(&self) -> usize {
     self.send_queue.iter().map(SendItem::len).sum::<usize>().saturating_sub(self.front_sent)
   }
@@ -289,7 +301,7 @@ impl StreamTable {
     self.buffered
   }
 
-  /// Body bytes queued on open streams and not yet sent.
+  /// Body bytes queued on open streams and not yet sent, not counting shared ones.
   pub(crate) const fn queued(&self) -> usize {
     self.queued
   }
@@ -349,7 +361,7 @@ impl StreamTable {
     if let Some(stream) = self.slots.get_mut(idx) {
       stream.live = false;
       self.buffered = self.buffered.saturating_sub(stream.recv_body_len);
-      self.queued = self.queued.saturating_sub(stream.send_pending());
+      self.queued = self.queued.saturating_sub(stream.send_pending_owned());
       stream.msg.clear();
       stream.owned.clear();
       stream.send_queue.clear();

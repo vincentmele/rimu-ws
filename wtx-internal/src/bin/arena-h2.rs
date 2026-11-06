@@ -1,5 +1,5 @@
-//! HttpArena HTTP/2 server: `/baseline2` and `/json/{count}` on h2c (8082) and h2 over TLS (8443),
-//! served by the HTTP/2 server framework on the io_uring executor. Used by `.scripts/h2-bench.sh`.
+//! HttpArena HTTP/2 server: `/baseline2`, `/json/{count}` and `/static/{*file}` on h2c (8082) and
+//! h2 over TLS (8443), served by the HTTP/2 server framework on the io_uring executor. Used by `.scripts/h2-bench.sh`.
 //!
 //! Environment: `CERT_DIR` (default `/certs`, with `server.crt` and `server.key`), `DATASET_PATH`
 //! (default `/data/dataset.json`), `STATIC_DIR` (default `/data/static`), `ARENA_PARAMS`
@@ -14,7 +14,8 @@ use rimu_ws::{
     Header, HttpRecvParams, KnownHeaderName, MsgBufferString, MsgDataMut as _, Request, Response,
     StatusCode,
     http2_server_framework::{
-      Http2ServerFramework, HttpRouter, JsonReply, Middleware, Path, State, VerbatimParams, get,
+      Get, Http2ServerFramework, HttpRouter, JsonReply, Middleware, Path, State, StaticFiles,
+      VerbatimParams, get,
     },
   },
   misc::JsonWriter,
@@ -28,11 +29,16 @@ macro_rules! router {
     HttpRouter::new(
       rimu_ws::paths!(
         ("/baseline2", get(endpoint_baseline2)),
-        ("/json/{count}", get(endpoint_json))
+        ("/json/{count}", get(endpoint_json)),
+        ("/static/{*file}", Get(StaticFiles::new(static_dir())?))
       ),
       ServerHeader,
     )
   };
+}
+
+fn static_dir() -> String {
+  std::env::var("STATIC_DIR").unwrap_or_else(|_| "/data/static".into())
 }
 
 fn main() -> rimu_ws::Result<()> {

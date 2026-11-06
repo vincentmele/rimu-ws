@@ -122,6 +122,7 @@ fn nested_middlewares() {
       peer: IpAddr::V4(Ipv4Addr::from_bits(0)),
       protocol: None,
       req: Request::new(Method::Get, MsgBufferString::default()),
+      shared_body: None,
     };
 
     {

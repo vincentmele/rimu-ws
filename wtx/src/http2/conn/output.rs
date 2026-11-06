@@ -34,16 +34,25 @@ pub(crate) struct Output {
   front_written: usize,
   /// Bytes queued and not yet written.
   pending: usize,
+  /// Of `pending`, the bytes queued by reference.
+  shared: usize,
 }
 
 impl Output {
   pub(crate) const fn new() -> Self {
-    Self { bytes: VectorUsize::new(), chunks: DequeUsize::new(), front_written: 0, pending: 0 }
+    Self {
+      bytes: VectorUsize::new(),
+      chunks: DequeUsize::new(),
+      front_written: 0,
+      pending: 0,
+      shared: 0,
+    }
   }
 
-  /// Bytes queued and not yet written.
-  pub(crate) const fn len(&self) -> usize {
-    self.pending
+  /// Bytes queued and not yet written that the output holds itself: not those queued by
+  /// reference, whose memory belongs to their owner.
+  pub(crate) const fn owned_len(&self) -> usize {
+    self.pending.wrapping_sub(self.shared)
   }
 
   pub(crate) const fn is_empty(&self) -> bool {
@@ -81,6 +90,7 @@ impl Output {
       return Ok(());
     }
     self.pending = self.pending.wrapping_add(bytes.len());
+    self.shared = self.shared.wrapping_add(bytes.len());
     self.chunks.push_back(Chunk::Shared(bytes))?;
     Ok(())
   }
@@ -160,6 +170,9 @@ impl Output {
         break;
       };
       let left = chunk.len().wrapping_sub(self.front_written);
+      if let Chunk::Shared(_) = chunk {
+        self.shared = self.shared.saturating_sub(n.min(left));
+      }
       if n < left {
         self.front_written = self.front_written.wrapping_add(n);
         break;
@@ -172,6 +185,7 @@ impl Output {
       self.bytes.clear();
       self.chunks.clear();
       self.front_written = 0;
+      self.shared = 0;
     }
   }
 }

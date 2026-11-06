@@ -24,6 +24,8 @@ mod redirect;
 mod res_finalizer;
 mod route_match;
 mod state;
+#[cfg(feature = "std")]
+mod static_files;
 #[cfg(test)]
 mod tests;
 #[cfg(all(test, feature = "io-uring", feature = "web-socket"))]
@@ -62,6 +64,8 @@ pub use redirect::Redirect;
 pub use res_finalizer::ResFinalizer;
 pub use route_match::RouteMatch;
 pub use state::{State, StateClean, StateGeneric, StateTest};
+#[cfg(feature = "std")]
+pub use static_files::StaticFiles;
 pub use verbatim_params::VerbatimParams;
 
 /// HTTP/2 Server Framework
@@ -207,7 +211,7 @@ mod uring {
       StatusCode,
       http2_server_framework::{
         Endpoint as _, EndpointNode, Http2ServerFramework, HttpRouter, Middleware, RouteMatch,
-        conn_driver::{Route, StreamDispatcher, drive_conn},
+        conn_driver::{AutoOutput, Route, StreamDispatcher, drive_conn},
       },
       misc::on_accept_error,
     },
@@ -432,7 +436,7 @@ mod uring {
     ER: From<crate::Error> + 'static,
     M: Middleware<DA, ER> + 'static,
   {
-    type AutoFut = impl Future<Output = (Request<MsgBufferString>, crate::Result<StatusCode>)>;
+    type AutoFut = impl Future<Output = AutoOutput>;
     type Matches = ArrayVectorCopy<RouteMatch, 4>;
 
     fn auto(
@@ -445,7 +449,7 @@ mod uring {
         (self.data.clone(), self.error_cb.clone(), self.peer, self.router.clone());
       async move {
         let Some(matches) = matches else {
-          return (req, Ok(StatusCode::NotFound));
+          return (req, None, Ok(StatusCode::NotFound));
         };
         let mut auto_stream = AutoStream::new(data, peer, protocol, req);
         let rslt = router.auto(&mut auto_stream, (0, &matches)).await;
@@ -456,7 +460,7 @@ mod uring {
             Err(crate::Error::ClosedHttpConnection)
           }
         };
-        (auto_stream.req, status)
+        (auto_stream.req, auto_stream.shared_body, status)
       }
     }
 

@@ -26,7 +26,7 @@ use crate::{
     Http2Error, Http2ErrorCode,
     common_flags::CommonFlags,
     conn::{
-      body::Body,
+      body::{Body, SharedBytes},
       decode_memo::{DecodeMemo, Decoded},
       header_cache::HeaderCache,
       output::Output,
@@ -416,11 +416,13 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     end_stream: bool,
   ) -> crate::Result<()> {
     let id = stream_id.u32();
-    let body_len = match &body {
+    // Shared bytes don't count toward the send queue: their memory is their owner's, whatever
+    // the number of streams that send them.
+    let owned_len = match &body {
       Body::Borrowed(elem) => elem.len(),
-      Body::Shared(elem) => elem.len(),
+      Body::Shared(_) => 0,
     };
-    self.check_send_queue(body_len)?;
+    self.check_send_queue(owned_len)?;
     let stream = self.streams.get_mut(id).ok_or(protocol_err(Http2Error::UnknownStreamReceiver))?;
     if stream.send_closed || stream.end_after_queue {
       return Err(protocol_err(Http2Error::InvalidSendStreamState));
@@ -430,7 +432,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     {
       return Ok(());
     }
-    self.streams.add_queued(body_len);
+    self.streams.add_queued(owned_len);
     let Some(stream) = self.streams.get_mut(id) else {
       return Ok(());
     };
@@ -523,9 +525,32 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     status: StatusCode,
     msg: &mut MsgBufferString,
   ) -> crate::Result<()> {
+    self.send_whole_response(stream_id, status, msg, None)
+  }
+
+  /// [`Self::send_response`] with `body`, sent by reference, in place of `msg.body`.
+  pub(crate) fn send_response_shared(
+    &mut self,
+    stream_id: U31,
+    status: StatusCode,
+    msg: &mut MsgBufferString,
+    body: SharedBytes,
+  ) -> crate::Result<()> {
+    self.send_whole_response(stream_id, status, msg, Some(body))
+  }
+
+  fn send_whole_response(
+    &mut self,
+    stream_id: U31,
+    status: StatusCode,
+    msg: &mut MsgBufferString,
+    shared: Option<SharedBytes>,
+  ) -> crate::Result<()> {
     let id = stream_id.u32();
-    let body_len = msg.body.len();
-    self.check_send_queue(body_len)?;
+    let body_len = shared.as_ref().map_or(msg.body.len(), SharedBytes::len);
+    if shared.is_none() {
+      self.check_send_queue(body_len)?;
+    }
     {
       let Self { header_buf, header_cache, hpack_enc, out, peer, streams, .. } = self;
       let stream = streams.get_mut(id).ok_or(protocol_err(Http2Error::UnknownStreamReceiver))?;
@@ -556,6 +581,8 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     }
     if body_len == 0 {
       self.after_send_closed(id);
+    } else if let Some(elem) = shared {
+      self.send_data(stream_id, Body::Shared(elem), true)?;
     } else {
       self.send_data(stream_id, Body::Borrowed(&msg.body), true)?;
     }
@@ -605,6 +632,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
           let bytes = stream.owned.get(start..start.wrapping_add(n)).unwrap_or_default();
           out.push_many(&[&fi.bytes(), bytes])?;
           stream.owned_read = start.wrapping_add(n);
+          queued_sent = queued_sent.wrapping_add(n);
         }
         SendItem::Shared(elem) => {
           let part = elem.slice(stream.front_sent, stream.front_sent.wrapping_add(n));
@@ -612,7 +640,6 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
           out.push_shared(part)?;
         }
       }
-      queued_sent = queued_sent.wrapping_add(n);
       let signed = i32::try_from(n).unwrap_or(i32::MAX);
       *conn_send = conn_send.wrapping_sub(signed);
       stream.send_window = stream.send_window.wrapping_sub(signed);
@@ -666,7 +693,8 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
   /// Fails when `additional` more bytes would put the output over `max_send_queue_len`.
   fn check_send_queue(&self, additional: usize) -> crate::Result<()> {
     let max = usize::try_from(self.hp.max_send_queue_len()).unwrap_or(usize::MAX);
-    let total = self.out.len().saturating_add(self.streams.queued()).saturating_add(additional);
+    let total =
+      self.out.owned_len().saturating_add(self.streams.queued()).saturating_add(additional);
     if total > max {
       return Err(crate::Error::Http2ErrorGoAway(
         Http2ErrorCode::EnhanceYourCalm,

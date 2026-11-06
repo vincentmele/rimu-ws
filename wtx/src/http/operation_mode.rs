@@ -1,4 +1,7 @@
-use crate::http::{MsgBufferString, Protocol, Request};
+use crate::{
+  http::{MsgBufferString, Protocol, Request},
+  misc::SharedBytes,
+};
 use core::net::IpAddr;
 
 /// Tells how an HTTP stream should be handled.
@@ -20,8 +23,10 @@ pub struct AutoStream<D> {
   pub peer: IpAddr,
   /// See [Protocol].
   pub protocol: Option<Protocol>,
-  /// Request
+  /// Request. A handler writes the response into its buffers.
   pub req: Request<MsgBufferString>,
+  /// A response body sent by reference instead of `req`'s body, which is then ignored.
+  pub shared_body: Option<SharedBytes>,
 }
 
 impl<D> AutoStream<D> {
@@ -33,7 +38,7 @@ impl<D> AutoStream<D> {
     protocol: Option<Protocol>,
     req: Request<MsgBufferString>,
   ) -> Self {
-    Self { data, peer, protocol, req }
+    Self { data, peer, protocol, req, shared_body: None }
   }
 }
 

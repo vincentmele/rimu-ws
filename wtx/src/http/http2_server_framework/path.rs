@@ -62,7 +62,7 @@ where
   }
 }
 
-fn manage_path<'uri>(
+pub(crate) fn manage_path<'uri>(
   path_defs: (u8, &[RouteMatch]),
   uri: &'uri UriString,
 ) -> crate::Result<&'uri str> {

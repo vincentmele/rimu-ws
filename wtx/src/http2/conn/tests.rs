@@ -752,3 +752,62 @@ fn conn_decode_memo_follows_table_changes() {
   assert_eq!(authority(&mut conn, id), "b");
   assert_eq!(conn.decode_memo_hits(), 1);
 }
+
+#[test]
+fn conn_response_shared_body() {
+  let mut conn = ready_server(HttpRecvParams::with_default_params());
+  let _ = conn.feed(&settings(&[(4, 1 << 20)])).unwrap();
+  let _ = conn.feed(&frame(WINDOW_UPDATE, 0, 0, &(1u32 << 20).to_be_bytes())).unwrap();
+  let _ = conn.feed(&headers_req(1, "GET", "/", &[], true)).unwrap();
+  let _ = take_output(&mut conn);
+  let id = U31::from_u32(1);
+  let shared = SharedBytes::new(Arc::from(vec![7u8; 40 * 1024].into_boxed_slice()));
+  let range = shared.as_slice().as_ptr_range();
+  let mut msg = MsgBufferString::default();
+  msg.headers.push_from_iter(Header::from_name_and_value("content-type", ["text/css"])).unwrap();
+  conn.send_response_shared(id, StatusCode::Ok, &mut msg, shared).unwrap();
+  assert_eq!(msg.headers.headers_len(), 0);
+  let mut slices = ArrayVectorCopy::<&[u8], 16>::new();
+  conn.output(&mut slices);
+  assert!(slices.iter().any(|el| range.contains(&el.as_ptr())));
+  let frames = take_frames(&mut conn);
+  assert_eq!(frames[0].0, HEADERS, "{frames:?}");
+  let fields = decode_block(&mut response_decoder(), &frames[0].3);
+  assert!(fields.contains(&("content-type".into(), "text/css".into())), "{fields:?}");
+  assert!(fields.contains(&("content-length".into(), "40960".into())), "{fields:?}");
+  let data_frames: Vec<_> = frames.iter().filter(|el| el.0 == DATA).collect();
+  assert_eq!(data_frames.iter().map(|el| el.3.len()).collect::<Vec<_>>(), [16384, 16384, 8192]);
+  assert!(data_frames.iter().all(|el| el.3.iter().all(|byte| *byte == 7)));
+  assert_eq!(data_frames.last().unwrap().1 & 1, 1);
+  assert_eq!(conn.open_streams(), 0);
+}
+
+#[test]
+fn conn_shared_bodies_do_not_count_toward_the_send_queue() {
+  let shared = SharedBytes::new(Arc::from(vec![1u8; 4000].into_boxed_slice()));
+  let own_response = |conn: &mut Http2Conn<false>, id: u32| {
+    conn.feed(&headers_req(id, "GET", "/", &[], true)).unwrap();
+    let mut msg = MsgBufferString::default();
+    msg.body.extend_from_copyable_slice(&[1; 600]).unwrap();
+    conn.send_response(U31::from_u32(id), StatusCode::Ok, &mut msg)
+  };
+  // Closed windows: the shared bodies wait on their streams. Open ones: they wait in the output.
+  for window in [0, 1 << 20] {
+    let hp = HttpRecvParams::with_default_params().set_max_send_queue_len(1000);
+    let mut conn = ready_server(hp);
+    conn.feed(&settings(&[(4, window)])).unwrap();
+    conn.feed(&frame(WINDOW_UPDATE, 0, 0, &(1u32 << 20).to_be_bytes())).unwrap();
+    let _ = take_output(&mut conn);
+    for id in (1..20).step_by(2) {
+      conn.feed(&headers_req(id, "GET", "/", &[], true)).unwrap();
+      let mut msg = MsgBufferString::default();
+      conn.send_response_shared(U31::from_u32(id), StatusCode::Ok, &mut msg, shared.clone()).unwrap();
+    }
+    assert!(conn.has_output());
+    own_response(&mut conn, 21).unwrap();
+    // Own bytes still count: with closed windows the first 600 are still queued.
+    if window == 0 {
+      assert!(own_response(&mut conn, 23).is_err());
+    }
+  }
+}

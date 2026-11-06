@@ -513,3 +513,27 @@ fn wrong_paths() {
   assert!(builder.add(&"foo".try_into().unwrap(), 1).is_err());
   assert!(builder.add(&"bar".try_into().unwrap(), 2).is_err());
 }
+
+#[test]
+fn router_catch_all_segment() {
+  let mut matcher = Router::default();
+  {
+    let mut builder = matcher.builder();
+    let _ = builder.add(&"/static/{*file}".try_into().unwrap(), 1).unwrap();
+    let _ = builder.add(&"/static/index".try_into().unwrap(), 2).unwrap();
+    let _ = builder.add(&"/user/{id}".try_into().unwrap(), 3).unwrap();
+  }
+  let found = matcher.find("/static/a/b.css").unwrap();
+  assert_eq!(found.data(), &1);
+  assert_eq!(found.param_by_name(b"file").unwrap(), RouterMatchParam::new("file", "a/b.css"));
+  assert_eq!(matcher.find("/static/x").unwrap().param_by_idx(0).unwrap().value, "x");
+  assert_eq!(matcher.find("/static/index").unwrap().data(), &2);
+  assert_eq!(matcher.find("/static//etc").unwrap().param_by_idx(0).unwrap().value, "/etc");
+  assert!(matcher.find("/static/").is_err());
+  assert_eq!(matcher.find("/user/7").unwrap().data(), &3);
+  assert!(matcher.find("/user/7/x").is_err());
+
+  let mut matcher = Router::<i32>::default();
+  let mut builder = matcher.builder();
+  assert!(builder.add(&"/a/{*rest}/b".try_into().unwrap(), 1).is_err());
+}

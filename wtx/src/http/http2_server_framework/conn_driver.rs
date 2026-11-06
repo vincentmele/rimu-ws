@@ -17,6 +17,7 @@ use crate::{
     conn::{ConnEvent, Http2Conn},
     server_stream::ConnShared,
   },
+  misc::SharedBytes,
   net::{StreamReader, StreamWriter, TryRead},
 };
 use alloc::{rc::Rc, vec::Vec};
@@ -34,11 +35,15 @@ use hashbrown::{HashMap, HashSet};
 /// The read buffer grows in steps of this many bytes.
 const READ_CHUNK: usize = 16 * 1024;
 
+/// What an automatic handler gives back: the request with the response written into its buffers
+/// (headers and body), a body sent by reference in place of the written one, and the status.
+pub(crate) type AutoOutput =
+  (Request<MsgBufferString>, Option<SharedBytes>, crate::Result<StatusCode>);
+
 /// Turns requests into handler futures.
 pub(crate) trait StreamDispatcher {
-  /// Answers a request. It owns the request and gives it back with the response written into
-  /// its buffers (headers and body) and the response status.
-  type AutoFut: Future<Output = (Request<MsgBufferString>, crate::Result<StatusCode>)>;
+  /// Answers a request. It owns the request and gives it back with the response.
+  type AutoFut: Future<Output = AutoOutput>;
   /// What a route lookup found, handed back to `auto` or `manual` so a path is looked up once.
   type Matches: Copy;
 
@@ -115,7 +120,7 @@ struct Driver<F, MT> {
 
 impl<F, MT> Driver<F, MT>
 where
-  F: Future<Output = (Request<MsgBufferString>, crate::Result<StatusCode>)>,
+  F: Future<Output = AutoOutput>,
   MT: Copy,
 {
   async fn run<S, D>(&mut self, stream: &mut S, dispatcher: &D) -> crate::Result<()>
@@ -361,7 +366,7 @@ where
     let stream_id = U31::from_u32(id);
     match self.slots.poll(idx) {
       SlotPoll::Pending => Ok(()),
-      SlotPoll::Done((req, rslt)) => {
+      SlotPoll::Done((req, shared, rslt)) => {
         let mut msg = req.msg_data;
         let status = match rslt {
           Ok(elem) => elem,
@@ -370,10 +375,11 @@ where
             StatusCode::InternalServerError
           }
         };
-        self.respond(conn, stream_id, status, msg)
+        self.respond(conn, stream_id, status, msg, shared)
       }
       SlotPoll::Panicked => {
-        self.respond(conn, stream_id, StatusCode::InternalServerError, MsgBufferString::default())
+        let msg = MsgBufferString::default();
+        self.respond(conn, stream_id, StatusCode::InternalServerError, msg, None)
       }
     }
   }
@@ -384,14 +390,19 @@ where
     stream_id: U31,
     status: StatusCode,
     mut msg: MsgBufferString,
+    mut shared: Option<SharedBytes>,
   ) -> crate::Result<()> {
     if status == StatusCode::InternalServerError {
       msg.headers.clear();
       msg.body.clear();
+      shared = None;
     }
     let date: &str = KnownHeaderName::Date.into();
     msg.headers.push_from_iter(Header::from_name_and_value(date, [self.date.as_str()]))?;
-    let rslt = conn.send_response(stream_id, status, &mut msg);
+    let rslt = match shared {
+      Some(body) => conn.send_response_shared(stream_id, status, &mut msg, body),
+      None => conn.send_response(stream_id, status, &mut msg),
+    };
     msg.clear();
     body_pool_give(mem::take(&mut msg.body));
     let _ = self.pool.push(msg);

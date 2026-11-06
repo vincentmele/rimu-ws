@@ -74,6 +74,45 @@ pub enum Mime {
 }
 
 impl Mime {
+  /// The type of a file by its extension, without the dot and in any case. `None` for an
+  /// extension outside the table.
+  #[inline]
+  pub fn from_extension(ext: &str) -> Option<Self> {
+    let mut buffer = [0u8; 8];
+    let lower = buffer.get_mut(..ext.len())?;
+    lower.copy_from_slice(ext.as_bytes());
+    lower.make_ascii_lowercase();
+    Some(match &*lower {
+      b"avif" => Self::ImageAvif,
+      b"css" => Self::TextCss,
+      b"csv" => Self::TextCsv,
+      b"gif" => Self::ImageGif,
+      b"htm" | b"html" => Self::TextHtml,
+      b"ico" => Self::ImageXIcon,
+      b"jpeg" | b"jpg" => Self::ImageJpeg,
+      b"js" | b"mjs" => Self::TextJavascript,
+      b"json" | b"map" => Self::ApplicationJson,
+      b"md" => Self::TextMarkdown,
+      b"mp3" => Self::AudioMpeg,
+      b"mp4" => Self::VideoMp4,
+      b"mpeg" => Self::VideoMpeg,
+      b"oga" | b"ogg" => Self::AudioOgg,
+      b"pdf" => Self::ApplicationPdf,
+      b"png" => Self::ImagePng,
+      b"svg" => Self::ImageSvgXml,
+      b"txt" => Self::TextPlain,
+      b"wasm" => Self::ApplicationWasm,
+      b"webm" => Self::VideoWebm,
+      b"webp" => Self::ImageWebp,
+      b"woff" => Self::FontWoff,
+      b"woff2" => Self::FontWoff2,
+      b"xml" => Self::ApplicationXml,
+      b"yaml" | b"yml" => Self::ApplicationYaml,
+      b"zip" => Self::ApplicationZip,
+      _ => return None,
+    })
+  }
+
   /// Common string representation.
   #[inline]
   pub fn as_str(&self) -> &'static str {
@@ -115,5 +154,21 @@ impl Mime {
       Self::VideoMpeg => "video/mpeg",
       Self::VideoWebm => "video/webm",
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use crate::http::Mime;
+
+  #[test]
+  fn mime_from_extension() {
+    assert_eq!(Mime::from_extension("css"), Some(Mime::TextCss));
+    assert_eq!(Mime::from_extension("JS"), Some(Mime::TextJavascript));
+    assert_eq!(Mime::from_extension("woff2"), Some(Mime::FontWoff2));
+    assert_eq!(Mime::from_extension("json"), Some(Mime::ApplicationJson));
+    assert_eq!(Mime::from_extension("tar"), None);
+    assert_eq!(Mime::from_extension("averyverylongext"), None);
+    assert_eq!(Mime::from_extension(""), None);
   }
 }

@@ -42,7 +42,7 @@ use std::{
 };
 
 pub(crate) type Frames = Vec<(u8, u8, u32, Vec<u8>)>;
-type AutoOut = (Request<MsgBufferString>, crate::Result<StatusCode>);
+type AutoOut = super::AutoOutput;
 
 const DATA: u8 = 0;
 const HEADERS: u8 = 1;
@@ -95,7 +95,7 @@ impl StreamDispatcher for TestDispatcher {
       };
       req.msg_data.body.clear();
       req.msg_data.body.extend_from_copyable_slice(&body).unwrap();
-      (req, Ok(StatusCode::Ok))
+      (req, None, Ok(StatusCode::Ok))
     })
   }
 }
