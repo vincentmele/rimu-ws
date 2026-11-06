@@ -251,3 +251,22 @@ parsed URI (`Uri::copy_from`) instead of re-parsing it (`Uri::process`, `memchr`
 | bounded scan + URI copy | 5,999k, 5,960k | 2,975, 2,974 | 1,175k, 1,179k | 25,606, 25,418 |
 
 baseline-h2c −13% cycles; throughput is h2load-bound at about 6.0M.
+
+### Floats without scaling, and a send pool sized for many connections
+
+- **Whole-number floats.** They print as `N.0` without the cents multiply and divide. Digits go
+  straight into the buffer, two at a time. json-h2c 1024: 25.5k → 23.1k cycles/req, 1.18M →
+  1.21–1.22M rps (two interleaved rounds).
+- **Short `raw` copies as fixed moves, constant literals in `write_json`.** No gain (23.1k →
+  23.5k). Reverted.
+- **Send pool 16 → 64, and a presized buffer when it is empty.** A frame-pointer profile put
+  3.4% of json-h2c in `Output::push_many` → `realloc` → `memmove`. With about 85 connections per
+  thread, more sends are in flight than 16 pooled buffers cover, and the connections that found
+  the pool empty grew a fresh buffer by doubling. On a box loaded by another workload, json-h2c
+  1024 went 23.3k/23.7k → 22.8k/22.0k cycles/req, 4096 was level, and baseline 3.08k → 3.02k.
+  Kept: the profile shows the copies gone. Cost: up to 64 pooled buffers per thread, about 7 MB
+  at json-h2c's output sizes (Task 13 checks memory bounds).
+- **What is left in json-h2c.** The kernel's send path takes about 21%: page zeroing for socket
+  buffers (`init_on_alloc`) and the copy into the socket. Zero-copy send does not help over
+  loopback, where HttpArena's load runs, since the kernel copies anyway. JSON generation takes
+  about 30%, and the body copy into the output about 2%.

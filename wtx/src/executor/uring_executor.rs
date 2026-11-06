@@ -63,8 +63,10 @@ const TLS_ALERT_PENDING: u8 = 4;
 // `tx_inflight` came from `try_send_owned`: its buffer goes to `Reactor::send_pool` once sent
 const TX_OWNED: u8 = 8;
 // Sent buffers kept for `try_send_owned` to hand out, most recently used first, so the ones a
-// thread writes into stay in its caches. Bigger buffers are freed.
-const SEND_POOL_MAX: usize = 16;
+// thread writes into stay in its caches. Bigger buffers are freed. With many connections more
+// sends are in flight than a small pool holds, and the connections that found it empty grew
+// fresh buffers by doubling, copying at each step.
+const SEND_POOL_MAX: usize = 64;
 const SEND_POOL_BUFFER_MAX: usize = 1 << 20;
 // A free slot keeps a buffer up to this capacity for the next connection, and drops a larger one.
 const SLOT_BUFFER_KEEP: usize = 64 * 1024;
@@ -2784,7 +2786,13 @@ impl Reactor {
       if bytes.is_empty() {
         return Ok(true);
       }
-      let spare = self.send_pool.borrow_mut().pop().unwrap_or_default();
+      // With the pool empty, the next output is likely as big as this one: room for it up front
+      // instead of growth by doubling.
+      let spare = self
+        .send_pool
+        .borrow_mut()
+        .pop()
+        .unwrap_or_else(|| Vec::with_capacity(bytes.len().min(SEND_POOL_BUFFER_MAX)));
       let idle = core::mem::replace(&mut conn.tx_inflight, core::mem::replace(bytes, spare));
       self.recycle_send_buffer(idle);
       conn.activity |= TX_OWNED;
