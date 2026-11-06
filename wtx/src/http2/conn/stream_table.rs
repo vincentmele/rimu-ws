@@ -371,6 +371,12 @@ impl StreamTable {
     true
   }
 
+  /// Slots allocated so far, open or free.
+  #[cfg(test)]
+  pub(crate) fn slots_len(&self) -> usize {
+    self.slots.len()
+  }
+
   /// Every open stream.
   pub(crate) fn iter(&self) -> impl Iterator<Item = &Stream> {
     self.slots.iter().filter(|el| el.live)

@@ -1010,3 +1010,39 @@ fn conn_idle_output_buffer_taken_back() {
   assert_eq!(slices[0].as_ptr(), ptr);
 }
 
+// With an event budget, feeding stops at the frame that reaches it, so a server can answer a few
+// requests before it decodes the next ones.
+#[test]
+fn conn_feed_some_stops_at_the_event_budget() {
+  let mut conn = ready_server(HttpRecvParams::with_default_params());
+  let first = headers_req(1, "GET", "/", &[], true);
+  let mut input = first.clone();
+  input.extend(headers_req(3, "GET", "/", &[], true));
+  input.extend(headers_req(5, "GET", "/", &[], true));
+  assert_eq!(conn.feed_some_at(&input, Duration::ZERO, 1).unwrap(), first.len());
+  assert_eq!(events(&mut conn).len(), 1);
+  let rest = input.get(first.len()..).unwrap();
+  assert_eq!(conn.feed_some_at(rest, Duration::ZERO, usize::MAX).unwrap(), rest.len());
+  assert_eq!(events(&mut conn).len(), 2);
+}
+
+// Answered between feeds, each request opens the slot the previous one freed: a batch of requests
+// keeps one stream slot, still in cache, instead of one cold slot per request.
+#[test]
+fn conn_requests_answered_between_feeds_share_a_slot() {
+  let mut conn = ready_server(HttpRecvParams::with_default_params());
+  let mut input = Vec::new();
+  for idx in 0..10u32 {
+    input.extend(headers_req(2 * idx + 1, "GET", "/", &[], true));
+  }
+  let mut offset = 0;
+  while offset < input.len() {
+    offset += conn.feed_some_at(input.get(offset..).unwrap(), Duration::ZERO, 1).unwrap();
+    for event in events(&mut conn) {
+      let ConnEvent::Headers { stream_id, .. } = event else { continue };
+      let mut msg = MsgBufferString::default();
+      conn.send_response(stream_id, StatusCode::Ok, &mut msg).unwrap();
+    }
+  }
+  assert_eq!(conn.stream_slots(), 1);
+}

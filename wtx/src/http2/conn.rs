@@ -245,6 +245,18 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
   /// [`Self::feed`] with the time the bytes arrived, which the rate limits count against. Any
   /// clock that only moves forward works.
   pub(crate) fn feed_at(&mut self, input: &[u8], now: Duration) -> crate::Result<usize> {
+    self.feed_some_at(input, now, usize::MAX)
+  }
+
+  /// [`Self::feed_at`] that stops after the frame which brings the queued events to
+  /// `max_events`, so a server can answer a few requests before decoding the next: their stream
+  /// slots and buffers are then reused while still in cache. Returns the bytes consumed.
+  pub(crate) fn feed_some_at(
+    &mut self,
+    input: &[u8],
+    now: Duration,
+    max_events: usize,
+  ) -> crate::Result<usize> {
     self.now = self.now.max(now);
     if self.fatal {
       return Err(protocol_err(Http2Error::UnknownStreamReceiver));
@@ -268,6 +280,10 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
           consumed = consumed.wrapping_add(len);
           if let Err(err) = self.on_frame(fi, payload) {
             return self.conn_error(err);
+          }
+          if self.events.len() >= max_events {
+            // The rest comes in a later call, which announces the window once.
+            return Ok(consumed);
           }
         }
         Err(err) => return self.conn_error(err),
@@ -818,6 +834,12 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
   #[cfg(test)]
   pub(crate) const fn hpack_generation(&self) -> u64 {
     self.hpack_enc.generation()
+  }
+
+  /// Stream slots allocated so far, open or free.
+  #[cfg(test)]
+  pub(crate) fn stream_slots(&self) -> usize {
+    self.streams.slots_len()
   }
 
   /// Request header blocks replayed from the decode memo.
