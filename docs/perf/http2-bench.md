@@ -270,3 +270,53 @@ baseline-h2c −13% cycles; throughput is h2load-bound at about 6.0M.
   buffers (`init_on_alloc`) and the copy into the socket. Zero-copy send does not help over
   loopback, where HttpArena's load runs, since the kernel copies anyway. JSON generation takes
   about 30%, and the body copy into the output about 2%.
+
+### json-h2c after Task 10A: integers, the writer's cursor, and the kernel's copy
+
+The kernel cost noted above was mostly ours, not the kernel's. With plod measured the same way
+(perf stat on the server CPUs, json-h2c 1024), our server spent 16–18k kernel cycles per request
+against plod's 5.7–6.1k. A profile of each put the whole difference in two functions: page
+zeroing (`kernel_init_pages`, 14.6% of samples against plod's 5.8%) and the copy into the socket
+(`_copy_from_iter`, 11.9% against 1.6%). Both servers allocate a fresh socket page per 32 KiB
+sent (0.12 against 0.11 page allocations per request), so the number of pages is the same; ours
+were slower to zero and to fill because the bytes the kernel copied were no longer in the cache.
+
+- **The dataset's numbers are integers.** HttpArena made every dataset field an integer, and `m`
+  is one. The entry read price, quantity and score as `f64` and wrote `328.0` for `328`: 4.6%
+  more body bytes than the reference sizes the rules list, (1,3) 203 B to (50,6) 8397 B. Now
+  `i64`, and a test pins the seven sizes. The bodies are byte for byte plod's. json-h2c 1024:
+  1.21M → 1.30M rps, 22k → 20.2k user cycles per request.
+- **The writer keeps its cursor in registers.** `JsonWriter` holds the vector's pointer, length
+  and capacity in its own fields and stores the length back on drop. Each byte stored through the
+  vector's pointer could alias the vector's fields, so before, the compiler reloaded them after
+  every piece. Integers below 10^4 are written inline. A short piece whose length is only known
+  at run time takes fixed-size moves, not a `memcpy` call. `end_seq` closes a list written with
+  trailing commas, so items need no first-element branch. User cycles per request 20.4k → 17.3k,
+  but throughput stayed at about 1.30M: the server's user time was no longer the limit.
+- **Sends are submitted once a turn has queued 128 KiB of them** (`UringParams::
+  set_send_submit_bytes`). A busy turn wrote output for about 85 connections per thread and
+  submitted it all at its end, by which time the first buffers were out of the caches.
+  `_copy_from_iter` fell from 11.9% to 3.1%, kernel cycles per request from 17.9k to about 12k.
+  Thresholds from 64 KiB to 512 KiB measure the same.
+- **Completions are taken right after such a submit.** Sends that complete inside the submit have
+  already posted their completions. Reaping them at once puts their buffers back in the send pool
+  while they are still in the cache, so the next connections of the turn write into those
+  buffers, much as plod reuses one 64 KiB buffer. A re-entry flag keeps a send started from
+  `reap` from reaping again.
+
+A/B, native, interleaved:
+
+| build | json-h2c 1024 rps | user cycles/req |
+|---|---|---|
+| integers | 1,296k, 1,336k | 20,543, 20,353 |
+| + writer cursor | 1,311k, 1,309k | 17,088, 17,501 |
+| + early submit | 1,491k, 1,529k | 18,524, 17,921 |
+| + reap after it | 1,576k, 1,597k | 17,719, 17,201 |
+
+plod measured the same way, in the same windows: 1,454k, 1,444k–1,488k.
+
+Early submit, other profiles: json-h2c 4096 1,276k → 1,309k; baseline-h2c 256 5,969k → 5,952k,
+baseline-h2 256 5,528k → 5,513k and baseline-h2c 4096 4,197k → 4,251k, all h2load-bound at 100%.
+
+What is left on json-h2c 1024: page zeroing is still 13.5% of samples against plod's 5.8%, for
+the same number of pages, and `write_json` with the body copy into the output about 35%.

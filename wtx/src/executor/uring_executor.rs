@@ -418,6 +418,16 @@ impl Runtime for UringRuntime {
   }
 }
 
+/// Clears a flag when dropped, so a panic doesn't leave it set.
+struct ClearOnDrop<'flag>(&'flag Cell<bool>);
+
+impl Drop for ClearOnDrop<'_> {
+  #[inline]
+  fn drop(&mut self) {
+    self.0.set(false);
+  }
+}
+
 struct RestoreCurrent(*const Reactor);
 
 impl Drop for RestoreCurrent {
@@ -1623,6 +1633,8 @@ struct Reactor {
   send_pool: RefCell<Vec<Vec<u8>>>,
   // Bytes of the sends queued since the last submit (see `UringParams::set_send_submit_bytes`)
   send_queued: Cell<usize>,
+  // Set while `reap` runs: a send it starts doesn't reap again from inside it
+  reaping: Cell<bool>,
   tasks: RefCell<Vec<TaskSlot>>,
   timers: RefCell<Timers>,
 }
@@ -1755,6 +1767,7 @@ impl Reactor {
       ring_failed: Cell::new(0),
       send_pool: RefCell::new(Vec::new()),
       send_queued: Cell::new(0),
+      reaping: Cell::new(false),
       ready: RefCell::new(VecDeque::new()),
       tasks: RefCell::new(Vec::new()),
       timers: RefCell::new(timers),
@@ -2245,6 +2258,8 @@ impl Reactor {
   }
 
   fn reap(&self) {
+    self.reaping.set(true);
+    let _reaping = ClearOnDrop(&self.reaping);
     let mut cqes = self.cqes.borrow_mut();
     cqes.clear();
     {
@@ -2855,6 +2870,11 @@ impl Reactor {
   /// Counts `len` more bytes queued for sending and, once those queued since the last submit
   /// reach `send_submit_bytes`, submits them now: the kernel copies them while they are still in
   /// the cache. A failed submit leaves them queued for the end of the turn.
+  ///
+  /// Sends that complete inside the submit have posted their completions already. Taking them at
+  /// once returns their buffers to `send_pool` while those are still in the cache, so the next
+  /// outputs of the turn are written into them, as into one reused buffer, rather than into
+  /// buffers recycled at the end of an earlier turn.
   #[inline]
   fn count_queued_send(&self, len: usize) {
     let queued = self.send_queued.get().saturating_add(len);
@@ -2865,6 +2885,9 @@ impl Reactor {
     self.send_queued.set(0);
     if self.ring.borrow_mut().submit().is_err() {
       bump(&self.counters.submit_errors);
+    }
+    if !self.reaping.get() {
+      self.reap();
     }
   }
 
@@ -4380,6 +4403,36 @@ mod tests {
       client.join().unwrap();
       assert_eq!(arrived, expected, "threshold {threshold}, {len} bytes");
     }
+  }
+
+  // A send that completes inside an early submit gives its buffer back at once, so the next
+  // output of the same turn is written into that buffer, still in the cache, instead of one
+  // recycled at the end of an earlier turn.
+  #[test]
+  fn a_buffer_sent_early_is_reused_within_the_turn() {
+    use crate::net::StreamWriter;
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let client = std::thread::spawn(move || {
+      let _stream = connect(&client_addr);
+      let _rslt = done_rx.recv();
+    });
+    let params = crate::executor::UringParams::new().set_send_submit_bytes(1000);
+    let runtime = UringRuntime::with_params(params).unwrap();
+    let (first, reused) = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+      let mut bytes = alloc::vec![1; 2000];
+      let first = bytes.as_ptr();
+      assert!(stream.try_send_owned(&mut bytes).unwrap());
+      let mut next = alloc::vec![2; 10];
+      assert!(stream.try_send_owned(&mut next).unwrap());
+      (first, next.as_ptr())
+    });
+    let _rslt = done_tx.send(());
+    client.join().unwrap();
+    assert_eq!(first, reused, "the second send's spare is not the first send's buffer");
   }
 
   // A connection that moved megabytes each way gives its buffers back when it is closed: its
