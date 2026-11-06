@@ -402,6 +402,11 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     if stream.send_closed || stream.end_after_queue {
       return Err(protocol_err(Http2Error::InvalidSendStreamState));
     }
+    if let Body::Borrowed(bytes) = &body
+      && self.send_now(id, bytes, end_stream)?
+    {
+      return Ok(());
+    }
     self.streams.add_queued(body_len);
     let Some(stream) = self.streams.get_mut(id) else {
       return Ok(());
@@ -422,6 +427,39 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     stream.end_after_queue = end_stream;
     let _ = self.flush_stream(id)?;
     Ok(())
+  }
+
+  /// The common case of [`Self::send_data`]: nothing is queued on the stream and the windows take
+  /// all of `bytes`, so its DATA frames go straight to the output without a copy into the
+  /// stream's queue. Returns whether it did.
+  fn send_now(&mut self, id: u32, bytes: &[u8], end_stream: bool) -> crate::Result<bool> {
+    let Self { conn_send, out, peer, streams, .. } = self;
+    let Some(stream) = streams.get_mut(id) else {
+      return Ok(false);
+    };
+    let len = i32::try_from(bytes.len()).unwrap_or(i32::MAX);
+    let fits = (*conn_send).min(stream.send_window) >= len;
+    if !fits || bytes.is_empty() || stream.send_queue.len() > 0 || stream.trailers.is_some() {
+      return Ok(false);
+    }
+    let max_frame_len = usize::try_from(peer.max_frame_len).unwrap_or(usize::MAX).max(1);
+    let mut chunks = bytes.chunks(max_frame_len).peekable();
+    while let Some(chunk) = chunks.next() {
+      let mut cf = CommonFlags::empty();
+      if end_stream && chunks.peek().is_none() {
+        cf.set_eos();
+      }
+      let frame_len = u32::try_from(chunk.len()).unwrap_or(u32::MAX);
+      let fi = FrameInit::new(cf, frame_len, U31::from_u32(id), FrameInitTy::Data);
+      out.push_many(&[&fi.bytes(), chunk])?;
+    }
+    *conn_send = conn_send.wrapping_sub(len);
+    stream.send_window = stream.send_window.wrapping_sub(len);
+    if end_stream {
+      stream.send_closed = true;
+      self.after_send_closed(id);
+    }
+    Ok(true)
   }
 
   /// Sends `trailers`, which end the stream, after the queued body.

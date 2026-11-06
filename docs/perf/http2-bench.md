@@ -153,3 +153,17 @@ Dockerfile does (`.scripts/h2-bench.sh` defaults to `target-h2-native`).
   that working set is hundreds of megabytes, so every copy misses cache. Steps 3 and 4 remove
   those copies. Floats (`zmij`, about 37 cycles each, 200 a response) and string escaping are
   next after that.
+
+### Step 4a: DATA straight from the handler's buffer
+
+When nothing is queued on the stream and the windows take the whole body, `send_data` writes the
+DATA frames from the borrowed body straight into the output, without the copy into the stream's
+queue. A/B, native, interleaved:
+
+| build | json-h2c 1024 rps | cycles/req | baseline-h2c 256 rps | cycles/req |
+|---|---|---|---|---|
+| before | 590k, 583k | 62,205, 61,784 | 5,205k | 5,932 |
+| direct DATA | 703k, 717k | 48,422, 48,264 | 5,385k | 5,516 |
+
+json-h2c: −22% cycles, +21% throughput. Each body copy costs this much because the buffers are
+per connection and cold (see Step 2).
