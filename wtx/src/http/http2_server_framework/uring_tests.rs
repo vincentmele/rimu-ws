@@ -148,3 +148,70 @@ fn framework_manual_error_answers_500() {
   let frames = client.read_until(Duration::from_secs(5), |frames| ended(frames).contains(&1));
   assert_eq!(status_of(&frames, 1), Some(0x8e), "{frames:?}");
 }
+
+// After a warm-up, a stream of GETs to an auto endpoint allocates nothing on the server's thread
+// (viltrum gates this in CI).
+#[test]
+fn server_steady_state_no_alloc() {
+  use crate::{
+    executor::{UringParams, UringRuntime},
+    http::http2_server_framework::{StateClean, VerbatimParams, get},
+    tests::{_ALLOCATIONS, _count_allocations},
+  };
+  use core::sync::atomic::Ordering;
+  async fn ok(state: StateClean<'_, ()>) -> crate::Result<VerbatimParams> {
+    state.req.msg_data.body.extend_from_copyable_slice(b"ok")?;
+    Ok(VerbatimParams(StatusCode::Ok))
+  }
+  fn runtime() -> crate::Result<UringRuntime> {
+    _count_allocations();
+    UringRuntime::with_params(UringParams::default())
+  }
+  let uri = _uri();
+  let addr = String::from(uri.hostname_with_implied_port().0) + ":" + &uri.port().unwrap().to_string();
+  let server_addr = addr.clone();
+  let _jh = std::thread::spawn(move || {
+    let router = HttpRouter::paths(crate::paths!(("/ok", get(ok)))).unwrap();
+    Http2ServerFramework::<(), fn(crate::Error), UringExecutor, _, _, _>::new(
+      UringExecutor::default(),
+      ChaCha20::from_std_random().unwrap(),
+      TlsConfig::plaintext(),
+    )
+    .unwrap()
+    .set_http_recv_params(HttpRecvParams::with_default_params())
+    .set_local_runtime_cb(runtime as fn() -> crate::Result<UringRuntime>)
+    .set_local_runtimes(NonZeroUsize::new(1))
+    .set_tcp_params(TcpParams::default().set_reuse_port(Some(false)))
+    .run_in_threads(&server_addr, router)
+    .unwrap();
+  });
+  for _ in 0..200 {
+    if std::net::TcpStream::connect(&addr).is_ok() {
+      break;
+    }
+    std::thread::sleep(Duration::from_millis(10));
+  }
+  let mut client = Client::connect(&addr, &[]);
+  let mut next_id = 1u32;
+  let mut round = |client: &mut Client, len: u32| {
+    let mut batch = vec::Vec::new();
+    let first = next_id;
+    for _ in 0..len {
+      batch.extend(headers_req(next_id, "GET", "/ok", &[], true));
+      next_id += 2;
+    }
+    client.send(&batch);
+    let frames = client.read_until(Duration::from_secs(5), |frames| ended(frames).len() == len as usize);
+    assert_eq!(ended(&frames).len(), len as usize, "from stream {first}");
+  };
+  // The warm-up runs at the measured concurrency, so every stream slot has its buffers.
+  for _ in 0..5 {
+    round(&mut client, 50);
+  }
+  let before = _ALLOCATIONS.load(Ordering::Relaxed);
+  for _ in 0..20 {
+    round(&mut client, 50);
+  }
+  let after = _ALLOCATIONS.load(Ordering::Relaxed);
+  assert_eq!(after - before, 0, "allocations on the server thread for 1000 requests");
+}

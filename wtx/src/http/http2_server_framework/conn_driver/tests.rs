@@ -146,6 +146,14 @@ impl StreamWriter for Counting {
     }
     Ok(rslt)
   }
+
+  fn try_send_owned(&mut self, bytes: &mut Vec<u8>) -> crate::Result<bool> {
+    let rslt = self.inner.try_send_owned(bytes)?;
+    if rslt {
+      self.writes.set(self.writes.get() + 1);
+    }
+    Ok(rslt)
+  }
 }
 
 struct Served {

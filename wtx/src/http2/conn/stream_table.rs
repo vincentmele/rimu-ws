@@ -23,7 +23,6 @@ impl SendItem {
     }
   }
 }
-use hashbrown::HashMap;
 
 /// One open stream.
 #[derive(Debug)]
@@ -44,6 +43,8 @@ pub(crate) struct Stream {
   pub(crate) recv_window: i32,
   /// The initial HEADERS have arrived (later HEADERS are trailers).
   pub(crate) recv_headers: bool,
+  /// The slot holds an open stream.
+  pub(crate) live: bool,
   /// We sent END_STREAM.
   pub(crate) send_closed: bool,
   /// We sent the initial HEADERS.
@@ -82,6 +83,7 @@ impl Stream {
       recv_closed: false,
       recv_window: 0,
       recv_headers: false,
+      live: false,
       send_closed: false,
       send_headers: false,
       send_window: 0,
@@ -127,13 +129,130 @@ impl Stream {
   }
 }
 
+/// Stream id → slot. Open addressing on `id >> 1` with linear probing and backward-shift
+/// deletion: a peer's ids are consecutive odd (or even) numbers, so open streams land in
+/// consecutive buckets and a lookup is usually one probe. Key 0 marks an empty bucket (stream 0
+/// is the connection). It allocates only to grow.
+#[derive(Debug)]
+struct IdIndex {
+  /// (stream id, slot) pairs; the length is 0 or a power of two.
+  entries: VectorUsize<(u32, u32)>,
+  len: usize,
+}
+
+impl IdIndex {
+  const fn new() -> Self {
+    Self { entries: VectorUsize::new(), len: 0 }
+  }
+
+  #[inline]
+  fn get(&self, id: u32) -> Option<usize> {
+    if self.len == 0 {
+      return None;
+    }
+    let entries = self.entries.as_slice();
+    let mask = entries.len().wrapping_sub(1);
+    let mut idx = (id >> 1) as usize & mask;
+    loop {
+      // SAFETY: `idx & mask < entries.len()`, a power of two
+      let (key, slot) = unsafe { *entries.get_unchecked(idx) };
+      if key == id {
+        return Some(slot as usize);
+      }
+      if key == 0 {
+        return None;
+      }
+      idx = idx.wrapping_add(1) & mask;
+    }
+  }
+
+  fn insert(&mut self, id: u32, slot: usize) -> crate::Result<()> {
+    if self.len.wrapping_add(1).wrapping_mul(2) > self.entries.len() {
+      self.grow()?;
+    }
+    let entries = self.entries.as_slice_mut();
+    let mask = entries.len().wrapping_sub(1);
+    let mut idx = (id >> 1) as usize & mask;
+    loop {
+      let Some(entry) = entries.get_mut(idx) else {
+        return Err(crate::Error::ProgrammingError);
+      };
+      if entry.0 == 0 || entry.0 == id {
+        if entry.0 == 0 {
+          self.len = self.len.wrapping_add(1);
+        }
+        *entry = (id, u32::try_from(slot).unwrap_or(u32::MAX));
+        return Ok(());
+      }
+      idx = idx.wrapping_add(1) & mask;
+    }
+  }
+
+  fn remove(&mut self, id: u32) -> Option<usize> {
+    if self.len == 0 {
+      return None;
+    }
+    let entries = self.entries.as_slice_mut();
+    let mask = entries.len().wrapping_sub(1);
+    let mut hole = (id >> 1) as usize & mask;
+    loop {
+      let (key, _) = *entries.get(hole)?;
+      if key == id {
+        break;
+      }
+      if key == 0 {
+        return None;
+      }
+      hole = hole.wrapping_add(1) & mask;
+    }
+    let slot = entries.get(hole).map(|el| el.1 as usize);
+    // Backward shift: later members of the probe run move into the hole unless their home
+    // bucket lies (cyclically) after the hole.
+    let mut next = hole;
+    loop {
+      next = next.wrapping_add(1) & mask;
+      let moved = entries.get(next).copied().unwrap_or_default();
+      if moved.0 == 0 {
+        break;
+      }
+      let home = (moved.0 >> 1) as usize & mask;
+      let stays = if hole <= next { hole < home && home <= next } else { hole < home || home <= next };
+      if stays {
+        continue;
+      }
+      if let Some(elem) = entries.get_mut(hole) {
+        *elem = moved;
+      }
+      hole = next;
+    }
+    if let Some(elem) = entries.get_mut(hole) {
+      *elem = (0, 0);
+    }
+    self.len = self.len.wrapping_sub(1);
+    slot
+  }
+
+  #[cold]
+  fn grow(&mut self) -> crate::Result<()> {
+    let capacity = self.entries.len().wrapping_mul(2).max(64);
+    let old = core::mem::replace(&mut self.entries, VectorUsize::from_cloneable_elem(capacity, (0, 0))?);
+    self.len = 0;
+    for (key, slot) in old.iter() {
+      if *key != 0 {
+        self.insert(*key, *slot as usize)?;
+      }
+    }
+    Ok(())
+  }
+}
+
 /// Open streams by id. Freed slots keep their buffers for reuse.
 #[derive(Debug)]
 pub(crate) struct StreamTable {
   /// Body bytes received on open streams.
   buffered: usize,
   free: VectorUsize<usize>,
-  ids: HashMap<u32, usize>,
+  ids: IdIndex,
   /// Body bytes queued on open streams and not yet sent.
   queued: usize,
   slots: VectorUsize<Stream>,
@@ -144,7 +263,7 @@ impl StreamTable {
     Self {
       buffered: 0,
       free: VectorUsize::new(),
-      ids: HashMap::new(),
+      ids: IdIndex::new(),
       queued: 0,
       slots: VectorUsize::new(),
     }
@@ -173,17 +292,17 @@ impl StreamTable {
   }
 
   /// Number of open streams.
-  pub(crate) fn len(&self) -> usize {
-    self.ids.len()
+  pub(crate) const fn len(&self) -> usize {
+    self.ids.len
   }
 
   pub(crate) fn get(&self, id: u32) -> Option<&Stream> {
-    let idx = *self.ids.get(&id)?;
+    let idx = self.ids.get(id)?;
     self.slots.get(idx)
   }
 
   pub(crate) fn get_mut(&mut self, id: u32) -> Option<&mut Stream> {
-    let idx = *self.ids.get(&id)?;
+    let idx = self.ids.get(id)?;
     self.slots.get_mut(idx)
   }
 
@@ -200,18 +319,20 @@ impl StreamTable {
       self.slots.push(Stream::new())?;
       self.slots.len().wrapping_sub(1)
     };
-    let _ = self.ids.insert(id, idx);
+    self.ids.insert(id, idx)?;
     let stream = self.slots.get_mut(idx).ok_or(crate::Error::ProgrammingError)?;
     stream.reset(id, recv_window, send_window);
+    stream.live = true;
     Ok(stream)
   }
 
   /// Closes stream `id`, keeping its slot's buffers for the next stream.
   pub(crate) fn close(&mut self, id: u32) -> bool {
-    let Some(idx) = self.ids.remove(&id) else {
+    let Some(idx) = self.ids.remove(id) else {
       return false;
     };
     if let Some(stream) = self.slots.get_mut(idx) {
+      stream.live = false;
       self.buffered = self.buffered.saturating_sub(stream.recv_body_len);
       self.queued = self.queued.saturating_sub(stream.send_pending());
       stream.msg.clear();
@@ -225,13 +346,43 @@ impl StreamTable {
 
   /// Every open stream.
   pub(crate) fn iter(&self) -> impl Iterator<Item = &Stream> {
-    let ids = &self.ids;
-    self.slots.iter().filter(move |el| ids.get(&el.id).is_some())
+    self.slots.iter().filter(|el| el.live)
   }
 
   /// Every open stream.
   pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut Stream> {
-    let ids = &self.ids;
-    self.slots.iter_mut().filter(move |el| ids.get(&el.id).is_some())
+    self.slots.iter_mut().filter(|el| el.live)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::IdIndex;
+  use crate::rng::{Rng as _, Xorshift64};
+  use std::collections::HashMap;
+
+  // Random inserts and removes, with ids that collide modulo the table size, agree with a map.
+  #[test]
+  fn id_index_matches_a_map() {
+    let mut rng = Xorshift64::from(17u64);
+    let mut index = IdIndex::new();
+    let mut model = HashMap::new();
+    for step in 0..200_000u32 {
+      let pick = u32::from_le_bytes(rng.u8_4());
+      // Small odd ids, plus ids 128 apart to force probe runs that wrap.
+      let id = if pick % 3 == 0 { 1 + 2 * (pick % 300) } else { 1 + 128 * (pick % 40) };
+      if pick % 2 == 0 {
+        index.insert(id, step as usize).unwrap();
+        let _ = model.insert(id, step as usize);
+      } else {
+        assert_eq!(index.remove(id), model.remove(&id), "remove {id}");
+      }
+      assert_eq!(index.len, model.len());
+      if step % 1000 == 0 {
+        for (key, value) in &model {
+          assert_eq!(index.get(*key), Some(*value));
+        }
+      }
+    }
   }
 }
