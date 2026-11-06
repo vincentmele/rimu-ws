@@ -66,12 +66,31 @@ impl<'buf> JsonWriter<'buf> {
   }
 
   /// A float in its shortest round-trip form; `null` when it is not finite, as `serde_json`.
+  ///
+  /// Values with at most two decimals and below 10^13 (prices, ratings, quantities) take a fast
+  /// path: such a value is the double nearest to `cents / 100`, a decimal of at most 15
+  /// significant digits, so that decimal is its shortest round-trip form and it can be printed
+  /// from the integer `cents` instead of running the general algorithm.
   #[inline]
   pub fn f64(&mut self, value: f64) -> crate::Result<()> {
     if !value.is_finite() {
       return self.raw(b"null");
     }
     self.ensure(32)?;
+    let magnitude = value.abs();
+    if magnitude < 1e13 {
+      let cents = (magnitude * 100.0).round();
+      if cents / 100.0 == magnitude {
+        // SAFETY: 32 bytes of spare capacity were ensured; the longest output is
+        // `-9999999999999.99`, 17 bytes.
+        unsafe {
+          let len = self.buf.len();
+          let written = write_cents(value.is_sign_negative(), cents as u64, self.buf.as_ptr_mut().add(len));
+          self.buf.set_len(len.wrapping_add(written));
+        }
+        return Ok(());
+      }
+    }
     let mut buffer = zmij::Buffer::new();
     let text = buffer.format_finite(value).as_bytes();
     // SAFETY: 32 bytes of spare capacity were ensured; `zmij` writes at most 24.
@@ -119,6 +138,16 @@ impl<'buf> JsonWriter<'buf> {
     let src = value.as_bytes();
     // Every byte may become six (`\u00XX`) and block copies store up to 32 bytes ahead.
     self.ensure(src.len().wrapping_mul(6).wrapping_add(32))?;
+    // Short strings with nothing to escape, the usual case: one check, one copy.
+    if src.len() <= 32 && !has_special_short(src) {
+      // SAFETY: capacity for `src.len()` bytes was ensured above.
+      unsafe {
+        let len = self.buf.len();
+        copy_small(src.as_ptr(), self.buf.as_ptr_mut().add(len), src.len());
+        self.buf.set_len(len.wrapping_add(src.len()));
+      }
+      return Ok(());
+    }
     // SAFETY: the capacity above bounds every store: after `idx` source bytes at most `6 * idx`
     // bytes were written, and a block store writes 32 bytes from there.
     unsafe {
@@ -169,6 +198,86 @@ impl<'buf> JsonWriter<'buf> {
   #[inline(never)]
   fn grow(&mut self, additional: usize) -> crate::Result<()> {
     self.buf.reserve(additional.max(self.buf.capacity()))
+  }
+}
+
+/// Writes `cents / 100` as `serde_json` would: `-`, the integer part, `.`, then the decimals with
+/// trailing zeros dropped but at least one (`3.0`, `4.5`, `49.99`). Returns the length.
+///
+/// # Safety
+///
+/// `dst` is writable for 17 bytes and `cents < 10^15`.
+#[inline]
+unsafe fn write_cents(negative: bool, cents: u64, dst: *mut u8) -> usize {
+  let mut digits = [0u8; 20];
+  let int = cents / 100;
+  let frac = usize::try_from(cents % 100).unwrap_or_default();
+  let mut start = digits.len();
+  let mut rest = int;
+  loop {
+    start = start.wrapping_sub(1);
+    if let Some(elem) = digits.get_mut(start) {
+      *elem = b'0'.wrapping_add(u8::try_from(rest % 10).unwrap_or_default());
+    }
+    rest /= 10;
+    if rest == 0 {
+      break;
+    }
+  }
+  let int_digits = digits.get(start..).unwrap_or_default();
+  let mut out: usize = 0;
+  // SAFETY: at most 1 + 13 + 1 + 2 bytes are written.
+  unsafe {
+    if negative {
+      *dst = b'-';
+      out = 1;
+    }
+    ptr::copy_nonoverlapping(int_digits.as_ptr(), dst.add(out), int_digits.len());
+    out = out.wrapping_add(int_digits.len());
+    *dst.add(out) = b'.';
+    let pair = PAIRS.get(frac.wrapping_mul(2)..frac.wrapping_mul(2).wrapping_add(2)).unwrap_or_default();
+    if let [tens, ones] = pair {
+      *dst.add(out.wrapping_add(1)) = *tens;
+      if *ones == b'0' {
+        out = out.wrapping_add(2);
+      } else {
+        *dst.add(out.wrapping_add(2)) = *ones;
+        out = out.wrapping_add(3);
+      }
+    }
+  }
+  out
+}
+
+/// Whether a string of at most 32 bytes has a byte JSON escapes: overlapping 8-byte words for
+/// 8 bytes and more (the word test marks bytes only when one truly needs escaping), the table
+/// below that.
+#[inline(always)]
+fn has_special_short(src: &[u8]) -> bool {
+  const ONES: u64 = 0x0101_0101_0101_0101;
+  const HIGHS: u64 = 0x8080_8080_8080_8080;
+  let len = src.len();
+  if len < 8 {
+    return src.iter().any(|el| ESCAPE[usize::from(*el)] != 0);
+  }
+  let zero = |el: u64| el.wrapping_sub(ONES) & !el & HIGHS;
+  let mut idx: usize = 0;
+  loop {
+    let at = idx.min(len.wrapping_sub(8));
+    let word = src
+      .get(at..at.wrapping_add(8))
+      .and_then(|el| <[u8; 8]>::try_from(el).ok())
+      .map_or(0, u64::from_le_bytes);
+    let hits = zero(word ^ (ONES * u64::from(b'"')))
+      | zero(word ^ (ONES * u64::from(b'\\')))
+      | (word.wrapping_sub(ONES * 0x20) & !word & HIGHS);
+    if hits != 0 {
+      return true;
+    }
+    idx = idx.wrapping_add(8);
+    if idx >= len {
+      return false;
+    }
   }
 }
 
@@ -365,6 +474,28 @@ mod tests {
     }
     for value in floats {
       assert_eq!(written(|w| w.f64(value).unwrap()), serde_json::to_string(&value).unwrap(), "{value:?}");
+    }
+  }
+
+  #[test]
+  fn json_writer_two_decimal_floats_match_serde_json() {
+    let check = |value: f64| {
+      assert_eq!(written(|w| w.f64(value).unwrap()), serde_json::to_string(&value).unwrap(), "{value:?}");
+    };
+    for cents in 0..2_000_000u32 {
+      let value = f64::from(cents) / 100.0;
+      check(value);
+      check(-value);
+    }
+    let mut rng = Xorshift64::from(13u64);
+    for _ in 0..200_000 {
+      let cents = u64::from_le_bytes(rng.u8_8()) % 1_000_000_000_000_000;
+      check(cents as f64 / 100.0);
+      check((cents % 10_000_000) as f64 / 10.0);
+    }
+    for value in [1e13, 9_999_999_999_999.99, 1e13 - 0.01, 0.005, 0.015, 1.005, 2.675, 1e-2, 1e-3] {
+      check(value);
+      check(-value);
     }
   }
 
