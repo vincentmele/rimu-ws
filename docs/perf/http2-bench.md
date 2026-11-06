@@ -315,6 +315,8 @@ A/B, native, interleaved:
 
 plod measured the same way, in the same windows: 1,454k, 1,444k–1,488k.
 
+json-h2c 4096 with all four, interleaved with plod: rimu 1,443k, 1,460k; plod 1,405k, 1,404k.
+
 Early submit, other profiles: json-h2c 4096 1,276k → 1,309k; baseline-h2c 256 5,969k → 5,952k,
 baseline-h2 256 5,528k → 5,513k and baseline-h2c 4096 4,197k → 4,251k, all h2load-bound at 100%.
 
