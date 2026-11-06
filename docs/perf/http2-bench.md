@@ -72,3 +72,13 @@ Notes:
   (59 min in one run), and every run fails. The script now stops h2load after 30 s and scores
   the run 0.
 - **Old rimu cost:** about 17k user cycles per request on baseline and about 62k on json-h2c.
+
+## Conformance baseline (old driver), 6 Nov 2026
+
+- **h2spec 2.6.0** (`CONTAINER=docker .scripts/h2spec.sh high`, against the raw `h2spec-high`
+  server on tokio): 139 tests, 139 passed, 0 failed. These are the sections the script lists;
+  priority and server push are excluded as unsupported.
+- **Interop** (`.scripts/h2-interop.sh http://127.0.0.1:8082 https://127.0.0.1:8443`, against
+  `arena-h2` with the 50 ms linger on): curl, nghttp and Go `net/http` all pass, over both h2c
+  and TLS. The curl failure the audit saw needs linger off, which `arena-h2` has no switch for.
+- **Negative check:** against a closed port, every client's check fails.

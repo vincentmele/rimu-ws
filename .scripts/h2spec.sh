@@ -2,29 +2,46 @@
 
 set -euxo pipefail
 
+# h2spec.sh [high|low] [tls] [ci]
+#
+#   tls  runs h2spec with -t -k against the server's TLS listener (the server must serve TLS on
+#        port 9000)
+#
+# CONTAINER (default podman) runs the h2spec image; TMPDIR (default /tmp) holds h2spec.xml and
+# h2spec.txt.
+
 TY=${1:-"high"}
-CI=${2:-""}
+TLS=""
+CI=""
+for arg in "${@:2}"; do
+	case $arg in
+	tls) TLS="-t -k" ;;
+	ci) CI="ci" ;;
+	esac
+done
+CONTAINER=${CONTAINER:-podman}
+OUT=${TMPDIR:-/tmp}
 
 if [ "$CI" != "ci" ]; then
 	trap "trap - SIGTERM && kill -- -$$" SIGINT SIGTERM EXIT
 fi;
 
-touch /tmp/h2spec.xml
+touch "$OUT/h2spec.xml"
 
 if [ "$TY" != "high" ]; then
 	TY="low";
 fi;
 
 cargo build --bin "h2spec-$TY" --features h2spec-$TY --release
-cargo run --bin "h2spec-$TY" --features h2spec-$TY --release &> /tmp/h2spec.txt &
+cargo run --bin "h2spec-$TY" --features h2spec-$TY --release &> "$OUT/h2spec.txt" &
 sleep 1
 
-podman run \
-	-v "/tmp/h2spec.xml:/tmp/h2spec.xml" \
+$CONTAINER run \
+	-v "$OUT/h2spec.xml:/tmp/h2spec.xml" \
 	--name h2spec \
 	--network host \
 	--rm \
-	docker.io/summerwind/h2spec:2.6.0 h2spec -j "/tmp/h2spec.xml" --max-header-length 800 -p 9000 -v \
+	docker.io/summerwind/h2spec:2.6.0 h2spec -j "/tmp/h2spec.xml" --max-header-length 800 -p 9000 $TLS -v \
 		generic/1 \
 		generic/2 \
 		generic/3.1 \
