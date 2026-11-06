@@ -620,6 +620,43 @@ and compiled under the `http2` feature.
   with `--features "$FEAT,tokio" client_on_tokio_smoke`, then h2spec low. Expected: all PASS.
 - [ ] **Step 5:** Commit with the message `http2 client: run on the shared core; remove the locked driver and linger`.
 
+### Task 10A: Performance foundations, from the rivals' code (added 6 Nov)
+
+**Why:** a line-level read of plod, cnetmod, zix and viltrum, against our own code, is in
+`/mnt/nvme1tb/claude-tmp/httpwin/rivals-h2-code.md`. It found structural costs that are cheaper to
+fix now than in Task 18. The rivals all write one coalesced buffer per read batch and run handlers
+inline, and we already do both.
+
+**Method:** each item is an A/B on `perf stat` user cycles per request (`h2-bench.sh`'s
+`server_ucyc_per_req`), plus throughput on the four profiles. Keep an item only if it wins and
+`cargo test --lib` and h2spec (plaintext and TLS) still pass.
+
+- [ ] **Step 1: json-h2c costs about 72k user cycles per request.** Profile `arena-h2` on json-h2c
+  (`perf record -g`) and fix what dominates before anything else. Expected: under 15k.
+- [ ] **Step 2: send without copies.**
+  - Hand the core's output buffer to the reactor's send queue by swapping, not by copying
+    (`uring_executor.rs` around the `tx_pending` copy at ~2696).
+  - Send by-reference (`Shared`) chunks with a vectored send (writev/SendMsg), holding the shared
+    bytes until completion.
+  - Drop the 8-slice cap in `write_output`.
+- [ ] **Step 3: write the response straight into the output buffer.**
+  - When the windows allow the whole body, write DATA straight into the output buffer, skipping
+    `stream.owned`.
+  - Encode the HPACK block straight into the output buffer, behind a reserved 9-byte header.
+- [ ] **Step 4: one router lookup per request, and no per-request `Arc`, data or `error_cb`
+  clones.** `StreamDispatcher::AutoFut` borrows the dispatcher (a GAT), and the route found in
+  `is_manual` is passed on to `auto`.
+- [ ] **Step 5: the stream table.** Remember the last stream looked up, or index by stream id.
+  Look at cnetmod's no-node path for END_STREAM GETs.
+- [ ] **Step 6: memo of the request HPACK block** (cnetmod: exact byte compare). Record a block
+  only when decoding it left the table unchanged, and clear the memo on any insert or size change.
+- [ ] **Step 7: header cache.**
+  - Key it by a hash, with an exact compare on hit.
+  - Include `date` in the cached block, and invalidate once a second, so a warm response block is
+    a memcpy plus the `content-length` literal.
+- [ ] **Step 8: record each kept item, with its numbers, in `docs/perf/http2-bench.md`.** Commit
+  each item separately.
+
 ---
 
 ## Phase D: features, defaults, entry
