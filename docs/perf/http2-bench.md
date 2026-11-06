@@ -101,3 +101,23 @@ Notes:
 - **Conformance:** h2spec (without `--max-header-length 800`) passes 139/139 in plaintext and over
   TLS.
 - **Interop:** curl, nghttp and Go `net/http` all pass, over h2c and TLS.
+
+## Task 10A: performance foundations, 6 Nov 2026
+
+Each item is an A/B on server user cycles per request plus throughput, on library defaults (no
+`ARENA_PARAMS`).
+
+### Step 1: 128 concurrent streams by default (was 32)
+
+| profile | conns | best rps | h2load CPU % | server user cycles/req |
+|---|---|---|---|---|
+| baseline-h2c | 256 | 4,991k | 91.1 | 7,056 |
+| baseline-h2c | 1024 | 4,588k | 94.2 | 8,174 |
+| baseline-h2c | 4096 | 3,882k | 100.0 | 8,692 |
+| baseline-h2 (TLS) | 256 | 4,606k | 91.9 | 7,140 |
+| baseline-h2 (TLS) | 1024 | 4,187k | 96.5 | 8,393 |
+| json-h2c | 1024 | 541k | 25.7 | 71,350 |
+| json-h2c | 4096 | 510k | 26.6 | 74,633 |
+
+- With 32 streams the defaults failed `-m 100` outright (`ExceedAmountOfOpenedStreams`); with 128
+  they match the permissive settings.

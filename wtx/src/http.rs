@@ -78,7 +78,7 @@ pub const WTX_USER_AGENT: &str = concat!("wtx/", env!("CARGO_PKG_VERSION"));
 
 pub(crate) const DEFAULT_INITIAL_WINDOW_LEN: u32 = 64 * 1024 - 1;
 pub(crate) const DEFAULT_MAX_CHILDREN: usize = 18;
-pub(crate) const DEFAULT_MAX_CONCURRENT_STREAMS_NUM: u32 = 32;
+pub(crate) const DEFAULT_MAX_CONCURRENT_STREAMS_NUM: u32 = 128;
 pub(crate) const DEFAULT_MAX_DEPTH: usize = 16;
 pub(crate) const DEFAULT_MAX_FRAME_LEN: u32 = 16 * 1024;
 pub(crate) const DEFAULT_MAX_HEADERS_LEN: u32 = 4 * 1024;

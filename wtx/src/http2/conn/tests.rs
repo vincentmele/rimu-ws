@@ -659,3 +659,15 @@ fn conn_peer_go_away_keeps_serving() {
   assert_eq!((frames[0].0, frames[0].1), (PING, 1));
   assert!(!conn.is_closed());
 }
+
+// The default limit leaves h2load's `-m 100` (and browsers' ~100) room on one connection.
+#[test]
+fn conn_default_settings_allow_128_streams() {
+  let mut conn = server(HttpRecvParams::with_default_params());
+  let frames = take_frames(&mut conn);
+  let advertised = frames[0].3.chunks(6).find_map(|pair| {
+    (u16::from_be_bytes([pair[0], pair[1]]) == 3)
+      .then(|| u32::from_be_bytes([pair[2], pair[3], pair[4], pair[5]]))
+  });
+  assert_eq!(advertised, Some(128));
+}
