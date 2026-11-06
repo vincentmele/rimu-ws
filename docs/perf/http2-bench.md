@@ -167,3 +167,19 @@ queue. A/B, native, interleaved:
 
 json-h2c: −22% cycles, +21% throughput. Each body copy costs this much because the buffers are
 per connection and cold (see Step 2).
+
+### Step 3: the output buffer handed to io_uring, not copied
+
+`StreamWriter::try_send_owned` lets a stream take a buffer instead of copying it. The uring
+reactor, when nothing is in flight, makes the caller's buffer the send and hands back a recycled
+one from a per-thread pool (16 buffers of up to 1 MiB, most recent first). Behind a send in flight
+it copies, as before. TLS forwards it in plaintext and with kernel TLS. The driver hands over the
+core's output whenever it is one run of bytes (always, without shared bodies), and the core writes
+its next output into the recycled buffer, which is warm in cache.
+
+| build | json-h2c 1024 rps | cycles/req | baseline-h2c 256 | baseline-h2 256 (kTLS) |
+|---|---|---|---|---|
+| Step 4a | 715k | 48,560 | 5,333k / 5,430 | 5,003k / 5,527 |
+| owned send | 863k | 38,776 | 5,342k / 5,636 | 5,048k / 5,639 |
+
+json-h2c: −20% cycles, +21% throughput. Baseline is unchanged within noise (h2load at 99% CPU).

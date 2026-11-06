@@ -4,6 +4,8 @@ use crate::{
   collections::{ArrayVectorCopy, DequeUsize, VectorUsize},
   http2::conn::body::SharedBytes,
 };
+use alloc::vec::Vec;
+use core::mem;
 
 /// One run of queued bytes.
 #[derive(Debug)]
@@ -98,6 +100,54 @@ impl Output {
       {
         return;
       }
+    }
+  }
+
+  /// Takes the queued bytes as one buffer when they are a single unwritten run of own bytes (the
+  /// usual case), leaving `spare`, cleared, in its place. Otherwise returns `spare`.
+  pub(crate) fn take_bytes(&mut self, spare: Vec<u8>) -> Result<Vec<u8>, Vec<u8>> {
+    let whole = matches!(
+      (self.chunks.len(), self.chunks.get(0)),
+      (1, Some(Chunk::Own { start: 0, end })) if *end == self.bytes.len()
+    );
+    if !whole || self.front_written != 0 {
+      return Err(spare);
+    }
+    let mut spare_vec = spare;
+    spare_vec.clear();
+    let Ok(replacement) = VectorUsize::from_vec(spare_vec) else {
+      return Err(Vec::new());
+    };
+    let bytes = mem::replace(&mut self.bytes, replacement).into_vec();
+    self.chunks.clear();
+    self.pending = 0;
+    Ok(bytes)
+  }
+
+  /// Puts back the bytes [`Self::take_bytes`] took, with nothing queued since; returns the spare.
+  pub(crate) fn untake_bytes(&mut self, bytes: Vec<u8>) -> Vec<u8> {
+    let len = bytes.len();
+    let Ok(restored) = VectorUsize::from_vec(bytes) else {
+      return Vec::new();
+    };
+    let spare = mem::replace(&mut self.bytes, restored).into_vec();
+    self.chunks.clear();
+    let _rslt = self.chunks.push_back(Chunk::Own { end: len, start: 0 });
+    self.pending = len;
+    self.front_written = 0;
+    spare
+  }
+
+  /// Writes the next bytes into `buffer` (cleared) when nothing is queued and the current buffer
+  /// holds no memory: a recycled, cache-warm buffer instead of a fresh allocation.
+  pub(crate) fn give_buffer(&mut self, buffer: Vec<u8>) {
+    if self.pending != 0 || self.bytes.capacity() != 0 {
+      return;
+    }
+    let mut buffer = buffer;
+    buffer.clear();
+    if let Ok(elem) = VectorUsize::from_vec(buffer) {
+      self.bytes = elem;
     }
   }
 

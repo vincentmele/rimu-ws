@@ -60,6 +60,12 @@ const ACTIVE_ANY: u8 = ACTIVE_RX | ACTIVE_TX;
 // Not activity: a kernel TLS alert waits in `Conn::tls_alert` for the sends before it to finish.
 // It sits in the same byte so that the send completion, which reads it, touches no other line.
 const TLS_ALERT_PENDING: u8 = 4;
+// `tx_inflight` came from `try_send_owned`: its buffer goes to `Reactor::send_pool` once sent
+const TX_OWNED: u8 = 8;
+// Sent buffers kept for `try_send_owned` to hand out, most recently used first, so the ones a
+// thread writes into stay in its caches. Bigger buffers are freed.
+const SEND_POOL_MAX: usize = 16;
+const SEND_POOL_BUFFER_MAX: usize = 1 << 20;
 // A free slot keeps a buffer up to this capacity for the next connection, and drops a larger one.
 const SLOT_BUFFER_KEEP: usize = 64 * 1024;
 // Free slots that keep their buffers however few connections are open; more stay warm while more
@@ -679,6 +685,11 @@ impl StreamWriter for UringTcpStream {
     try_write_all_vectored(self.conn, bytes)
   }
 
+  #[inline]
+  fn try_send_owned(&mut self, bytes: &mut Vec<u8>) -> crate::Result<bool> {
+    try_send_owned(self.conn, bytes)
+  }
+
   #[cfg(feature = "tls")]
   #[inline]
   fn send_kernel_tls_alert(&mut self, level: u8, description: u8) -> crate::Result<()> {
@@ -803,6 +814,11 @@ impl StreamWriter for UringWriteHalf {
   #[inline]
   fn try_write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<bool> {
     try_write_all_vectored(self.conn, bytes)
+  }
+
+  #[inline]
+  fn try_send_owned(&mut self, bytes: &mut Vec<u8>) -> crate::Result<bool> {
+    try_send_owned(self.conn, bytes)
   }
 
   #[cfg(feature = "tls")]
@@ -1023,6 +1039,12 @@ async fn write_all_vectored(conn: ConnRef, bytes: &[&[u8]]) -> crate::Result<()>
 
 fn try_write_all_vectored(conn: ConnRef, bytes: &[&[u8]]) -> crate::Result<bool> {
   with_own_reactor(conn.runtime, |reactor| reactor.try_queue_send(conn.idx, conn.generation, bytes))
+}
+
+fn try_send_owned(conn: ConnRef, bytes: &mut Vec<u8>) -> crate::Result<bool> {
+  with_own_reactor(conn.runtime, |reactor| {
+    reactor.try_queue_send_owned(conn.idx, conn.generation, bytes)
+  })
 }
 
 /// Drops a handle's reference on its own runtime, or, from anywhere else, asks that runtime to.
@@ -1581,6 +1603,8 @@ struct Reactor {
   // The errno the ring kept refusing submissions with, if it did: `block_on` panics with it
   ring_failed: Cell<i32>,
   ready: RefCell<VecDeque<usize>>,
+  // See `SEND_POOL_MAX`
+  send_pool: RefCell<Vec<Vec<u8>>>,
   tasks: RefCell<Vec<TaskSlot>>,
   timers: RefCell<Timers>,
 }
@@ -1711,6 +1735,7 @@ impl Reactor {
       counters: Counters::default(),
       enter_failures: Cell::new(0),
       ring_failed: Cell::new(0),
+      send_pool: RefCell::new(Vec::new()),
       ready: RefCell::new(VecDeque::new()),
       tasks: RefCell::new(Vec::new()),
       timers: RefCell::new(timers),
@@ -2730,6 +2755,60 @@ impl Reactor {
     Ok(true)
   }
 
+  /// [`Self::try_queue_send`] for one buffer, taken instead of copied when nothing is being sent:
+  /// `bytes` becomes the send and is replaced by a recycled buffer from `send_pool` (or an empty
+  /// one). Behind a send in flight it is copied after it, as `try_queue_send` would. `false`
+  /// takes nothing.
+  fn try_queue_send_owned(
+    &self,
+    idx: u32,
+    generation: u32,
+    bytes: &mut Vec<u8>,
+  ) -> crate::Result<bool> {
+    let sqe = {
+      let mut conns = self.conns.borrow_mut();
+      let Some(conn) = conns.get_mut(idx as usize).filter(|el| el.generation == generation) else {
+        return Err(io_err(libc::EBADF));
+      };
+      if conn.tx_err != 0 {
+        return Err(io_err(conn.tx_err.into()));
+      }
+      if conn.sending || !conn.tx_pending.is_empty() {
+        if conn.tx_pending.len() >= self.params.tx_high_water {
+          return Ok(false);
+        }
+        conn.tx_pending.extend_from_slice(bytes);
+        bytes.clear();
+        return Ok(true);
+      }
+      if bytes.is_empty() {
+        return Ok(true);
+      }
+      let spare = self.send_pool.borrow_mut().pop().unwrap_or_default();
+      let idle = core::mem::replace(&mut conn.tx_inflight, core::mem::replace(bytes, spare));
+      self.recycle_send_buffer(idle);
+      conn.activity |= TX_OWNED;
+      conn.tx_done = 0;
+      conn.sending = true;
+      send_sqe(conn, &conn.tx_inflight).user_data(user_data(KIND_SEND, generation, idx))
+    };
+    self.push_sqe(&sqe);
+    Ok(true)
+  }
+
+  /// Keeps an emptied send buffer for `try_queue_send_owned`, or frees it.
+  fn recycle_send_buffer(&self, mut buffer: Vec<u8>) {
+    let capacity = buffer.capacity();
+    if capacity == 0 || capacity > SEND_POOL_BUFFER_MAX {
+      return;
+    }
+    let mut pool = self.send_pool.borrow_mut();
+    if pool.len() < SEND_POOL_MAX {
+      buffer.clear();
+      pool.push(buffer);
+    }
+  }
+
   fn start_send(&self, idx: u32, generation: u32) {
     let sqe = {
       let mut conns = self.conns.borrow_mut();
@@ -2771,7 +2850,12 @@ impl Reactor {
         return;
       }
       conn.sending = false;
-      conn.tx_inflight.clear();
+      if conn.activity & TX_OWNED == 0 {
+        conn.tx_inflight.clear();
+      } else {
+        conn.activity &= !TX_OWNED;
+        self.recycle_send_buffer(core::mem::take(&mut conn.tx_inflight));
+      }
     }
     deferred.wake = conn.writer.take();
     if !conn.tx_pending.is_empty() && conn.tx_err == 0 {

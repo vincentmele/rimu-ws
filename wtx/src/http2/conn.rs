@@ -44,6 +44,7 @@ use crate::{
   net::Uri,
   rng::Rng,
 };
+use alloc::vec::Vec;
 use core::{mem, time::Duration};
 
 /// The window every stream and the connection start with (RFC 9113 §6.9.2).
@@ -253,6 +254,23 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
   /// The queued bytes, front first.
   pub(crate) fn output<'this>(&'this self, out: &mut ArrayVectorCopy<&'this [u8], 16>) {
     self.out.slices(out);
+  }
+
+  /// The queued bytes as one buffer, taken without a copy, when they are a single run of own
+  /// bytes; `spare` takes their place. `Err(spare)` otherwise: use [`Self::output`]. Call
+  /// [`Self::has_output`] first.
+  pub(crate) fn take_output(&mut self, spare: Vec<u8>) -> Result<Vec<u8>, Vec<u8>> {
+    self.out.take_bytes(spare)
+  }
+
+  /// Undoes [`Self::take_output`] when the bytes could not be handed on; returns the spare.
+  pub(crate) fn untake_output(&mut self, bytes: Vec<u8>) -> Vec<u8> {
+    self.out.untake_bytes(bytes)
+  }
+
+  /// A recycled buffer to queue the next output into, used if the output holds none.
+  pub(crate) fn give_output_buffer(&mut self, buffer: Vec<u8>) {
+    self.out.give_buffer(buffer);
   }
 
   /// Marks the first `n` queued bytes as written.

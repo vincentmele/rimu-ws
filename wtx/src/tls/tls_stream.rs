@@ -534,6 +534,19 @@ where
     }
     Ok(false)
   }
+
+  /// Plaintext and kernel TLS forward to the stream, as [`Self::try_write_all_vectored`].
+  #[inline]
+  fn try_send_owned(&mut self, bytes: &mut alloc::vec::Vec<u8>) -> crate::Result<bool> {
+    #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
+    if self.kernel_tls_tries > 0 {
+      self.try_kernel_tls()?;
+    }
+    if TCX::TY.is_plain_text() || (self.kernel_tls && !self.connection_state.cannot_write()) {
+      return self.stream.try_send_owned(bytes);
+    }
+    Ok(false)
+  }
 }
 
 /// What a pending read becomes given the state of the connection when the read started.

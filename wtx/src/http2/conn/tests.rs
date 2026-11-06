@@ -671,3 +671,31 @@ fn conn_default_settings_allow_128_streams() {
   });
   assert_eq!(advertised, Some(128));
 }
+
+// The output handed on as one buffer is exactly what the slices give; putting it back restores
+// it, and a buffer given while the output is empty and holds none is the one written into next.
+#[test]
+fn conn_take_output_is_the_queued_bytes() {
+  fn respond(conn: &mut Http2Conn<false>, stream: u32) {
+    let _ = conn.feed(&headers_req(stream, "GET", "/", &[], true)).unwrap();
+    let _ = events(conn);
+    let mut msg = MsgBufferString::default();
+    msg.body.extend_from_copyable_slice(b"hello").unwrap();
+    conn.send_response(U31::from_u32(stream), StatusCode::Ok, &mut msg).unwrap();
+  }
+  let mut conn = ready_server(HttpRecvParams::with_default_params());
+  respond(&mut conn, 1);
+  assert!(conn.has_output());
+  let taken = conn.take_output(Vec::with_capacity(7)).unwrap();
+  assert!(!conn.has_output());
+  let spare = conn.untake_output(taken.clone());
+  assert_eq!(spare.capacity(), 7);
+  assert!(conn.has_output());
+  assert_eq!(conn.take_output(Vec::new()).unwrap(), taken);
+  conn.give_output_buffer(Vec::with_capacity(4096));
+  respond(&mut conn, 3);
+  assert!(conn.has_output());
+  let next = conn.take_output(Vec::new()).unwrap();
+  assert!(next.capacity() >= 4096);
+  assert_eq!(parse_all(&next).iter().map(|el| (el.0, el.2)).collect::<Vec<_>>(), [(HEADERS, 3), (DATA, 3)]);
+}

@@ -19,7 +19,7 @@ use crate::{
   },
   net::{StreamReader, StreamWriter, TryRead},
 };
-use alloc::rc::Rc;
+use alloc::{rc::Rc, vec::Vec};
 use core::{
   cell::RefCell,
   future::poll_fn,
@@ -391,6 +391,15 @@ where
       let mut guard = shared.borrow_mut();
       if !guard.conn.has_output() {
         return Ok(());
+      }
+      // The usual case: the output is one run of bytes, handed to the stream without a copy;
+      // the stream gives back a recycled buffer for the next output.
+      if let Ok(mut bytes) = guard.conn.take_output(Vec::new()) {
+        if stream.try_send_owned(&mut bytes)? {
+          guard.conn.give_output_buffer(bytes);
+          continue;
+        }
+        let _spare = guard.conn.untake_output(bytes);
       }
       let mut slices = ArrayVectorCopy::<&[u8], 16>::new();
       guard.conn.output(&mut slices);

@@ -20,6 +20,15 @@ pub trait StreamWriter: StreamCommon {
     Ok(false)
   }
 
+  /// [`Self::try_write_all_vectored`] for one buffer that the stream may take instead of copy:
+  /// `true` when it took or queued all of `bytes`, which then holds an empty buffer (perhaps a
+  /// recycled one, with capacity) for the caller to write its next bytes into. `false` leaves
+  /// `bytes` as it was. The default never takes.
+  #[inline]
+  fn try_send_owned(&mut self, _bytes: &mut alloc::vec::Vec<u8>) -> crate::Result<bool> {
+    Ok(false)
+  }
+
   /// For kernel TLS: sends an alert record after what was written before it, which may be once
   /// those bytes are out. The default, for streams without kernel TLS, fails with `Unsupported`.
   #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
@@ -47,6 +56,11 @@ where
   #[inline]
   fn try_write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<bool> {
     (**self).try_write_all_vectored(bytes)
+  }
+
+  #[inline]
+  fn try_send_owned(&mut self, bytes: &mut alloc::vec::Vec<u8>) -> crate::Result<bool> {
+    (**self).try_send_owned(bytes)
   }
 
   #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
