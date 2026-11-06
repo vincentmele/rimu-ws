@@ -41,12 +41,14 @@ impl HeaderCache {
     self.hits
   }
 
-  /// The fields a cached block covers: everything but `content-length` and `date`, which
-  /// change per response or per second.
+  /// The fields a cached block covers: everything but `content-length`, which changes per
+  /// response. `date` is covered: it changes once a second, so the block for a new second is
+  /// encoded twice (the first time adds the date to the dynamic table) and then replayed.
   pub(crate) fn is_cached_field(header: &Header<&str, &str>) -> bool {
-    let name = header.name.as_bytes();
-    !name.eq_ignore_ascii_case(<&str>::from(KnownHeaderName::ContentLength).as_bytes())
-      && !name.eq_ignore_ascii_case(<&str>::from(KnownHeaderName::Date).as_bytes())
+    !header
+      .name
+      .as_bytes()
+      .eq_ignore_ascii_case(<&str>::from(KnownHeaderName::ContentLength).as_bytes())
   }
 
   /// The block for `status` and the cached fields of `headers`, if it was encoded under the
