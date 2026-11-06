@@ -1,0 +1,2 @@
+{"kind":"violation","cycle":0,"violation":"PidGone"}
+{"kind":"summary","label":"dead","mode":"common","rules_version":"1","seed":1001,"cycles":1,"records":10,"fails":0,"should_fails":0,"marks":0,"scenarios":{"echo":{"runs":10,"must":0,"should":0,"marks":0,"harness_errors":0,"example_must":null,"example_should":null,"example_mark":null}},"invalid":null,"harness_errors":0,"violations":["PidGone"],"client_saturated_cycles":0,"fails_while_saturated":0,"latency":{"count":0,"p50_us":0,"p99_us":0,"p999_us":0,"max_us":0,"failures":0},"stopped":null}

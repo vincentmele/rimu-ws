@@ -29,6 +29,21 @@ enum Cmd {
   Run(RunArgs),
   /// Reruns one scenario run by its replay id and prints its record and transcript.
   Replay(ReplayArgs),
+  /// The report card of runs judged by the common rules: one row per --label.
+  Report(ReportArgs),
+}
+
+#[derive(clap::Args)]
+struct ReportArgs {
+  /// The server held to every check, whose row comes first and gets the gate line.
+  #[arg(long, default_value = "rimu-ws")]
+  gated: String,
+  /// Where to write the card (Markdown); stdout without it.
+  #[arg(long)]
+  out: Option<PathBuf>,
+  /// The runs' JSONL files; several rounds of one server are merged by label.
+  #[arg(required = true)]
+  files: Vec<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -240,6 +255,7 @@ fn main() -> ExitCode {
   let rslt = match cli.cmd {
     Cmd::Run(args) => runtime.block_on(run(args)),
     Cmd::Replay(args) => runtime.block_on(replay_one(args)),
+    Cmd::Report(args) => report(args),
   };
   rslt.unwrap_or_else(|err| {
     eprintln!("error: {err}");
@@ -341,4 +357,17 @@ async fn replay_one(args: ReplayArgs) -> Result<ExitCode, String> {
     println!("{transcript}");
   }
   Ok(ExitCode::from(u8::from(record.outcome != "pass")))
+}
+
+fn report(args: ReportArgs) -> Result<ExitCode, String> {
+  let rows = rimu_ws_soak::report::merge(rimu_ws_soak::report::load(&args.files)?);
+  let card = rimu_ws_soak::report::card(&rows, &args.gated);
+  match &args.out {
+    Some(path) => {
+      std::fs::write(path, &card).map_err(|err| format!("{}: {err}", path.display()))?
+    }
+    None => print!("{card}"),
+  }
+  let pass = card.contains(&format!("{}: PASS", args.gated));
+  Ok(ExitCode::from(u8::from(!pass)))
 }
