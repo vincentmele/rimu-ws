@@ -600,7 +600,8 @@ fn server_userspace_tls_seals_into_owned_sends() {
       got
     })
   });
-  let params = UringParams::default().set_tx_high_water(64 * 1024);
+  // Submitted only at the end of a turn, the sends can't drain the queue as it fills.
+  let params = UringParams::default().set_tx_high_water(64 * 1024).set_send_submit_bytes(usize::MAX);
   let runtime = UringRuntime::with_params(params).unwrap();
   let (taken, declined) = runtime.block_on(async {
     let listener = UringTcpListener::bind(addr.as_str(), TcpParams::default().set_reuse_port(Some(false)))

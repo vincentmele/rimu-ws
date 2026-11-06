@@ -184,7 +184,7 @@ impl UringParams {
       recv_buffer_len: 4096,
       recv_buffers: 512,
       rx_high_water: 64 * 1024,
-      send_submit_bytes: 128 * 1024,
+      send_submit_bytes: 16 * 1024,
       spin: Duration::ZERO,
       sq_entries: 1024,
       tx_high_water: 16 * 1024,
@@ -264,7 +264,9 @@ impl UringParams {
   /// once, rather than with everything else at the end of the turn. A busy turn produces output
   /// for many connections; submitted together, the first buffers are out of the CPU's caches by
   /// the time the kernel copies them, and that copy costs several times more. `0` submits every
-  /// send as it is queued and `usize::MAX` only at the end of the turn. Defaults to 128 KiB.
+  /// send as it is queued and `usize::MAX` only at the end of the turn. Defaults to 16 KiB, the
+  /// default send threshold: static-h2 measured 23% faster than at 128 KiB at 1024 connections,
+  /// json-h2c 1-2% slower (a few more submits).
   #[inline]
   #[must_use]
   pub const fn set_send_submit_bytes(mut self, value: usize) -> Self {
@@ -4614,6 +4616,13 @@ mod tests {
   #[test]
   fn tx_high_water_defaults_to_16_kib() {
     assert_eq!(crate::executor::UringParams::new().tx_high_water, 16 * 1024);
+  }
+
+  // Sends are submitted once a turn has queued 16 KiB of them: the kernel copies them while they
+  // are still in the cache. static-h2 at 1024 connections: 332k req/s at 128 KiB, 408k at 16 KiB.
+  #[test]
+  fn send_submit_bytes_defaults_to_16_kib() {
+    assert_eq!(crate::executor::UringParams::new().send_submit_bytes, 16 * 1024);
   }
 
   // A write declined because the queue is full can wait for room instead of being copied into
