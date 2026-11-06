@@ -2,20 +2,23 @@
 
 set -euxo pipefail
 
-# h2spec.sh [high|low] [tls] [ci]
+# h2spec.sh [high|low] [tls|tls-user] [ci]
 #
-#   tls  runs h2spec with -t -k against the server's TLS listener (the server must serve TLS on
-#        port 9000)
+#   tls       runs h2spec with -t -k against the server's TLS listener (the server must serve TLS
+#             on port 9000)
+#   tls-user  the same with the server sealing records in user space (no kernel TLS)
 #
 # CONTAINER (default podman) runs the h2spec image; TMPDIR (default /tmp) holds h2spec.xml and
 # h2spec.txt.
 
 TY=${1:-"high"}
 TLS=""
+TLS_MODE=0
 CI=""
 for arg in "${@:2}"; do
 	case $arg in
-	tls) TLS="-t -k" ;;
+	tls) TLS="-t -k" TLS_MODE=1 ;;
+	tls-user) TLS="-t -k" TLS_MODE=user ;;
 	ci) CI="ci" ;;
 	esac
 done
@@ -33,7 +36,7 @@ if [ "$TY" != "high" ]; then
 fi;
 
 cargo build --bin "h2spec-$TY" --features h2spec-$TY --release
-H2SPEC_TLS=$([ -n "$TLS" ] && echo 1 || echo 0) cargo run --bin "h2spec-$TY" --features h2spec-$TY --release &> "$OUT/h2spec.txt" &
+H2SPEC_TLS=$TLS_MODE cargo run --bin "h2spec-$TY" --features h2spec-$TY --release &> "$OUT/h2spec.txt" &
 sleep 1
 
 $CONTAINER run \

@@ -5,8 +5,8 @@ use crate::{
   net::{ConnectionState, Stream, StreamCommon, StreamReader, StreamWriter, TryRead},
   sync::{Arc, AtomicBool, AtomicU8, AtomicWaker},
   tls::{
-    AlertDescription, AlertLevel, TlsBuffer, TlsCtx, TlsError, TlsStreamBridge, TlsStreamReader,
-    TlsStreamWriter,
+    AlertDescription, AlertLevel, RECORD_HEADER_LEN, TlsBuffer, TlsCtx, TlsError, TlsStreamBridge,
+    TlsStreamReader, TlsStreamWriter,
     key_schedule::{KeySchedule, KeyScheduleWrite},
     misc::{
       manage_err_ad, manage_key_update, manage_user_canceled, read_after_handshake_data,
@@ -451,11 +451,19 @@ where
     Ok(TryRead::Unsupported)
   }
 
-  /// The stream's own future, with no state of this one's: only a plaintext stream ever returns
-  /// [`TryRead::Pending`], and its bytes are the stream's.
+  /// The stream's own readiness, but ready at once when user space holds input the socket can't
+  /// show: decrypted bytes not read yet, or a whole record read from the socket along with an
+  /// earlier one (a `read` decrypts one record).
   #[inline]
   fn readable(&mut self) -> impl Future<Output = crate::Result<()>> {
-    self.stream.readable()
+    let buffered = !TCX::TY.is_plain_text() && !self.kernel_tls && self.has_buffered_input();
+    let readable = self.stream.readable();
+    async move {
+      if buffered {
+        return Ok(());
+      }
+      readable.await
+    }
   }
 }
 
@@ -546,6 +554,21 @@ where
       return self.stream.try_send_owned(bytes);
     }
     Ok(false)
+  }
+}
+
+impl<S, TCX, const IS_CLIENT: bool> TlsStream<S, TCX, IS_CLIENT> {
+  /// Decrypted bytes not read yet, or a whole record in the read buffer.
+  fn has_buffered_input(&self) -> bool {
+    if self.plaintext_len > self.plaintext_consumed {
+      return true;
+    }
+    let following = self.buffer.reader_buffer.following();
+    let Some([_, _, _, hi, lo]) = following.first_chunk::<RECORD_HEADER_LEN>() else {
+      return false;
+    };
+    let body_len = usize::from(u16::from_be_bytes([*hi, *lo]));
+    following.len() >= RECORD_HEADER_LEN.wrapping_add(body_len)
   }
 }
 

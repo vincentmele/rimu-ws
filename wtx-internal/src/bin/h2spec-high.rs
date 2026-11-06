@@ -1,5 +1,6 @@
 //! h2spec target: the HTTP/2 server framework on io_uring, port 9000. `H2SPEC_TLS=1` serves TLS
-//! with the repository's test certificate.
+//! with the repository's test certificate; `H2SPEC_TLS=user` does too, with the records sealed in
+//! user space instead of by the kernel.
 
 #![expect(clippy::print_stderr, reason = "internal")]
 
@@ -17,7 +18,7 @@ const PUBLIC_KEY: &[u8] = include_bytes!("../../../.certs/cert.pem");
 const SECRET_KEY: &[u8] = include_bytes!("../../../.certs/key.pem");
 
 fn main() -> rimu_ws::Result<()> {
-  let tls = std::env::var("H2SPEC_TLS").is_ok_and(|el| el == "1");
+  let tls = std::env::var("H2SPEC_TLS").ok().filter(|el| el == "1" || el == "user");
   macro_rules! run {
     ($tls_config:expr) => {
       Http2ServerFramework::<(), fn(rimu_ws::Error), UringExecutor, _, _, _>::new(
@@ -34,7 +35,13 @@ fn main() -> rimu_ws::Result<()> {
       )
     };
   }
-  if tls { run!(TlsConfig::from_keys_pem(PUBLIC_KEY, SECRET_KEY)?) } else { run!(TlsConfig::plaintext()) }
+  if let Some(mode) = tls {
+    let mut tls_config = TlsConfig::from_keys_pem(PUBLIC_KEY, SECRET_KEY)?;
+    *tls_config.kernel_tls_mut() = mode != "user";
+    run!(tls_config)
+  } else {
+    run!(TlsConfig::plaintext())
+  }
 }
 
 async fn hello(state: StateClean<'_, ()>) -> rimu_ws::Result<VerbatimParams> {

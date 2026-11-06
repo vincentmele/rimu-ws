@@ -2,7 +2,8 @@
 //! manual-mode endpoint, for any method, that reads the request body and answers through its
 //! stream. (A GET-only route would answer h2spec's POSTs before their bodies arrive, so the
 //! body checks would never run on a manual stream.)
-//! `H2SPEC_TLS=1` serves TLS with the repository's test certificate.
+//! `H2SPEC_TLS=1` serves TLS with the repository's test certificate; `H2SPEC_TLS=user` does too,
+//! with the records sealed in user space instead of by the kernel.
 
 #![expect(clippy::print_stderr, reason = "internal")]
 
@@ -23,7 +24,7 @@ const PUBLIC_KEY: &[u8] = include_bytes!("../../../.certs/cert.pem");
 const SECRET_KEY: &[u8] = include_bytes!("../../../.certs/key.pem");
 
 fn main() -> rimu_ws::Result<()> {
-  let tls = std::env::var("H2SPEC_TLS").is_ok_and(|el| el == "1");
+  let tls = std::env::var("H2SPEC_TLS").ok().filter(|el| el == "1" || el == "user");
   macro_rules! run {
     ($tls_config:expr) => {
       Http2ServerFramework::<(), fn(rimu_ws::Error), UringExecutor, _, _, _>::new(
@@ -37,8 +38,10 @@ fn main() -> rimu_ws::Result<()> {
       .run_in_threads("127.0.0.1:9000", HttpRouter::paths(rimu_ws::paths!(("/", AnyMethod(hello.into_wrapper()))))?)
     };
   }
-  if tls {
-    run!(TlsConfig::from_keys_pem(PUBLIC_KEY, SECRET_KEY)?)
+  if let Some(mode) = tls {
+    let mut tls_config = TlsConfig::from_keys_pem(PUBLIC_KEY, SECRET_KEY)?;
+    *tls_config.kernel_tls_mut() = mode != "user";
+    run!(tls_config)
   } else {
     run!(TlsConfig::plaintext())
   }

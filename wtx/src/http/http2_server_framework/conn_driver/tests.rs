@@ -544,3 +544,63 @@ fn server_userspace_tls_parked_handler_answers() {
   });
   assert!(done_rx.recv_timeout(Duration::from_secs(5)).is_ok(), "no response to the parked handler");
 }
+
+// User-space TLS reads one record per `read`: records that arrived together wait in the stream's
+// buffer, where the socket's readiness can't see them. `readable` must report them, or a driver
+// waiting on it stalls until the peer sends something more.
+#[test]
+fn userspace_tls_readable_reports_buffered_records() {
+  use crate::{
+    executor::StdRuntime,
+    tests::{_PUBLIC_KEY, _ROOT_CA, _SECRET_KEY},
+    tls::{TlsAcceptor, TlsConfig, TlsConnectorBuilder},
+  };
+  let uri = _uri();
+  let (host, port) = uri.hostname_with_implied_port();
+  let addr = alloc::format!("{host}:{port}");
+  let client_uri = uri.clone();
+  let (done_tx, done_rx) = mpsc::channel::<()>();
+  let _client = std::thread::spawn(move || {
+    StdRuntime::new().block_on(async move {
+      let mut rng = <crate::rng::ChaCha20 as crate::rng::CryptoSeedableRng>::from_std_random().unwrap();
+      let config = TlsConfig::from_trust_anchors_pem([_ROOT_CA]).unwrap();
+      let mut tls_stream = loop {
+        let connector = TlsConnectorBuilder::std(client_uri.clone()).build(&config, &mut rng).await;
+        if let Ok(elem) = connector {
+          break elem.connect().await.unwrap().tls_stream;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+      };
+      tls_stream.write_all(b"one").await.unwrap();
+      tls_stream.write_all(b"two").await.unwrap();
+      // Stay connected, sending nothing more, until the server is done.
+      let _rslt = done_rx.recv_timeout(Duration::from_secs(5));
+    })
+  });
+  let runtime = UringRuntime::with_params(UringParams::default()).unwrap();
+  let (first, ready, second) = runtime.block_on(async {
+    let listener = UringTcpListener::bind(addr.as_str(), TcpParams::default().set_reuse_port(Some(false)))
+      .await
+      .unwrap();
+    let (stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+    let mut rng = <crate::rng::ChaCha20 as crate::rng::CryptoSeedableRng>::from_std_random().unwrap();
+    let mut config = TlsConfig::from_keys_pem(_PUBLIC_KEY, _SECRET_KEY).unwrap();
+    *config.kernel_tls_mut() = false;
+    let mut tls_stream = TlsAcceptor::new(&config, &mut rng, stream).accept().await.unwrap().tls_stream;
+    // Both records are in the socket before the first read.
+    Sleep::new(Duration::from_millis(200)).unwrap().await.unwrap();
+    let mut buf = [0u8; 64];
+    let len = tls_stream.read(buf.as_mut_slice().into()).await.unwrap().unwrap();
+    let first = buf[..len.get()].to_vec();
+    let ready = {
+      let mut readable = core::pin::pin!(tls_stream.readable());
+      core::future::poll_fn(|cx| core::task::Poll::Ready(readable.as_mut().poll(cx).is_ready())).await
+    };
+    let len = tls_stream.read(buf.as_mut_slice().into()).await.unwrap().unwrap();
+    (first, ready, buf[..len.get()].to_vec())
+  });
+  let _rslt = done_tx.send(());
+  assert_eq!(first, b"one", "the first read took both records: the test doesn't cover buffering");
+  assert!(ready, "a buffered record wasn't reported readable");
+  assert_eq!(second, b"two");
+}
