@@ -172,9 +172,11 @@ fn write_json(
 ) -> rimu_ws::Result<()> {
   let clamped = count.min(dataset.len());
   let mut w = JsonWriter::new(buf);
+  // Every item and tag is written with a trailing comma; `end_seq` turns the last one into the
+  // closing bracket.
   w.raw(b"{\"items\":[")?;
-  for (idx, el) in dataset.iter().take(clamped).enumerate() {
-    w.raw(if idx == 0 { b"{\"id\":" } else { b",{\"id\":" })?;
+  for el in dataset.iter().take(clamped) {
+    w.raw(b"{\"id\":")?;
     w.i64(el.id)?;
     w.raw(b",\"name\":\"")?;
     w.str_contents(&el.name)?;
@@ -184,21 +186,25 @@ fn write_json(
     w.i64(el.price)?;
     w.raw(b",\"quantity\":")?;
     w.i64(el.quantity)?;
-    w.raw(if el.active { b",\"active\":true,\"tags\":[" } else { b",\"active\":false,\"tags\":[" })?;
-    for (tag_idx, tag) in el.tags.iter().enumerate() {
-      w.raw(if tag_idx == 0 { b"\"" } else { b",\"" })?;
-      w.str_contents(tag)?;
+    w.raw(b",\"active\":")?;
+    w.bool(el.active)?;
+    w.raw(b",\"tags\":[")?;
+    for tag in el.tags.iter() {
       w.raw(b"\"")?;
+      w.str_contents(tag)?;
+      w.raw(b"\",")?;
     }
-    w.raw(b"],\"rating\":{\"score\":")?;
+    w.end_seq(b']')?;
+    w.raw(b",\"rating\":{\"score\":")?;
     w.i64(el.rating.score)?;
     w.raw(b",\"count\":")?;
     w.i64(el.rating.count)?;
     w.raw(b"},\"total\":")?;
     w.i64(el.price.wrapping_mul(el.quantity).wrapping_mul(m))?;
-    w.raw(b"}")?;
+    w.raw(b"},")?;
   }
-  w.raw(b"],\"count\":")?;
+  w.end_seq(b']')?;
+  w.raw(b",\"count\":")?;
   w.u64(u64::try_from(clamped).unwrap_or(u64::MAX))?;
   w.raw(b"}")
 }
@@ -295,8 +301,15 @@ mod tests {
       return;
     };
     let dataset: VectorUsize<DatasetItem> = serde_json::from_str(&text).unwrap();
-    let pairs: [(usize, i32, usize); 7] =
-      [(1, 3, 203), (5, 7, 888), (10, 2, 1695), (15, 5, 2556), (25, 4, 4190), (40, 8, 6707), (50, 6, 8397)];
+    let pairs: [(usize, i32, usize); 7] = [
+      (1, 3, 203),
+      (5, 7, 888),
+      (10, 2, 1695),
+      (15, 5, 2556),
+      (25, 4, 4190),
+      (40, 8, 6707),
+      (50, 6, 8397),
+    ];
     for (count, m, len) in pairs {
       let mut buf = VectorUsize::new();
       write_json(&mut buf, &dataset, count, m.into()).unwrap();
