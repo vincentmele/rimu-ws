@@ -164,6 +164,7 @@ pub struct UringParams {
   recv_buffer_len: u32,
   recv_buffers: u16,
   rx_high_water: usize,
+  send_submit_bytes: usize,
   spin: Duration,
   sq_entries: u32,
   tx_high_water: usize,
@@ -183,6 +184,7 @@ impl UringParams {
       recv_buffer_len: 4096,
       recv_buffers: 512,
       rx_high_water: 64 * 1024,
+      send_submit_bytes: 128 * 1024,
       spin: Duration::ZERO,
       sq_entries: 1024,
       tx_high_water: 256 * 1024,
@@ -255,6 +257,18 @@ impl UringParams {
   pub const fn set_ring_entries(mut self, submission: u32, completion: u32) -> Self {
     self.sq_entries = submission;
     self.cq_entries = completion;
+    self
+  }
+
+  /// How many bytes the sends queued during a turn may add up to before they are submitted at
+  /// once, rather than with everything else at the end of the turn. A busy turn produces output
+  /// for many connections; submitted together, the first buffers are out of the CPU's caches by
+  /// the time the kernel copies them, and that copy costs several times more. `0` submits every
+  /// send as it is queued and `usize::MAX` only at the end of the turn. Defaults to 128 KiB.
+  #[inline]
+  #[must_use]
+  pub const fn set_send_submit_bytes(mut self, value: usize) -> Self {
+    self.send_submit_bytes = value;
     self
   }
 
@@ -1607,6 +1621,8 @@ struct Reactor {
   ready: RefCell<VecDeque<usize>>,
   // See `SEND_POOL_MAX`
   send_pool: RefCell<Vec<Vec<u8>>>,
+  // Bytes of the sends queued since the last submit (see `UringParams::set_send_submit_bytes`)
+  send_queued: Cell<usize>,
   tasks: RefCell<Vec<TaskSlot>>,
   timers: RefCell<Timers>,
 }
@@ -1738,6 +1754,7 @@ impl Reactor {
       enter_failures: Cell::new(0),
       ring_failed: Cell::new(0),
       send_pool: RefCell::new(Vec::new()),
+      send_queued: Cell::new(0),
       ready: RefCell::new(VecDeque::new()),
       tasks: RefCell::new(Vec::new()),
       timers: RefCell::new(timers),
@@ -2174,6 +2191,7 @@ impl Reactor {
   }
 
   fn enter(&self, wait: bool) {
+    self.send_queued.set(0);
     let mut ring = self.ring.borrow_mut();
     if !wait {
       if needs_enter(&mut ring) && ring.submit().is_err() {
@@ -2767,7 +2785,7 @@ impl Reactor {
     generation: u32,
     bytes: &mut Vec<u8>,
   ) -> crate::Result<bool> {
-    let sqe = {
+    let (sqe, len) = {
       let mut conns = self.conns.borrow_mut();
       let Some(conn) = conns.get_mut(idx as usize).filter(|el| el.generation == generation) else {
         return Err(io_err(libc::EBADF));
@@ -2798,9 +2816,11 @@ impl Reactor {
       conn.activity |= TX_OWNED;
       conn.tx_done = 0;
       conn.sending = true;
-      send_sqe(conn, &conn.tx_inflight).user_data(user_data(KIND_SEND, generation, idx))
+      let sqe = send_sqe(conn, &conn.tx_inflight).user_data(user_data(KIND_SEND, generation, idx));
+      (sqe, conn.tx_inflight.len())
     };
     self.push_sqe(&sqe);
+    self.count_queued_send(len);
     Ok(true)
   }
 
@@ -2818,16 +2838,34 @@ impl Reactor {
   }
 
   fn start_send(&self, idx: u32, generation: u32) {
-    let sqe = {
+    let (sqe, len) = {
       let mut conns = self.conns.borrow_mut();
       let conn = &mut conns[idx as usize];
       core::mem::swap(&mut conn.tx_inflight, &mut conn.tx_pending);
       conn.tx_pending.clear();
       conn.tx_done = 0;
       conn.sending = true;
-      send_sqe(conn, &conn.tx_inflight).user_data(user_data(KIND_SEND, generation, idx))
+      let sqe = send_sqe(conn, &conn.tx_inflight).user_data(user_data(KIND_SEND, generation, idx));
+      (sqe, conn.tx_inflight.len())
     };
     self.push_sqe(&sqe);
+    self.count_queued_send(len);
+  }
+
+  /// Counts `len` more bytes queued for sending and, once those queued since the last submit
+  /// reach `send_submit_bytes`, submits them now: the kernel copies them while they are still in
+  /// the cache. A failed submit leaves them queued for the end of the turn.
+  #[inline]
+  fn count_queued_send(&self, len: usize) {
+    let queued = self.send_queued.get().saturating_add(len);
+    if queued < self.params.send_submit_bytes {
+      self.send_queued.set(queued);
+      return;
+    }
+    self.send_queued.set(0);
+    if self.ring.borrow_mut().submit().is_err() {
+      bump(&self.counters.submit_errors);
+    }
   }
 
   fn on_send(&self, idx: u32, generation: u32, res: i32) {
@@ -4263,6 +4301,85 @@ mod tests {
     client.join().unwrap();
     assert!(largest >= 64 * 1024, "the peer never stopped taking bytes ({largest})");
     assert!(largest <= 1 << 20, "{largest} bytes of send buffer for one peer");
+  }
+
+  /// Writes `bytes` with `try_send_owned` and reports whether the peer can read them before the
+  /// writing task yields, then waits until the peer has read them all.
+  async fn arrives_within_the_turn(
+    stream: &mut super::UringTcpStream,
+    peer: &mut std::net::TcpStream,
+    bytes: alloc::vec::Vec<u8>,
+  ) -> bool {
+    use crate::net::StreamWriter;
+    use std::io::Read;
+    let len = bytes.len();
+    let mut owned = bytes;
+    assert!(stream.try_send_owned(&mut owned).unwrap());
+    let mut probe = [0; 1];
+    let arrived = peer.peek(&mut probe).is_ok();
+    let mut buf = alloc::vec![0; 64 * 1024];
+    let mut read = 0;
+    let begin = std::time::Instant::now();
+    while read < len {
+      assert!(begin.elapsed() < core::time::Duration::from_secs(5), "{read} of {len} bytes");
+      match peer.read(&mut buf) {
+        Ok(n) => read += n,
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => yield_once().await,
+        Err(err) => panic!("{err}"),
+      }
+    }
+    arrived
+  }
+
+  // Sends reach the kernel once those queued in a turn add up to the submit threshold, not only
+  // when the turn ends, so the kernel copies them while they are still in the cache. Below the
+  // threshold they wait for the turn's single submit.
+  #[test]
+  fn large_sends_reach_the_peer_within_the_turn() {
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let (peer_tx, peer_rx) = std::sync::mpsc::channel::<std::net::TcpStream>();
+    let client = std::thread::spawn(move || {
+      let stream = connect(&client_addr);
+      stream.set_nonblocking(true).unwrap();
+      peer_tx.send(stream).unwrap();
+    });
+    let runtime = UringRuntime::with_params(crate::executor::UringParams::new()).unwrap();
+    let (small, large) = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+      let mut peer = peer_rx.recv().unwrap();
+      let small = arrives_within_the_turn(&mut stream, &mut peer, alloc::vec![1; 1000]).await;
+      let large = arrives_within_the_turn(&mut stream, &mut peer, alloc::vec![2; 1 << 20]).await;
+      (small, large)
+    });
+    client.join().unwrap();
+    assert!(!small, "a 1000-byte send was submitted before the turn ended");
+    assert!(large, "a 1 MiB send waited for the end of the turn");
+  }
+
+  #[test]
+  fn send_submit_bytes_sets_the_threshold() {
+    for (threshold, len, expected) in [(0, 1000, true), (usize::MAX, 1 << 20, false)] {
+      let addr = test_addr();
+      let client_addr = addr.clone();
+      let (peer_tx, peer_rx) = std::sync::mpsc::channel::<std::net::TcpStream>();
+      let client = std::thread::spawn(move || {
+        let stream = connect(&client_addr);
+        stream.set_nonblocking(true).unwrap();
+        peer_tx.send(stream).unwrap();
+      });
+      let params = crate::executor::UringParams::new().set_send_submit_bytes(threshold);
+      let runtime = UringRuntime::with_params(params).unwrap();
+      let arrived = runtime.block_on(async {
+        let listener = bind(&addr).await;
+        let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+        let mut peer = peer_rx.recv().unwrap();
+        arrives_within_the_turn(&mut stream, &mut peer, alloc::vec![3; len]).await
+      });
+      client.join().unwrap();
+      assert_eq!(arrived, expected, "threshold {threshold}, {len} bytes");
+    }
   }
 
   // A connection that moved megabytes each way gives its buffers back when it is closed: its
