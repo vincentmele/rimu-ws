@@ -89,6 +89,17 @@ impl Headers {
     *trailers = Trailers::None;
   }
 
+  /// Makes this a copy of `other`, reusing this buffer.
+  #[cfg(feature = "http2")]
+  pub(crate) fn copy_from(&mut self, other: &Self) -> crate::Result<()> {
+    self.clear();
+    self.bytes.extend_from_copyable_slice(other.bytes.as_slice())?;
+    self.headers = other.headers;
+    self.sensitive_headers = other.sensitive_headers;
+    self.trailers = other.trailers;
+    Ok(())
+  }
+
   /// Returns the header that is referenced by `name`, if any.
   #[inline]
   pub fn get_by_name(&self, name: &[u8]) -> Option<Header<&str, &str>> {

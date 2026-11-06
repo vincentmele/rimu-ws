@@ -17,6 +17,9 @@ const DYN_IDX_OFFSET: u32 = 62;
 #[derive(Debug)]
 pub(crate) struct HpackDecoder {
   dyn_headers: HpackHeaders<HpackHeaderBasic>,
+  /// Changes whenever the dynamic table may have: an insert, a size update, a clear. Equal
+  /// generations mean the same table, so the same block decodes to the same fields.
+  generation: u64,
   header_buffers: (_HeaderNameBuffer, VectorUsize<u8>),
   max_bytes: (u32, Option<u32>),
 }
@@ -25,13 +28,15 @@ impl HpackDecoder {
   pub(crate) fn new() -> Self {
     Self {
       dyn_headers: HpackHeaders::new(0),
+      generation: 0,
       header_buffers: (_HeaderNameBuffer::new(), VectorUsize::new()),
       max_bytes: (0, None),
     }
   }
 
   pub(crate) fn clear(&mut self) {
-    let Self { dyn_headers, header_buffers, max_bytes } = self;
+    let Self { dyn_headers, generation, header_buffers, max_bytes } = self;
+    *generation = generation.wrapping_add(1);
     dyn_headers.clear();
     header_buffers.0.clear();
     header_buffers.1.clear();
@@ -45,6 +50,7 @@ impl HpackDecoder {
     mut cb: impl FnMut((HpackHeaderBasic, HeaderName<&str>, &str)) -> crate::Result<()>,
   ) -> crate::Result<()> {
     if let Some(elem) = self.max_bytes.1.take() {
+      self.generation = self.generation.wrapping_add(1);
       self.dyn_headers.set_max_bytes(elem, |_| {});
       self.max_bytes.0 = elem;
     }
@@ -67,6 +73,11 @@ impl HpackDecoder {
       })?;
     }
     Ok(())
+  }
+
+  /// See the `generation` field.
+  pub(crate) const fn generation(&self) -> u64 {
+    self.generation
   }
 
   pub(crate) fn get(&self, idx: u32) -> crate::Result<(HpackHeaderBasic, HeaderName<&str>, &str)> {
@@ -163,6 +174,7 @@ impl HpackDecoder {
       (hhb, name, value)
     };
     if STORE {
+      self.generation = self.generation.wrapping_add(1);
       self.dyn_headers.push_front(false, hhb, name.str(), [value], |_| {})?;
     }
     Ok(())
@@ -327,6 +339,7 @@ impl HpackDecoder {
             Http2Error::OutOfBoundsIndex,
           ));
         }
+        self.generation = self.generation.wrapping_add(1);
         self.dyn_headers.set_max_bytes(local_max_bytes, |_| {});
       }
     }

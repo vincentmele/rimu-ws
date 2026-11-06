@@ -699,3 +699,56 @@ fn conn_take_output_is_the_queued_bytes() {
   assert!(next.capacity() >= 4096);
   assert_eq!(parse_all(&next).iter().map(|el| (el.0, el.2)).collect::<Vec<_>>(), [(HEADERS, 3), (DATA, 3)]);
 }
+
+// A request block repeated byte for byte replays its decode, with the same fields.
+#[test]
+fn conn_decode_memo_replays_identical_block() {
+  let mut conn = ready_server(HttpRecvParams::with_default_params());
+  // GET http://a/x with `user-agent: t`, all literal without indexing: the table never changes.
+  let block = [0x82, 0x86, 0x04, 0x02, b'/', b'x', 0x01, 0x01, b'a', 0x00, 0x0a, b'u', b's', b'e', b'r', b'-', b'a', b'g', b'e', b'n', b't', 0x01, b't'];
+  let mut decoded = Vec::new();
+  // The first block also applies the table size the SETTINGS announced, so it is not kept; the
+  // second is, and the third replays it.
+  for id in [1u32, 3, 5] {
+    let _ = conn.feed(&frame(HEADERS, 0b101, id, &block)).unwrap();
+    let _ = events(&mut conn);
+    let msg = conn.msg_mut(U31::from_u32(id)).unwrap();
+    let headers: Vec<(String, String)> =
+      msg.headers.iter().map(|el| (el.name.to_string(), el.value.to_string())).collect();
+    decoded.push((msg.uri.as_str().to_string(), headers, conn.method(U31::from_u32(id))));
+  }
+  assert_eq!(conn.decode_memo_hits(), 1);
+  assert_eq!(decoded[0], decoded[2]);
+  assert_eq!(decoded[1], decoded[2]);
+  assert_eq!(decoded[2].0, "http://a/x");
+  assert_eq!(decoded[2].1, [("user-agent".to_string(), "t".to_string())]);
+}
+
+// A block that refers to the dynamic table decodes afresh once the table changed: index 62 names
+// another entry after a new insert, and the memo must not answer with the old one.
+#[test]
+fn conn_decode_memo_follows_table_changes() {
+  let mut conn = ready_server(HttpRecvParams::with_default_params());
+  let authority = |conn: &mut Http2Conn<false>, id: u32| {
+    conn.msg_mut(U31::from_u32(id)).unwrap().uri.authority().to_string()
+  };
+  // :authority "a" with incremental indexing: it becomes dynamic index 62.
+  let insert_a = [0x82, 0x86, 0x84, 0x41, 0x01, b'a'];
+  let insert_b = [0x82, 0x86, 0x84, 0x41, 0x01, b'b'];
+  let refer = [0x82, 0x86, 0x84, 0xbe];
+  let mut id = 1;
+  for block in [&insert_a[..], &refer, &refer] {
+    let _ = conn.feed(&frame(HEADERS, 0b101, id, block)).unwrap();
+    let _ = events(&mut conn);
+    assert_eq!(authority(&mut conn, id), "a");
+    id += 2;
+  }
+  assert_eq!(conn.decode_memo_hits(), 1);
+  let _ = conn.feed(&frame(HEADERS, 0b101, id, &insert_b)).unwrap();
+  let _ = events(&mut conn);
+  id += 2;
+  let _ = conn.feed(&frame(HEADERS, 0b101, id, &refer)).unwrap();
+  let _ = events(&mut conn);
+  assert_eq!(authority(&mut conn, id), "b");
+  assert_eq!(conn.decode_memo_hits(), 1);
+}

@@ -212,3 +212,27 @@ Cumulative builds, interleaved, native (json-h2c two rounds; baseline-h2c one, h
   and looked the path up, then the auto future looked it up again.
 - **`date` in the cached header block.** The block changes once a second; within the second a
   response's header block is one copy plus `content-length`.
+
+### Steps 7, 8 and 11: stream table, request-block memo, no allocation per request
+
+Interleaved, native, two rounds each, nothing else building:
+
+| build | baseline-h2c 256 rps | cycles/req | json-h2c 1024 rps | cycles/req |
+|---|---|---|---|---|
+| Step 9 (`date` cached) | 5,573k, 5,492k | 4,937, 4,954 | 1,158k, 1,153k | 26,928, 26,889 |
+| + stream id index | 5,542k, 5,481k | 4,989, 4,978 | 1,168k, 1,162k | 26,586, 26,999 |
+| + request-block memo | 5,887k, 5,895k | 3,425, 3,436 | 1,179k, 1,173k | 25,687, 25,704 |
+
+- **Stream id index.** The `HashMap` from stream id to slot is now an open-addressed table on
+  `id >> 1`. A peer's ids are consecutive, so a lookup is one probe. Deletion is a backward
+  shift, so there are no tombstones and it never rehashes: it allocates only to grow. Speed is
+  the same within noise. It is kept because the hash map's occasional rehash under churn was the
+  last allocation in steady state.
+- **Request-block memo (cnetmod's idea, several entries).** The HPACK decoder counts changes to
+  its dynamic table. A request block whose decode left the table unchanged is kept (up to 8, of
+  at most 512 bytes) with its decoded URI and fields. A later identical block under the same
+  table is answered with a byte compare and two copies. json-h2c's 7 rotating URIs all hit.
+  Tests cover the replay and a block whose dynamic index changes meaning.
+- **No allocation per request.** `server_steady_state_no_alloc` counts allocations on the
+  server's thread with a counting global allocator. After a warm-up at the same concurrency,
+  1000 GETs to an auto endpoint allocate nothing.

@@ -6,6 +6,7 @@
 //! framework and of the client feed it what they read and write what it queued.
 
 pub(crate) mod body;
+mod decode_memo;
 pub(crate) mod header_cache;
 pub(crate) mod output;
 pub(crate) mod scan;
@@ -26,6 +27,7 @@ use crate::{
     common_flags::CommonFlags,
     conn::{
       body::Body,
+      decode_memo::{DecodeMemo, Decoded},
       header_cache::HeaderCache,
       output::Output,
       scan::{PREFACE, Preface, next_frame, strip_preface},
@@ -115,6 +117,8 @@ pub(crate) struct Http2Conn<const IS_CLIENT: bool> {
   /// Scratch for encoding header blocks.
   header_buf: VectorUsize<u8>,
   header_cache: HeaderCache,
+  /// Request blocks seen lately (server).
+  decode_memo: DecodeMemo,
   /// Streams whose released capacity is not yet announced.
   window_updates: DequeUsize<u32>,
   conn_recv: i32,
@@ -159,6 +163,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       blocked: DequeUsize::new(),
       header_buf: VectorUsize::new(),
       header_cache: HeaderCache::new(),
+      decode_memo: DecodeMemo::new(),
       window_updates: DequeUsize::new(),
       conn_recv: DEFAULT_WINDOW.max(initial),
       conn_recv_unacked: 0,
@@ -725,6 +730,12 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     self.hpack_enc.generation()
   }
 
+  /// Request header blocks replayed from the decode memo.
+  #[cfg(test)]
+  pub(crate) const fn decode_memo_hits(&self) -> u64 {
+    self.decode_memo.hits()
+  }
+
   /// Responses whose header block came from the cache.
   #[cfg(test)]
   pub(crate) const fn header_cache_hits(&self) -> u64 {
@@ -980,35 +991,52 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     let recv_window = i32::try_from(self.hp.initial_window_len()).unwrap_or(i32::MAX);
     let send_window = self.peer.initial_window;
     let stream = self.streams.open(id, recv_window, send_window)?;
-    let rslt = HeadersFrame::read::<IS_CLIENT, false>(
-      Some(block),
-      fi,
-      &self.hp,
-      &mut self.hpack_dec,
-      (&mut stream.msg, 0),
-    );
-    let (content_length, hf) = match rslt {
-      Ok(elem) => elem,
-      Err(err) => {
-        if is_malformed(&err) {
-          self.stream_error(id, Http2ErrorCode::ProtocolError);
-          return Ok(());
+    let generation = self.hpack_dec.generation();
+    let (decoded, over_size) =
+      if let Some(elem) = self.decode_memo.replay(block, generation, &mut stream.msg)? {
+        (elem, false)
+      } else {
+        let rslt = HeadersFrame::read::<IS_CLIENT, false>(
+          Some(block),
+          fi,
+          &self.hp,
+          &mut self.hpack_dec,
+          (&mut stream.msg, 0),
+        );
+        let (content_length, hf) = match rslt {
+          Ok(elem) => elem,
+          Err(err) => {
+            if is_malformed(&err) {
+              self.stream_error(id, Http2ErrorCode::ProtocolError);
+              return Ok(());
+            }
+            let _ = self.streams.close(id);
+            return Err(err);
+          }
+        };
+        let decoded = Decoded {
+          content_length,
+          method: hf.hsreqh().method,
+          protocol: hf.hsreqh().protocol,
+        };
+        // A block that left the table as it was decodes the same way while it stays so.
+        if !hf.is_over_size() && self.hpack_dec.generation() == generation {
+          self.decode_memo.insert(block, generation, &stream.msg, decoded)?;
         }
-        let _ = self.streams.close(id);
-        return Err(err);
-      }
-    };
+        (decoded, hf.is_over_size())
+      };
     if refuse {
       let _ = self.streams.close(id);
       push_reset(&mut self.out, id, Http2ErrorCode::RefusedStream);
       return Ok(());
     }
+    let content_length = decoded.content_length;
     stream.content_length = content_length;
-    stream.method = hf.hsreqh().method;
-    stream.protocol = hf.hsreqh().protocol;
+    stream.method = decoded.method;
+    stream.protocol = decoded.protocol;
     stream.recv_closed = end_stream;
     stream.recv_headers = true;
-    if hf.is_over_size() {
+    if over_size {
       // The fields were decoded, so the HPACK state is intact: answer instead of resetting.
       stream.msg.clear();
       let status = Some(StatusCode::RequestHeaderFieldsTooLarge);
