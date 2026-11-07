@@ -650,6 +650,16 @@ mod tests {
   }
 
   #[test]
+  fn unknown_transfer_coding_gets_501() {
+    let mut c = conn();
+    c.feed(b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip, chunked\r\n\r\n").unwrap();
+    assert_eq!(c.poll_event(), Http1Event::NeedMore);
+    assert!(c.wants_close());
+    assert!(output(&mut c).starts_with(b"HTTP/1.1 501 "));
+    assert_eq!(c.poll_event(), Http1Event::Closed);
+  }
+
+  #[test]
   fn feed_is_bounded_without_polling() {
     let mut c = conn();
     let big = vec![b'a'; 1024 * 1024];

@@ -164,14 +164,11 @@ pub fn parse_request<'b>(
         content_length = Some(parse_decimal(value.as_bytes())?);
       }
       17 if name.eq_ignore_ascii_case("transfer-encoding") => {
-        let last = match value.rfind(',') {
-          Some(idx) => value.get(idx + 1..).ok_or_else(bad)?,
-          None => value,
-        }
-        .trim_matches([' ', '\t']);
-        if !last.eq_ignore_ascii_case("chunked") {
+        // A second header is rejected like a list with `chunked` twice.
+        if chunked {
           return Err(bad());
         }
+        check_transfer_encoding(value)?;
         chunked = true;
       }
       _ => {}
@@ -197,7 +194,8 @@ pub fn parse_request<'b>(
   } else {
     BodyKind::None
   };
-  let keep_alive = if close { false } else { !http10 || keep_alive_token };
+  // RFC 9112 §6.1: chunked framing in HTTP/1.0 is faulty, the connection closes after it.
+  let keep_alive = if close || (http10 && chunked) { false } else { !http10 || keep_alive_token };
 
   let scratch: &'b ParseScratch = scratch;
   // SAFETY: the first `len` slots were initialized above.
@@ -224,6 +222,37 @@ pub fn error_status(error: &crate::Error) -> StatusCode {
 #[inline]
 fn bad() -> crate::Error {
   HttpError::BadRequest.into()
+}
+
+/// Accepts a `Transfer-Encoding` value that is exactly `chunked`, the only coding supported.
+///
+/// A malformed list, or one where `chunked` is not the final coding or appears twice, is a bad
+/// request (RFC 9112 §6.1, §6.3). `chunked` after other codings is answered as not
+/// implemented (RFC 9112 §6.1).
+#[inline]
+fn check_transfer_encoding(value: &str) -> crate::Result<()> {
+  let mut chunked = 0usize;
+  let mut others = false;
+  let mut last_is_chunked = false;
+  for token in value.split(',') {
+    let token = token.trim_matches([' ', '\t']);
+    if token.is_empty() || !token.bytes().all(is_tchar) {
+      return Err(bad());
+    }
+    last_is_chunked = token.eq_ignore_ascii_case("chunked");
+    if last_is_chunked {
+      chunked = chunked.wrapping_add(1);
+    } else {
+      others = true;
+    }
+  }
+  if !last_is_chunked || chunked > 1 {
+    return Err(bad());
+  }
+  if others {
+    return Err(HttpError::UnsupportedTransferCoding.into());
+  }
+  Ok(())
 }
 
 /// Strictly digits, no sign, no overflow.
@@ -567,6 +596,47 @@ mod tests {
       assert!(matches!(parse_request(&raw[..n], &mut scratch), Ok(ParseOutcome::Partial)), "{n}");
     }
     assert!(is_err(b"\r\n\r\nGET /x HTTP/1.1\r\nHost: a\r\n\r\n"));
+  }
+
+  #[test]
+  fn transfer_encoding_is_exactly_chunked() {
+    let te = |value: &str| {
+      let raw = format!("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: {value}\r\n\r\n");
+      let mut scratch = ParseScratch::new();
+      match parse_request(raw.as_bytes(), &mut scratch) {
+        Ok(ParseOutcome::Complete { request, .. }) => {
+          assert_eq!(request.body_kind, BodyKind::Chunked);
+          StatusCode::Ok
+        }
+        Ok(ParseOutcome::Partial) => panic!("partial"),
+        Err(err) => error_status(&err),
+      }
+    };
+    assert_eq!(te("chunked"), StatusCode::Ok);
+    assert_eq!(te("CHUNKED"), StatusCode::Ok);
+    // Not chunked last: the length can not be known (RFC 9112 §6.3).
+    assert_eq!(te("gzip"), StatusCode::BadRequest);
+    assert_eq!(te("gzip, chunked"), StatusCode::NotImplemented);
+    assert_eq!(te("chunked, chunked"), StatusCode::BadRequest);
+    assert_eq!(te("chunked, gzip"), StatusCode::BadRequest);
+    assert_eq!(te(""), StatusCode::BadRequest);
+    assert_eq!(te(", chunked"), StatusCode::BadRequest);
+    assert_eq!(te("chu nked"), StatusCode::BadRequest);
+    assert_eq!(
+      err_status(
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n"
+      ),
+      StatusCode::BadRequest
+    );
+  }
+
+  #[test]
+  fn chunked_http10_does_not_keep_alive() {
+    let (_, _, _, _, body_kind, keep_alive, _) = complete(
+      b"POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+    );
+    assert_eq!(body_kind, BodyKind::Chunked);
+    assert!(!keep_alive);
   }
 
   #[test]
