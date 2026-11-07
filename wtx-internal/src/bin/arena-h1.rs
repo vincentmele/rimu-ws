@@ -3,6 +3,10 @@
 //!
 //! The runtimes do not spin: the latency profiles charge spin to the score.
 //!
+//! A second listener on TLS 8081 (`CERT_DIR`, default `/certs`, with `server.crt` and `server.key`;
+//! skipped without a certificate) serves `GET /json/{count}?m=` uncompressed (json-tls) and
+//! `POST /echo` (8gbit), which answers with the request body verbatim.
+//!
 //! `/json` serializes the dataset on every request and compresses those bytes on every request by
 //! the request's `Accept-Encoding`: brotli (quality 2), else gzip, else none. Nothing is cached.
 //!
@@ -16,6 +20,8 @@ use rimu_ws::{
   http::{Http1Req, Http1Res, Http1Router, Http1ServerFramework, Method, StatusCode},
   misc::JsonWriter,
   net::TcpParams,
+  rng::{ChaCha20, CryptoSeedableRng as _},
+  tls::TlsConfig,
 };
 use std::sync::OnceLock;
 
@@ -41,6 +47,28 @@ thread_local! {
 fn main() -> rimu_ws::Result<()> {
   // Loaded once; the numbers the validator draws later only choose a prefix of it.
   let _ = DATASET.set(load_dataset());
+  let cert_dir = std::env::var("CERT_DIR").unwrap_or_else(|_| "/certs".into());
+  let tls = if std::path::Path::new(&cert_dir).join("server.crt").exists() {
+    let cert = std::fs::read(format!("{cert_dir}/server.crt"))?;
+    let key = std::fs::read(format!("{cert_dir}/server.key"))?;
+    Some(std::thread::spawn(move || -> rimu_ws::Result<()> {
+      let tls_config = TlsConfig::from_keys_pem(&cert, key.as_slice())?;
+      let router = Http1Router::new()
+        .route(Some(Method::Get), "/json/{count}", endpoint_json_plain)
+        .route(Some(Method::Post), "/echo", endpoint_echo);
+      Http1ServerFramework::<(), fn(rimu_ws::Error), UringExecutor, _, _, _>::new_tls(
+        UringExecutor::default(),
+        ChaCha20::from_std_random()?,
+        tls_config,
+      )?
+      .set_error_cb(error_cb)
+      .set_local_runtime_cb(runtime)
+      .run_in_threads("0.0.0.0:8081", router)
+    }))
+  } else {
+    eprintln!("arena-h1: no {cert_dir}/server.crt, TLS on 8081 disabled");
+    None
+  };
   let router = Http1Router::new()
     .route(Some(Method::Get), "/baseline11", endpoint_baseline11)
     .route(Some(Method::Post), "/baseline11", endpoint_baseline11)
@@ -51,7 +79,11 @@ fn main() -> rimu_ws::Result<()> {
     // Every client speaks first
     .set_tcp_params(TcpParams::default().set_tcp_defer_accept(Some(1)))
     .set_local_runtime_cb(runtime)
-    .run_in_threads("0.0.0.0:8080", router)
+    .run_in_threads("0.0.0.0:8080", router)?;
+  if let Some(elem) = tls {
+    elem.join().map_err(|_| std::io::Error::other("TLS thread panicked"))??;
+  }
+  Ok(())
 }
 
 fn error_cb(err: rimu_ws::Error) {
@@ -154,6 +186,38 @@ fn endpoint_json(_: &mut (), req: &Http1Req<'_>, res: &mut Http1Res) -> rimu_ws:
     Encoding::Identity => {}
   }
   res.set_content_type("application/json");
+  res.set_status(StatusCode::Ok);
+  Ok(())
+}
+
+/// json-tls: the dataset for `{count}` and `m`, serialized on every request and sent as it is, with no
+/// `Accept-Encoding` handling.
+fn endpoint_json_plain(_: &mut (), req: &Http1Req<'_>, res: &mut Http1Res) -> rimu_ws::Result<()> {
+  let count: usize = req.param("count").unwrap_or("0").parse()?;
+  let m = query_m(req.query())?;
+  let dataset = DATASET.get().map_or(&[][..], |el| el.as_slice());
+  JSON_BUF.with(|cell| -> rimu_ws::Result<()> {
+    let mut json = cell.borrow_mut();
+    json.clear();
+    write_json(&mut json, dataset, count, m)?;
+    res.body_mut().extend_from_slice(json.as_slice());
+    Ok(())
+  })?;
+  res.set_content_type("application/json");
+  res.set_status(StatusCode::Ok);
+  Ok(())
+}
+
+/// 8gbit: the response body is this request's body, byte for byte.
+fn echo_body(body: &[u8]) -> &[u8] {
+  body
+}
+
+/// `POST /echo`: answers with the body the framework decoded from this request (Content-Length or
+/// chunked), never from a length header or a kept buffer.
+fn endpoint_echo(_: &mut (), req: &Http1Req<'_>, res: &mut Http1Res) -> rimu_ws::Result<()> {
+  res.body_mut().extend_from_slice(echo_body(req.body()));
+  res.set_content_type("application/octet-stream");
   res.set_status(StatusCode::Ok);
   Ok(())
 }
@@ -447,6 +511,14 @@ mod tests {
     assert_eq!(delay_ms(Some("")), None);
     assert_eq!(delay_ms(Some("-5")), None);
     assert_eq!(delay_ms(Some("1.5")), None);
+  }
+
+  #[test]
+  fn echo_returns_the_same_bytes() {
+    assert_eq!(echo_body(b"abc"), b"abc");
+    assert_eq!(echo_body(b""), b"");
+    let binary: Vec<u8> = (0..=255u8).cycle().take(10_240).collect();
+    assert_eq!(echo_body(&binary), binary.as_slice());
   }
 
   #[test]
