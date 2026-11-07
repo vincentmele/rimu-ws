@@ -2,7 +2,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(feature = "_bench", feature(test))]
 #![doc = include_str!("../README.md")]
-#![feature(impl_trait_in_assoc_type, random, return_type_notation)]
+#![feature(allocator_ext, impl_trait_in_assoc_type, random, return_type_notation)]
 #![no_std]
 
 extern crate alloc;

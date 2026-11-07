@@ -23,9 +23,9 @@ use crate::{
     ToSocketAddrs, TryRead,
   },
 };
-use alloc::{boxed::Box, collections::VecDeque, rc::Rc, vec::Vec};
+use alloc::{alloc::Global, boxed::Box, collections::VecDeque, rc::Rc, vec::Vec};
 use core::{
-  alloc::Layout,
+  alloc::{AllocError, Allocator, AllocatorClone, Layout},
   cell::{Cell, RefCell},
   future::poll_fn,
   net::SocketAddr,
@@ -66,10 +66,22 @@ const TX_OWNED: u8 = 8;
 // thread writes into stay in its caches. Bigger buffers are freed. With many connections more
 // sends are in flight than a small pool holds, and the connections that found it empty grew
 // fresh buffers by doubling, copying at each step.
+//
+// The pool also takes the larger buffers of closed connections, and gives them to the receives and
+// copied writes that would grow a buffer, so a connection that moves large bodies doesn't grow new
+// ones by doubling when an earlier one left them. With no connection open it keeps its most recent
+// `SEND_POOL_IDLE_KEEP` buffers within `SEND_POOL_IDLE_BYTES`: enough for connections that come
+// one after the other, without the largest outputs of a burst held for good.
 const SEND_POOL_MAX: usize = 64;
 const SEND_POOL_BUFFER_MAX: usize = 1 << 20;
-// A free slot keeps a buffer up to this capacity for the next connection, and drops a larger one.
+const SEND_POOL_IDLE_KEEP: usize = 4;
+const SEND_POOL_IDLE_BYTES: usize = 1 << 20;
+// A free slot keeps a buffer up to this capacity for the next connection, and gives a larger one
+// to the pool.
 const SLOT_BUFFER_KEEP: usize = 64 * 1024;
+// Room the handshake and lingering lists start with, so that connections accepted between two
+// ticks don't grow them as they come.
+const TIMER_LIST_CAPACITY: usize = 1024;
 // Free slots that keep their buffers however few connections are open; more stay warm while more
 // are open.
 const WARM_FREE_MIN: usize = 64;
@@ -445,7 +457,7 @@ impl Drop for RestoreCurrent {
 /// Resolves to the output of a spawned task. Dropping it leaves the task running.
 pub struct UringJoinHandle<T> {
   // `None` if there was no runtime to spawn on.
-  task: Option<Rc<dyn JoinTask<T>>>,
+  task: Option<TaskRc<dyn JoinTask<T>>>,
 }
 
 impl<T> core::fmt::Debug for UringJoinHandle<T> {
@@ -466,6 +478,137 @@ impl<T> Future for UringJoinHandle<T> {
     task.poll_join(cx)
   }
 }
+
+// ---- task allocations
+
+/// A spawned task's allocation, from [`TaskAlloc`].
+type TaskRc<T> = Rc<T, TaskAlloc>;
+
+// Ended tasks' blocks a thread keeps for the next tasks, most recent last: at most this many, of
+// at most this many bytes in all, and with no connection open (see `Reactor::trim_free_slots`)
+// the most recent `TASK_POOL_IDLE_KEEP` within `TASK_POOL_IDLE_BYTES`. A block is one of a size
+// class (its size rounded up to `TASK_CLASS`); tasks larger than `TASK_BLOCK_MAX`, or aligned
+// beyond `TASK_CLASS`, are not pooled.
+const TASK_POOL_MAX: usize = 256;
+const TASK_POOL_BYTES: usize = 2 << 20;
+const TASK_POOL_IDLE_KEEP: usize = 4;
+const TASK_POOL_IDLE_BYTES: usize = 256 << 10;
+const TASK_CLASS: usize = 64;
+const TASK_BLOCK_MAX: usize = 64 << 10;
+
+/// Allocates the tasks spawned on a runtime from the blocks of the tasks that ended on its thread,
+/// so that a server that spawns a task per connection allocates nothing for it once warm (the
+/// tasks of one server are of one size). A block is zeroed when it comes back: a task's future may
+/// have held a connection's secrets, which the next task must not find.
+#[derive(Clone, Copy, Debug, Default)]
+struct TaskAlloc;
+
+/// The blocks of ended tasks: pointer and size, each allocated with [`task_class`].
+struct TaskPool {
+  blocks: Vec<(core::ptr::NonNull<u8>, usize)>,
+  bytes: usize,
+}
+
+impl TaskPool {
+  /// Frees the oldest blocks until at most `keep` are left, of at most `bytes`.
+  fn trim(&mut self, keep: usize, bytes: usize) {
+    while self.blocks.len() > keep || self.bytes > bytes {
+      let (ptr, size) = self.blocks.remove(0);
+      self.bytes = self.bytes.wrapping_sub(size);
+      // SAFETY: a block of the pool, allocated with this layout and owned by it
+      unsafe { Global.deallocate(ptr, Layout::from_size_align_unchecked(size, TASK_CLASS)) };
+    }
+  }
+}
+
+impl Drop for TaskPool {
+  fn drop(&mut self) {
+    self.trim(0, 0);
+  }
+}
+
+std::thread_local! {
+  static TASK_POOL: RefCell<TaskPool> =
+    const { RefCell::new(TaskPool { blocks: Vec::new(), bytes: 0 }) };
+}
+
+/// The layout a task's block is allocated with, if it is pooled.
+fn task_class(layout: Layout) -> Option<Layout> {
+  if layout.align() > TASK_CLASS || layout.size() == 0 || layout.size() > TASK_BLOCK_MAX {
+    return None;
+  }
+  Layout::from_size_align(layout.size().next_multiple_of(TASK_CLASS), TASK_CLASS).ok()
+}
+
+/// Trims this thread's task pool: see `TASK_POOL_IDLE_KEEP`.
+fn trim_task_pool(keep: usize, bytes: usize) {
+  let _rslt = TASK_POOL.try_with(|pool| {
+    if let Ok(mut elem) = pool.try_borrow_mut() {
+      elem.trim(keep, bytes);
+    }
+  });
+}
+
+// SAFETY: blocks come from `Global` with the layout `task_class` gives (or the caller's, for those
+// not pooled) and go back to it with that layout; a pooled block is handed out once, and is the
+// pool's alone until then.
+unsafe impl Allocator for TaskAlloc {
+  #[inline]
+  fn allocate(&self, layout: Layout) -> Result<core::ptr::NonNull<[u8]>, AllocError> {
+    let Some(class) = task_class(layout) else {
+      return Global.allocate(layout);
+    };
+    let pooled = TASK_POOL
+      .try_with(|pool| {
+        let mut pool = pool.try_borrow_mut().ok()?;
+        let idx = pool.blocks.iter().rposition(|el| el.1 == class.size())?;
+        let (ptr, size) = pool.blocks.remove(idx);
+        pool.bytes = pool.bytes.wrapping_sub(size);
+        Some(ptr)
+      })
+      .ok()
+      .flatten();
+    let ptr = match pooled {
+      Some(elem) => elem,
+      None => Global.allocate(class)?.cast(),
+    };
+    Ok(core::ptr::NonNull::slice_from_raw_parts(ptr, class.size()))
+  }
+
+  #[inline]
+  unsafe fn deallocate(&self, ptr: core::ptr::NonNull<u8>, layout: Layout) {
+    let Some(class) = task_class(layout) else {
+      // SAFETY: allocated by `Global` with this layout, in `allocate`
+      unsafe { Global.deallocate(ptr, layout) };
+      return;
+    };
+    // SAFETY: the block has `class.size()` bytes, all of them the caller's to give back
+    unsafe { ptr.as_ptr().write_bytes(0, class.size()) };
+    // The zeroes are written before the block can be handed out again, whatever is inlined.
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    let kept = TASK_POOL
+      .try_with(|pool| {
+        let Ok(mut pool) = pool.try_borrow_mut() else {
+          return false;
+        };
+        let bytes = pool.bytes.wrapping_add(class.size());
+        if pool.blocks.len() >= TASK_POOL_MAX || bytes > TASK_POOL_BYTES {
+          return false;
+        }
+        pool.blocks.push((ptr, class.size()));
+        pool.bytes = bytes;
+        true
+      })
+      .unwrap_or(false);
+    if !kept {
+      // SAFETY: allocated by `Global` with `class`, in `allocate`
+      unsafe { Global.deallocate(ptr, class) };
+    }
+  }
+}
+
+// SAFETY: every `TaskAlloc` is the same allocator: a block one allocates, any other frees.
+unsafe impl AllocatorClone for TaskAlloc {}
 
 // A spawned future and its output share one allocation, seen by the runtime as a `RunTask` and by
 // the join handle as a `JoinTask`.
@@ -1162,7 +1305,8 @@ where
   if reactor.is_null() {
     return UringJoinHandle { task: None };
   }
-  let cell = Rc::new(TaskCell { inner: RefCell::new((TaskState::Running(future), None)) });
+  let cell =
+    Rc::new_in(TaskCell { inner: RefCell::new((TaskState::Running(future), None)) }, TaskAlloc);
   // SAFETY: set by `block_on`, which outlives everything it polls
   unsafe { &*reactor }.spawn(cell.clone());
   UringJoinHandle { task: Some(cell) }
@@ -1409,7 +1553,7 @@ fn send_to_runtime(runtime: u32, message: Message) {
 // 32 bytes, so that no slot straddles two cache lines: a wake reads one.
 #[repr(align(32))]
 struct TaskSlot {
-  future: Option<Rc<dyn RunTask>>,
+  future: Option<TaskRc<dyn RunTask>>,
   generation: u32,
   scheduled: bool,
 }
@@ -1666,7 +1810,7 @@ struct Reactor {
   // The task `run_ready` is polling, or `usize::MAX`
   polling: Cell<usize>,
   // The task `run_ready` is polling
-  current: Cell<Option<Rc<dyn RunTask>>>,
+  current: Cell<Option<TaskRc<dyn RunTask>>>,
   // `UringSleep`s, by slot, and the free slots
   sleeps: RefCell<Vec<SleepSlot>>,
   connects: RefCell<Vec<ConnectSlot>>,
@@ -1776,11 +1920,11 @@ impl Reactor {
     let timers = Timers {
       armed: false,
       close_ticks: ticks_of(params.close_timeout),
-      handshakes: Vec::new(),
+      handshakes: Vec::with_capacity(TIMER_LIST_CAPACITY),
       handshake_ticks: ticks_of(params.handshake_timeout),
       idle_every: (idle_ticks / 16).max(1),
       idle_ticks,
-      lingering: Vec::new(),
+      lingering: Vec::with_capacity(TIMER_LIST_CAPACITY),
       tick: 0,
     };
     let (id, inbox) = register_runtime()?;
@@ -1814,7 +1958,7 @@ impl Reactor {
       counters: Counters::default(),
       enter_failures: Cell::new(0),
       ring_failed: Cell::new(0),
-      send_pool: RefCell::new(Vec::new()),
+      send_pool: RefCell::new(Vec::with_capacity(SEND_POOL_MAX)),
       send_queued: Cell::new(0),
       reaping: Cell::new(false),
       ready: RefCell::new(VecDeque::new()),
@@ -2086,7 +2230,7 @@ impl Reactor {
 
   // ---- tasks
 
-  fn spawn(&self, future: Rc<dyn RunTask>) {
+  fn spawn(&self, future: TaskRc<dyn RunTask>) {
     let mut tasks = self.tasks.borrow_mut();
     let idx = if let Some(idx) = self.free_tasks.borrow_mut().pop() {
       let slot = &mut tasks[idx as usize];
@@ -2673,6 +2817,9 @@ impl Reactor {
         } else if off >= RX_COMPACT && off >= conn.rx.len() - off {
           compact_rx(conn);
         }
+        if conn.rx.capacity() - conn.rx.len() < len {
+          self.grow_rx(conn, len);
+        }
         let bufs = self.bufs.borrow();
         conn.rx.extend_from_slice(bufs.mem.get(begin..begin + len).unwrap_or_default());
         drop(bufs);
@@ -2707,6 +2854,23 @@ impl Reactor {
       }
     }
     recycled
+  }
+
+  /// Moves the unread bytes of `conn.rx` into a pooled buffer with room for `additional` more, if
+  /// the pool has one, instead of growing it by doubling; the buffer it leaves goes to the pool.
+  #[cold]
+  #[inline(never)]
+  fn grow_rx(&self, conn: &mut Conn, additional: usize) {
+    let unread = conn.rx.get(conn.rx_off as usize..).unwrap_or_default();
+    let Some(mut buffer) =
+      self.take_send_buffer(unread.len().saturating_add(additional), usize::MAX)
+    else {
+      return;
+    };
+    buffer.extend_from_slice(unread);
+    conn.rx_off = 0;
+    let old = core::mem::replace(&mut conn.rx, buffer);
+    self.recycle_send_buffer(old);
   }
 
   /// Stops receiving into a connection that holds `rx_high_water` unread bytes: the rest waits in
@@ -2814,7 +2978,7 @@ impl Reactor {
     // No floor: copied writes are mostly small (WebSocket echoes, HTTP/2 control frames), and small
     // buffers let thousands of connections share pages. A 32 KiB floor here cost WebSocket echo
     // about 10% more user cycles per frame.
-    reserve_send(&mut conn.tx_pending, len, 0);
+    self.reserve_send(&mut conn.tx_pending, len, 0);
     for elem in bytes {
       conn.tx_pending.extend_from_slice(elem);
     }
@@ -2868,7 +3032,7 @@ impl Reactor {
         if conn.tx_pending.len() >= self.params.tx_high_water {
           return Ok(false);
         }
-        reserve_send(&mut conn.tx_pending, len, self.params.tx_high_water.saturating_mul(2));
+        self.reserve_send(&mut conn.tx_pending, len, self.params.tx_high_water.saturating_mul(2));
         let before = conn.tx_pending.len();
         if let Err(err) = write(&mut conn.tx_pending) {
           conn.tx_pending.truncate(before);
@@ -2877,8 +3041,11 @@ impl Reactor {
         return Ok(true);
       }
       // A buffer too small would be grown by a copy of its whole capacity: start a new one.
-      let mut buffer = self.send_pool.borrow_mut().pop().unwrap_or_default();
-      reserve_send(&mut buffer, len, self.params.tx_high_water.saturating_mul(2));
+      let mut buffer = self
+        .take_send_buffer(len, usize::MAX)
+        .or_else(|| self.send_pool.borrow_mut().pop())
+        .unwrap_or_default();
+      self.reserve_send(&mut buffer, len, self.params.tx_high_water.saturating_mul(2));
       if let Err(err) = write(&mut buffer) {
         self.recycle_send_buffer(buffer);
         return Err(err);
@@ -2922,7 +3089,8 @@ impl Reactor {
         if conn.tx_pending.len() >= self.params.tx_high_water {
           return Ok(false);
         }
-        reserve_send(&mut conn.tx_pending, bytes.len(), self.params.tx_high_water.saturating_mul(2));
+        let floor = self.params.tx_high_water.saturating_mul(2);
+        self.reserve_send(&mut conn.tx_pending, bytes.len(), floor);
         conn.tx_pending.extend_from_slice(bytes);
         bytes.clear();
         return Ok(true);
@@ -2930,12 +3098,11 @@ impl Reactor {
       if bytes.is_empty() {
         return Ok(true);
       }
-      // With the pool empty, the next output is likely as big as this one: room for it up front
-      // instead of growth by doubling.
+      // The next output is likely as big as this one: a buffer with room for it, else room for it
+      // up front instead of growth by doubling.
       let spare = self
-        .send_pool
-        .borrow_mut()
-        .pop()
+        .take_send_buffer(bytes.len(), usize::MAX)
+        .or_else(|| self.send_pool.borrow_mut().pop())
         .unwrap_or_else(|| Vec::with_capacity(bytes.len().min(SEND_POOL_BUFFER_MAX)));
       let idle = core::mem::replace(&mut conn.tx_inflight, core::mem::replace(bytes, spare));
       self.recycle_send_buffer(idle);
@@ -2948,6 +3115,43 @@ impl Reactor {
     self.push_sqe(&sqe);
     self.count_queued_send(len);
     Ok(true)
+  }
+
+  /// The most recently pooled buffer with a capacity of `min` to `max` bytes, if any.
+  #[inline]
+  fn take_send_buffer(&self, min: usize, max: usize) -> Option<Vec<u8>> {
+    let mut pool = self.send_pool.borrow_mut();
+    let idx = pool.iter().rposition(|el| (min..=max).contains(&el.capacity()))?;
+    Some(pool.remove(idx))
+  }
+
+  /// Room in `buf` for `additional` more bytes, in a size class (a power of two, at least `floor`),
+  /// so that buffers settle at sizes later outputs fit rather than grow by a few bytes now and then.
+  /// An empty buffer is replaced, not grown: growing copies its whole capacity. The replacement is
+  /// a pooled buffer of up to four times the class if there is one, a new one of the class if not.
+  #[inline]
+  fn reserve_send(&self, buf: &mut Vec<u8>, additional: usize, floor: usize) {
+    let want = buf.len().saturating_add(additional);
+    if buf.capacity() >= want {
+      return;
+    }
+    self.grow_send(buf, want, floor);
+  }
+
+  #[cold]
+  #[inline(never)]
+  fn grow_send(&self, buf: &mut Vec<u8>, want: usize, floor: usize) {
+    let class = want.max(floor).checked_next_power_of_two().unwrap_or(want);
+    if !buf.is_empty() {
+      buf.reserve_exact(class.saturating_sub(buf.len()));
+      return;
+    }
+    if let Some(elem) = self.take_send_buffer(want, class.saturating_mul(4)) {
+      let old = core::mem::replace(buf, elem);
+      self.recycle_send_buffer(old);
+      return;
+    }
+    *buf = Vec::with_capacity(class);
   }
 
   /// Keeps an emptied send buffer for `try_queue_send_owned`, or frees it.
@@ -3184,10 +3388,11 @@ impl Reactor {
     conn.in_use = false;
     conn.generation = conn.generation.wrapping_add(1) & 0x0FFF_FFFF;
     // Slots are reused, so a buffer that grew for one connection would stay allocated for as
-    // long as the runtime runs: memory a burst of large or unread transfers never gives back.
+    // long as the runtime runs: memory a burst of large or unread transfers never gives back. It
+    // goes to the pool instead, which is bounded.
     for buffer in [&mut conn.rx, &mut conn.tx_inflight, &mut conn.tx_pending] {
       if buffer.capacity() > SLOT_BUFFER_KEEP {
-        *buffer = Vec::new();
+        self.recycle_send_buffer(core::mem::take(buffer));
       }
     }
     drop(conns);
@@ -3209,18 +3414,21 @@ impl Reactor {
   }
 
   /// Strips the buffers of the free slots the next connections are unlikely to reuse soon: all but
-  /// as many as are open, and at least `WARM_FREE_MIN`; with no connection open, the send pool's
-  /// too. After a burst closes, memory then follows
-  /// the connections open rather than the most ever open. The free list is a stack, so the
-  /// stripped slots are a prefix at its bottom, which `cold_free` counts: each slot is stripped
-  /// at most once per time it is freed.
+  /// as many as are open, and at least `WARM_FREE_MIN`; with no connection open, the pools are
+  /// trimmed to a few entries too (the send pool, ended tasks' blocks and TLS state). After a
+  /// burst closes, memory then follows the connections open rather than the most ever open. The
+  /// free list is a stack, so the stripped slots are a prefix at its bottom, which `cold_free`
+  /// counts: each slot is stripped at most once per time it is freed.
   fn trim_free_slots(&self) {
     let free = self.free_conns.borrow();
     let mut conns = self.conns.borrow_mut();
-    // With no connection left, the send buffers kept for reuse would only hold the largest outputs
-    // of the last burst.
+    // With no connection left, the buffers kept for reuse would only hold the largest outputs of
+    // the last burst, but for the few the next connection needs.
     if free.len() == conns.len() {
-      self.send_pool.borrow_mut().clear();
+      trim_newest(&mut self.send_pool.borrow_mut(), SEND_POOL_IDLE_KEEP, SEND_POOL_IDLE_BYTES);
+      trim_task_pool(TASK_POOL_IDLE_KEEP, TASK_POOL_IDLE_BYTES);
+      #[cfg(feature = "tls")]
+      crate::tls::trim_idle_pools();
     }
     let keep = conns.len().wrapping_sub(free.len()).max(WARM_FREE_MIN);
     let mut cold = self.cold_free.get().min(free.len());
@@ -3438,20 +3646,20 @@ fn drop_sent(conn: &mut Conn) {
   conn.tx_done = 0;
 }
 
-/// Room in `buf` for `additional` more bytes, in a size class (a power of two, at least `floor`),
-/// so that buffers settle at sizes later outputs fit rather than grow by a few bytes now and then.
-/// An empty buffer is replaced, not grown: growing copies its whole capacity.
-fn reserve_send(buf: &mut Vec<u8>, additional: usize, floor: usize) {
-  let want = buf.len().saturating_add(additional);
-  if buf.capacity() >= want {
-    return;
+/// Frees the oldest of `pool`'s buffers until at most `keep` are left, of at most `bytes` in all.
+fn trim_newest(pool: &mut Vec<Vec<u8>>, keep: usize, bytes: usize) {
+  let mut kept = 0usize;
+  let mut total = 0usize;
+  let mut first = pool.len();
+  for (idx, elem) in pool.iter().enumerate().rev() {
+    total = total.saturating_add(elem.capacity());
+    if kept == keep || total > bytes {
+      break;
+    }
+    kept = kept.wrapping_add(1);
+    first = idx;
   }
-  let class = want.max(floor).checked_next_power_of_two().unwrap_or(want);
-  if buf.is_empty() {
-    *buf = Vec::with_capacity(class);
-  } else {
-    buf.reserve_exact(class.saturating_sub(buf.len()));
-  }
+  let _ = pool.drain(..first);
 }
 
 fn send_sqe(conn: &Conn, bytes: &[u8]) -> squeue::Entry {
@@ -3686,6 +3894,40 @@ mod tests {
       ALLOCATIONS.load(Ordering::SeqCst) - before
     });
     assert_eq!(allocations, 0, "allocations of 100 spawned tasks");
+  }
+
+  // The task allocator, without a runtime (so under Miri too): a block comes back zeroed, the
+  // next task of its class takes it, others don't, and the pool keeps its bounds.
+  #[test]
+  fn task_blocks_come_back_zeroed_and_are_reused() {
+    use super::{TASK_POOL, TASK_POOL_MAX, TaskAlloc, TaskRc, trim_task_pool};
+    use alloc::rc::Rc;
+    trim_task_pool(0, 0);
+    let first = Rc::new_in([0xA5u8; 1000], TaskAlloc);
+    let addr = Rc::as_ptr(&first).addr();
+    drop(first);
+    TASK_POOL.with(|pool| {
+      let pool = pool.borrow();
+      let &(ptr, size) = pool.blocks.last().unwrap();
+      assert!(size >= 1000 && size % super::TASK_CLASS == 0);
+      // SAFETY: a block of the pool, every byte of which was written with a zero
+      let bytes = unsafe { core::slice::from_raw_parts(ptr.as_ptr(), size) };
+      assert!(bytes.iter().all(|el| *el == 0), "a pooled task block kept its bytes");
+    });
+    // Another class doesn't take it, the same one does.
+    let other: TaskRc<[u8; 4000]> = Rc::new_in([1; 4000], TaskAlloc);
+    assert_ne!(Rc::as_ptr(&other).cast::<u8>().addr(), addr);
+    let again = Rc::new_in([2u8; 1000], TaskAlloc);
+    assert_eq!(Rc::as_ptr(&again).addr(), addr);
+    assert_eq!(again[999], 2);
+    drop((other, again));
+    let many: Vec<_> = (0..TASK_POOL_MAX + 8).map(|_| Rc::new_in([3u8; 100], TaskAlloc)).collect();
+    drop(many);
+    let (len, bytes) = TASK_POOL.with(|pool| (pool.borrow().blocks.len(), pool.borrow().bytes));
+    assert!(len <= TASK_POOL_MAX && bytes <= super::TASK_POOL_BYTES, "{len} {bytes}");
+    trim_task_pool(super::TASK_POOL_IDLE_KEEP, super::TASK_POOL_IDLE_BYTES);
+    let len = TASK_POOL.with(|pool| pool.borrow().blocks.len());
+    assert_eq!(len, super::TASK_POOL_IDLE_KEEP);
   }
 
   async fn yield_once() {
@@ -4698,14 +4940,18 @@ mod tests {
         yield_once().await;
       }
       super::with_reactor(|reactor| {
-        Ok(reactor.conns.borrow().iter().fold(0, |acc, el| {
+        let largest = reactor.conns.borrow().iter().fold(0, |acc, el| {
           acc.max(el.rx.capacity()).max(el.tx_inflight.capacity()).max(el.tx_pending.capacity())
-        }))
+        });
+        Ok((largest, reactor.send_pool.borrow().iter().map(Vec::capacity).sum::<usize>()))
       })
       .unwrap()
     });
     client.join().unwrap();
+    let (largest, pooled) = largest;
     assert!(largest <= 64 * 1024, "a free slot holds a {largest}-byte buffer");
+    // The large ones went to the pool, which keeps little once no connection is left.
+    assert!(pooled <= super::SEND_POOL_IDLE_BYTES, "{pooled} bytes pooled");
   }
 
   // The send threshold defaults to 16 KiB: with less output waiting per connection, the rest
@@ -4763,10 +5009,11 @@ mod tests {
     assert_eq!(client.join().unwrap(), sent);
   }
 
-  // A runtime left with no connection keeps no send buffers: the pool that let a busy turn reuse
-  // them would otherwise hold the largest outputs of a burst for good.
+  // A runtime left with no connection keeps few send buffers, of little memory: the pool that let
+  // a busy turn reuse them would otherwise hold the largest outputs of a burst for good. The most
+  // recent are kept, for a connection that comes after the last one.
   #[test]
-  fn no_connection_left_keeps_no_send_buffers() {
+  fn no_connection_left_keeps_few_send_buffers() {
     use crate::net::StreamWriter;
     const LEN: usize = 512 * 1024;
     let addr = test_addr();
@@ -4790,7 +5037,13 @@ mod tests {
           yield_once().await;
         }
       }
-      let pool_len = || super::with_reactor(|reactor| Ok(reactor.send_pool.borrow().len())).unwrap();
+      let pool_len = || {
+        super::with_reactor(|reactor| {
+          let pool = reactor.send_pool.borrow();
+          Ok((pool.len(), pool.iter().map(Vec::capacity).sum::<usize>()))
+        })
+        .unwrap()
+      };
       for _ in 0..100 {
         yield_once().await;
       }
@@ -4804,8 +5057,11 @@ mod tests {
       (pooled_open, pool_len())
     });
     client.join().unwrap();
-    assert!(pooled_open > 0, "the test never filled the pool");
-    assert_eq!(pooled_closed, 0, "{pooled_closed} send buffers kept with no connection left");
+    assert!(pooled_open.0 > 0, "the test never filled the pool");
+    let (len, bytes) = pooled_closed;
+    assert!(len > 0, "no send buffer kept for the next connection");
+    assert!(len <= super::SEND_POOL_IDLE_KEEP, "{len} send buffers kept with no connection left");
+    assert!(bytes <= super::SEND_POOL_IDLE_BYTES, "{bytes} bytes kept with no connection left");
   }
 
   // After a burst of connections closes, at most `WARM_FREE_MIN` free slots keep buffers: the rest
