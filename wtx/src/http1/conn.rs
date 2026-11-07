@@ -228,7 +228,11 @@ impl Http1Conn {
   /// Does nothing if no request is ready.
   ///
   /// The request's method and version shape the response as [`write_response`] describes: no
-  /// body for `HEAD`, no content for 1xx / 204 / 304, `Connection: keep-alive` for HTTP/1.0.
+  /// body for `HEAD`, no content for 204 / 304, `Connection: keep-alive` for HTTP/1.0.
+  ///
+  /// `status` must be final (2xx to 5xx): a response ends the request, so an informational 1xx
+  /// would be taken by the client as an interim response before the real one that never comes,
+  /// and the connection would desynchronize.
   #[inline]
   pub fn respond(&mut self, status: StatusCode, content_type: &str, body: &[u8]) {
     let Phase::Ready { len, keep_alive, method, version } = self.phase else {
