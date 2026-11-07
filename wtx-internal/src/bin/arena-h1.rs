@@ -15,7 +15,7 @@
 //! Environment: `ARENA_LOG_ERRORS` prints the errors the server reports to stderr; `DATASET_PATH`
 //! (default `/data/dataset.json`) is the dataset `/json` serves.
 
-use core::{cell::RefCell, time::Duration};
+use core::{cell::RefCell, num::NonZeroUsize, time::Duration};
 use rimu_ws::{
   collections::{ArrayVectorU8, VectorUsize},
   executor::{UringExecutor, UringParams, UringRuntime},
@@ -53,24 +53,23 @@ fn main() -> rimu_ws::Result<()> {
   let tls = if std::path::Path::new(&cert_dir).join("server.crt").exists() {
     let cert = std::fs::read(format!("{cert_dir}/server.crt"))?;
     let key = std::fs::read(format!("{cert_dir}/server.key"))?;
-    Some(std::thread::spawn(move || -> rimu_ws::Result<()> {
-      let tls_config = TlsConfig::from_keys_pem(&cert, key.as_slice())?;
-      let router = Http1Router::new()
-        .route(Some(Method::Get), "/json/{count}", endpoint_json_plain)
-        .route(Some(Method::Post), "/echo", endpoint_echo);
-      Http1ServerFramework::<(), fn(rimu_ws::Error), UringExecutor, _, _, _>::new_tls(
-        UringExecutor::default(),
-        ChaCha20::from_std_random()?,
-        tls_config,
-      )?
-      .set_error_cb(error_cb)
-      .set_local_runtime_cb(runtime)
-      .run_in_threads("0.0.0.0:8081", router)
-    }))
+    Some(std::thread::spawn(move || serve_tls("0.0.0.0:8081", None, &cert, &key, runtime)))
   } else {
     eprintln!("arena-h1: no {cert_dir}/server.crt, TLS on 8081 disabled");
     None
   };
+  serve_plain("0.0.0.0:8080", None, runtime)?;
+  if let Some(elem) = tls {
+    elem.join().map_err(|_| std::io::Error::other("TLS thread panicked"))??;
+  }
+  Ok(())
+}
+
+/// The plaintext server: `runtimes` runtimes (one per thread if `None`), each built by `rc`.
+fn serve_plain<RC>(addr: &str, runtimes: Option<NonZeroUsize>, rc: RC) -> rimu_ws::Result<()>
+where
+  RC: Clone + Fn() -> rimu_ws::Result<UringRuntime> + Send + 'static,
+{
   let router = Http1Router::new()
     .route(Some(Method::Get), "/baseline11", endpoint_baseline11)
     .route(Some(Method::Post), "/baseline11", endpoint_baseline11)
@@ -82,12 +81,35 @@ fn main() -> rimu_ws::Result<()> {
     .set_max_delay(Duration::from_millis(MAX_DELAY_MS))
     // Every client speaks first
     .set_tcp_params(TcpParams::default().set_tcp_defer_accept(Some(1)))
-    .set_local_runtime_cb(runtime)
-    .run_in_threads("0.0.0.0:8080", router)?;
-  if let Some(elem) = tls {
-    elem.join().map_err(|_| std::io::Error::other("TLS thread panicked"))??;
-  }
-  Ok(())
+    .set_local_runtime_cb(rc)
+    .set_local_runtimes(runtimes)
+    .run_in_threads(addr, router)
+}
+
+/// The TLS server of the certificate `cert` and its key `key`, with runtimes as [`serve_plain`].
+fn serve_tls<RC>(
+  addr: &str,
+  runtimes: Option<NonZeroUsize>,
+  cert: &[u8],
+  key: &[u8],
+  rc: RC,
+) -> rimu_ws::Result<()>
+where
+  RC: Clone + Fn() -> rimu_ws::Result<UringRuntime> + Send + 'static,
+{
+  let tls_config = TlsConfig::from_keys_pem(cert, key)?;
+  let router = Http1Router::new()
+    .route(Some(Method::Get), "/json/{count}", endpoint_json_plain)
+    .route(Some(Method::Post), "/echo", endpoint_echo);
+  Http1ServerFramework::<(), fn(rimu_ws::Error), UringExecutor, _, _, _>::new_tls(
+    UringExecutor::default(),
+    ChaCha20::from_std_random()?,
+    tls_config,
+  )?
+  .set_error_cb(error_cb)
+  .set_local_runtime_cb(rc)
+  .set_local_runtimes(runtimes)
+  .run_in_threads(addr, router)
 }
 
 fn error_cb(err: rimu_ws::Error) {
@@ -597,6 +619,10 @@ fn push_i64(out: &mut Vec<u8>, n: i64) {
   }
   out.extend_from_slice(&buf[i..]);
 }
+
+#[cfg(test)]
+#[path = "arena_h1/alloc_tests.rs"]
+mod alloc_tests;
 
 #[cfg(test)]
 mod tests {
