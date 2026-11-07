@@ -5,6 +5,7 @@ use crate::{
   net::{ConnectionState, Stream, StreamCommon, StreamReader, StreamWriter, TryRead},
   sync::{Arc, AtomicBool, AtomicU8, AtomicWaker},
   tls::{
+    KsBox,
     AlertDescription, AlertLevel, RECORD_HEADER_LEN, TlsBuffer, TlsCtx, TlsError, TlsStreamBridge,
     TlsStreamReader, TlsStreamWriter,
     key_schedule::{KeySchedule, KeyScheduleWrite},
@@ -54,8 +55,9 @@ pub struct TlsStream<S, TCX, const IS_CLIENT: bool> {
   pub(crate) max_fragment_length_send: u16,
   pub(crate) phantom: PhantomData<TCX>,
   pub(crate) buffer: TlsBuffer,
-  // Boxed: it is most of the stream's size, and a plaintext stream moves it without using it.
-  pub(crate) key_schedule: Box<KeySchedule>,
+  // Boxed: it is most of the stream's size, and a plaintext stream moves it without using it. The
+  // box comes from, and goes back zeroed to, its thread's pool.
+  pub(crate) key_schedule: KsBox,
   pub(crate) new_session_ticket: Option<NewSessionTicket<ShortBoxSliceU16<u8>>>,
   pub(crate) plaintext_consumed: usize,
   pub(crate) plaintext_len: usize,
@@ -81,7 +83,7 @@ where
   ) -> crate::Result<Self> {
     Self::new_boxed(
       buffer,
-      Box::new(key_schedule),
+      KsBox::new(key_schedule),
       max_fragment_length,
       max_fragment_length_send,
       stream,
@@ -91,7 +93,7 @@ where
   #[inline]
   pub(crate) fn new_boxed(
     buffer: TlsBuffer,
-    key_schedule: Box<KeySchedule>,
+    key_schedule: KsBox,
     max_fragment_length: u16,
     max_fragment_length_send: u16,
     stream: S,
@@ -290,11 +292,11 @@ where
 
   #[inline]
   fn into_split(
-    self,
+    mut self,
   ) -> crate::Result<(Self::BridgeOwned, Self::ReadHalfOwned, Self::WriteHalfOwned)> {
     let stream_bridge = TlsStreamBridge::new();
     let exporter_secret = *self.key_schedule.exporter_secret();
-    let (ksr, ksw) = self.key_schedule.into_split();
+    let (ksr, ksw) = self.key_schedule.into_inner().into_split();
     let (_, stream_reader, stream_writer) = self.stream.into_split()?;
     let common = Arc::new(TlsStreamCommon {
       can_reply_key_update: AtomicBool::new(self.can_reply_key_update),
@@ -311,7 +313,7 @@ where
         self.new_session_ticket,
         self.plaintext_consumed,
         self.plaintext_len,
-        self.buffer.reader_buffer,
+        core::mem::take(&mut self.buffer.reader_buffer),
         stream_bridge,
         stream_reader,
       )?,
@@ -321,7 +323,7 @@ where
         ksw,
         self.max_fragment_length_send,
         stream_writer,
-        self.buffer.writer_buffer,
+        core::mem::take(&mut self.buffer.writer_buffer),
       ),
     ))
   }

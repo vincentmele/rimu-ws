@@ -32,6 +32,7 @@ mod tls_hash;
 mod tls_hkdf;
 mod tls_hmac;
 mod tls_mode;
+mod tls_pool;
 mod tls_stream;
 mod tls_stream_bridge;
 pub(crate) mod tls_stream_common;
@@ -75,6 +76,7 @@ pub use tls_ctx::{
 };
 pub use tls_error::TlsError;
 pub use tls_mode::TlsMode;
+pub(crate) use tls_pool::{KsBox, trim_idle_pools};
 pub use tls_stream::TlsStream;
 pub use tls_stream_bridge::{TlsStreamBridge, TlsStreamBridgeData};
 pub use tls_stream_reader::TlsStreamReader;

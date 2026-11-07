@@ -41,6 +41,21 @@ impl BufStreamReader {
     }
   }
 
+  /// [`Self::new`] reading into `buffer`, emptied first.
+  #[inline]
+  pub(crate) fn with_buffer(mut buffer: VectorUsize<u8>) -> Self {
+    buffer.clear();
+    Self { buffer, ..Self::new() }
+  }
+
+  /// Takes the internal buffer out, leaving an empty one and nothing to read.
+  #[inline]
+  pub(crate) fn take_buffer(&mut self) -> VectorUsize<u8> {
+    self.antecedent_end_idx = 0;
+    self.current_end_idx = 0;
+    core::mem::take(&mut self.buffer)
+  }
+
   /// The antecedent (already consumed) region.
   #[inline]
   pub fn antecedent(&self) -> &[u8] {

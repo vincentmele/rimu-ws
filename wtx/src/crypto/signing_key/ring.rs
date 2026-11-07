@@ -1,5 +1,4 @@
 use crate::{
-  collections::VectorUsize,
   crypto::{
     CryptoError, EcdsaP256SigningKeyRing, EcdsaP384SigningKeyRing, Ed25519SigningKeyRing, HashTy,
     RsaPkcs1SigningKeyRing, RsaPssSigningKeyRing, SigningOutput, signing_key::SigningKey,
@@ -95,7 +94,7 @@ impl SigningKey for Ed25519SigningKeyRing {
 }
 
 impl SigningKey for RsaPkcs1SigningKeyRing {
-  type Signature = VectorUsize<u8>;
+  type Signature = RsaSignature;
 
   #[inline]
   fn from_pkcs8(bytes: &[u8], hash_ty: HashTy) -> crate::Result<Self> {
@@ -107,11 +106,11 @@ impl SigningKey for RsaPkcs1SigningKeyRing {
   where
     RNG: CryptoRng,
   {
-    let mut signature = VectorUsize::from_vec(alloc::vec![0; self.0.1.public().modulus_len()])?;
+    let mut signature = rsa_signature_buffer(self.0.1.public().modulus_len())?;
     self
       .0
       .1
-      .sign(self.0.0.rsa_pkcs1_enc_ring(), &SystemRandom::new(), msg, &mut signature)
+      .sign(self.0.0.rsa_pkcs1_enc_ring(), &SystemRandom::new(), msg, signature.as_mut())
       .map_err(|_err| CryptoError::SignatureError)?;
     Ok(SigningOutput::new(self.0.0, signature))
   }
@@ -123,7 +122,7 @@ impl SigningKey for RsaPkcs1SigningKeyRing {
 }
 
 impl SigningKey for RsaPssSigningKeyRing {
-  type Signature = VectorUsize<u8>;
+  type Signature = RsaSignature;
 
   #[inline]
   fn from_pkcs8(bytes: &[u8], hash_ty: HashTy) -> crate::Result<Self> {
@@ -135,11 +134,11 @@ impl SigningKey for RsaPssSigningKeyRing {
   where
     RNG: CryptoRng,
   {
-    let mut signature = VectorUsize::from_vec(alloc::vec![0; self.0.1.public().modulus_len()])?;
+    let mut signature = rsa_signature_buffer(self.0.1.public().modulus_len())?;
     self
       .0
       .1
-      .sign(self.0.0.rsa_pss_enc_ring(), &SystemRandom::new(), msg, &mut signature)
+      .sign(self.0.0.rsa_pss_enc_ring(), &SystemRandom::new(), msg, signature.as_mut())
       .map_err(|_err| CryptoError::SignatureError)?;
     Ok(SigningOutput::new(self.0.0, signature))
   }
@@ -160,4 +159,34 @@ fn validate_signature(
   UnparsedPublicKey::new(alg, pk)
     .verify(msg, signature)
     .map_err(|_err| CryptoError::SignatureError.into())
+}
+
+/// An RSA signature, in place: ring signs keys of up to 8192 bits, whose signatures take at most
+/// 1024 bytes. A handshake signs once, and a vector would be its one allocation.
+#[derive(Clone, Copy, Debug)]
+pub struct RsaSignature {
+  bytes: [u8; 1024],
+  len: u16,
+}
+
+impl AsRef<[u8]> for RsaSignature {
+  #[inline]
+  fn as_ref(&self) -> &[u8] {
+    self.bytes.get(..usize::from(self.len)).unwrap_or_default()
+  }
+}
+
+impl AsMut<[u8]> for RsaSignature {
+  #[inline]
+  fn as_mut(&mut self) -> &mut [u8] {
+    self.bytes.get_mut(..usize::from(self.len)).unwrap_or_default()
+  }
+}
+
+/// A zeroed signature of `len` bytes, for ring to sign into.
+fn rsa_signature_buffer(len: usize) -> crate::Result<RsaSignature> {
+  match u16::try_from(len) {
+    Ok(elem) if len <= 1024 => Ok(RsaSignature { bytes: [0; 1024], len: elem }),
+    _ => Err(CryptoError::SignatureError.into()),
+  }
 }

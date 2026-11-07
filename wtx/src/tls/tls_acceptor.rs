@@ -1,4 +1,3 @@
-use alloc::boxed::Box;
 use crate::{
   codec::{Decode as _, Encode as _},
   collections::{ArrayVectorCopy, SingleTypeStorage},
@@ -6,6 +5,7 @@ use crate::{
   net::{RoleTy, Stream},
   rng::CryptoRng,
   tls::{
+    KsBox,
     AlertDescription, Alpn, CHANGE_CIPHER_SPEC, CipherSuite, DLFT_MAX_FRAGMENT_LENGTH,
     HandshakePath, HandshakeTy, MaxFragmentLength, NamedGroup, ProtocolVersion, SignatureScheme,
     TlsBuffer, TlsConfig, TlsCtx, TlsCtxSk, TlsError, TlsStream,
@@ -40,7 +40,7 @@ pub struct TlsAcceptor<RNG, S, TCG> {
   buffer: TlsBuffer,
   config: TCG,
   handshake_path: HandshakePath,
-  key_schedule: Box<KeySchedule>,
+  key_schedule: KsBox,
   max_fragment_length: u16,
   max_fragment_length_send: u16,
   named_group: NamedGroup,
@@ -60,7 +60,7 @@ where
   pub fn new(config: TCG, rng: RNG, stream: S) -> Self {
     let cfg_ref = config.lease();
     let key_schedule =
-      Box::new(if TCX::TY.is_plain_text() { KeySchedule::unset() } else { KeySchedule::default() });
+      KsBox::new(if TCX::TY.is_plain_text() { KeySchedule::unset() } else { KeySchedule::default() });
     let transcript_hash = key_schedule.cipher_suite().hash_new();
     let max_fragment_length =
       cfg_ref.max_fragment_length().map_or(DLFT_MAX_FRAGMENT_LENGTH, |el| el.num());
@@ -75,7 +75,7 @@ where
       .unwrap_or(NamedGroup::default());
     let signature_algorithms = filter_signature_algorithms(cfg_ref);
     Self {
-      buffer: TlsBuffer::new(),
+      buffer: TlsBuffer::pooled(),
       config,
       handshake_path: HandshakePath::Full,
       key_schedule,

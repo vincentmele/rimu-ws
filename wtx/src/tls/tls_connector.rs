@@ -1,4 +1,3 @@
-use alloc::boxed::Box;
 use crate::{
   asn1::Asn1DecodeWrapperAux,
   codec::{Decode as _, Encode as _},
@@ -7,6 +6,7 @@ use crate::{
   net::{BufStreamReader, RoleTy, Stream, Uri},
   rng::CryptoRng,
   tls::{
+    KsBox,
     AlertDescription, CHANGE_CIPHER_SPEC, DLFT_MAX_FRAGMENT_LENGTH, HandshakePath, HandshakeTy,
     MAX_CERTIFICATES, NamedGroup, ProtocolVersion, TlsBuffer, TlsConfig, TlsCtx, TlsError,
     TlsServerEndPoint, TlsStream,
@@ -70,7 +70,7 @@ pub struct TlsConnector<RNG, S, TCG, U> {
   handshake_path: HandshakePath,
   has_sent_ccs: bool,
   hash_leaf_cert: bool,
-  key_schedule: Box<KeySchedule>,
+  key_schedule: KsBox,
   max_fragment_length_send: u16,
   max_fragment_length: u16,
   named_group: NamedGroup,
@@ -94,7 +94,7 @@ where
   pub fn new(config: TCG, rng: RNG, stream: S, uri: U) -> Self {
     let cfg_ref = config.lease();
     let key_schedule =
-      Box::new(if TCX::TY.is_plain_text() { KeySchedule::unset() } else { KeySchedule::default() });
+      KsBox::new(if TCX::TY.is_plain_text() { KeySchedule::unset() } else { KeySchedule::default() });
     let transcript_hash = key_schedule.cipher_suite().hash_new();
     let max_fragment_length =
       cfg_ref.max_fragment_length().map_or(DLFT_MAX_FRAGMENT_LENGTH, |el| el.num());
