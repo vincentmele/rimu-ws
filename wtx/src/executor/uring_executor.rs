@@ -1153,7 +1153,7 @@ fn poll_own_reactor<T>(
   })
 }
 
-fn spawn_on_current<F>(future: F) -> UringJoinHandle<F::Output>
+pub(crate) fn spawn_on_current<F>(future: F) -> UringJoinHandle<F::Output>
 where
   F: Future + 'static,
   F::Output: 'static,

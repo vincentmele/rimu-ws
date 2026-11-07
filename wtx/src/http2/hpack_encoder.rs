@@ -778,6 +778,19 @@ mod tests {
     }
   }
 
+  // A peer may allow a large table (browsers advertise 64 KiB): the storage reserved up front stays
+  // at the default table's 4 KiB, and grows only with what is stored.
+  #[test]
+  fn table_storage_reserved_up_front_is_bounded() {
+    let mut buffer = VectorUsize::new();
+    let mut hpack_enc = HpackEncoder::new(&mut Xorshift64::from(9u64));
+    hpack_enc.dyn_headers.set_max_bytes(65_536, |_| {});
+    let field = crate::http::Header::new(false, false, "date", "Sat, 07 Nov 2026 01:00:00 GMT");
+    hpack_enc.encode(&mut buffer, 0, [], [field]).unwrap();
+    let (blocks, elements) = hpack_enc.dyn_headers.capacity();
+    assert!(elements <= 4096 && blocks <= 128, "{elements} bytes and {blocks} entries reserved");
+  }
+
   #[test]
   fn duplicated_is_indexed() {
     let headers = [(HpackHeaderBasic::Method(Method::Patch), Method::Patch.strings().custom[0])];

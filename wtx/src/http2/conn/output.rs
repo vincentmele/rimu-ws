@@ -215,6 +215,59 @@ impl Output {
       self.chunks.clear();
       self.front_written = 0;
       self.shared = 0;
+    } else {
+      self.compact();
     }
+  }
+
+  /// Drops the written front of `bytes` once it is most of the buffer: output that never drains
+  /// all at once (a handler streaming to a slow reader) would otherwise keep every byte it wrote.
+  fn compact(&mut self) {
+    // The written part of an own front chunk is dropped with the rest.
+    if let Some(Chunk::Own { start, .. }) = self.chunks.get_mut(0) {
+      *start = start.wrapping_add(self.front_written);
+      self.front_written = 0;
+    }
+    let Some(lo) = self.chunks.iter().find_map(|el| match el {
+      Chunk::Own { start, .. } => Some(*start),
+      Chunk::Shared(_) => None,
+    }) else {
+      self.bytes.clear();
+      return;
+    };
+    let len = self.bytes.len();
+    if lo < COMPACT_MIN || lo < len / 2 {
+      return;
+    }
+    self.bytes.as_slice_mut().copy_within(lo..len, 0);
+    self.bytes.truncate(len.wrapping_sub(lo));
+    for chunk in self.chunks.iter_mut() {
+      if let Chunk::Own { end, start } = chunk {
+        *start = start.wrapping_sub(lo);
+        *end = end.wrapping_sub(lo);
+      }
+    }
+  }
+}
+
+/// Written bytes `Output::compact` leaves in place: moving fewer costs more than it frees.
+const COMPACT_MIN: usize = 64 * 1024;
+
+#[cfg(test)]
+mod tests {
+  use crate::http2::conn::output::Output;
+
+  // Output that is written as fast as it is queued, but never all at once, keeps a bounded buffer:
+  // the written front is dropped instead of piling up until the output drains.
+  #[test]
+  fn output_never_drained_stays_bounded() {
+    let mut out = Output::new();
+    out.push(&[1; 1024]).unwrap();
+    for _ in 0..1024 {
+      out.push(&[2; 1024]).unwrap();
+      out.advance(1024);
+    }
+    assert_eq!(out.owned_len(), 1024);
+    assert!(out.bytes.len() <= 256 * 1024, "{} bytes held for 1 KiB queued", out.bytes.len());
   }
 }

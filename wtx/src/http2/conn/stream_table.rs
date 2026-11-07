@@ -37,6 +37,9 @@ pub(crate) struct Stream {
   pub(crate) protocol: Option<Protocol>,
   /// Body bytes received so far.
   pub(crate) recv_body_len: usize,
+  /// Of those, the ones the stream still holds: not taken by a handler that consumes the body as
+  /// it arrives.
+  pub(crate) recv_held: usize,
   /// The peer sent END_STREAM.
   pub(crate) recv_closed: bool,
   /// Flow-control window for what the peer sends us.
@@ -80,6 +83,7 @@ impl Stream {
       msg: MsgBufferString::default(),
       protocol: None,
       recv_body_len: 0,
+      recv_held: 0,
       recv_closed: false,
       recv_window: 0,
       recv_headers: false,
@@ -123,6 +127,7 @@ impl Stream {
     self.msg.clear();
     self.protocol = None;
     self.recv_body_len = 0;
+    self.recv_held = 0;
     self.recv_closed = false;
     self.recv_window = recv_window;
     self.recv_headers = false;
@@ -310,6 +315,11 @@ impl StreamTable {
     self.buffered = self.buffered.wrapping_add(n);
   }
 
+  /// Body bytes a handler took out of a stream.
+  pub(crate) const fn sub_buffered(&mut self, n: usize) {
+    self.buffered = self.buffered.saturating_sub(n);
+  }
+
   pub(crate) const fn add_queued(&mut self, n: usize) {
     self.queued = self.queued.wrapping_add(n);
   }
@@ -360,7 +370,7 @@ impl StreamTable {
     };
     if let Some(stream) = self.slots.get_mut(idx) {
       stream.live = false;
-      self.buffered = self.buffered.saturating_sub(stream.recv_body_len);
+      self.buffered = self.buffered.saturating_sub(stream.recv_held);
       self.queued = self.queued.saturating_sub(stream.send_pending_owned());
       stream.msg.clear();
       stream.owned.clear();

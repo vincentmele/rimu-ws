@@ -13,7 +13,7 @@ use crate::{
   },
   http2::{
     Http2RecvStatus, ServerStream, WebSocketOverStream,
-    conn::test_frames::{data, headers_req},
+    conn::test_frames::{data, frame, headers_req},
   },
   net::TcpParams,
   rng::{ChaCha20, CryptoSeedableRng, Xorshift64},
@@ -95,6 +95,56 @@ fn framework_manual_stream_echo() {
   client.send(&input);
   let frames = client.read_until(Duration::from_secs(5), |frames| ended(frames).contains(&1));
   assert_eq!(body_of(&frames, 1), b"hello manual stream");
+}
+
+// A manual handler streaming faster than its peer reads waits for the connection's output to
+// drain instead of queuing everything: 8 MiB through a connection whose send queue may hold 1 MiB,
+// to a client that opened large windows but reads late, all arrive.
+#[test]
+fn framework_manual_send_waits_for_the_connection_output() {
+  async fn stream(mut ms: ManualStream<(), ServerStream>) -> crate::Result<()> {
+    let _ = ms.stream.send_headers(&Headers::new(), false, StatusCode::Ok).await?;
+    let chunk = vec![9; 64 * 1024];
+    for idx in 0..128 {
+      let _ = ms.stream.send_data(&chunk, idx == 127).await?;
+    }
+    Ok(())
+  }
+  let router = HttpRouter::paths(crate::paths!(("/stream", post(stream)))).unwrap();
+  let addr = start(HttpRecvParams::with_optioned_params().set_max_send_queue_len(1 << 20), router);
+  let mut client = Client::connect(&addr, &[(4, 0x7fff_ffff)]);
+  let mut input = frame(8, 0, 0, &(0x7fff_ffff_u32 - 65_535).to_be_bytes());
+  input.extend(headers_req(1, "POST", "/stream", &[], true));
+  client.send(&input);
+  std::thread::sleep(Duration::from_millis(300));
+  let frames = client.read_until(Duration::from_secs(10), |frames| ended(frames).contains(&1));
+  assert_eq!(body_of(&frames, 1).len(), 8 << 20);
+}
+
+// A manual handler waiting in `recv_data` when the connection ends sees the stream close and
+// finishes: otherwise its task, the stream and the whole connection core stay alive for good.
+#[test]
+fn framework_manual_handler_finishes_when_the_connection_ends() {
+  static FINISHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+  async fn wait(mut ms: ManualStream<(), ServerStream>) -> crate::Result<()> {
+    let mut body = VectorUsize::new();
+    while let Http2RecvStatus::Ongoing(()) = ms.stream.recv_data(&mut body).await? {}
+    FINISHED.store(true, core::sync::atomic::Ordering::SeqCst);
+    Ok(())
+  }
+  let router = HttpRouter::paths(crate::paths!(("/wait", post(wait)))).unwrap();
+  let addr = start(HttpRecvParams::with_optioned_params(), router);
+  let mut client = Client::connect(&addr, &[]);
+  let mut input = headers_req(1, "POST", "/wait", &[], false);
+  input.extend(data(1, b"part", false));
+  client.send(&input);
+  std::thread::sleep(Duration::from_millis(100));
+  drop(client);
+  let deadline = std::time::Instant::now() + Duration::from_secs(5);
+  while !FINISHED.load(core::sync::atomic::Ordering::SeqCst) {
+    assert!(std::time::Instant::now() < deadline, "the handler is still waiting");
+    std::thread::sleep(Duration::from_millis(10));
+  }
 }
 
 #[test]

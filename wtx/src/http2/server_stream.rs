@@ -20,6 +20,10 @@ use hashbrown::HashMap;
 /// Above this many bytes queued on a stream, [`ServerStream::send_data`] waits for the peer to
 /// open its window.
 const SEND_HIGH_WATER: u32 = 256 * 1024;
+/// Above this many bytes of the connection's own output waiting to be written,
+/// [`ServerStream::send_data`] waits for the connection to write them: a peer with large windows
+/// that reads slowly would otherwise have everything queued, up to `max_send_queue_len`.
+pub(crate) const OUTPUT_HIGH_WATER: usize = 256 * 1024;
 
 /// The connection core shared by the connection task and its manual streams. Every access is a
 /// short, synchronous borrow on the connection's thread.
@@ -30,6 +34,8 @@ pub(crate) struct ConnShared {
   pub(crate) conn_waker: Option<Waker>,
   /// A stream queued output since the connection task last wrote.
   pub(crate) dirty: bool,
+  /// Handlers waiting for the connection to write its output.
+  pub(crate) output_wakers: alloc::vec::Vec<Waker>,
   /// Streams waiting for data, window or a reset.
   pub(crate) wakers: HashMap<u32, Waker>,
 }
@@ -40,7 +46,13 @@ impl ConnShared {
     allow(dead_code, reason = "used by the server driver")
   )]
   pub(crate) fn new(conn: Http2Conn<false>) -> Rc<RefCell<Self>> {
-    Rc::new(RefCell::new(Self { conn, conn_waker: None, dirty: false, wakers: HashMap::new() }))
+    Rc::new(RefCell::new(Self {
+      conn,
+      conn_waker: None,
+      dirty: false,
+      output_wakers: alloc::vec::Vec::new(),
+      wakers: HashMap::new(),
+    }))
   }
 
   /// Wakes the stream `id` waits on, if any.
@@ -129,6 +141,7 @@ impl ServerStream {
           return Poll::Ready(Err(err));
         }
         msg.body.clear();
+        shared.conn.consume_body(id, n);
         if let Err(err) = shared.conn.release_capacity(id, u32::try_from(n).unwrap_or(u32::MAX)) {
           return Poll::Ready(Err(err));
         }
@@ -182,12 +195,18 @@ impl ServerStream {
     let id = self.stream_id;
     poll_fn(|cx| {
       let mut shared = self.shared.borrow_mut();
-      if shared.conn.msg_mut(id).is_none() || shared.conn.stream_send_pending(id) <= SEND_HIGH_WATER
-      {
+      if shared.conn.msg_mut(id).is_none() {
         return Poll::Ready(Ok(Http2SendStatus::Ok));
       }
-      let _ = shared.wakers.insert(id.u32(), cx.waker().clone());
-      Poll::Pending
+      if shared.conn.stream_send_pending(id) > SEND_HIGH_WATER {
+        let _ = shared.wakers.insert(id.u32(), cx.waker().clone());
+        return Poll::Pending;
+      }
+      if shared.conn.owned_output_len() > OUTPUT_HIGH_WATER {
+        shared.output_wakers.push(cx.waker().clone());
+        return Poll::Pending;
+      }
+      Poll::Ready(Ok(Http2SendStatus::Ok))
     })
     .await
   }

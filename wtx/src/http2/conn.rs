@@ -463,6 +463,49 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     Ok(())
   }
 
+  /// Bytes of output waiting to be written that the connection holds itself (not those sent by
+  /// reference).
+  #[cfg_attr(
+    not(feature = "http2-server-framework"),
+    allow(dead_code, reason = "used by the server driver")
+  )]
+  pub(crate) fn owned_output_len(&self) -> usize {
+    self.out.owned_len()
+  }
+
+  /// Whether `stream_id` is open.
+  #[cfg_attr(
+    not(feature = "http2-server-framework"),
+    allow(dead_code, reason = "used by the server driver")
+  )]
+  pub(crate) fn has_stream(&self, stream_id: U31) -> bool {
+    self.streams.get(stream_id.u32()).is_some()
+  }
+
+  /// Closes every stream without a frame or an event: the connection is gone, and handlers still
+  /// holding a stream then see it closed.
+  #[cfg_attr(
+    not(feature = "http2-server-framework"),
+    allow(dead_code, reason = "used by the server driver")
+  )]
+  pub(crate) fn close_all_streams(&mut self) {
+    let ids: Vec<u32> = self.streams.iter().map(|el| el.id).collect();
+    for id in ids {
+      let _ = self.streams.close(id);
+    }
+  }
+
+  /// `n` bytes of the body of `stream_id` were taken by its handler: they no longer count against
+  /// `max_body_len` and `max_conn_buffered_len`, which bound what streams hold.
+  pub(crate) fn consume_body(&mut self, stream_id: U31, n: usize) {
+    let Some(stream) = self.streams.get_mut(stream_id.u32()) else {
+      return;
+    };
+    let n = n.min(stream.recv_held);
+    stream.recv_held = stream.recv_held.wrapping_sub(n);
+    self.streams.sub_buffered(n);
+  }
+
   /// Queues HEADERS for `stream_id`: `:status` (server) and `headers`.
   pub(crate) fn send_headers(
     &mut self,
@@ -691,6 +734,17 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
   /// Sends what the windows allow of the queue of `id`; reports whether anything moved.
   fn flush_stream(&mut self, id: u32) -> crate::Result<bool> {
     let Self { blocked, conn_send, header_buf, hpack_enc, out, peer, streams, .. } = self;
+    // Ids of streams that closed while waiting are only dropped when the window opens: keep them
+    // from piling up on a connection whose window never does.
+    if blocked.len() >= streams.len().saturating_mul(2).max(16) {
+      for _ in 0..blocked.len() {
+        if let Some(elem) = blocked.pop_front()
+          && streams.get(elem).is_some_and(|el| el.blocked)
+        {
+          blocked.push_back(elem)?;
+        }
+      }
+    }
     let Some(stream) = streams.get_mut(id) else {
       return Ok(false);
     };
@@ -848,6 +902,12 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     self.hpack_enc.generation()
   }
 
+  /// Ids in the queue of streams waiting for window.
+  #[cfg(test)]
+  pub(crate) fn blocked_len(&self) -> usize {
+    self.blocked.len()
+  }
+
   /// Stream slots allocated so far, open or free.
   #[cfg(test)]
   pub(crate) fn stream_slots(&self) -> usize {
@@ -930,7 +990,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
           return Err(protocol_err(Http2Error::UnexpectedStreamId));
         }
         if payload.len() != 5 {
-          self.stream_error(id, Http2ErrorCode::FrameSizeError);
+          self.stream_error(id, Http2ErrorCode::FrameSizeError)?;
         }
         Ok(())
       }
@@ -952,6 +1012,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
         Http2Error::TooManyContinuations,
       ));
     }
+    self.check_block_len(self.block.len().wrapping_add(payload.len()))?;
     self.block.extend_from_copyable_slice(payload)?;
     if !fi.cf.has_eoh() {
       self.pending_block = Some(block);
@@ -997,22 +1058,22 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       return Ok(());
     };
     if stream.recv_closed {
-      self.stream_error(id, Http2ErrorCode::StreamClosed);
+      self.stream_error(id, Http2ErrorCode::StreamClosed)?;
       return Ok(());
     }
     stream.recv_window = stream.recv_window.wrapping_sub(frame_len);
     if stream.recv_window < 0 {
-      self.stream_error(id, Http2ErrorCode::FlowControlError);
+      self.stream_error(id, Http2ErrorCode::FlowControlError)?;
       return Ok(());
     }
     let max_body_len = usize::try_from(self.hp.max_body_len()).unwrap_or(usize::MAX);
-    if stream.recv_body_len.saturating_add(body.len()) > max_body_len {
-      self.stream_error(id, Http2ErrorCode::Cancel);
+    if stream.recv_held.saturating_add(body.len()) > max_body_len {
+      self.stream_error(id, Http2ErrorCode::Cancel)?;
       return Ok(());
     }
     let max_buffered = usize::try_from(self.hp.max_conn_buffered_len()).unwrap_or(usize::MAX);
     if self.streams.buffered().saturating_add(body.len()) > max_buffered {
-      self.stream_error(id, Http2ErrorCode::RefusedStream);
+      self.stream_error(id, Http2ErrorCode::RefusedStream)?;
       return Ok(());
     }
     let Some(stream) = self.streams.get_mut(id) else {
@@ -1020,6 +1081,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     };
     stream.msg.body.extend_from_copyable_slice(body)?;
     stream.recv_body_len = stream.recv_body_len.wrapping_add(body.len());
+    stream.recv_held = stream.recv_held.wrapping_add(body.len());
     self.streams.add_buffered(body.len());
     let Some(stream) = self.streams.get_mut(id) else {
       return Ok(());
@@ -1028,7 +1090,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       .content_length
       .is_some_and(|el| stream.recv_body_len > el || (end_stream && stream.recv_body_len != el));
     if over_length {
-      self.stream_error(id, Http2ErrorCode::ProtocolError);
+      self.stream_error(id, Http2ErrorCode::ProtocolError)?;
       return Ok(());
     }
     stream.recv_closed = end_stream;
@@ -1074,9 +1136,23 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     if fi.cf.has_eoh() {
       return self.on_header_block(id, end_stream, fragment);
     }
+    self.check_block_len(fragment.len())?;
     self.block.clear();
     self.block.extend_from_copyable_slice(fragment)?;
     self.pending_block = Some(PendingBlock { continuations: 0, end_stream, stream_id: id });
+    Ok(())
+  }
+
+  /// A header block split over frames is buffered only up to `max_headers_len`: an HPACK block is
+  /// never larger than the header list it decodes to, so a bigger one could only be refused after
+  /// buffering it whole. It ends the connection: dropping it unread would leave HPACK out of sync.
+  fn check_block_len(&self, len: usize) -> crate::Result<()> {
+    if len > usize::try_from(self.hp.max_headers_len()).unwrap_or(usize::MAX) {
+      return Err(crate::Error::Http2ErrorGoAway(
+        Http2ErrorCode::EnhanceYourCalm,
+        Http2Error::VeryLargeHeadersLen,
+      ));
+    }
     Ok(())
   }
 
@@ -1138,7 +1214,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
           Ok(elem) => elem,
           Err(err) => {
             if is_malformed(&err) {
-              self.stream_error(id, Http2ErrorCode::ProtocolError);
+              self.stream_error(id, Http2ErrorCode::ProtocolError)?;
               return Ok(());
             }
             let _ = self.streams.close(id);
@@ -1171,7 +1247,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       return self.send_headers(U31::from_u32(id), status, &Headers::new(), true);
     }
     if end_stream && content_length.is_some_and(|el| el != 0) {
-      self.stream_error(id, Http2ErrorCode::ProtocolError);
+      self.stream_error(id, Http2ErrorCode::ProtocolError)?;
       return Ok(());
     }
     let max_body_len = usize::try_from(self.hp.max_body_len()).unwrap_or(usize::MAX);
@@ -1202,7 +1278,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       Ok(elem) => elem,
       Err(err) => {
         if is_malformed(&err) {
-          self.stream_error(id, Http2ErrorCode::ProtocolError);
+          self.stream_error(id, Http2ErrorCode::ProtocolError)?;
           return Ok(());
         }
         return Err(err);
@@ -1316,18 +1392,18 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     );
     if let Err(err) = rslt {
       if is_malformed(&err) {
-        self.stream_error(id, Http2ErrorCode::ProtocolError);
+        self.stream_error(id, Http2ErrorCode::ProtocolError)?;
         return Ok(());
       }
       return Err(err);
     }
     if !fi.cf.has_eos() {
-      self.stream_error(id, Http2ErrorCode::ProtocolError);
+      self.stream_error(id, Http2ErrorCode::ProtocolError)?;
       return Ok(());
     }
     stream.recv_closed = true;
     if stream.content_length.is_some_and(|el| el != stream.recv_body_len) {
-      self.stream_error(id, Http2ErrorCode::ProtocolError);
+      self.stream_error(id, Http2ErrorCode::ProtocolError)?;
       return Ok(());
     }
     self.events.push_back(ConnEvent::Trailers { stream_id: fi.stream_id })?;
@@ -1360,13 +1436,13 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       return Ok(());
     };
     if increment == 0 {
-      self.stream_error(id, Http2ErrorCode::ProtocolError);
+      self.stream_error(id, Http2ErrorCode::ProtocolError)?;
       return Ok(());
     }
     match stream.send_window.checked_add(increment) {
       Some(elem) => stream.send_window = elem,
       None => {
-        self.stream_error(id, Http2ErrorCode::FlowControlError);
+        self.stream_error(id, Http2ErrorCode::FlowControlError)?;
         return Ok(());
       }
     }
@@ -1408,11 +1484,20 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
   }
 
   /// Resets stream `id` with `code` and reports it.
-  fn stream_error(&mut self, id: u32, code: Http2ErrorCode) {
+  /// Resets `id` for something the peer did wrong. These count against the same budget as the
+  /// peer's own resets: provoking resets is as cheap as sending them (CVE-2025-8671).
+  fn stream_error(&mut self, id: u32, code: Http2ErrorCode) -> crate::Result<()> {
     self.push_stream_reset(id, code);
     if self.streams.close(id) {
       let _rslt = self.events.push_back(ConnEvent::Reset { code, stream_id: U31::from_u32(id) });
     }
+    if self.resets.exceeded(self.now, self.hp.max_resets_per_window()) {
+      return Err(crate::Error::Http2ErrorGoAway(
+        Http2ErrorCode::EnhanceYourCalm,
+        Http2Error::TooManyResets,
+      ));
+    }
+    Ok(())
   }
 }
 

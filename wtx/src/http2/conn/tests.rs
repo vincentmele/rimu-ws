@@ -1066,3 +1066,92 @@ fn conn_feed_some_budget_on_the_last_frame_opens_the_window() {
     "no connection WINDOW_UPDATE of 4000: {frames:?}"
   );
 }
+
+// A header block split over frames is buffered only up to `max_headers_len`: a raw block is never
+// larger than the header list it decodes to, so a bigger one ends the connection instead of being
+// buffered whole (HEADERS + 8 CONTINUATIONs of 16 MiB frames would be 144 MiB).
+#[test]
+fn conn_header_block_over_the_limit_is_not_buffered() {
+  let hp = HttpRecvParams::with_optioned_params();
+  let limit = usize::try_from(hp.max_headers_len()).unwrap();
+  let half = vec![0x82; limit / 2 + 1];
+  let mut conn = ready_server(hp);
+  let mut input = frame(HEADERS, 0, 1, &half);
+  input.extend(frame(9, 0, 1, &half));
+  assert!(conn.feed(&input).is_err());
+  assert_eq!(go_away_code(&take_frames(&mut conn)).map(|el| el.1), Some(11));
+  let mut conn = ready_server(hp);
+  assert!(conn.feed(&frame(HEADERS, 0, 1, &vec![0x82; limit + 1])).is_err());
+  assert_eq!(go_away_code(&take_frames(&mut conn)).map(|el| el.1), Some(11));
+}
+
+// Streams that close while waiting for the connection window leave the queue of blocked streams:
+// a client that never opens the window, and keeps opening and resetting streams, does not grow it.
+#[test]
+fn conn_closed_streams_leave_the_blocked_queue() {
+  let mut conn = ready_server(HttpRecvParams::with_permissive_params());
+  let _ = conn.feed(&headers_req(1, "GET", "/", &[], true)).unwrap();
+  let mut msg = MsgBufferString::default();
+  msg.body.extend_from_copyable_slice(&vec![1; 65_535]).unwrap();
+  conn.send_response(U31::from_u32(1), StatusCode::Ok, &mut msg).unwrap();
+  let _ = take_output(&mut conn);
+  for idx in 0..1000u32 {
+    let id = 3 + 2 * idx;
+    let _ = conn.feed(&headers_req(id, "GET", "/", &[], true)).unwrap();
+    let _ = events(&mut conn);
+    let mut msg = MsgBufferString::default();
+    msg.body.extend_from_copyable_slice(&[1; 10]).unwrap();
+    conn.send_response(U31::from_u32(id), StatusCode::Ok, &mut msg).unwrap();
+    let _ = conn.feed(&frame(3, 0, id, &8u32.to_be_bytes())).unwrap();
+    let _ = events(&mut conn);
+    let _ = take_output(&mut conn);
+  }
+  assert_eq!(conn.open_streams(), 0);
+  assert!(conn.blocked_len() <= 32, "{} ids blocked with no stream open", conn.blocked_len());
+}
+
+// Resets the peer provokes count against the same budget as the ones it sends (MadeYouReset,
+// CVE-2025-8671): a WINDOW_UPDATE of 0 on each new stream makes the server reset it, and past the
+// budget the connection ends.
+#[test]
+fn limit_provoked_resets_goaway() {
+  let mut conn = ready_server(HttpRecvParams::with_default_params());
+  let mut failed = false;
+  for idx in 0..201u32 {
+    let id = 2 * idx + 1;
+    let mut input = headers_req(id, "GET", "/", &[], false);
+    input.extend(frame(WINDOW_UPDATE, 0, id, &0u32.to_be_bytes()));
+    let at = secs(f64::from(idx) / 1000.0);
+    if conn.feed_at(&input, at).is_err() {
+      failed = true;
+      break;
+    }
+    let _ = events(&mut conn);
+  }
+  assert!(failed, "201 provoked resets within the window and the connection still stands");
+  assert_eq!(go_away_code(&take_frames(&mut conn)).map(|el| el.1), Some(11));
+}
+
+// A stream whose body is consumed as it arrives (manual mode, WebSocket over HTTP/2) is limited by
+// what it holds, not by what it ever received: 1.25 MiB through a stream with a 1 MiB limit,
+// consumed 16 KiB at a time, is not reset.
+#[test]
+fn conn_consumed_body_does_not_count_against_the_limits() {
+  let hp = HttpRecvParams::with_default_params();
+  assert_eq!(hp.max_body_len(), 1 << 20);
+  let mut conn = ready_server(hp);
+  let _ = conn.feed(&headers_req(1, "POST", "/", &[], false)).unwrap();
+  let _ = events(&mut conn);
+  let id = U31::from_u32(1);
+  for _ in 0..80 {
+    let _ = conn.feed(&data(1, &[5; 16 * 1024], false)).unwrap();
+    let _ = events(&mut conn);
+    let n = conn.msg_mut(id).unwrap().body.len();
+    conn.msg_mut(id).unwrap().body.clear();
+    conn.consume_body(id, n);
+    conn.release_capacity(id, u32::try_from(n).unwrap()).unwrap();
+    let frames = take_frames(&mut conn);
+    assert_eq!(rst_code(&frames, 1), None, "{frames:?}");
+  }
+  assert_eq!(conn.open_streams(), 1);
+}

@@ -61,15 +61,25 @@ The framework starts from `HttpRecvParams::with_optioned_params()`.
   clients that pipeline many requests; each open stream costs its request buffers.
 - `set_max_recv_streams_num` (256): streams kept for receiving at once.
 - `set_max_frame_len` (16 MiB − 1): the largest frame the server accepts.
-- `set_max_headers_len` (64 KiB) and `set_max_hpack_len` (128 KiB each way): header block size and
-  HPACK dynamic tables. Lower them to bound per-stream and per-connection memory.
+- `set_max_headers_len` (64 KiB) and `set_max_hpack_len` (128 KiB each way): the decoded header
+  list (larger is answered 431) and the HPACK dynamic tables. A header block split over frames is
+  buffered only up to `max_headers_len`; a larger one ends the connection (`ENHANCE_YOUR_CALM`).
+  Lower them to bound per-stream and per-connection memory.
 - `set_max_continuations` (8): CONTINUATION frames per header block, against continuation floods.
-- `set_max_body_len` (64 MiB): the largest request body a stream may carry.
-- `set_max_conn_buffered_len` (64 MiB): request body bytes a connection may hold for its handlers.
+- `set_max_body_len` (64 MiB): the most body bytes a stream may hold for its handler: the whole
+  body in auto mode; in manual mode (and WebSocket over HTTP/2) only what `recv_data` has not
+  taken yet, so a stream consumed as it arrives may carry more. A declared `content-length` above
+  it is answered 413 at once.
+- `set_max_conn_buffered_len` (64 MiB): request body bytes a connection's streams may hold, not
+  yet taken by their handlers.
 - `set_max_send_queue_len` (64 MiB): response bytes the core may hold for a connection before it
-  ends it (`ENHANCE_YOUR_CALM`); shared bodies don't count.
+  ends it (`ENHANCE_YOUR_CALM`); shared bodies don't count. Manual-mode `send_data` waits once
+  256 KiB of a stream wait for window or 256 KiB of the connection's output wait to be written,
+  so a streaming handler stays under it.
 - `set_max_control_frames_per_window` (1000 per 10 s) and `set_max_resets_per_window` (200 per
-  10 s): PING/SETTINGS/empty-frame and RST_STREAM floods end the connection past these.
+  10 s): PING/SETTINGS/empty-frame and RST_STREAM floods end the connection past these. The reset
+  budget also counts the resets the peer provokes (a zero WINDOW_UPDATE, an over-window DATA, a bad
+  header block).
 - `set_enable_connect_protocol` (off): turn it on to serve WebSocket over HTTP/2 (RFC 8441).
 
 ## `UringParams` (`set_local_runtime_cb`)

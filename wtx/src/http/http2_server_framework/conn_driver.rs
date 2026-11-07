@@ -165,8 +165,24 @@ where
     woken: VectorUsize::new(),
   };
   let rslt = state.run(stream, dispatcher).await;
+  #[cfg(test)]
+  MANUAL_AT_EXIT.set(state.manual.len());
   // Whatever the core queued last (a GOAWAY after an error) still goes out.
   let _flush = write_output(stream, &shared).await;
+  // Manual handlers still holding a stream see it closed and finish: each holds the connection's
+  // state, which would otherwise outlive the connection with them.
+  let wakers = {
+    let mut guard = shared.borrow_mut();
+    guard.conn.close_all_streams();
+    guard.conn_waker = None;
+    for waker in mem::take(&mut guard.output_wakers) {
+      waker.wake();
+    }
+    mem::take(&mut guard.wakers)
+  };
+  for waker in wakers.into_values() {
+    waker.wake();
+  }
   rslt
 }
 
@@ -252,8 +268,12 @@ where
         }
         self.handle_events(state, dispatcher)?;
         self.poll_woken(&mut state.conn)?;
+        if !self.manual.is_empty() {
+          self.forget_closed_manual(state);
+        }
       }
       write_output(stream, &shared).await?;
+      wake_output_waiters(&shared);
       if closed || shared.borrow().conn.is_closed() {
         return Ok(());
       }
@@ -458,6 +478,18 @@ where
     Ok(())
   }
 
+  /// Drops the manual streams the core closed without an event (both sides ended, or answered
+  /// before the request ended), waking their handlers if they wait: they see the stream closed.
+  fn forget_closed_manual(&mut self, state: &mut ConnShared) {
+    self.manual.retain(|&id| {
+      if state.conn.has_stream(U31::from_u32(id)) {
+        return true;
+      }
+      state.wake_stream(id);
+      false
+    });
+  }
+
   fn poll_woken(&mut self, conn: &mut Http2Conn<false>) -> crate::Result<()> {
     if !self.slots.has_woken() {
       return Ok(());
@@ -481,14 +513,14 @@ where
       SlotPoll::Pending => Ok(()),
       SlotPoll::Done((req, shared, rslt)) => {
         let mut msg = req.msg_data;
-        let status = match rslt {
-          Ok(elem) => elem,
+        match rslt {
+          Ok(status) => self.respond(conn, stream_id, status, msg, shared),
+          // What a failed handler left behind is not a response.
           Err(_) => {
             msg.clear();
-            StatusCode::InternalServerError
+            self.respond(conn, stream_id, StatusCode::InternalServerError, msg, None)
           }
-        };
-        self.respond(conn, stream_id, status, msg, shared)
+        }
       }
       SlotPoll::Panicked => {
         let msg = MsgBufferString::default();
@@ -503,13 +535,8 @@ where
     stream_id: U31,
     status: StatusCode,
     mut msg: MsgBufferString,
-    mut shared: Option<SharedBytes>,
+    shared: Option<SharedBytes>,
   ) -> crate::Result<()> {
-    if status == StatusCode::InternalServerError {
-      msg.headers.clear();
-      msg.body.clear();
-      shared = None;
-    }
     let date: &str = KnownHeaderName::Date.into();
     msg.headers.push_from_iter(Header::from_name_and_value(date, [self.date.as_str()]))?;
     let rslt = match shared {
@@ -646,6 +673,12 @@ fn rx_pool_give(buffer: VectorUsize<u8>) {
 }
 
 #[cfg(test)]
+std::thread_local! {
+  /// Manual streams the driver still tracked when it last returned on this thread.
+  static MANUAL_AT_EXIT: core::cell::Cell<usize> = const { core::cell::Cell::new(usize::MAX) };
+}
+
+#[cfg(test)]
 fn rx_pool_len() -> usize {
   RX_POOL.with(|pool| pool.borrow().len())
 }
@@ -653,6 +686,22 @@ fn rx_pool_len() -> usize {
 #[cfg(test)]
 fn output_pool_len() -> usize {
   OUTPUT_POOL.with(|pool| pool.borrow().len())
+}
+
+/// Wakes the handlers waiting for the connection's output to drain, once it has.
+fn wake_output_waiters(shared: &RefCell<ConnShared>) {
+  let waiters = {
+    let mut guard = shared.borrow_mut();
+    if guard.output_wakers.is_empty()
+      || guard.conn.owned_output_len() > crate::http2::server_stream::OUTPUT_HIGH_WATER
+    {
+      return;
+    }
+    mem::take(&mut guard.output_wakers)
+  };
+  for waker in waiters {
+    waker.wake();
+  }
 }
 
 /// Writes everything the core queued, in groups of at most 8 slices.

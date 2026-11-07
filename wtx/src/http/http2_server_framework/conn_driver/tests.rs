@@ -54,7 +54,8 @@ const WINDOW_UPDATE: u8 = 8;
 
 /// Handlers by path: `/` answers `ok`, `/slow` sleeps 20 ms, `/park` never finishes (and sets
 /// `dropped` when dropped), `/panic` panics, `/echo` answers the length of the request body,
-/// `/big` answers 1 MiB.
+/// `/big` answers 1 MiB, `/fail` answers its own 500 with a body. `/manual` goes to a manual-mode
+/// handler that drops its stream at once (a 500).
 struct TestDispatcher {
   dropped: Arc<AtomicBool>,
 }
@@ -71,11 +72,14 @@ impl StreamDispatcher for TestDispatcher {
   type AutoFut = Pin<Box<dyn Future<Output = AutoOut>>>;
   type Matches = ();
 
-  fn route(&self, _: &str) -> Route<()> {
-    Route::Auto(())
+  fn route(&self, path: &str) -> Route<()> {
+    if path == "/manual" { Route::Manual(()) } else { Route::Auto(()) }
   }
 
-  fn manual(&self, _: ServerStream, _: Request<MsgBufferString>, (): ()) {}
+  fn manual(&self, stream: ServerStream, _: Request<MsgBufferString>, (): ()) {
+    // Dropped in a task of its own, as a spawned handler would, outside the driver's turn.
+    let _jh = crate::executor::spawn_on_current(async move { drop(stream) });
+  }
 
   fn auto(&self, mut req: Request<MsgBufferString>, _: Option<Protocol>, _: Option<()>) -> Self::AutoFut {
     let dropped = self.dropped.clone();
@@ -94,6 +98,11 @@ impl StreamDispatcher for TestDispatcher {
         "/panic" => panic!("handler panic"),
         "/echo" => req.msg_data.body.len().to_string().into_bytes(),
         "/big" => vec![7; 1 << 20],
+        "/fail" => {
+          req.msg_data.body.clear();
+          req.msg_data.body.extend_from_copyable_slice(b"handler error").unwrap();
+          return (req, None, Ok(StatusCode::InternalServerError));
+        }
         _ => b"ok".to_vec(),
       };
       req.msg_data.body.clear();
@@ -749,4 +758,52 @@ fn idle_connection_returns_its_buffers() {
   let (output, rx) = pool_rx.recv_timeout(Duration::from_secs(5)).unwrap();
   assert!(output >= 1, "{output} output buffers pooled while the connection is idle");
   assert!(rx >= 1, "{rx} read buffers pooled while the connection is idle");
+}
+
+// A 500 the handler answers itself keeps its body: only a failed or panicked handler gets an
+// empty 500.
+#[test]
+fn server_handler_500_keeps_its_body() {
+  let served = serve(HttpRecvParams::with_default_params());
+  let mut client = Client::connect(&served.addr, &[]);
+  client.send(&headers_req(1, "GET", "/fail", &[], true));
+  let frames = client.read_until(Duration::from_secs(5), |frames| ended(frames).len() == 1);
+  assert_eq!(status_of(&frames, 1), Some(0x8e));
+  assert_eq!(body_of(&frames, 1), b"handler error");
+}
+
+// Manual streams that end without a reset (here each handler drops its stream, which answers 500
+// and closes it) leave the driver's set: it does not grow by one per manual request.
+#[test]
+fn manual_streams_that_end_leave_the_driver() {
+  let uri = _uri();
+  let addr = String::from(uri.hostname_with_implied_port().0) + ":" + &uri.port().unwrap().to_string();
+  let (ready_tx, ready_rx) = mpsc::channel();
+  let (len_tx, len_rx) = mpsc::channel();
+  let server_addr = addr.clone();
+  let _jh = std::thread::spawn(move || {
+    let runtime = UringRuntime::with_params(UringParams::default()).unwrap();
+    runtime.block_on(async move {
+      let listener =
+        UringTcpListener::bind(server_addr.as_str(), TcpParams::default().set_reuse_port(Some(false)))
+          .await
+          .unwrap();
+      ready_tx.send(()).unwrap();
+      let (mut stream, peer) = listener.accept(TcpParams::default()).await.unwrap();
+      let conn = Http2Conn::<false>::new(HttpRecvParams::with_default_params(), &mut Xorshift64::from(9u64));
+      let dispatcher = TestDispatcher { dropped: Arc::new(AtomicBool::new(false)) };
+      let _rslt = drive_conn(&mut stream, conn, &dispatcher, peer.ip(), DriveParams::default()).await;
+      len_tx.send(super::MANUAL_AT_EXIT.get()).unwrap();
+    });
+  });
+  ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+  let mut client = Client::connect(&addr, &[]);
+  for idx in 0..50u32 {
+    client.send(&headers_req(2 * idx + 1, "GET", "/manual", &[], true));
+    let frames = client.read_until(Duration::from_secs(5), |frames| ended(frames).len() == 1);
+    assert_eq!(ended(&frames), [2 * idx + 1]);
+  }
+  drop(client);
+  let len = len_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+  assert!(len <= 1, "{len} ended manual streams still tracked");
 }

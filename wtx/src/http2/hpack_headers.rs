@@ -4,6 +4,10 @@ use crate::{
 };
 use core::str;
 
+/// The most table storage [`HpackHeaders::reserve_table`] reserves up front: the default table
+/// size (RFC 7541 §6.5.2).
+const RESERVED_TABLE_MAX: u32 = 4096;
+
 #[derive(Debug, Default)]
 pub(crate) struct HpackHeaders<M> {
   bd: BlocksDequeU32<u8, Metadata<M>>,
@@ -74,15 +78,17 @@ where
     Ok(())
   }
 
-  /// Gives the storage room for a full table, so pushes and evictions within `max_bytes` don't
-  /// allocate. For small tables: the encoder's is at most 4 KiB.
+  /// Gives the storage room for a full table of up to `RESERVED_TABLE_MAX` bytes (the default
+  /// table size), so pushes and evictions in a table that size don't allocate. A peer that allows a
+  /// larger table gets storage that grows with what is stored.
   pub(crate) fn reserve_table(&mut self) -> crate::Result<()> {
-    let blocks = self.max_bytes / 32;
-    if self.bd.elements_capacity() >= self.max_bytes && self.bd.blocks_capacity() >= blocks {
+    let bytes = self.max_bytes.min(RESERVED_TABLE_MAX);
+    let blocks = bytes / 32;
+    if self.bd.elements_capacity() >= bytes && self.bd.blocks_capacity() >= blocks {
       return Ok(());
     }
     let more_blocks = blocks.saturating_sub(self.bd.blocks_len());
-    let more_elements = self.max_bytes.saturating_sub(self.bd.elements_len());
+    let more_elements = bytes.saturating_sub(self.bd.elements_len());
     self.bd.reserve_front(more_blocks, more_elements)?;
     Ok(())
   }
