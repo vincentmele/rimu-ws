@@ -2,9 +2,18 @@
 
 use crate::{
   http::{HttpRecvParams, StatusCode},
-  http1::Http1Request,
+  http1::{
+    BodyDecoder, BodyKind, BodyStatus, Http1Request, ParseOutcome, ParseScratch, parse_request,
+    write_response,
+  },
 };
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
+
+/// Maximum number of bytes buffered between two `poll_event` calls.
+const BUF_CAP: usize = 256 * 1024;
+/// Chunk framing, extensions and trailers a body may carry in addition to a quarter of its
+/// payload.
+const FRAMING_BUDGET: usize = 16 * 1024;
 
 /// What a connection needs next.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,58 +27,523 @@ pub enum Http1Event {
 }
 
 /// Keep-alive connection state.
+///
+/// The driver loop is: `feed` what was read, `poll_event` until it is not
+/// [`Http1Event::RequestReady`] (answering each ready request with `respond`), flush the output
+/// with `take_output` / `advance_output`, and close once `poll_event` returns
+/// [`Http1Event::Closed`].
+///
+/// Memory is bounded: at most 256 KiB of unparsed input is buffered, a head is limited to 16 KiB
+/// by the parser, and a decoded body to [`HttpRecvParams::max_body_len`]. A request that breaks
+/// a limit or is malformed is answered with a `Connection: close` 413 / 400 response and the
+/// connection then reports [`Http1Event::Closed`] once that response is flushed.
 #[derive(Debug)]
 pub struct Http1Conn {
-  _private: (),
+  /// Unparsed input; the live part is `buf[start..]`.
+  buf: Vec<u8>,
+  start: usize,
+  /// Decoded body of the current request.
+  body: Vec<u8>,
+  out: Vec<u8>,
+  /// Bytes handed out by `take_output` and not yet acknowledged by `advance_output`.
+  inflight: usize,
+  max_body_len: usize,
+  phase: Phase,
+  scratch: Box<ParseScratch>,
+  /// Points into `buf` and `scratch`; `Some` only while neither changed since it was set.
+  view: Option<Http1Request<'static>>,
+  closing: bool,
+}
+
+#[derive(Debug)]
+enum Phase {
+  /// Waiting for a complete head.
+  Head,
+  /// Head parsed (it stays at `buf[start..start + head_len]`), decoding the body.
+  Body { decoder: BodyDecoder, head_len: usize, raw: usize },
+  /// A complete request awaits `respond`.
+  Ready { head_len: usize, keep_alive: bool },
+}
+
+/// Outcome of looking at the head in the buffer.
+enum Head {
+  Bad,
+  Partial,
+  Bodyless(Http1Request<'static>, usize),
+  WithBody(BodyKind, usize),
 }
 
 impl Http1Conn {
   /// New connection.
   #[inline]
-  pub fn new(_params: &HttpRecvParams) -> Self {
-    Self { _private: () }
+  pub fn new(params: &HttpRecvParams) -> Self {
+    Self {
+      buf: Vec::new(),
+      start: 0,
+      body: Vec::new(),
+      out: Vec::new(),
+      inflight: 0,
+      max_body_len: usize::try_from(params.max_body_len()).unwrap_or(usize::MAX),
+      phase: Phase::Head,
+      scratch: Box::new(ParseScratch::new()),
+      view: None,
+      closing: false,
+    }
   }
 
   /// Buffers `input`, returning how many bytes were consumed.
+  ///
+  /// Fewer than `input.len()` bytes are taken only when the buffer is full; call `poll_event`
+  /// (and `respond`) and feed the rest afterwards. Input arriving after the connection started
+  /// closing is discarded.
   #[inline]
-  pub fn feed(&mut self, _input: &[u8]) -> crate::Result<usize> {
-    todo!()
+  pub fn feed(&mut self, input: &[u8]) -> crate::Result<usize> {
+    if self.closing {
+      return Ok(input.len());
+    }
+    if self.start > 0 {
+      let _ = self.buf.drain(..self.start);
+      self.start = 0;
+    }
+    let take = input.len().min(BUF_CAP.saturating_sub(self.buf.len()));
+    if take > 0 {
+      // The append may move `buf`.
+      self.view = None;
+      self.buf.extend_from_slice(input.get(..take).unwrap_or_default());
+    }
+    Ok(take)
   }
 
   /// Advances the state machine.
   #[inline]
   pub fn poll_event(&mut self) -> Http1Event {
-    todo!()
+    if self.closing {
+      return if self.out.is_empty() && self.inflight == 0 {
+        Http1Event::Closed
+      } else {
+        Http1Event::NeedMore
+      };
+    }
+    if let Phase::Ready { .. } = self.phase {
+      if self.view.is_none() && self.set_view().is_err() {
+        return self.fail(StatusCode::BadRequest);
+      }
+      return Http1Event::RequestReady;
+    }
+    if let Phase::Head = self.phase {
+      let (kind, head_len) = match self.parse_head() {
+        Head::Bad => return self.fail(StatusCode::BadRequest),
+        Head::Partial => return Http1Event::NeedMore,
+        Head::Bodyless(request, head_len) => {
+          self.body.clear();
+          self.view = Some(request);
+          self.phase = Phase::Ready { head_len, keep_alive: request.keep_alive };
+          return Http1Event::RequestReady;
+        }
+        Head::WithBody(kind, head_len) => (kind, head_len),
+      };
+      if let BodyKind::ContentLength(len) = kind
+        && len > self.max_body_len
+      {
+        return self.fail(StatusCode::PayloadTooLarge);
+      }
+      self.body.clear();
+      self.phase = Phase::Body { decoder: BodyDecoder::new(kind), head_len, raw: 0 };
+    }
+    let Phase::Body { decoder, head_len, raw } = &mut self.phase else {
+      return Http1Event::NeedMore;
+    };
+    let head_len = *head_len;
+    let head_end = self.start.wrapping_add(head_len);
+    let input = self.buf.get(head_end..).unwrap_or_default();
+    let input_len = input.len();
+    let status = match decoder.feed(input, &mut self.body) {
+      Ok(status) => status,
+      Err(_) => return self.fail(StatusCode::BadRequest),
+    };
+    *raw = raw.wrapping_add(input_len);
+    let overhead = raw.saturating_sub(self.body.len());
+    let too_large = self.body.len() > self.max_body_len
+      || overhead > FRAMING_BUDGET.saturating_add(self.body.len() / 4);
+    if too_large {
+      return self.fail(StatusCode::PayloadTooLarge);
+    }
+    match status {
+      BodyStatus::NeedMore => {
+        // Everything after the head went through the decoder, so it is not kept.
+        self.buf.truncate(head_end);
+        Http1Event::NeedMore
+      }
+      BodyStatus::Complete { consumed } => {
+        let _ = self.buf.drain(head_end..head_end.wrapping_add(consumed));
+        let keep_alive = match self.set_view() {
+          Ok(keep_alive) => keep_alive,
+          Err(_) => return self.fail(StatusCode::BadRequest),
+        };
+        self.phase = Phase::Ready { head_len, keep_alive };
+        Http1Event::RequestReady
+      }
+    }
   }
 
-  /// Current request. Valid only right after [`Http1Event::RequestReady`].
+  /// Current request. Valid only right after [`Http1Event::RequestReady`], and until the next
+  /// `feed` or `respond`.
   #[inline]
   pub fn request(&self) -> Option<Http1Request<'_>> {
-    todo!()
+    // Shortens the placeholder `'static` to the borrow of `self`.
+    self.view
   }
 
-  /// Queues the response of the current request.
+  /// Decoded body of the current request; empty when it has none. Same validity as
+  /// [`Self::request`].
   #[inline]
-  pub fn respond(&mut self, _status: StatusCode, _content_type: &str, _body: &[u8]) {
-    todo!()
+  pub fn body(&self) -> &[u8] {
+    match self.phase {
+      Phase::Ready { .. } => &self.body,
+      _ => &[],
+    }
+  }
+
+  /// Queues the response of the current request and moves on to the next buffered one.
+  /// Does nothing if no request is ready.
+  #[inline]
+  pub fn respond(&mut self, status: StatusCode, content_type: &str, body: &[u8]) {
+    let Phase::Ready { head_len, keep_alive } = self.phase else {
+      return;
+    };
+    write_response(&mut self.out, status, content_type, body, keep_alive);
+    self.view = None;
+    self.body.clear();
+    self.phase = Phase::Head;
+    if keep_alive {
+      self.start = self.start.wrapping_add(head_len);
+      if self.start >= self.buf.len() {
+        self.buf.clear();
+        self.start = 0;
+      }
+    } else {
+      self.closing = true;
+      self.buf.clear();
+      self.start = 0;
+    }
   }
 
   /// Takes the pending output, swapping in `spare`. Returns `spare` back in `Err` if there is
-  /// nothing to send.
+  /// nothing to send. The taken bytes count as in flight until `advance_output` acknowledges
+  /// them.
   #[inline]
-  pub fn take_output(&mut self, _spare: Vec<u8>) -> Result<Vec<u8>, Vec<u8>> {
-    todo!()
+  pub fn take_output(&mut self, mut spare: Vec<u8>) -> Result<Vec<u8>, Vec<u8>> {
+    if self.out.is_empty() {
+      return Err(spare);
+    }
+    spare.clear();
+    let taken = core::mem::replace(&mut self.out, spare);
+    self.inflight = self.inflight.wrapping_add(taken.len());
+    Ok(taken)
   }
 
   /// Marks `n` bytes of the taken output as sent.
   #[inline]
-  pub fn advance_output(&mut self, _n: usize) {
-    todo!()
+  pub fn advance_output(&mut self, n: usize) {
+    self.inflight = self.inflight.saturating_sub(n);
   }
 
   /// If the connection should be closed once the output is flushed.
   #[inline]
   pub fn wants_close(&self) -> bool {
-    todo!()
+    self.closing
+  }
+
+  /// Parses the head at the front of the live input.
+  fn parse_head(&mut self) -> Head {
+    let input = self.buf.get(self.start..).unwrap_or_default();
+    match parse_request(input, &mut self.scratch) {
+      Err(_) => Head::Bad,
+      Ok(ParseOutcome::Partial) => Head::Partial,
+      Ok(ParseOutcome::Complete { request, head_len }) => match request.body_kind {
+        BodyKind::None | BodyKind::ContentLength(0) => {
+          // SAFETY: `request` points into `self.buf` and `self.scratch` (heap data that does
+          // not move with `self`). `self.view` is cleared before either changes.
+          let request = unsafe {
+            core::mem::transmute::<Http1Request<'_>, Http1Request<'static>>(request)
+          };
+          Head::Bodyless(request, head_len)
+        }
+        kind => Head::WithBody(kind, head_len),
+      },
+    }
+  }
+
+  /// Parses the head again to set `view`, returning its `keep_alive`.
+  fn set_view(&mut self) -> crate::Result<bool> {
+    let input = self.buf.get(self.start..).unwrap_or_default();
+    match parse_request(input, &mut self.scratch)? {
+      ParseOutcome::Complete { request, .. } => {
+        // SAFETY: same as in `parse_head`.
+        let request = unsafe {
+          core::mem::transmute::<Http1Request<'_>, Http1Request<'static>>(request)
+        };
+        self.view = Some(request);
+        Ok(request.keep_alive)
+      }
+      ParseOutcome::Partial => Err(crate::http::HttpError::BadRequest.into()),
+    }
+  }
+
+  /// Answers with an error, stops reading and starts closing.
+  fn fail(&mut self, status: StatusCode) -> Http1Event {
+    write_response(&mut self.out, status, "text/plain", b"", false);
+    self.view = None;
+    self.body.clear();
+    self.buf.clear();
+    self.start = 0;
+    self.phase = Phase::Head;
+    self.closing = true;
+    Http1Event::NeedMore
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use alloc::{vec, vec::Vec};
+  use crate::{
+    http::{HttpRecvParams, Method, StatusCode},
+    http1::{BodyKind, Http1Conn, Http1Event},
+  };
+
+  const GET: &[u8] = b"GET /plaintext?x=1 HTTP/1.1\r\nHost: a\r\n\r\n";
+  const POST_CL: &[u8] = b"POST /upload HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\n20";
+  const POST_CHUNKED: &[u8] =
+    b"POST /upload HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1\r\n2\r\n1\r\n0\r\n0\r\n\r\n";
+  const CLOSE: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
+
+  fn conn() -> Http1Conn {
+    Http1Conn::new(&HttpRecvParams::with_default_params())
+  }
+
+  fn answer(conn: &mut Http1Conn) {
+    conn.respond(StatusCode::Ok, "text/plain", b"ok");
+  }
+
+  fn output(conn: &mut Http1Conn) -> Vec<u8> {
+    let out = conn.take_output(Vec::new()).unwrap_or_default();
+    conn.advance_output(out.len());
+    out
+  }
+
+  fn count(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack.windows(needle.len()).filter(|w| *w == needle).count()
+  }
+
+  #[test]
+  fn get_request_ready_then_needmore() {
+    let mut c = conn();
+    assert_eq!(c.feed(GET).unwrap(), GET.len());
+    assert_eq!(c.poll_event(), Http1Event::RequestReady);
+    let request = c.request().unwrap();
+    assert_eq!(request.method, Method::Get);
+    assert_eq!(request.path, "/plaintext");
+    assert_eq!(request.query, "x=1");
+    assert!(request.keep_alive);
+    assert!(c.body().is_empty());
+    answer(&mut c);
+    assert!(c.request().is_none());
+    assert_eq!(c.poll_event(), Http1Event::NeedMore);
+    assert!(!c.wants_close());
+    assert!(output(&mut c).starts_with(b"HTTP/1.1 200 OK\r\n"));
+  }
+
+  #[test]
+  fn post_body_available() {
+    for raw in [POST_CL, POST_CHUNKED] {
+      let mut c = conn();
+      c.feed(raw).unwrap();
+      assert_eq!(c.poll_event(), Http1Event::RequestReady);
+      assert_eq!(c.request().unwrap().method, Method::Post);
+      assert_eq!(c.body(), b"20");
+      answer(&mut c);
+      assert_eq!(c.poll_event(), Http1Event::NeedMore);
+      assert!(c.body().is_empty());
+    }
+  }
+
+  #[test]
+  fn pipelined_two_requests() {
+    let mut c = conn();
+    let both = [GET, GET].concat();
+    c.feed(&both).unwrap();
+    for _ in 0..2 {
+      assert_eq!(c.poll_event(), Http1Event::RequestReady);
+      assert_eq!(c.request().unwrap().path, "/plaintext");
+      answer(&mut c);
+    }
+    assert_eq!(c.poll_event(), Http1Event::NeedMore);
+    let out = output(&mut c);
+    assert_eq!(count(&out, b"HTTP/1.1 200 OK\r\n"), 2);
+  }
+
+  #[test]
+  fn pipelined_bodies_and_gets_mixed() {
+    let mut c = conn();
+    let all = [POST_CHUNKED, GET, POST_CL, GET].concat();
+    c.feed(&all).unwrap();
+    let mut seen = Vec::new();
+    while c.poll_event() == Http1Event::RequestReady {
+      seen.push((c.request().unwrap().method, c.body().to_vec()));
+      answer(&mut c);
+    }
+    assert_eq!(
+      seen,
+      [
+        (Method::Post, b"20".to_vec()),
+        (Method::Get, Vec::new()),
+        (Method::Post, b"20".to_vec()),
+        (Method::Get, Vec::new())
+      ]
+    );
+    assert_eq!(count(&output(&mut c), b"HTTP/1.1 200 OK\r\n"), 4);
+  }
+
+  #[test]
+  fn request_split_across_feeds() {
+    for raw in [GET, POST_CL, POST_CHUNKED] {
+      let mut c = conn();
+      let mut ready = 0;
+      for (idx, byte) in raw.iter().enumerate() {
+        c.feed(&[*byte]).unwrap();
+        match c.poll_event() {
+          Http1Event::RequestReady => {
+            assert_eq!(idx, raw.len() - 1);
+            ready += 1;
+          }
+          event => assert_eq!(event, Http1Event::NeedMore),
+        }
+      }
+      assert_eq!(ready, 1);
+      if raw != GET {
+        assert_eq!(c.body(), b"20");
+      }
+      answer(&mut c);
+      assert_eq!(c.poll_event(), Http1Event::NeedMore);
+    }
+  }
+
+  #[test]
+  fn connection_close_sets_wants_close() {
+    let mut c = conn();
+    c.feed(&[CLOSE, GET].concat()).unwrap();
+    assert_eq!(c.poll_event(), Http1Event::RequestReady);
+    assert!(!c.request().unwrap().keep_alive);
+    assert!(!c.wants_close());
+    answer(&mut c);
+    assert!(c.wants_close());
+    // Output not flushed yet.
+    assert_eq!(c.poll_event(), Http1Event::NeedMore);
+    let out = c.take_output(Vec::new()).unwrap();
+    assert!(out.windows(19).any(|w| w == b"Connection: close\r\n"));
+    assert_eq!(c.poll_event(), Http1Event::NeedMore);
+    c.advance_output(out.len());
+    assert_eq!(c.poll_event(), Http1Event::Closed);
+    // The pipelined request after the close is dropped.
+    assert_eq!(c.feed(GET).unwrap(), GET.len());
+    assert_eq!(c.poll_event(), Http1Event::Closed);
+  }
+
+  #[test]
+  fn request_survives_feed_after_ready() {
+    let mut c = conn();
+    c.feed(POST_CL).unwrap();
+    assert_eq!(c.poll_event(), Http1Event::RequestReady);
+    c.feed(GET).unwrap();
+    assert!(c.request().is_none());
+    assert_eq!(c.poll_event(), Http1Event::RequestReady);
+    assert_eq!(c.request().unwrap().body_kind, BodyKind::ContentLength(2));
+    assert_eq!(c.body(), b"20");
+    answer(&mut c);
+    assert_eq!(c.poll_event(), Http1Event::RequestReady);
+    assert_eq!(c.request().unwrap().method, Method::Get);
+  }
+
+  #[test]
+  fn take_output_swaps_and_reports_empty() {
+    let mut c = conn();
+    assert_eq!(c.take_output(Vec::with_capacity(8)).unwrap_err().capacity(), 8);
+    c.feed(GET).unwrap();
+    c.poll_event();
+    answer(&mut c);
+    let out = c.take_output(Vec::new()).unwrap();
+    assert!(c.take_output(Vec::new()).is_err());
+    assert!(out.starts_with(b"HTTP/1.1 200 OK\r\n"));
+  }
+
+  #[test]
+  fn oversized_content_length_is_rejected_then_closes() {
+    let params = HttpRecvParams::with_default_params().set_max_body_len(4);
+    let mut c = Http1Conn::new(&params);
+    c.feed(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n").unwrap();
+    assert_eq!(c.poll_event(), Http1Event::NeedMore);
+    assert!(c.wants_close());
+    let out = output(&mut c);
+    assert!(out.starts_with(b"HTTP/1.1 413 "));
+    assert_eq!(c.poll_event(), Http1Event::Closed);
+  }
+
+  #[test]
+  fn oversized_chunked_body_is_rejected() {
+    let params = HttpRecvParams::with_default_params().set_max_body_len(4);
+    let mut c = Http1Conn::new(&params);
+    c.feed(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n").unwrap();
+    assert_eq!(c.poll_event(), Http1Event::NeedMore);
+    assert!(!c.wants_close());
+    c.feed(b"3\r\ndef\r\n").unwrap();
+    assert_eq!(c.poll_event(), Http1Event::NeedMore);
+    assert!(c.wants_close());
+    assert!(output(&mut c).starts_with(b"HTTP/1.1 413 "));
+    assert_eq!(c.poll_event(), Http1Event::Closed);
+  }
+
+  #[test]
+  fn endless_trailer_is_bounded() {
+    let mut c = conn();
+    c.feed(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n").unwrap();
+    let junk = [b'a'; 1024];
+    let mut closed = false;
+    for _ in 0..64 {
+      c.feed(&junk).unwrap();
+      c.poll_event();
+      if c.wants_close() {
+        closed = true;
+        break;
+      }
+    }
+    assert!(closed);
+    assert!(output(&mut c).starts_with(b"HTTP/1.1 413 "));
+  }
+
+  #[test]
+  fn malformed_and_oversized_heads_get_400() {
+    let mut c = conn();
+    c.feed(b"NOPE\r\n\r\n").unwrap();
+    assert_eq!(c.poll_event(), Http1Event::NeedMore);
+    assert!(c.wants_close());
+    assert!(output(&mut c).starts_with(b"HTTP/1.1 400 "));
+    assert_eq!(c.poll_event(), Http1Event::Closed);
+
+    let mut c = conn();
+    let mut head = b"GET / HTTP/1.1\r\nX: ".to_vec();
+    head.resize(20 * 1024, b'a');
+    c.feed(&head).unwrap();
+    c.poll_event();
+    assert!(c.wants_close());
+    assert!(output(&mut c).starts_with(b"HTTP/1.1 400 "));
+  }
+
+  #[test]
+  fn feed_is_bounded_without_polling() {
+    let mut c = conn();
+    let big = vec![b'a'; 1024 * 1024];
+    let taken = c.feed(&big).unwrap();
+    assert!(taken < big.len());
+    assert_eq!(c.feed(&big).unwrap(), 0);
   }
 }
