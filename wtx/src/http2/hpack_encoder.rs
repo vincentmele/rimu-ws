@@ -492,6 +492,7 @@ impl HpackEncoder {
   ) -> crate::Result<()> {
     self.idx = self.idx.wrapping_add(1);
     self.generation = self.generation.wrapping_add(1);
+    self.dyn_headers.reserve_table()?;
     self.dyn_headers.push_front(
       is_sensitive,
       Metadata { name_hash, pair_hash },
@@ -752,6 +753,28 @@ mod tests {
         })
         .unwrap();
       assert_eq!(decoded, [("x-test".into(), value.clone())]);
+    }
+  }
+
+  // A server adds a new `date` every second for as long as a connection lives: once the table
+  // has its first entry, its storage holds the whole table, so later inserts and evictions never
+  // allocate.
+  #[test]
+  fn table_storage_does_not_grow_in_steady_state() {
+    let mut buffer = VectorUsize::new();
+    let mut hpack_enc = HpackEncoder::new(&mut Xorshift64::from(9u64));
+    hpack_enc.dyn_headers.set_max_bytes(4096, |_| {});
+    let encode = |hpack_enc: &mut HpackEncoder, buffer: &mut VectorUsize<u8>, idx: u32| {
+      let value = alloc::format!("Sat, 07 Nov 2026 01:{:02}:{:02} GMT", idx / 60 % 60, idx % 60);
+      let field = crate::http::Header::new(false, false, "date", value.as_str());
+      buffer.clear();
+      hpack_enc.encode(buffer, 0, [], [field]).unwrap();
+    };
+    encode(&mut hpack_enc, &mut buffer, 0);
+    let capacity = hpack_enc.dyn_headers.capacity();
+    for idx in 1..500 {
+      encode(&mut hpack_enc, &mut buffer, idx);
+      assert_eq!(hpack_enc.dyn_headers.capacity(), capacity, "grew at insert {idx}");
     }
   }
 

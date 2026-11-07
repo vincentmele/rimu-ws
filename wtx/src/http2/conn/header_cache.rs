@@ -35,6 +35,12 @@ impl HeaderCache {
     Self { entries: VectorUsize::new(), hits: 0, key: VectorUsize::new(), uses: 0 }
   }
 
+  /// Entries held.
+  #[cfg(test)]
+  pub(crate) fn len(&self) -> usize {
+    self.entries.len()
+  }
+
   /// Cache hits so far.
   #[cfg(test)]
   pub(crate) const fn hits(&self) -> u64 {
@@ -79,7 +85,18 @@ impl HeaderCache {
     block: &[u8],
     generation: u64,
   ) -> crate::Result<()> {
-    let idx = if self.entries.len() < MAX_ENTRIES {
+    // An entry encoded under an older table can never be replayed: reuse the least recently used
+    // of those, buffers and all, before adding one.
+    let stale = self
+      .entries
+      .iter()
+      .enumerate()
+      .filter(|(_, el)| el.generation != generation)
+      .min_by_key(|(_, el)| el.last_use)
+      .map(|(idx, _)| idx);
+    let idx = if let Some(idx) = stale {
+      idx
+    } else if self.entries.len() < MAX_ENTRIES {
       self.entries.push(Entry {
         block: VectorUsize::new(),
         generation: 0,
@@ -125,5 +142,32 @@ impl HeaderCache {
       ])?;
     }
     Ok(())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use crate::{
+    http::{Header, Headers, StatusCode},
+    http2::conn::header_cache::HeaderCache,
+  };
+
+  fn headers(date: &str) -> Headers {
+    let mut headers = Headers::new();
+    headers.push_from_iter(Header::from_name_and_value("date", [date])).unwrap();
+    headers
+  }
+
+  // A block cached under an older table is useless: its entry is reused for the next block, so a
+  // connection whose `date` changes every second keeps one entry instead of adding one a second.
+  #[test]
+  fn header_cache_reuses_a_stale_entry() {
+    let mut cache = HeaderCache::new();
+    for (generation, date) in [(1, "a"), (2, "b"), (3, "c")] {
+      assert!(cache.get(StatusCode::Ok, &headers(date), generation).unwrap().is_none());
+      cache.insert(StatusCode::Ok, &[0x88, 0xbe], generation).unwrap();
+      assert!(cache.get(StatusCode::Ok, &headers(date), generation).unwrap().is_some());
+    }
+    assert_eq!(cache.len(), 1);
   }
 }

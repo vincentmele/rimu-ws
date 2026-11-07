@@ -34,6 +34,12 @@ where
     self.bd.get(idx).as_ref().map(Self::map)
   }
 
+  /// Capacity of the storage, in entries and in bytes of names and values.
+  #[cfg(test)]
+  pub(crate) fn capacity(&self) -> (u32, u32) {
+    (self.bd.blocks_capacity(), self.bd.elements_capacity())
+  }
+
   pub(crate) const fn max_bytes(&self) -> u32 {
     self.max_bytes
   }
@@ -65,6 +71,19 @@ where
       [name].into_iter().chain(iter).map(str::as_bytes),
       Metadata { is_sensitive, misc, name_len },
     )?;
+    Ok(())
+  }
+
+  /// Gives the storage room for a full table, so pushes and evictions within `max_bytes` don't
+  /// allocate. For small tables: the encoder's is at most 4 KiB.
+  pub(crate) fn reserve_table(&mut self) -> crate::Result<()> {
+    let blocks = self.max_bytes / 32;
+    if self.bd.elements_capacity() >= self.max_bytes && self.bd.blocks_capacity() >= blocks {
+      return Ok(());
+    }
+    let more_blocks = blocks.saturating_sub(self.bd.blocks_len());
+    let more_elements = self.max_bytes.saturating_sub(self.bd.elements_len());
+    self.bd.reserve_front(more_blocks, more_elements)?;
     Ok(())
   }
 
