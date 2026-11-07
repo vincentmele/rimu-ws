@@ -20,8 +20,11 @@ use crate::{
   tls::{PlaintextCtx, TlsAcceptor, TlsConfig, TlsCtxSk},
 };
 use alloc::{boxed::Box, rc::Rc, string::String, vec::Vec};
-use conn_driver::{ConnGroup, Http1Service, drive_conn};
+use conn_driver::{ConnGroup, DriveParams, Http1Service, drive_conn};
 use core::{num::NonZeroUsize, ops::ControlFlow, time::Duration};
+
+/// Default of [`Http1ServerFramework::set_max_delay`].
+const DEFAULT_MAX_DELAY: Duration = Duration::from_secs(10);
 
 type Handler<DA, ER> =
   Box<dyn Fn(&mut DA, &Http1Req<'_>, &mut Http1Res) -> Result<(), ER> + Send + Sync>;
@@ -113,13 +116,17 @@ impl Http1Res {
   }
 
   /// Time the connection waits, without blocking its thread, before this response is sent.
-  /// Responses of the same connection stay in order. Cleared for every request.
+  /// Responses of the same connection stay in order. Cleared for every request. A delay longer
+  /// than the server's maximum ([`Http1ServerFramework::set_max_delay`]) is cut to it.
+  ///
+  /// The connection's socket is watched while it waits: a peer that goes away ends the
+  /// connection at once, and requests that arrive meanwhile are answered after this response.
   #[inline]
   pub fn delay(&self) -> Option<core::time::Duration> {
     self.delay
   }
 
-  /// Asks for the response to be sent only after `delay`.
+  /// Asks for the response to be sent only after `delay`. See [`Self::delay`].
   #[inline]
   pub const fn set_delay(&mut self, delay: core::time::Duration) {
     self.delay = Some(delay);
@@ -423,6 +430,7 @@ pub struct Http1ServerFramework<DA, EC, EX, RC, RNG = ChaCha20, TCX = PlaintextC
   local_runtime_cb: RC,
   local_runtimes: Option<NonZeroUsize>,
   max_connections: Option<NonZeroUsize>,
+  max_delay: Duration,
   shutdown: Option<(ShutdownSignal, Duration)>,
   tcp_params: TcpParams,
   /// The generator and the configuration of the TLS connections, if the server is a TLS one.
@@ -458,6 +466,7 @@ where
       local_runtime_cb,
       local_runtimes: None,
       max_connections: None,
+      max_delay: DEFAULT_MAX_DELAY,
       shutdown: None,
       tcp_params: TcpParams::default(),
       tls: None,
@@ -505,6 +514,7 @@ where
       local_runtime_cb,
       local_runtimes: None,
       max_connections: None,
+      max_delay: DEFAULT_MAX_DELAY,
       shutdown: None,
       tcp_params: TcpParams::default(),
       tls: Some((rng, tls_config.into())),
@@ -524,6 +534,7 @@ impl<DA, EC, EX, RC, RNG, TCX> Http1ServerFramework<DA, EC, EX, RC, RNG, TCX> {
       local_runtime_cb: self.local_runtime_cb,
       local_runtimes: self.local_runtimes,
       max_connections: self.max_connections,
+      max_delay: self.max_delay,
       shutdown: self.shutdown,
       tcp_params: self.tcp_params,
       tls: self.tls,
@@ -541,6 +552,7 @@ impl<DA, EC, EX, RC, RNG, TCX> Http1ServerFramework<DA, EC, EX, RC, RNG, TCX> {
       local_runtime_cb: self.local_runtime_cb,
       local_runtimes: self.local_runtimes,
       max_connections: self.max_connections,
+      max_delay: self.max_delay,
       shutdown: self.shutdown,
       tcp_params: self.tcp_params,
       tls: self.tls,
@@ -566,6 +578,7 @@ impl<DA, EC, EX, RC, RNG, TCX> Http1ServerFramework<DA, EC, EX, RC, RNG, TCX> {
       local_runtime_cb: value,
       local_runtimes: self.local_runtimes,
       max_connections: self.max_connections,
+      max_delay: self.max_delay,
       shutdown: self.shutdown,
       tcp_params: self.tcp_params,
       tls: self.tls,
@@ -588,6 +601,16 @@ impl<DA, EC, EX, RC, RNG, TCX> Http1ServerFramework<DA, EC, EX, RC, RNG, TCX> {
   #[must_use = must_use_itself_doc!()]
   pub const fn set_max_connections(mut self, value: Option<NonZeroUsize>) -> Self {
     self.max_connections = value;
+    self
+  }
+
+  /// The longest delay a response may ask for ([`Http1Res::set_delay`]): longer ones are cut to
+  /// it, so that a handler fed a client's number can't hold a connection for as long as the client
+  /// likes. Defaults to 10 s.
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub const fn set_max_delay(mut self, value: Duration) -> Self {
+    self.max_delay = value;
     self
   }
 
@@ -661,7 +684,7 @@ where
         active: active.clone(),
         data: self.data.clone(),
         error_cb: self.error_cb.clone(),
-        hrc: self.hrc,
+        params: DriveParams { hrc: self.hrc, max_delay: self.max_delay },
         max_connections: self.max_connections,
         router: router.clone(),
         shutdown: self.shutdown.clone(),
@@ -701,8 +724,8 @@ struct ThreadServer<DA, EC, ER, M, RNG, TCX> {
   active: Option<Arc<crate::sync::AtomicUsize>>,
   data: DA,
   error_cb: EC,
-  hrc: HttpRecvParams,
   max_connections: Option<NonZeroUsize>,
+  params: DriveParams,
   router: Arc<Http1Router<DA, ER, M>>,
   shutdown: Option<(ShutdownSignal, Duration)>,
   tcp_params: TcpParams,
@@ -760,7 +783,7 @@ where
         Some((rng, tls_config)) => Some((RNG::from_crypto_rng(rng)?, tls_config.clone())),
         None => None,
       };
-      let fut = conn_fut(stream, service, self.hrc, group.clone(), tls);
+      let fut = conn_fut(stream, service, self.params, group.clone(), tls);
       if let Some(active) = &self.active {
         let _jh = executor.spawn_local(tracked(fut, active.clone()), lc);
       } else {
@@ -781,7 +804,7 @@ where
 async fn conn_fut<DA, EC, ER, M, RNG, S, TCX>(
   mut stream: S,
   mut service: RouterService<DA, EC, ER, M>,
-  hrc: HttpRecvParams,
+  params: DriveParams,
   group: Option<Rc<ConnGroup>>,
   tls: Option<(RNG, Arc<TlsConfig<TCX>>)>,
 ) where
@@ -793,13 +816,13 @@ async fn conn_fut<DA, EC, ER, M, RNG, S, TCX>(
   TCX: TlsCtxSk,
 {
   let rslt = match tls {
-    None => drive_conn(&mut stream, &mut service, &hrc, group.as_deref()).await,
+    None => drive_conn(&mut stream, &mut service, &params, group.as_deref()).await,
     // The stream is never split: the core drives the TLS stream as it drives a plain one.
     Some((mut rng, tls_config)) => {
       match TlsAcceptor::new(&*tls_config, &mut rng, stream).accept().await {
         Ok(accepted) => {
           let mut tls_stream = accepted.tls_stream;
-          drive_conn(&mut tls_stream, &mut service, &hrc, group.as_deref()).await
+          drive_conn(&mut tls_stream, &mut service, &params, group.as_deref()).await
         }
         Err(err) => Err(err),
       }
@@ -883,6 +906,15 @@ mod tests {
 
   // A one-runtime server; returns its address.
   fn server(error_cb: fn(crate::Error)) -> String {
+    server_with(error_cb, None, Duration::from_secs(10))
+  }
+
+  // A one-runtime server serving at most `max_connections` at once; returns its address.
+  fn server_with(
+    error_cb: fn(crate::Error),
+    max_connections: Option<core::num::NonZeroUsize>,
+    max_delay: Duration,
+  ) -> String {
     let uri = _uri();
     let (host, port) = uri.hostname_with_implied_port();
     let addr = std::format!("{host}:{port}");
@@ -893,9 +925,38 @@ mod tests {
         .set_error_cb(error_cb)
         .set_local_runtime_cb(|| UringRuntime::with_params(UringParams::new()))
         .set_local_runtimes(core::num::NonZeroUsize::new(1))
+        .set_max_connections(max_connections)
+        .set_max_delay(max_delay)
         .run_in_threads(&server_addr, router().set_middleware(Http1ServerHeader("rimu-ws")))
     });
     addr
+  }
+
+  /// Resets the connection (linger 0) instead of closing it.
+  fn reset(stream: TcpStream) {
+    let socket = socket2::Socket::from(stream);
+    socket.set_linger(Some(Duration::ZERO)).unwrap();
+    drop(socket);
+  }
+
+  /// How long, from now, until a new connection to a server that serves one at a time is served.
+  fn time_to_serve_another(addr: &str) -> Duration {
+    let begin = std::time::Instant::now();
+    loop {
+      assert!(begin.elapsed() < Duration::from_secs(5), "never served");
+      let mut next = connect(addr);
+      next.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+      let _rslt = next.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n");
+      let mut buf = [0; 256];
+      let mut got = Vec::new();
+      while let Ok(len @ 1..) = next.read(&mut buf) {
+        got.extend_from_slice(&buf[..len]);
+        if got.ends_with(b"pong") {
+          return begin.elapsed();
+        }
+      }
+      std::thread::sleep(Duration::from_millis(20));
+    }
   }
 
   fn connect(addr: &str) -> TcpStream {
@@ -1183,6 +1244,125 @@ mod tests {
     assert_eq!(body, b"pong");
   }
 
+  /// A one-runtime TLS server; returns its address, and a receiver of whether `run_in_threads`
+  /// returned `Ok`.
+  #[cfg(feature = "crypto-ring")]
+  fn tls_server(
+    error_cb: fn(crate::Error),
+    max_connections: Option<core::num::NonZeroUsize>,
+    shutdown: Option<(crate::http::ShutdownSignal, Duration)>,
+  ) -> (crate::net::UriString, std::sync::mpsc::Receiver<bool>) {
+    use crate::{
+      rng::{ChaCha20, CryptoSeedableRng as _},
+      tests::{_PUBLIC_KEY, _SECRET_KEY},
+      tls::TlsConfig,
+    };
+    let uri = _uri();
+    let (host, port) = uri.hostname_with_implied_port();
+    let server_addr = std::format!("{host}:{port}");
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let _server = std::thread::spawn(move || {
+      let config = TlsConfig::from_keys_pem(_PUBLIC_KEY, _SECRET_KEY).unwrap();
+      let rng = ChaCha20::from_std_random().unwrap();
+      let fw = Http1ServerFramework::<(), fn(crate::Error), UringExecutor, _, _, _>::new_tls(
+        UringExecutor::default(),
+        rng,
+        config,
+      )
+      .unwrap()
+      .set_error_cb(error_cb)
+      .set_local_runtime_cb(|| UringRuntime::with_params(UringParams::new()))
+      .set_local_runtimes(core::num::NonZeroUsize::new(1))
+      .set_max_connections(max_connections);
+      let fw = match shutdown {
+        Some((signal, drain)) => fw.set_shutdown(signal, drain),
+        None => fw,
+      };
+      let rslt = fw.run_in_threads(&server_addr, router());
+      let _rslt = done_tx.send(rslt.is_ok());
+    });
+    (uri, done_rx)
+  }
+
+  /// A TLS connection to `uri` that offers "http/1.1", retried until the server is up. Reads
+  /// time out after 2 s.
+  #[cfg(feature = "crypto-ring")]
+  async fn tls_connect(
+    uri: &crate::net::UriString,
+  ) -> crate::tls::TlsStream<TcpStream, crate::tls::TrustedCtx, true> {
+    use crate::{
+      rng::{ChaCha20, CryptoSeedableRng as _},
+      tests::_ROOT_CA,
+      tls::{TlsConfig, TlsConnectorBuilder},
+    };
+    let mut rng = ChaCha20::from_std_random().unwrap();
+    let mut config = TlsConfig::from_trust_anchors_pem([_ROOT_CA]).unwrap();
+    config
+      .alpn_mut()
+      .get_or_insert_default()
+      .protocol_name_list
+      .push(b"http/1.1".as_slice().try_into().unwrap())
+      .unwrap();
+    let begin = std::time::Instant::now();
+    loop {
+      assert!(begin.elapsed() < Duration::from_secs(5), "never connected");
+      let connector = TlsConnectorBuilder::std(uri.clone()).build(&config, &mut rng).await;
+      if let Ok(elem) = connector
+        && let Ok(output) = elem.connect().await
+      {
+        let tls_stream = output.tls_stream;
+        tls_stream.stream().set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        return tls_stream;
+      }
+      std::thread::sleep(Duration::from_millis(5));
+    }
+  }
+
+  /// Bytes read over TLS until `end` is seen; `None` if the stream ended or failed first.
+  #[cfg(feature = "crypto-ring")]
+  async fn tls_read_until<S>(stream: &mut S, end: &[u8]) -> Option<Vec<u8>>
+  where
+    S: crate::net::StreamReader,
+  {
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !got.ends_with(end) {
+      let len = stream.read(buf.as_mut_slice().into()).await.ok()??;
+      got.extend_from_slice(&buf[..len.get()]);
+    }
+    Some(got)
+  }
+
+  // Over TLS too, a peer that resets its connection while its response is delayed ends it at
+  // once.
+  #[cfg(feature = "crypto-ring")]
+  #[test]
+  fn delayed_tls_response_notices_a_reset_peer() {
+    use crate::{executor::StdRuntime, net::StreamWriter as _};
+    let (uri, _done) = tls_server(|_| {}, core::num::NonZeroUsize::new(1), None);
+    StdRuntime::new().block_on(async move {
+      let mut first = tls_connect(&uri).await;
+      first.write_all(b"GET /delay/3000 HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+      std::thread::sleep(Duration::from_millis(100));
+      socket2::SockRef::from(first.stream()).set_linger(Some(Duration::ZERO)).unwrap();
+      drop(first);
+      let begin = std::time::Instant::now();
+      loop {
+        assert!(begin.elapsed() < Duration::from_secs(5), "never served");
+        let mut next = tls_connect(&uri).await;
+        next.stream().set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        if next.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n").await.is_ok()
+          && tls_read_until(&mut next, b"pong").await.is_some()
+        {
+          break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+      }
+      let elapsed = begin.elapsed();
+      assert!(elapsed < Duration::from_millis(1000), "{elapsed:?}");
+    });
+  }
+
   // The response leaves only after the handler's delay, and the next response of the same
   // connection, which asks for none, is not held back.
   #[test]
@@ -1201,6 +1381,84 @@ mod tests {
     stream.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
     assert_eq!(read_response(&mut stream).1, b"pong");
     assert!(begin.elapsed() < Duration::from_millis(40), "{:?}", begin.elapsed());
+  }
+
+  // A peer that resets its connection while its response is delayed ends the connection at
+  // once: its slot is free for the next client long before the delay is over.
+  #[test]
+  fn delayed_response_notices_a_reset_peer() {
+    use crate::sync::AtomicUsize;
+    use core::sync::atomic::Ordering;
+    static ERRORS: AtomicUsize = AtomicUsize::new(0);
+    let addr = server_with(
+      |err| {
+        if !matches!(err, crate::Error::TooManyConnections) {
+          let _prev = ERRORS.fetch_add(1, Ordering::Relaxed);
+        }
+      },
+      core::num::NonZeroUsize::new(1),
+      Duration::from_secs(10),
+    );
+    let mut first = connect(&addr);
+    first.write_all(b"GET /delay/3000 HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    reset(first);
+    let elapsed = time_to_serve_another(&addr);
+    assert!(elapsed < Duration::from_millis(1000), "{elapsed:?}");
+    assert_eq!(ERRORS.load(Ordering::Relaxed), 0, "a reset peer was reported as an error");
+    // The same for a peer that only closes
+    let mut first = connect(&addr);
+    first.write_all(b"GET /delay/3000 HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    drop(first);
+    let elapsed = time_to_serve_another(&addr);
+    assert!(elapsed < Duration::from_millis(1000), "{elapsed:?}");
+    assert_eq!(ERRORS.load(Ordering::Relaxed), 0, "a closed peer was reported as an error");
+  }
+
+  // What arrives while a response is delayed is kept: a request pipelined during the delay is
+  // answered after the delayed response, which still waits for the whole delay.
+  #[test]
+  fn request_pipelined_during_a_delay_is_answered_after_it() {
+    let addr = server(|_| {});
+    let mut stream = connect(&addr);
+    let begin = std::time::Instant::now();
+    stream.write_all(b"GET /delay/300 HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    // In two pieces, the second with a body
+    stream.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\nPOST /echo HTTP/1.1\r\nHo").unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    stream.write_all(b"st: x\r\nContent-Length: 3\r\n\r\nabc").unwrap();
+    let (head, body) = read_response(&mut stream);
+    let elapsed = begin.elapsed();
+    assert!(head.starts_with("http/1.1 200 ok\r\n"), "{head}");
+    assert_eq!(body, b"300");
+    assert!(elapsed >= Duration::from_millis(295), "{elapsed:?}");
+    assert_eq!(read_response(&mut stream).1, b"pong");
+    assert_eq!(read_response(&mut stream).1, b"abc");
+    // And a delay after a delay, both pipelined at once
+    let begin = std::time::Instant::now();
+    stream
+      .write_all(
+        b"GET /delay/100 HTTP/1.1\r\nHost: x\r\n\r\nGET /delay/100 HTTP/1.1\r\nHost: x\r\n\r\n",
+      )
+      .unwrap();
+    assert_eq!(read_response(&mut stream).1, b"100");
+    assert_eq!(read_response(&mut stream).1, b"100");
+    assert!(begin.elapsed() >= Duration::from_millis(195), "{:?}", begin.elapsed());
+  }
+
+  // A delay longer than the server's maximum is cut to it.
+  #[test]
+  fn delay_is_capped_by_max_delay() {
+    let addr = server_with(|_| {}, None, Duration::from_millis(150));
+    let mut stream = connect(&addr);
+    let begin = std::time::Instant::now();
+    stream.write_all(b"GET /delay/3000 HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    assert_eq!(read_response(&mut stream).1, b"3000");
+    let elapsed = begin.elapsed();
+    assert!(elapsed >= Duration::from_millis(145), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(1000), "{elapsed:?}");
   }
 
   // Delays overlap: the one runtime thread serves every connection while they wait.

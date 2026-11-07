@@ -12,6 +12,8 @@
 //!    is only valid right after `RequestReady`.
 //! 3. `feed` may take fewer bytes than offered when its buffer is full. The rest is fed again
 //!    after the requests it made room for were answered.
+//! 4. While a response is delayed the socket is still watched: what arrives is kept for after
+//!    the response, and a peer that goes away ends the connection at once.
 
 use crate::{
   collections::VectorUsize,
@@ -25,8 +27,9 @@ use core::{
   cell::{Cell, RefCell},
   future::poll_fn,
   mem,
-  pin::pin,
+  pin::{Pin, pin},
   task::{Poll, Waker},
+  time::Duration,
 };
 
 /// The read buffer grows in steps of this many bytes.
@@ -37,6 +40,14 @@ const RX_MAX: usize = 256 * 1024;
 /// Responses are flushed once this much has been queued, so that a long pipeline of large
 /// responses can't pile up in memory.
 const OUT_HIGH_WATER: usize = 256 * 1024;
+
+/// What every connection of a server is driven with.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DriveParams {
+  pub(crate) hrc: HttpRecvParams,
+  /// Longest delay a response may ask for; longer ones are cut to it.
+  pub(crate) max_delay: Duration,
+}
 
 /// Answers the requests of a connection.
 pub(crate) trait Http1Service {
@@ -91,7 +102,7 @@ impl Drop for Member<'_> {
 pub(crate) async fn drive_conn<S, V>(
   stream: &mut S,
   service: &mut V,
-  hrc: &HttpRecvParams,
+  params: &DriveParams,
   group: Option<&ConnGroup>,
 ) -> crate::Result<()>
 where
@@ -101,7 +112,8 @@ where
   let _open = OpenConn::new();
   let mut driver = Driver {
     answered: 0,
-    conn: Http1Conn::new(hrc),
+    conn: Http1Conn::new(&params.hrc),
+    max_delay: params.max_delay,
     midreq: false,
     offset: 0,
     queued: 0,
@@ -126,6 +138,7 @@ struct Driver {
   /// Requests answered in the current round.
   answered: usize,
   conn: Http1Conn,
+  max_delay: Duration,
   /// Bytes arrived and no response went out since: probably the middle of a request.
   midreq: bool,
   /// How much of `rx` was fed.
@@ -195,6 +208,15 @@ impl Driver {
   where
     S: StreamReader,
   {
+    self.read_into(stream, false).await
+  }
+
+  /// [`Self::read_available`], also when the stream reads only by awaiting and `rx` already holds
+  /// bytes: `ready` says that the stream has something to report, so the read won't wait long.
+  async fn read_into<S>(&mut self, stream: &mut S, ready: bool) -> crate::Result<bool>
+  where
+    S: StreamReader,
+  {
     loop {
       if self.rx.len() >= RX_MAX {
         return Ok(false);
@@ -215,7 +237,7 @@ impl Driver {
         TryRead::Pending => return Ok(false),
         TryRead::Unsupported => {
           self.reads_async = true;
-          if !self.rx.is_empty() {
+          if !ready && !self.rx.is_empty() {
             return Ok(false);
           }
           // Nothing is waiting to be sent: every round ends with a flush.
@@ -238,7 +260,7 @@ impl Driver {
   /// when it stopped early to let the queued responses out.
   async fn process<S, V>(&mut self, stream: &mut S, service: &mut V) -> crate::Result<bool>
   where
-    S: StreamWriter,
+    S: StreamReader + StreamWriter,
     V: Http1Service,
   {
     loop {
@@ -273,10 +295,11 @@ impl Driver {
   ///
   /// A response with a delay waits for it here, before it is queued: what was answered earlier
   /// leaves first and nothing of this response is sent before the delay is over. Only this
-  /// connection's future waits, the thread keeps running the others.
+  /// connection's future waits, the thread keeps running the others, and its socket is watched
+  /// meanwhile (see [`Self::sleep_watching`]).
   async fn answer<S, V>(&mut self, stream: &mut S, service: &mut V) -> crate::Result<()>
   where
-    S: StreamWriter,
+    S: StreamReader + StreamWriter,
     V: Http1Service,
   {
     self.answered = self.answered.wrapping_add(1);
@@ -289,7 +312,7 @@ impl Driver {
       && !delay.is_zero()
     {
       self.flush(stream).await?;
-      Sleep::new(delay)?.await?;
+      self.sleep_watching(stream, delay.min(self.max_delay)).await?;
     }
     if self.res.extra_headers().is_empty() {
       self.conn.respond(self.res.status(), self.res.content_type(), self.res.body());
@@ -313,6 +336,43 @@ impl Driver {
     }
     self.queued = self.queued.wrapping_add(self.wire.len().wrapping_sub(before));
     Ok(())
+  }
+
+  /// Waits for `delay` while watching the socket. What arrives is appended to `rx`, to be fed
+  /// after the delayed response, in order. A peer that closes or resets the connection ends it at
+  /// once: the timer is cancelled with the connection's future, and the connection's slot, buffers
+  /// and count are released instead of being held for the rest of the delay.
+  ///
+  /// A stream that reads only by awaiting (TLS) is read once it is readable, and that read is not
+  /// cut short by the timer, so a record that arrives in pieces may hold the response back until
+  /// it is whole: late, never early.
+  async fn sleep_watching<S>(&mut self, stream: &mut S, delay: Duration) -> crate::Result<()>
+  where
+    S: StreamReader,
+  {
+    let mut sleep = Sleep::new(delay)?;
+    loop {
+      // Enough is waiting to be fed: the peer is slowed down by TCP until the response is out.
+      if self.rx.len() >= RX_MAX {
+        return (&mut sleep).await;
+      }
+      let readable = {
+        let mut readable = pin!(stream.readable());
+        poll_fn(|cx| {
+          if let Poll::Ready(rslt) = Pin::new(&mut sleep).poll(cx) {
+            return Poll::Ready(rslt.map(|()| false));
+          }
+          readable.as_mut().poll(cx).map(|rslt| rslt.map(|()| true))
+        })
+        .await?
+      };
+      if !readable {
+        return Ok(());
+      }
+      if self.read_into(stream, true).await? {
+        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+      }
+    }
   }
 
   /// Moves what the core holds to the end of `wire`.
@@ -489,14 +549,14 @@ mod tests {
       HttpRecvParams,
       http1_server_framework::{
         Http1Res,
-        conn_driver::{Http1Service, drive_conn},
+        conn_driver::{DriveParams, Http1Service, drive_conn},
       },
     },
     http1::Http1Request,
     net::{StreamCommon, StreamReader, StreamWriter, TryRead},
   };
   use alloc::vec::Vec;
-  use core::num::NonZeroUsize;
+  use core::{num::NonZeroUsize, time::Duration};
 
   /// Gives its input at once, then reports the end of the stream; counts the writes.
   struct Scripted {
@@ -560,8 +620,11 @@ mod tests {
       input.extend_from_slice(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n");
     }
     let mut stream = Scripted { input, output: Vec::new(), writes: 0 };
-    let hrc = HttpRecvParams::with_default_params();
-    StdRuntime::new().block_on(drive_conn(&mut stream, &mut WithHeader, &hrc, None)).unwrap();
+    let params = DriveParams {
+      hrc: HttpRecvParams::with_default_params(),
+      max_delay: Duration::from_secs(10),
+    };
+    StdRuntime::new().block_on(drive_conn(&mut stream, &mut WithHeader, &params, None)).unwrap();
     let answered = stream.output.windows(4).filter(|el| el == b"pong").count();
     assert_eq!(answered, count);
     assert!(stream.output.len() < 64 * 1024, "{}", stream.output.len());
