@@ -9,6 +9,8 @@ mod generic_request;
 mod generic_response;
 mod header_name;
 mod headers;
+#[cfg(feature = "http1-server-framework")]
+mod http1_server_framework;
 #[cfg(feature = "http2-client-pool")]
 pub mod http2_client_pool;
 #[cfg(feature = "http2-server-framework")]
@@ -30,12 +32,16 @@ mod router;
 mod same_site;
 #[cfg(feature = "http-session")]
 mod session;
+#[cfg(any(
+  feature = "http1-server-framework",
+  feature = "http2-server-framework",
+  feature = "web-socket-server-framework"
+))]
+mod shutdown_signal;
 mod status_code;
 mod u31;
 mod version;
 pub mod web_authn;
-#[cfg(any(feature = "http2-server-framework", feature = "web-socket-server-framework"))]
-mod shutdown_signal;
 #[cfg(feature = "web-socket-server-framework")]
 mod web_socket_server_framework;
 
@@ -47,6 +53,10 @@ pub use headers::{Header, Headers, HeadersIter, Trailers};
 pub use http_client::HttpClient;
 pub use http_error::HttpError;
 pub use http_recv_params::HttpRecvParams;
+#[cfg(feature = "http1-server-framework")]
+pub use http1_server_framework::{
+  Http1Middleware, Http1Req, Http1Res, Http1Router, Http1ServerFramework, Http1ServerHeader,
+};
 pub use method::Method;
 pub use mime::Mime;
 pub use misc::*;
@@ -61,11 +71,15 @@ pub use router::{Router, RouterBuilder, RouterError, RouterMatch, RouterMatchPar
 pub use same_site::SameSite;
 #[cfg(feature = "http-session")]
 pub use session::*;
+#[cfg(any(
+  feature = "http1-server-framework",
+  feature = "http2-server-framework",
+  feature = "web-socket-server-framework"
+))]
+pub use shutdown_signal::ShutdownSignal;
 pub use status_code::StatusCode;
 pub use u31::U31;
 pub use version::Version;
-#[cfg(any(feature = "http2-server-framework", feature = "web-socket-server-framework"))]
-pub use shutdown_signal::ShutdownSignal;
 #[cfg(feature = "web-socket-server-framework")]
 pub use web_socket_server_framework::{WebSocketRouter, WebSocketServerFramework};
 

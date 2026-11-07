@@ -1,11 +1,19 @@
 use crate::http::{Headers, KnownHeaderName, Method, Protocol};
-#[cfg(any(feature = "http2-server-framework", feature = "web-socket-server-framework"))]
+#[cfg(any(
+  feature = "http1-server-framework",
+  feature = "http2-server-framework",
+  feature = "web-socket-server-framework"
+))]
 use crate::{
   futures::Sleep,
   http::ShutdownSignal,
   sync::{Arc, AtomicUsize},
 };
-#[cfg(any(feature = "http2-server-framework", feature = "web-socket-server-framework"))]
+#[cfg(any(
+  feature = "http1-server-framework",
+  feature = "http2-server-framework",
+  feature = "web-socket-server-framework"
+))]
 use core::{
   future::poll_fn, num::NonZeroUsize, pin::pin, sync::atomic::Ordering, task::Poll, time::Duration,
 };
@@ -32,7 +40,11 @@ pub(crate) fn push_h2_alpn<TCX>(tc: &mut crate::tls::TlsConfig<TCX>) -> crate::R
 /// Reports a failed accept to the error callback. Unless the connection only went away before it
 /// was taken, the next accept would most likely fail the same way at once (out of descriptors,
 /// say), so the loop waits a moment first instead of spinning.
-#[cfg(any(feature = "http2-server-framework", feature = "web-socket-server-framework"))]
+#[cfg(any(
+  feature = "http1-server-framework",
+  feature = "http2-server-framework",
+  feature = "web-socket-server-framework"
+))]
 pub(crate) async fn on_accept_error<EC, ER>(error_cb: &EC, err: crate::Error)
 where
   EC: Fn(ER),
@@ -60,7 +72,11 @@ where
 }
 
 /// The next accepted connection, or `None` once `shutdown` is triggered.
-#[cfg(any(feature = "http2-server-framework", feature = "web-socket-server-framework"))]
+#[cfg(any(
+  feature = "http1-server-framework",
+  feature = "http2-server-framework",
+  feature = "web-socket-server-framework"
+))]
 pub(crate) async fn accept_or_shutdown<T>(
   accept: impl Future<Output = T>,
   shutdown: Option<&ShutdownSignal>,
@@ -99,7 +115,11 @@ pub(crate) async fn within<T>(
 }
 
 /// The count of open connections, when a shutdown has to wait for them or a limit caps them.
-#[cfg(any(feature = "http2-server-framework", feature = "web-socket-server-framework"))]
+#[cfg(any(
+  feature = "http1-server-framework",
+  feature = "http2-server-framework",
+  feature = "web-socket-server-framework"
+))]
 pub(crate) fn counter(
   shutdown: Option<&(ShutdownSignal, Duration)>,
   max_connections: Option<NonZeroUsize>,
@@ -109,7 +129,11 @@ pub(crate) fn counter(
 
 /// Counts a new connection in `active`, unless that would take it past `max`. Counted first and
 /// then checked, so that runtimes accepting at the same time can't together pass the limit.
-#[cfg(any(feature = "http2-server-framework", feature = "web-socket-server-framework"))]
+#[cfg(any(
+  feature = "http1-server-framework",
+  feature = "http2-server-framework",
+  feature = "web-socket-server-framework"
+))]
 pub(crate) fn admit(active: &AtomicUsize, max: Option<NonZeroUsize>) -> bool {
   let prev = active.fetch_add(1, Ordering::AcqRel);
   if max.is_some_and(|el| prev >= el.get()) {
@@ -120,24 +144,40 @@ pub(crate) fn admit(active: &AtomicUsize, max: Option<NonZeroUsize>) -> bool {
 }
 
 /// A connection's task, counted in `active` while it runs.
-#[cfg(any(feature = "http2-server-framework", feature = "web-socket-server-framework"))]
+#[cfg(any(
+  feature = "http1-server-framework",
+  feature = "http2-server-framework",
+  feature = "web-socket-server-framework"
+))]
 pub(crate) async fn tracked(fut: impl Future<Output = ()>, active: Arc<AtomicUsize>) {
   struct Guard(Arc<AtomicUsize>);
 
-#[cfg(any(feature = "http2-server-framework", feature = "web-socket-server-framework"))]
+  #[cfg(any(
+    feature = "http1-server-framework",
+    feature = "http2-server-framework",
+    feature = "web-socket-server-framework"
+  ))]
   impl Drop for Guard {
     fn drop(&mut self) {
       let _prev = self.0.fetch_sub(1, Ordering::AcqRel);
     }
   }
 
-#[cfg(any(feature = "http2-server-framework", feature = "web-socket-server-framework"))]
+  #[cfg(any(
+    feature = "http1-server-framework",
+    feature = "http2-server-framework",
+    feature = "web-socket-server-framework"
+  ))]
   let _guard = Guard(active);
   fut.await;
 }
 
 /// Waits until no connection is left, or `drain` has passed.
-#[cfg(any(feature = "http2-server-framework", feature = "web-socket-server-framework"))]
+#[cfg(any(
+  feature = "http1-server-framework",
+  feature = "http2-server-framework",
+  feature = "web-socket-server-framework"
+))]
 pub(crate) async fn drain_connections(active: &AtomicUsize, drain: Duration) {
   let begin = crate::calendar::Instant::new();
   while active.load(Ordering::Acquire) > 0 && begin.elapsed().is_ok_and(|el| el < drain) {
