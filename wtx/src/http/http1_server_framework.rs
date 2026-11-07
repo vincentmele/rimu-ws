@@ -28,7 +28,11 @@ use core::{num::NonZeroUsize, ops::ControlFlow, time::Duration};
 /// Default of [`Http1ServerFramework::set_handshake_timeout`].
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default of [`Http1ServerFramework::set_max_delay`].
-const DEFAULT_MAX_DELAY: Duration = Duration::from_secs(10);
+///
+/// Half of the default handshake timeouts (the runtime's, [`crate::executor::UringParams`], and
+/// this framework's): a plaintext connection's first response must leave before the runtime's
+/// handshake timeout, delay included.
+const DEFAULT_MAX_DELAY: Duration = Duration::from_secs(5);
 
 type Handler<DA, ER> =
   Box<dyn Fn(&mut DA, &Http1Req<'_>, &mut Http1Res) -> Result<(), ER> + Send + Sync>;
@@ -633,7 +637,12 @@ impl<DA, EC, EX, RC, RNG, TCX> Http1ServerFramework<DA, EC, EX, RC, RNG, TCX> {
 
   /// The longest delay a response may ask for ([`Http1Res::set_delay`]): longer ones are cut to
   /// it, so that a handler fed a client's number can't hold a connection for as long as the client
-  /// likes. Defaults to 10 s.
+  /// likes. Defaults to 5 s.
+  ///
+  /// Keep it below the runtime's handshake timeout (see [`crate::executor::UringParams`], 10 s by
+  /// default), less the time a client may take to send its first request: that timeout runs until
+  /// a plaintext connection sends anything, so a first response delayed past it is never sent and
+  /// the connection is closed. A TLS connection sends its ServerHello first, and is not concerned.
   #[inline]
   #[must_use = must_use_itself_doc!()]
   pub const fn set_max_delay(mut self, value: Duration) -> Self {
@@ -1845,6 +1854,47 @@ mod tests {
     assert_eq!(read_response(&mut stream).1, b"3000");
     let elapsed = begin.elapsed();
     assert!(elapsed >= Duration::from_millis(145), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(1000), "{elapsed:?}");
+  }
+
+  // The runtime's handshake timeout runs until a plaintext connection sends its first response,
+  // delay included: by default the maximum delay stays well below it (both defaults).
+  #[test]
+  fn default_max_delay_is_below_the_handshake_timeout() {
+    assert!(
+      super::DEFAULT_MAX_DELAY < super::DEFAULT_HANDSHAKE_TIMEOUT,
+      "{:?} {:?}",
+      super::DEFAULT_MAX_DELAY,
+      super::DEFAULT_HANDSHAKE_TIMEOUT
+    );
+    assert!(super::DEFAULT_MAX_DELAY <= super::DEFAULT_HANDSHAKE_TIMEOUT / 2);
+  }
+
+  // With a maximum delay below the runtime's handshake timeout, a first request asking for a
+  // longer delay is answered (at the maximum), not cut by that timeout.
+  #[test]
+  fn first_delayed_response_beats_a_short_runtime_handshake_timeout() {
+    let uri = _uri();
+    let (host, port) = uri.hostname_with_implied_port();
+    let addr = std::format!("{host}:{port}");
+    let server_addr = addr.clone();
+    let _server = std::thread::spawn(move || {
+      Http1ServerFramework::<(), fn(crate::Error), UringExecutor, _>::new(UringExecutor::default())
+        .unwrap()
+        .set_local_runtime_cb(|| {
+          let params = UringParams::new().set_handshake_timeout(Some(Duration::from_secs(1)));
+          UringRuntime::with_params(params)
+        })
+        .set_local_runtimes(core::num::NonZeroUsize::new(1))
+        .set_max_delay(Duration::from_millis(500))
+        .run_in_threads(&server_addr, router())
+    });
+    let mut stream = connect(&addr);
+    let begin = std::time::Instant::now();
+    stream.write_all(b"GET /delay/1500 HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    assert_eq!(read_response(&mut stream).1, b"1500");
+    let elapsed = begin.elapsed();
+    assert!(elapsed >= Duration::from_millis(495), "{elapsed:?}");
     assert!(elapsed < Duration::from_millis(1000), "{elapsed:?}");
   }
 
