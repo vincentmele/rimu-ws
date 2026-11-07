@@ -3990,6 +3990,11 @@ mod tests {
     assert_eq!(Rc::as_ptr(&again).addr(), addr);
     assert_eq!(again[999], 2);
     drop((other, again));
+    // As the runtime holds them: unsized, through clones
+    let unsized_rc: TaskRc<dyn core::any::Any> = Rc::new_in([4u8; 1000], TaskAlloc);
+    let clone = unsized_rc.clone();
+    assert_eq!(Rc::as_ptr(&clone).cast::<u8>().addr(), addr);
+    drop((unsized_rc, clone));
     let many: Vec<_> = (0..TASK_POOL_MAX + 8).map(|_| Rc::new_in([3u8; 100], TaskAlloc)).collect();
     drop(many);
     let (len, bytes) = TASK_POOL.with(|pool| (pool.borrow().blocks.len(), pool.borrow().bytes));

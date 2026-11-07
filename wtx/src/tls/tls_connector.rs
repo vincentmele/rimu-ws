@@ -6,9 +6,8 @@ use crate::{
   net::{BufStreamReader, RoleTy, Stream, Uri},
   rng::CryptoRng,
   tls::{
-    KsBox,
     AlertDescription, CHANGE_CIPHER_SPEC, DLFT_MAX_FRAGMENT_LENGTH, HandshakePath, HandshakeTy,
-    MAX_CERTIFICATES, NamedGroup, ProtocolVersion, TlsBuffer, TlsConfig, TlsCtx, TlsError,
+    KsBox, MAX_CERTIFICATES, NamedGroup, ProtocolVersion, TlsBuffer, TlsConfig, TlsCtx, TlsError,
     TlsServerEndPoint, TlsStream,
     key_schedule::KeySchedule,
     misc::{
@@ -93,8 +92,11 @@ where
   #[inline]
   pub fn new(config: TCG, rng: RNG, stream: S, uri: U) -> Self {
     let cfg_ref = config.lease();
-    let key_schedule =
-      KsBox::new(if TCX::TY.is_plain_text() { KeySchedule::unset() } else { KeySchedule::default() });
+    let key_schedule = KsBox::new(if TCX::TY.is_plain_text() {
+      KeySchedule::unset()
+    } else {
+      KeySchedule::default()
+    });
     let transcript_hash = key_schedule.cipher_suite().hash_new();
     let max_fragment_length =
       cfg_ref.max_fragment_length().map_or(DLFT_MAX_FRAGMENT_LENGTH, |el| el.num());

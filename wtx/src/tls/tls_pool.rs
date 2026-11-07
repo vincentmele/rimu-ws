@@ -31,6 +31,7 @@ const BUF_POOL_IDLE_BYTES: usize = 2 << 20;
 
 #[cfg(feature = "std")]
 std::thread_local! {
+  #[allow(clippy::vec_box, reason = "the boxes are what is pooled")]
   static KS_POOL: core::cell::RefCell<alloc::vec::Vec<Box<MaybeUninit<KeySchedule>>>> =
     const { core::cell::RefCell::new(alloc::vec::Vec::new()) };
   static BUF_POOL: core::cell::RefCell<BufPool> =
@@ -95,9 +96,7 @@ impl KsBox {
   #[inline]
   pub(crate) fn new(key_schedule: KeySchedule) -> Self {
     #[cfg(feature = "std")]
-    if let Some(elem) =
-      KS_POOL.try_with(|pool| pool.try_borrow_mut().ok()?.pop()).ok().flatten()
-    {
+    if let Some(elem) = KS_POOL.try_with(|pool| pool.try_borrow_mut().ok()?.pop()).ok().flatten() {
       return Self(ManuallyDrop::new(Box::write(elem, key_schedule)));
     }
     Self(ManuallyDrop::new(Box::new(key_schedule)))
@@ -247,7 +246,8 @@ mod tests {
   #[test]
   fn key_schedule_box_comes_back_zeroed() {
     KS_POOL.with(|el| el.borrow_mut().clear());
-    let ks = KsBox::new(KeySchedule::default());
+    // `unset`: the crypto backend is not needed, so Miri runs this too
+    let ks = KsBox::new(KeySchedule::unset());
     let addr = (&raw const *ks).addr();
     drop(ks);
     KS_POOL.with(|pool| {
@@ -259,11 +259,10 @@ mod tests {
       let bytes = unsafe { core::slice::from_raw_parts(ptr, size_of::<KeySchedule>()) };
       assert!(bytes.iter().all(|el| *el == 0), "a pooled key schedule kept its bytes");
     });
-    let again = KsBox::new(KeySchedule::default());
+    let again = KsBox::new(KeySchedule::unset());
     assert_eq!((&raw const *again).addr(), addr);
-    let moved = again.into_inner();
+    let _moved = again.into_inner();
     assert!(KS_POOL.with(|el| el.borrow().len()) == 1);
-    drop(moved);
   }
 
   // A stream's buffers come back zeroed in all of their capacity, and are the next one's.

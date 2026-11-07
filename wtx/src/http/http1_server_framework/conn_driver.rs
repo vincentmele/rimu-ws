@@ -1068,6 +1068,7 @@ mod tests {
 
   // A member in a slot an earlier member freed is woken when the group goes away, and the
   // member that left is not: the slot holds the waker of whoever has it now.
+  #[allow(clippy::disallowed_types, reason = "std's `Wake` takes std's `Arc`")]
   #[test]
   fn a_member_in_a_reused_slot_is_woken_by_go_away() {
     use crate::http::http1_server_framework::conn_driver::{ConnGroup, Member};

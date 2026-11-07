@@ -5,10 +5,9 @@ use crate::{
   net::{RoleTy, Stream},
   rng::CryptoRng,
   tls::{
-    KsBox,
     AlertDescription, Alpn, CHANGE_CIPHER_SPEC, CipherSuite, DLFT_MAX_FRAGMENT_LENGTH,
-    HandshakePath, HandshakeTy, MaxFragmentLength, NamedGroup, ProtocolVersion, SignatureScheme,
-    TlsBuffer, TlsConfig, TlsCtx, TlsCtxSk, TlsError, TlsStream,
+    HandshakePath, HandshakeTy, KsBox, MaxFragmentLength, NamedGroup, ProtocolVersion,
+    SignatureScheme, TlsBuffer, TlsConfig, TlsCtx, TlsCtxSk, TlsError, TlsStream,
     key_schedule::KeySchedule,
     misc::{
       fetch_rec_from_stream, manage_err_handshake, post_handshake_dec_error,
@@ -59,8 +58,11 @@ where
   #[inline]
   pub fn new(config: TCG, rng: RNG, stream: S) -> Self {
     let cfg_ref = config.lease();
-    let key_schedule =
-      KsBox::new(if TCX::TY.is_plain_text() { KeySchedule::unset() } else { KeySchedule::default() });
+    let key_schedule = KsBox::new(if TCX::TY.is_plain_text() {
+      KeySchedule::unset()
+    } else {
+      KeySchedule::default()
+    });
     let transcript_hash = key_schedule.cipher_suite().hash_new();
     let max_fragment_length =
       cfg_ref.max_fragment_length().map_or(DLFT_MAX_FRAGMENT_LENGTH, |el| el.num());

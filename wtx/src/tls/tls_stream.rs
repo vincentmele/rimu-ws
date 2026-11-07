@@ -5,9 +5,8 @@ use crate::{
   net::{ConnectionState, Stream, StreamCommon, StreamReader, StreamWriter, TryRead},
   sync::{Arc, AtomicBool, AtomicU8, AtomicWaker},
   tls::{
-    KsBox,
-    AlertDescription, AlertLevel, RECORD_HEADER_LEN, TlsBuffer, TlsCtx, TlsError, TlsStreamBridge,
-    TlsStreamReader, TlsStreamWriter,
+    AlertDescription, AlertLevel, KsBox, RECORD_HEADER_LEN, TlsBuffer, TlsCtx, TlsError,
+    TlsStreamBridge, TlsStreamReader, TlsStreamWriter,
     key_schedule::{KeySchedule, KeyScheduleWrite},
     misc::{
       manage_err_ad, manage_key_update, manage_user_canceled, read_after_handshake_data,

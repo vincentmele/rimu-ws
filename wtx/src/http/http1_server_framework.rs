@@ -1954,7 +1954,9 @@ mod tests {
     std::thread::sleep(Duration::from_millis(100));
     let before = stats(&addr);
     // An incomplete head, one byte at a time: each wakes the delayed connection once
-    for byte in b"GET /ping HTTP/1.1\r\nHost: x\r\nX-Padding: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+    for byte in
+      b"GET /ping HTTP/1.1\r\nHost: x\r\nX-Padding: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    {
       stream.write_all(&[*byte]).unwrap();
       std::thread::sleep(Duration::from_millis(5));
     }
