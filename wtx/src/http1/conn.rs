@@ -626,6 +626,14 @@ mod tests {
   }
 
   #[test]
+  fn crlf_after_a_body_is_skipped() {
+    let mut c = conn();
+    c.feed(&[POST_CL, b"\r\n", GET].concat()).unwrap();
+    assert_eq!(answer_all(&mut c), 2);
+    assert!(!c.wants_close());
+  }
+
+  #[test]
   fn feed_is_bounded_without_polling() {
     let mut c = conn();
     let big = vec![b'a'; 1024 * 1024];

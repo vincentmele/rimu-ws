@@ -59,11 +59,16 @@ impl Default for ParseScratch {
 /// Returns [`ParseOutcome::Partial`], never an error, while the blank line that ends the head
 /// has not arrived (unless the head is already larger than the 16 KiB limit). The function is
 /// pure over `buf`, so it can simply be called again after more bytes were appended.
+///
+/// One empty line in front of the request line is skipped (RFC 9112 §2.2); it counts toward
+/// `head_len`.
 #[inline]
 pub fn parse_request<'b>(
   buf: &'b [u8],
   scratch: &'b mut ParseScratch,
 ) -> crate::Result<ParseOutcome<'b>> {
+  let skip = if buf.starts_with(b"\r\n") { 2 } else { 0 };
+  let buf = buf.get(skip..).unwrap_or_default();
   let window = buf.get(..MAX_HEAD_LEN).unwrap_or(buf);
   let Some(head_len) = find_head_end(window) else {
     if buf.len() > MAX_HEAD_LEN {
@@ -79,7 +84,10 @@ pub fn parse_request<'b>(
   // Request line
 
   let line_end = find_byte(head_bytes, b'\n').ok_or_else(bad)?;
-  let line = head.get(..line_end.wrapping_sub(1)).ok_or_else(bad)?;
+  if line_end == 0 || head_bytes.get(line_end - 1) != Some(&b'\r') {
+    return Err(bad());
+  }
+  let line = head.get(..line_end - 1).ok_or_else(bad)?;
   let line_bytes = line.as_bytes();
   if has_ctl(line_bytes) || find_byte(line_bytes, b'\t').is_some() {
     return Err(bad());
@@ -193,7 +201,7 @@ pub fn parse_request<'b>(
     unsafe { core::slice::from_raw_parts(scratch.headers.as_ptr().cast::<Header>(), len) };
   Ok(ParseOutcome::Complete {
     request: Http1Request { method, path, query, headers, body_kind, keep_alive },
-    head_len,
+    head_len: head_len.wrapping_add(skip),
   })
 }
 
@@ -516,6 +524,26 @@ mod tests {
     assert!(is_err(b"POST / HTTP/1.1\r\nContent-Length: \r\n\r\n"));
     assert!(is_err(b"POST / HTTP/1.1\r\nContent-Length: 99999999999999999999999\r\n\r\n"));
     assert!(is_err(b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n"));
+  }
+
+  #[test]
+  fn request_line_needs_crlf() {
+    assert!(is_err(b"GET / HTTP/1.11\nHost: a\r\n\r\n"));
+    assert!(is_err(b"GET / HTTP/1.1X\nHost: a\r\n\r\n"));
+    assert!(is_err(b"GET / HTTP/1.1\0\nHost: a\r\n\r\n"));
+    assert!(is_err(b"GET / HTTP/1.1\nHost: a\r\n\r\n"));
+  }
+
+  #[test]
+  fn one_leading_crlf_is_skipped() {
+    let raw: &[u8] = b"\r\nGET /x HTTP/1.1\r\nHost: a\r\n\r\n";
+    let (method, path, _, _, _, _, head_len) = complete(raw);
+    assert_eq!((method, path.as_str(), head_len), (Method::Get, "/x", raw.len()));
+    let mut scratch = ParseScratch::new();
+    for n in 1..raw.len() {
+      assert!(matches!(parse_request(&raw[..n], &mut scratch), Ok(ParseOutcome::Partial)), "{n}");
+    }
+    assert!(is_err(b"\r\n\r\nGET /x HTTP/1.1\r\nHost: a\r\n\r\n"));
   }
 
   #[test]
