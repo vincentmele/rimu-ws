@@ -234,7 +234,14 @@ where
 }
 
 /// Routes paths to handlers. A path may have one handler per method, or one for any method.
+///
+/// A HEAD request is answered by the path's HEAD handler or, without one, by its GET handler: the
+/// response then has the headers of the GET response, `Content-Length` included, and no body. A
+/// method a path has no handler for is answered 405, with an `Allow` header listing the methods it
+/// has.
 pub struct Http1Router<DA, ER, M = ()> {
+  /// For every path, the value of the `Allow` header of its 405 responses.
+  allows: Vec<String>,
   groups: Vec<Vec<(Option<Method>, Handler<DA, ER>)>>,
   matcher: Router<usize>,
   middleware: M,
@@ -245,7 +252,13 @@ impl<DA, ER> Http1Router<DA, ER, ()> {
   /// No route and no middleware.
   #[inline]
   pub const fn new() -> Self {
-    Self { groups: Vec::new(), matcher: Router::new(), middleware: (), pending: Vec::new() }
+    Self {
+      allows: Vec::new(),
+      groups: Vec::new(),
+      matcher: Router::new(),
+      middleware: (),
+      pending: Vec::new(),
+    }
   }
 }
 
@@ -286,7 +299,13 @@ impl<DA, ER, M> Http1Router<DA, ER, M> {
   #[inline]
   #[must_use]
   pub fn set_middleware<_M>(self, middleware: _M) -> Http1Router<DA, ER, _M> {
-    Http1Router { groups: self.groups, matcher: self.matcher, middleware, pending: self.pending }
+    Http1Router {
+      allows: self.allows,
+      groups: self.groups,
+      matcher: self.matcher,
+      middleware,
+      pending: self.pending,
+    }
   }
 
   /// Moves the registered routes into the path matcher.
@@ -310,6 +329,7 @@ impl<DA, ER, M> Http1Router<DA, ER, M> {
       }
       group.push((method, handler));
     }
+    self.allows = self.groups.iter().map(|group| allow(group.iter().map(|el| el.0))).collect();
     let mut builder = self.matcher.builder();
     for (idx, path) in paths.iter().enumerate() {
       let _ = builder.add(&(*path).try_into()?, idx)?;
@@ -332,12 +352,24 @@ where
     let route = self.matcher.find(head.path).ok();
     let req = Http1Req { head, body, route };
     if let ControlFlow::Continue(()) = self.middleware.req(data, &req, res)? {
-      let group = req.route.as_ref().and_then(|el| self.groups.get(*el.data()));
-      match group {
+      let idx = req.route.as_ref().map(|el| *el.data());
+      match idx.and_then(|el| self.groups.get(el)) {
         None => res.set_status(StatusCode::NotFound),
         Some(group) => {
-          match group.iter().find(|el| el.0.is_none_or(|method| method == head.method)) {
-            None => res.set_status(StatusCode::MethodNotAllowed),
+          let find = |method| group.iter().find(|el| el.0.is_none_or(|elem| elem == method));
+          let mut found = find(head.method);
+          // HEAD is GET without the body, which the core leaves out.
+          if found.is_none() && head.method == Method::Head {
+            found = find(Method::Get);
+          }
+          match found {
+            None => {
+              res.set_status(StatusCode::MethodNotAllowed);
+              if let Some(allow) = idx.and_then(|el| self.allows.get(el)) {
+                // Method names: never a line break.
+                let _rslt = res.push_header("allow", allow);
+              }
+            }
             Some((_, handler)) => handler(data, &req, res)?,
           }
         }
@@ -345,6 +377,26 @@ where
     }
     self.middleware.res(data, &req, res)
   }
+}
+
+/// The `Allow` header of a path with handlers for `methods`: they in the order they were added,
+/// and HEAD after GET when the path has no HEAD handler of its own.
+fn allow(methods: impl Clone + Iterator<Item = Option<Method>>) -> String {
+  let has_head = methods.clone().any(|el| el == Some(Method::Head));
+  let mut allow = String::new();
+  let mut push = |method: Method| {
+    if !allow.is_empty() {
+      allow.push_str(", ");
+    }
+    allow.push_str(method.strings().custom.first().copied().unwrap_or_default());
+  };
+  for method in methods.flatten() {
+    push(method);
+    if method == Method::Get && !has_head {
+      push(Method::Head);
+    }
+  }
+  allow
 }
 
 impl<DA, ER> Default for Http1Router<DA, ER, ()> {
@@ -820,6 +872,13 @@ mod tests {
         res.set_status(StatusCode::Created);
         Ok(())
       })
+      .post("/both", |_, _, _| Ok(()))
+      .get("/both", |_, _, _| Ok(()))
+      .get("/own-head", |_, _, _| Ok(()))
+      .route(Some(crate::http::Method::Head), "/own-head", |_, _, res| {
+        res.set_status(StatusCode::Created);
+        Ok(())
+      })
   }
 
   // A one-runtime server; returns its address.
@@ -972,6 +1031,48 @@ mod tests {
     let (head, _) = ask("GET /teapot HTTP/1.1\r\nHost: x\r\n\r\n");
     assert!(head.starts_with("http/1.1 201 "), "{head}");
     assert_eq!(ask("GET /ping HTTP/1.1\r\nHost: x\r\n\r\n").1, b"pong");
+  }
+
+  /// Status line and headers (lower-cased) of the next response, which has no body.
+  fn read_head(stream: &mut TcpStream) -> String {
+    let mut head = Vec::new();
+    let mut byte = [0; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+      assert_eq!(stream.read(&mut byte).unwrap(), 1, "closed in the middle of a head");
+      head.push(byte[0]);
+    }
+    String::from_utf8(head).unwrap().to_ascii_lowercase()
+  }
+
+  // HEAD is answered by the GET route, with the length of the GET body and no body, so the next
+  // response of the connection is not misread. A method the path has no route for is a 405 that
+  // lists the methods it has.
+  #[test]
+  fn head_is_served_by_get_and_405_lists_allow() {
+    let addr = server(|_| {});
+    let mut stream = connect(&addr);
+    stream
+      .write_all(b"HEAD /ping HTTP/1.1\r\nHost: x\r\n\r\nGET /ping HTTP/1.1\r\nHost: x\r\n\r\n")
+      .unwrap();
+    let head = read_head(&mut stream);
+    assert!(head.starts_with("http/1.1 200 ok\r\n"), "{head}");
+    assert!(head.contains("content-length: 4\r\n"), "{head}");
+    let (head, body) = read_response(&mut stream);
+    assert!(head.starts_with("http/1.1 200 ok\r\n"), "{head}");
+    assert_eq!(body, b"pong");
+    stream.write_all(b"POST /ping HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n").unwrap();
+    let (head, _) = read_response(&mut stream);
+    assert!(head.starts_with("http/1.1 405 "), "{head}");
+    assert!(head.contains("allow: get, head\r\n"), "{head}");
+    // A path with routes for two methods lists both, and HEAD after GET
+    stream.write_all(b"PUT /both HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n").unwrap();
+    let (head, _) = read_response(&mut stream);
+    assert!(head.starts_with("http/1.1 405 "), "{head}");
+    assert!(head.contains("allow: post, get, head\r\n"), "{head}");
+    // A HEAD route of its own wins over the GET one
+    stream.write_all(b"HEAD /own-head HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let head = read_head(&mut stream);
+    assert!(head.starts_with("http/1.1 201 "), "{head}");
   }
 
   // A malformed head is answered 400 and then closed.
