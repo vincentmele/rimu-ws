@@ -1670,6 +1670,26 @@ mod tests {
       std::thread::sleep(Duration::from_millis(500));
       stream.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
       assert!(tls_read_until(&mut stream, b"pong").await.is_some());
+      // Nor is a first request whose head came in time and whose body is slower: late as a whole
+      let mut stream = tls_connect(&uri).await;
+      stream
+        .write_all(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\n")
+        .await
+        .unwrap();
+      std::thread::sleep(Duration::from_millis(500));
+      stream.write_all(b"abc").await.unwrap();
+      assert!(tls_read_until(&mut stream, b"abc").await.is_some(), "late body");
+      // or trickled
+      let mut stream = tls_connect(&uri).await;
+      stream
+        .write_all(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 6\r\n\r\n")
+        .await
+        .unwrap();
+      for byte in b"abcdef" {
+        std::thread::sleep(Duration::from_millis(100));
+        stream.write_all(&[*byte]).await.unwrap();
+      }
+      assert!(tls_read_until(&mut stream, b"abcdef").await.is_some(), "trickled body");
       // A delayed first response is not cut by the timeout either
       let mut stream = tls_connect(&uri).await;
       stream.write_all(b"GET /delay/500 HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();

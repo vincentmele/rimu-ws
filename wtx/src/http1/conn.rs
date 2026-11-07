@@ -271,6 +271,13 @@ impl Http1Conn {
     self.inflight = self.inflight.saturating_sub(n);
   }
 
+  /// If no request head has been parsed since the last response: the connection waits for (more
+  /// of) one. `false` while a body is being received or a request awaits its response.
+  #[inline]
+  pub fn awaits_head(&self) -> bool {
+    matches!(self.phase, Phase::Head)
+  }
+
   /// If the connection should be closed once the output is flushed.
   #[inline]
   pub fn wants_close(&self) -> bool {

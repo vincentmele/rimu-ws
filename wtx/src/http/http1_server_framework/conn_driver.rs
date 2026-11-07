@@ -14,8 +14,8 @@
 //!    after the requests it made room for were answered.
 //! 4. While a response is delayed a plaintext socket is still watched: what arrives is kept for
 //!    after the response, and a peer that goes away ends the connection at once.
-//! 5. A connection with a first-head deadline (TLS) races it in every wait until its first
-//!    request is ready.
+//! 5. A connection with a first-head deadline (TLS) races it in every wait until the head of its
+//!    first request is parsed.
 
 use crate::{
   collections::VectorUsize,
@@ -144,7 +144,7 @@ struct Driver {
   /// Requests answered in the current round.
   answered: usize,
   conn: Http1Conn,
-  /// Until the first request is ready: when the connection's time for it is over.
+  /// Until the head of the first request is parsed: when the connection's time for it is over.
   deadline: Option<Sleep>,
   max_delay: Duration,
   /// Bytes arrived and no response went out since: probably the middle of a request.
@@ -300,6 +300,10 @@ impl Driver {
           Http1Event::NeedMore | Http1Event::Closed => break,
         }
       }
+      // A head is in, its body perhaps not: the first-head deadline is over.
+      if self.deadline.is_some() && !self.conn.awaits_head() {
+        self.deadline = None;
+      }
       if self.offset >= self.rx.len() {
         self.rx.clear();
         self.offset = 0;
@@ -324,7 +328,7 @@ impl Driver {
     V: Http1Service,
   {
     self.answered = self.answered.wrapping_add(1);
-    // The first request is here: its deadline is over, and its timer cancelled.
+    // The first request is here: the first-head deadline is over, and its timer cancelled.
     self.deadline = None;
     self.res.reset();
     match self.conn.request() {
