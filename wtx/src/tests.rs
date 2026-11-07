@@ -30,23 +30,30 @@ pub(crate) fn _vars() -> &'static Vars {
 
 /// Allocations made by threads that called [`_count_allocations`], for tests that pin a path as
 /// allocation-free.
-pub(crate) static _ALLOCATIONS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(crate) static _ALLOCATIONS: crate::sync::AtomicU64 = crate::sync::AtomicU64::new(0);
 
 std::thread_local! {
-  static COUNTING: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+  static COUNTING: core::cell::Cell<Option<&'static crate::sync::AtomicU64>> =
+    const { core::cell::Cell::new(None) };
 }
 
 /// Counts this thread's allocations in [`_ALLOCATIONS`] from now on.
 pub(crate) fn _count_allocations() {
-  COUNTING.with(|el| el.set(true));
+  _count_allocations_in(&_ALLOCATIONS);
+}
+
+/// Counts this thread's allocations in `counter` from now on: a test of its own counter is not
+/// disturbed by the threads of the tests that run alongside.
+pub(crate) fn _count_allocations_in(counter: &'static crate::sync::AtomicU64) {
+  COUNTING.with(|el| el.set(Some(counter)));
 }
 
 struct CountingAlloc;
 
 impl CountingAlloc {
   fn count() {
-    if COUNTING.try_with(core::cell::Cell::get).unwrap_or(false) {
-      let _ = _ALLOCATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if let Some(counter) = COUNTING.try_with(core::cell::Cell::get).ok().flatten() {
+      let _ = counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
   }
 }

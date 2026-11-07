@@ -352,14 +352,17 @@ impl Driver {
     // What `wire` already holds was counted when it was queued.
     let before = self.wire.len();
     self.conn.respond(self.res.status(), self.res.content_type(), self.res.body());
-    if let Ok(taken) = self.conn.take_output(mem::take(&mut self.spare)) {
-      let line_end =
-        taken.windows(2).position(|el| el == b"\r\n").map_or(0, |at| at.wrapping_add(2));
-      self.wire.extend_from_slice(taken.get(..line_end).unwrap_or_default());
-      self.wire.extend_from_slice(self.res.extra_headers());
-      self.wire.extend_from_slice(taken.get(line_end..).unwrap_or_default());
-      self.conn.advance_output(taken.len());
-      self.spare = taken;
+    match self.conn.take_output(mem::take(&mut self.spare)) {
+      Ok(taken) => {
+        let line_end =
+          taken.windows(2).position(|el| el == b"\r\n").map_or(0, |at| at.wrapping_add(2));
+        self.wire.extend_from_slice(taken.get(..line_end).unwrap_or_default());
+        self.wire.extend_from_slice(self.res.extra_headers());
+        self.wire.extend_from_slice(taken.get(line_end..).unwrap_or_default());
+        self.conn.advance_output(taken.len());
+        self.spare = taken;
+      }
+      Err(spare) => self.spare = spare,
     }
     self.queued = self.queued.wrapping_add(self.wire.len().wrapping_sub(before));
     Ok(())
@@ -408,12 +411,16 @@ impl Driver {
     }
   }
 
-  /// Moves what the core holds to the end of `wire`.
+  /// Moves what the core holds to the end of `wire`. The spare buffer comes back either way:
+  /// dropped, the core's next output would grow a new one from nothing.
   fn pull_core(&mut self) {
-    if let Ok(taken) = self.conn.take_output(mem::take(&mut self.spare)) {
-      self.wire.extend_from_slice(&taken);
-      self.conn.advance_output(taken.len());
-      self.spare = taken;
+    match self.conn.take_output(mem::take(&mut self.spare)) {
+      Ok(taken) => {
+        self.wire.extend_from_slice(&taken);
+        self.conn.advance_output(taken.len());
+        self.spare = taken;
+      }
+      Err(spare) => self.spare = spare,
     }
   }
 

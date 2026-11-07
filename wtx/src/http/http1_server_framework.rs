@@ -1938,4 +1938,54 @@ mod tests {
     // Serialized they would take 480 ms
     assert!(begin.elapsed() < Duration::from_millis(300), "{:?}", begin.elapsed());
   }
+
+  // After a warm-up, the requests of a keep-alive connection allocate nothing on the server's
+  // thread: responses with a header of their own (the middleware's `server`), with a body taken
+  // from the request, delayed ones.
+  #[test]
+  fn steady_state_requests_allocate_nothing() {
+    use crate::{sync::AtomicU64, tests::_count_allocations_in};
+    use core::sync::atomic::Ordering;
+    static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+    let uri = _uri();
+    let (host, port) = uri.hostname_with_implied_port();
+    let addr = std::format!("{host}:{port}");
+    let server_addr = addr.clone();
+    let _server = std::thread::spawn(move || {
+      Http1ServerFramework::<(), fn(crate::Error), UringExecutor, _>::new(UringExecutor::default())
+        .unwrap()
+        .set_local_runtime_cb(|| {
+          _count_allocations_in(&ALLOCATIONS);
+          UringRuntime::with_params(UringParams::new())
+        })
+        .set_local_runtimes(core::num::NonZeroUsize::new(1))
+        .run_in_threads(&server_addr, router().set_middleware(Http1ServerHeader("rimu-ws")))
+    });
+    let mut stream = connect(&addr);
+    let mut echo =
+      Vec::from(&b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 4096\r\n\r\n"[..]);
+    echo.extend(core::iter::repeat_n(b'e', 4096));
+    let reqs: [(&[u8], usize); 3] = [
+      (b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n", 4),
+      (&echo, 4096),
+      (b"GET /delay/1 HTTP/1.1\r\nHost: x\r\n\r\n", 1),
+    ];
+    let round = |stream: &mut TcpStream| {
+      for (req, len) in reqs {
+        stream.write_all(req).unwrap();
+        let (head, body) = read_response(stream);
+        assert!(head.contains("server: rimu-ws"), "{head}");
+        assert_eq!(body.len(), len);
+      }
+    };
+    for _ in 0..100 {
+      round(&mut stream);
+    }
+    let before = ALLOCATIONS.load(Ordering::SeqCst);
+    for _ in 0..300 {
+      round(&mut stream);
+    }
+    let after = ALLOCATIONS.load(Ordering::SeqCst);
+    assert_eq!(after - before, 0, "allocations on the server thread for 900 requests");
+  }
 }
