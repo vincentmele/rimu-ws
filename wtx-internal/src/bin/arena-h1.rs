@@ -8,17 +8,14 @@
 use core::time::Duration;
 use rimu_ws::{
   executor::{UringExecutor, UringParams, UringRuntime},
-  http::{
-    Http1Req, Http1Res, Http1Router, Http1ServerFramework, Http1ServerHeader, Method, StatusCode,
-  },
+  http::{Http1Req, Http1Res, Http1Router, Http1ServerFramework, Method, StatusCode},
   net::TcpParams,
 };
 
 fn main() -> rimu_ws::Result<()> {
   let router = Http1Router::new()
     .route(Some(Method::Get), "/baseline11", endpoint_baseline11)
-    .route(Some(Method::Post), "/baseline11", endpoint_baseline11)
-    .set_middleware(Http1ServerHeader("rimu-ws"));
+    .route(Some(Method::Post), "/baseline11", endpoint_baseline11);
   Http1ServerFramework::<(), fn(rimu_ws::Error), UringExecutor, _>::new(UringExecutor::default())?
     .set_error_cb(error_cb)
     // Every client speaks first
