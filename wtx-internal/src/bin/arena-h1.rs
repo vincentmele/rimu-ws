@@ -76,6 +76,8 @@ fn main() -> rimu_ws::Result<()> {
     .route(Some(Method::Get), "/json/{count}", endpoint_json);
   Http1ServerFramework::<(), fn(rimu_ws::Error), UringExecutor, _>::new(UringExecutor::default())?
     .set_error_cb(error_cb)
+    // `/delay/{ms}` takes at most MAX_DELAY_MS, which the framework must not cut
+    .set_max_delay(Duration::from_millis(MAX_DELAY_MS))
     // Every client speaks first
     .set_tcp_params(TcpParams::default().set_tcp_defer_accept(Some(1)))
     .set_local_runtime_cb(runtime)
@@ -140,16 +142,35 @@ fn delay_ms(param: Option<&str>) -> Option<u64> {
   if param.is_empty() || !param.bytes().all(|el| el.is_ascii_digit()) {
     return None;
   }
-  param.parse().ok()
+  // Digits that overflow are a number too big, not "not a number"
+  Some(param.parse().unwrap_or(u64::MAX))
 }
 
-/// Waits `ms` milliseconds, then answers with `ms`. The delay is read from this request's path, so
+/// The longest `/delay/{ms}` served, in milliseconds. It is the framework's maximum delay too, set
+/// below, so that a delay is never cut: a longer one is a bad request.
+const MAX_DELAY_MS: u64 = 5000;
+
+/// The status and the delay in milliseconds for the `{ms}` segment: more than [`MAX_DELAY_MS`] is a
+/// 400 (no delay), no number is no delay.
+fn delay_response(param: Option<&str>) -> (StatusCode, u64) {
+  match delay_ms(param) {
+    Some(ms) if ms > MAX_DELAY_MS => (StatusCode::BadRequest, 0),
+    Some(ms) => (StatusCode::Ok, ms),
+    None => (StatusCode::Ok, 0),
+  }
+}
+
+/// Waits `ms` milliseconds (at most [`MAX_DELAY_MS`], else 400), then answers with `ms`. The delay is read from this request's path, so
 /// concurrent requests wait independently. The framework sends nothing before the delay elapses.
 fn endpoint_delay(_: &mut (), req: &Http1Req<'_>, res: &mut Http1Res) -> rimu_ws::Result<()> {
-  let ms = delay_ms(req.param("ms")).unwrap_or(0);
-  push_i64(res.body_mut(), i64::try_from(ms).unwrap_or(i64::MAX));
+  let (status, ms) = delay_response(req.param("ms"));
+  if status == StatusCode::BadRequest {
+    res.body_mut().extend_from_slice(b"delay over 5000 ms");
+  } else {
+    push_i64(res.body_mut(), i64::try_from(ms).unwrap_or(i64::MAX));
+  }
   res.set_content_type("text/plain");
-  res.set_status(StatusCode::Ok);
+  res.set_status(status);
   if ms > 0 {
     res.set_delay(Duration::from_millis(ms));
   }
@@ -521,6 +542,21 @@ mod tests {
     assert_eq!(delay_ms(Some("")), None);
     assert_eq!(delay_ms(Some("-5")), None);
     assert_eq!(delay_ms(Some("1.5")), None);
+  }
+
+  #[test]
+  fn delay_over_the_cap_is_a_bad_request() {
+    assert_eq!(MAX_DELAY_MS, 5000);
+    assert_eq!(delay_response(Some("0")), (StatusCode::Ok, 0));
+    assert_eq!(delay_response(Some("500")), (StatusCode::Ok, 500));
+    assert_eq!(delay_response(Some("5000")), (StatusCode::Ok, 5000));
+    assert_eq!(delay_response(Some("5001")), (StatusCode::BadRequest, 0));
+    assert_eq!(delay_response(Some("86400000")), (StatusCode::BadRequest, 0));
+    // Digits only, but too big for a u64
+    assert_eq!(delay_response(Some("99999999999999999999999")), (StatusCode::BadRequest, 0));
+    // Not a number: no delay, as before
+    assert_eq!(delay_response(Some("abc")), (StatusCode::Ok, 0));
+    assert_eq!(delay_response(None), (StatusCode::Ok, 0));
   }
 
   #[test]
