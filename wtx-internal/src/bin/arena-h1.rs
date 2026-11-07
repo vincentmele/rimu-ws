@@ -304,17 +304,18 @@ enum Encoding {
   Identity,
 }
 
-/// The encoding for an `Accept-Encoding` value: brotli if offered, else gzip, else none. A coding
-/// listed with `q=0` is not offered.
+/// The encoding for an `Accept-Encoding` value: gzip if offered, else brotli, else none. A coding
+/// listed with `q=0` is not offered. gzip is preferred over brotli because, measured on this
+/// dataset, zlib level 6 produces a body about the same size as brotli q2 at a fraction of the CPU,
+/// so it wins the bandwidth-penalised json-comp score (eff = rps x (min_bytes/own_bytes)^2).
 fn choose_encoding(accept: &str) -> Encoding {
   let (mut brotli, mut gzip) = (false, false);
   for item in accept.split(',') {
     let (token, params) = item.split_once(';').unwrap_or((item, ""));
     let refused = params.split(';').any(|param| {
-      param
-        .trim()
-        .split_once('=')
-        .is_some_and(|(k, v)| k.trim().eq_ignore_ascii_case("q") && v.trim().parse::<f32>() == Ok(0.0))
+      param.trim().split_once('=').is_some_and(|(k, v)| {
+        k.trim().eq_ignore_ascii_case("q") && v.trim().parse::<f32>() == Ok(0.0)
+      })
     });
     if refused {
       continue;
@@ -323,10 +324,10 @@ fn choose_encoding(accept: &str) -> Encoding {
     brotli |= token.eq_ignore_ascii_case("br");
     gzip |= token.eq_ignore_ascii_case("gzip");
   }
-  if brotli {
-    Encoding::Brotli
-  } else if gzip {
+  if gzip {
     Encoding::Gzip
+  } else if brotli {
+    Encoding::Brotli
   } else {
     Encoding::Identity
   }
@@ -348,8 +349,10 @@ fn encode(encoding: Encoding, input: &[u8], out: &mut Vec<u8>) -> std::io::Resul
     }
     Encoding::Gzip => {
       out.resize(zlib_rs::compress_bound(input.len()).saturating_add(64), 0);
-      let config =
-        zlib_rs::DeflateConfig { window_bits: GZIP_WINDOW_BITS, ..zlib_rs::DeflateConfig::new(GZIP_LEVEL) };
+      let config = zlib_rs::DeflateConfig {
+        window_bits: GZIP_WINDOW_BITS,
+        ..zlib_rs::DeflateConfig::new(GZIP_LEVEL)
+      };
       let (done, code) = zlib_rs::compress_slice(out, input, config);
       if code != zlib_rs::ReturnCode::Ok {
         return Err(std::io::Error::other("gzip failed"));
@@ -373,9 +376,14 @@ fn push_i64(out: &mut Vec<u8>, n: i64) {
     i -= 1;
     buf[i] = b'0' + (m % 10) as u8;
     m /= 10;
-    if m == 0 { break; }
+    if m == 0 {
+      break;
+    }
   }
-  if neg { i -= 1; buf[i] = b'-'; }
+  if neg {
+    i -= 1;
+    buf[i] = b'-';
+  }
   out.extend_from_slice(&buf[i..]);
 }
 
@@ -403,18 +411,20 @@ mod tests {
   }
 
   #[test]
-  fn chooses_brotli_when_offered() {
-    assert_eq!(choose_encoding("gzip, br"), Encoding::Brotli);
-    assert_eq!(choose_encoding("br"), Encoding::Brotli);
-    assert_eq!(choose_encoding("gzip, deflate, br, zstd"), Encoding::Brotli);
-    assert_eq!(choose_encoding("BR;q=0.5, gzip;q=1.0"), Encoding::Brotli);
+  fn prefers_gzip_when_offered() {
+    // gzip is preferred over brotli (cheaper CPU, same size on this dataset → higher json-comp eff).
+    assert_eq!(choose_encoding("gzip, br"), Encoding::Gzip);
+    assert_eq!(choose_encoding("gzip, deflate, br, zstd"), Encoding::Gzip);
+    assert_eq!(choose_encoding("BR;q=0.5, gzip;q=1.0"), Encoding::Gzip);
+    assert_eq!(choose_encoding("gzip"), Encoding::Gzip);
+    assert_eq!(choose_encoding("deflate, gzip;q=0.8"), Encoding::Gzip);
   }
 
   #[test]
-  fn chooses_gzip_when_only_gzip() {
-    assert_eq!(choose_encoding("gzip"), Encoding::Gzip);
-    assert_eq!(choose_encoding("deflate, gzip;q=0.8"), Encoding::Gzip);
-    assert_eq!(choose_encoding("gzip, br;q=0"), Encoding::Gzip);
+  fn chooses_brotli_only_when_gzip_absent() {
+    assert_eq!(choose_encoding("br"), Encoding::Brotli);
+    assert_eq!(choose_encoding("deflate, br, zstd"), Encoding::Brotli);
+    assert_eq!(choose_encoding("br, gzip;q=0"), Encoding::Brotli);
   }
 
   #[test]
