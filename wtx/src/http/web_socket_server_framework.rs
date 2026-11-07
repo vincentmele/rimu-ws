@@ -267,6 +267,7 @@ where
     <EX::TcpStream as StreamReader>::read(..): Send,
     <EX::TcpStream as StreamWriter>::write_all(..): Send,
     <EX::TcpStream as StreamWriter>::write_all_vectored(..): Send,
+    <EX::TcpStream as StreamWriter>::send_room(..): Send,
   {
     let uri = Uri::new(addr);
     let web_socket_router = Arc::new(wsr);

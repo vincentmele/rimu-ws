@@ -2,7 +2,7 @@
 //! handshake deadline, idle connections, shutdown and error reporting.
 
 use crate::{
-  executor::UringExecutor,
+  executor::{Runtime as _, UringExecutor, UringParams, UringRuntime},
   futures::Sleep,
   http::{
     HttpRecvParams, ShutdownSignal, StatusCode,
@@ -239,4 +239,66 @@ fn fw_error_cb_reports_protocol_error() {
   }
   let errors = served.errors.lock().unwrap().clone();
   assert!(errors.iter().any(|el| el.contains("Http2")), "{errors:?}");
+}
+
+// Two servers on one runtime thread: shutting one down sends GOAWAY to its connections only, and
+// the other keeps serving, its connections and new ones alike.
+#[test]
+fn fw_shutdown_reaches_only_its_server() {
+  let addr = || {
+    let uri = _uri();
+    String::from(uri.hostname_with_implied_port().0) + ":" + &uri.port().unwrap().to_string()
+  };
+  let (addr_a, addr_b) = (addr(), addr());
+  let signal = ShutdownSignal::new();
+  let (thread_a, thread_b, thread_signal) = (addr_a.clone(), addr_b.clone(), signal.clone());
+  let _jh = std::thread::spawn(move || -> crate::Result<()> {
+    let runtime = Arc::new(UringRuntime::with_params(UringParams::default())?);
+    let fw = || {
+      Ok::<_, crate::Error>(
+        Http2ServerFramework::<(), fn(crate::Error), UringExecutor, _, _, _>::new(
+          UringExecutor::default(),
+          ChaCha20::from_std_random()?,
+          TlsConfig::plaintext(),
+        )?
+        .set_tcp_params(TcpParams::default().set_reuse_port(Some(false))),
+      )
+    };
+    let router = || HttpRouter::paths(crate::paths!(("/", get(hello)), ("/slow", get(slow))));
+    let (server_a, server_b) = (fw()?.set_shutdown(thread_signal, Duration::from_secs(3)), fw()?);
+    let (router_a, router_b) = (router()?, router()?);
+    let rt = runtime.clone();
+    runtime.block_on(async move {
+      let rt_b = rt.clone();
+      let _jh = crate::executor::Executor::spawn_local(
+        &UringExecutor::default(),
+        async move { server_b.run_local(&thread_b, router_b, rt_b).await },
+        &rt,
+      );
+      server_a.run_local(&thread_a, router_a, rt).await
+    })
+  });
+  for addr in [&addr_a, &addr_b] {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(addr).is_err() {
+      assert!(Instant::now() < deadline, "{addr} did not start");
+      std::thread::sleep(Duration::from_millis(10));
+    }
+  }
+  let mut client_a = connect(&addr_a);
+  client_a.write_all(&headers_req(1, "GET", "/slow", &[], true)).unwrap();
+  let mut client_b = connect(&addr_b);
+  client_b.write_all(&headers_req(1, "GET", "/", &[], true)).unwrap();
+  let (frames, _) = read(&mut client_b, Duration::from_secs(5), |frames| answered(frames, 1));
+  assert!(answered(&frames, 1), "{frames:?}");
+  signal.trigger();
+  let (frames, _) = read(&mut client_a, Duration::from_secs(5), |frames| go_away(frames).is_some());
+  assert!(go_away(&frames).is_some(), "the server shutting down sent no GOAWAY: {frames:?}");
+  client_b.write_all(&headers_req(3, "GET", "/", &[], true)).unwrap();
+  let (frames, _) = read(&mut client_b, Duration::from_secs(5), |frames| answered(frames, 3));
+  assert!(go_away(&frames).is_none() && answered(&frames, 3), "the other server: {frames:?}");
+  let mut late_b = connect(&addr_b);
+  late_b.write_all(&headers_req(1, "GET", "/", &[], true)).unwrap();
+  let (frames, _) = read(&mut late_b, Duration::from_secs(5), |frames| answered(frames, 1));
+  assert!(go_away(&frames).is_none() && answered(&frames, 1), "a new connection: {frames:?}");
 }

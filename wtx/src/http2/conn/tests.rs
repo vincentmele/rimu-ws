@@ -352,19 +352,22 @@ fn conn_settings_shrink_window_goes_negative() {
   msg.body.extend_from_copyable_slice(&body).unwrap();
   conn.send_response(id, StatusCode::Ok, &mut msg).unwrap();
   let mut received: Vec<u8> = Vec::new();
-  let mut collect = |conn: &mut Http2Conn<false>| {
+  let collect = |conn: &mut Http2Conn<false>, received: &mut Vec<u8>| {
     for el in take_frames(conn) {
       if el.0 == DATA {
         received.extend_from_slice(&el.3);
       }
     }
   };
-  collect(&mut conn);
+  collect(&mut conn, &mut received);
+  assert_eq!(received.len(), 10, "the first window");
+  // The window drops by 10 to -10: a WINDOW_UPDATE of 5 leaves it at -5, so nothing more goes.
   let _ = conn.feed(&settings(&[(4, 0)])).unwrap();
   let _ = conn.feed(&frame(WINDOW_UPDATE, 0, 1, &5u32.to_be_bytes())).unwrap();
-  collect(&mut conn);
+  collect(&mut conn, &mut received);
+  assert_eq!(received.len(), 10, "data sent on a negative window");
   let _ = conn.feed(&frame(WINDOW_UPDATE, 0, 1, &200u32.to_be_bytes())).unwrap();
-  collect(&mut conn);
+  collect(&mut conn, &mut received);
   assert_eq!(received, body);
 }
 
@@ -633,6 +636,8 @@ fn limit_send_queue() {
   }
   assert!(failed, "queued {queued} bytes without an error");
   assert!(queued <= 1000);
+  // The peer learns why the connection ends.
+  assert_eq!(go_away_code(&take_frames(&mut conn)).map(|el| el.1), Some(11));
 }
 
 #[test]
@@ -1154,4 +1159,23 @@ fn conn_consumed_body_does_not_count_against_the_limits() {
     assert_eq!(rst_code(&frames, 1), None, "{frames:?}");
   }
   assert_eq!(conn.open_streams(), 1);
+}
+
+// Until the client acknowledges our SETTINGS it may use the default 65,535-byte stream window
+// (RFC 9113 §6.9.2): 5,000 bytes sent before the ACK are taken though our window is 1,000, and
+// once it is acknowledged the window is ours, so one more byte overruns it.
+#[test]
+fn conn_stream_window_before_our_settings_are_acknowledged() {
+  let hp = HttpRecvParams::with_default_params().set_initial_window_len(1000);
+  let mut conn = server(hp);
+  let mut input = PREFACE.to_vec();
+  input.extend(settings(&[]));
+  input.extend(headers_req(1, "POST", "/", &[], false));
+  input.extend(data(1, &[3; 5000], false));
+  assert_eq!(conn.feed(&input).unwrap(), input.len());
+  let frames = take_frames(&mut conn);
+  assert_eq!(rst_code(&frames, 1), None, "{frames:?}");
+  let _ = conn.feed(&frame(SETTINGS, 1, 0, &[])).unwrap();
+  let _ = conn.feed(&data(1, &[3; 1], false)).unwrap();
+  assert_eq!(rst_code(&take_frames(&mut conn), 1), Some(3));
 }

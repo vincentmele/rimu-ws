@@ -155,6 +155,8 @@ pub(crate) struct Http2Conn<const IS_CLIENT: bool> {
   fatal: bool,
   go_away_recv: Option<U31>,
   go_away_sent: bool,
+  /// The peer acknowledged our SETTINGS: our initial stream window is in force.
+  settings_acked: bool,
   /// Highest stream id the peer opened.
   highest_peer_id: u32,
   /// The id this side opens its next stream with (client).
@@ -202,6 +204,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       fatal: false,
       go_away_recv: None,
       go_away_sent: false,
+      settings_acked: false,
       highest_peer_id: 0,
       next_local_id: 1,
       hp,
@@ -835,12 +838,14 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
   }
 
   /// Fails when `additional` more bytes would put the output over `max_send_queue_len`.
-  fn check_send_queue(&self, additional: usize) -> crate::Result<()> {
+  /// Ends the connection, GOAWAY included, when `additional` more bytes would put more than
+  /// `max_send_queue_len` in the core.
+  fn check_send_queue(&mut self, additional: usize) -> crate::Result<()> {
     let max = usize::try_from(self.hp.max_send_queue_len()).unwrap_or(usize::MAX);
     let total =
       self.out.owned_len().saturating_add(self.streams.queued()).saturating_add(additional);
     if total > max {
-      return Err(crate::Error::Http2ErrorGoAway(
+      return self.conn_error(crate::Error::Http2ErrorGoAway(
         Http2ErrorCode::EnhanceYourCalm,
         Http2Error::SendQueueFull,
       ));
@@ -1146,6 +1151,13 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
   /// A header block split over frames is buffered only up to `max_headers_len`: an HPACK block is
   /// never larger than the header list it decodes to, so a bigger one could only be refused after
   /// buffering it whole. It ends the connection: dropping it unread would leave HPACK out of sync.
+  /// A new stream's receive window: ours, but no less than the default until the peer
+  /// acknowledged our SETTINGS, as it may send under the default until then (RFC 9113 §6.9.2).
+  fn initial_recv_window(&self) -> i32 {
+    let ours = i32::try_from(self.hp.initial_window_len()).unwrap_or(i32::MAX);
+    if self.settings_acked { ours } else { ours.max(DEFAULT_WINDOW) }
+  }
+
   fn check_block_len(&self, len: usize) -> crate::Result<()> {
     if len > usize::try_from(self.hp.max_headers_len()).unwrap_or(usize::MAX) {
       return Err(crate::Error::Http2ErrorGoAway(
@@ -1195,7 +1207,7 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
     let refuse = self.go_away_sent
       || u32::try_from(self.streams.len()).unwrap_or(u32::MAX)
         >= self.hp.max_concurrent_streams_num();
-    let recv_window = i32::try_from(self.hp.initial_window_len()).unwrap_or(i32::MAX);
+    let recv_window = self.initial_recv_window();
     let send_window = self.peer.initial_window;
     let stream = self.streams.open(id, recv_window, send_window)?;
     let generation = self.hpack_dec.generation();
@@ -1339,6 +1351,17 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
       Err(err) => return Err(err),
     };
     if sf.has_ack() {
+      if !self.settings_acked {
+        self.settings_acked = true;
+        // Streams opened before took the default window; the peer now counts against ours.
+        let ours = i32::try_from(self.hp.initial_window_len()).unwrap_or(i32::MAX);
+        let delta = ours.wrapping_sub(ours.max(DEFAULT_WINDOW));
+        if delta != 0 {
+          for stream in self.streams.iter_mut() {
+            stream.recv_window = stream.recv_window.saturating_add(delta);
+          }
+        }
+      }
       return Ok(());
     }
     self.count_control_frame()?;
@@ -1513,7 +1536,7 @@ impl Http2Conn<true> {
     }
     let id = self.next_local_id;
     self.next_local_id = id.wrapping_add(2);
-    let recv_window = i32::try_from(self.hp.initial_window_len()).unwrap_or(i32::MAX);
+    let recv_window = self.initial_recv_window();
     let send_window = self.peer.initial_window;
     let _ = self.streams.open(id, recv_window, send_window)?;
     Ok(U31::from_u32(id))

@@ -682,17 +682,33 @@ async fn key_update_cb<S>(
   stream: &mut S,
 ) -> crate::Result<()>
 where
-  S: Stream,
+  S: StreamWriter,
 {
   manage_key_update(aux.key_updates)?;
-  if let Some(elem) = key_update
-    && *aux.can_reply_key_update
-  {
-    let kss = aux.ksw.state_mut();
-    stream.write_all(&elem.record_bytes(kss)?).await?;
-    kss.rotate()?;
-    *aux.can_reply_key_update = false;
+  let Some(elem) = key_update else {
+    return Ok(());
+  };
+  if !*aux.can_reply_key_update {
+    return Ok(());
   }
+  let kss = aux.ksw.state_mut();
+  let record = elem.record_bytes(kss)?;
+  // The reply is queued and the write key rotated in one synchronous step: this future is
+  // dropped when a user-space TLS read is given up, and a reply queued without the rotation would
+  // have every later record sealed with the key the peer just replaced. Dropped while it waits for
+  // room, neither happened.
+  loop {
+    if stream.try_write_all_vectored(&[&record])? {
+      break;
+    }
+    if !stream.send_room().await? {
+      // A stream that can only write by awaiting.
+      stream.write_all(&record).await?;
+      break;
+    }
+  }
+  kss.rotate()?;
+  *aux.can_reply_key_update = false;
   Ok(())
 }
 
@@ -710,4 +726,101 @@ struct Aux<'any> {
   key_updates: &'any mut u8,
   ksw: &'any mut KeyScheduleWrite,
   warning_alerts: &'any mut u8,
+}
+
+#[cfg(test)]
+mod tests {
+  use crate::{
+    net::{ConnectionState, StreamCommon, StreamWriter},
+    tls::{
+      key_schedule::{KeySchedule, KeyScheduleWrite},
+      protocol::{
+        cipher_suite::CipherSuite,
+        key_update::{KeyUpdate, KeyUpdateRequest},
+      },
+      tls_stream::{Aux, key_update_cb},
+    },
+  };
+  use alloc::vec::Vec;
+  use core::{
+    future::{Future as _, pending},
+    pin::pin,
+    task::{Context, Poll, Waker},
+  };
+
+  /// A writer whose awaited writes queue their bytes and then never complete, whose room never
+  /// comes, and whose synchronous writes queue only when `accept`.
+  struct Queueing {
+    accept: bool,
+    queued: Vec<u8>,
+  }
+
+  impl StreamCommon for Queueing {}
+
+  impl StreamWriter for Queueing {
+    async fn write_all(&mut self, bytes: &[u8]) -> crate::Result<()> {
+      self.queued.extend_from_slice(bytes);
+      pending().await
+    }
+
+    async fn write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<()> {
+      for elem in bytes {
+        self.queued.extend_from_slice(elem);
+      }
+      pending().await
+    }
+
+    fn try_write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<bool> {
+      if !self.accept {
+        return Ok(false);
+      }
+      for elem in bytes {
+        self.queued.extend_from_slice(elem);
+      }
+      Ok(true)
+    }
+
+    async fn send_room(&mut self) -> crate::Result<bool> {
+      pending().await
+    }
+  }
+
+  fn write_schedule() -> KeyScheduleWrite {
+    let cipher_suite = CipherSuite::default();
+    let mut key_schedule = KeySchedule::from_cipher_suite(cipher_suite);
+    key_schedule.early_secret().unwrap();
+    let digest = cipher_suite.hash_digest([&b"transcript"[..]]);
+    key_schedule.handshake_secret::<false>(&[1; 32], &digest).unwrap();
+    key_schedule.master_secret::<false>(&digest).unwrap();
+    key_schedule.into_split().1
+  }
+
+  // A KeyUpdate reply is queued in the same step that rotates the write key: dropped before it is
+  // queued (a user-space TLS read the driver gave up on) neither happened, so later records are
+  // never sealed with a key the peer doesn't expect.
+  #[test]
+  fn key_update_reply_queued_with_its_rotation() {
+    for accept in [false, true] {
+      let mut ksw = write_schedule();
+      let before = ksw.state().raw_traffic_secret().to_vec();
+      let (mut can_reply, mut state, mut key_updates, mut warnings) =
+        (true, ConnectionState::Open, 0, 0);
+      let mut stream = Queueing { accept, queued: Vec::new() };
+      {
+        let mut aux = Aux {
+          can_reply_key_update: &mut can_reply,
+          connection_state: &mut state,
+          key_updates: &mut key_updates,
+          ksw: &mut ksw,
+          warning_alerts: &mut warnings,
+        };
+        let reply = Some(KeyUpdate::new(KeyUpdateRequest::UpdateNotRequested));
+        let fut = pin!(key_update_cb(&mut aux, reply, &mut stream));
+        let _: Poll<_> = fut.poll(&mut Context::from_waker(Waker::noop()));
+      }
+      let rotated = ksw.state().raw_traffic_secret() != before.as_slice();
+      assert_eq!(!stream.queued.is_empty(), rotated, "accept {accept}: queued without a rotation");
+      assert_eq!(can_reply, !rotated, "accept {accept}");
+    }
+  }
 }

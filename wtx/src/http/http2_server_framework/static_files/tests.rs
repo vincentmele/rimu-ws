@@ -177,3 +177,19 @@ fn static_caches_large_file() {
   assert_eq!(second.body, bytes);
   assert_eq!(opens(), opened);
 }
+
+// Requests for paths that don't exist don't push real files out of the cache: past a bound only
+// the misses are dropped, so a scan of random paths doesn't make every hit a disk read again.
+#[test]
+fn static_misses_do_not_evict_files() {
+  let (_, root) = dirs("misses");
+  let files = StaticFiles::new(&root).unwrap();
+  fs::write(root.join("app.js"), b"app").unwrap();
+  assert_eq!(get(&files, "/static/app.js", None).body, b"app");
+  let opened = opens();
+  for idx in 0..9000 {
+    assert_eq!(get(&files, &format!("/static/missing-{idx}"), None).status, StatusCode::NotFound);
+  }
+  assert_eq!(get(&files, "/static/app.js", None).body, b"app");
+  assert_eq!(opens(), opened, "the file was read again");
+}

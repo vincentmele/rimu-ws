@@ -164,7 +164,8 @@ impl HttpRecvParams {
 
   /// Maximum number of receiving streams
   ///
-  /// Servers only. Prevents clients from opening more than the specified number of streams.
+  /// Not used by the HTTP/2 connection core, which bounds a client's open streams with
+  /// [`Self::max_concurrent_streams_num`] alone. Kept so existing configurations still build.
   #[inline]
   pub const fn max_recv_streams_num(&self) -> u32 {
     self.max_recv_streams_num

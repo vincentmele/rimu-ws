@@ -59,7 +59,8 @@ The framework starts from `HttpRecvParams::with_optioned_params()`.
   then buffer up to `max_conn_buffered_len` of bodies its handlers haven't read.
 - `set_max_concurrent_streams_num` (256): streams a client may have open at once. Higher favours
   clients that pipeline many requests; each open stream costs its request buffers.
-- `set_max_recv_streams_num` (256): streams kept for receiving at once.
+- `set_max_recv_streams_num` (256): no effect on the HTTP/2 server, which bounds a client's open
+  streams with `set_max_concurrent_streams_num` alone; kept so existing configurations build.
 - `set_max_frame_len` (16 MiB − 1): the largest frame the server accepts.
 - `set_max_headers_len` (64 KiB) and `set_max_hpack_len` (128 KiB each way): the decoded header
   list (larger is answered 431) and the HPACK dynamic tables. A header block split over frames is

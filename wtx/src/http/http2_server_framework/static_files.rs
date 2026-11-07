@@ -27,6 +27,9 @@ const RECHECK: Duration = Duration::from_secs(1);
 const CACHE_BYTES: usize = 32 * 1024 * 1024;
 /// Above this many entries (files, twins and misses) a thread's cache starts over.
 const MAX_ENTRIES: usize = 8 * 1024;
+/// Above this many entries for paths with no file, those entries alone are dropped: requests for
+/// random missing paths don't push the real files out.
+const MAX_MISSES: usize = 1024;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -335,6 +338,8 @@ struct Cache {
   entries: HashMap<String, Entry>,
   id: u64,
   key: String,
+  /// Entries for paths with no regular file.
+  misses: usize,
   /// The path of the current request, decoded.
   path: String,
   used: usize,
@@ -351,6 +356,7 @@ impl Cache {
         entries: HashMap::new(),
         id: sf.id,
         key: String::new(),
+        misses: 0,
         path: String::new(),
         used: 0,
         uses: 0,
@@ -393,7 +399,13 @@ impl Cache {
       return Ok(None);
     };
     entry.checked = now;
+    let gone = entry.file.is_some() && file.is_none();
     entry.file = file;
+    if gone {
+      // Removed between the stat and the read.
+      self.misses = self.misses.wrapping_add(1);
+      return Ok(None);
+    }
     if entry.file.is_none() {
       return Ok(None);
     }
@@ -410,7 +422,7 @@ impl Cache {
     self.key.push(encoding.tag());
     self.key.push_str(&self.path);
     self.key.push_str(encoding.suffix());
-    let Self { entries, key, used, uses, .. } = self;
+    let Self { entries, key, misses, used, uses, .. } = self;
     if let Some(entry) = entries.get_mut(key.as_str()) {
       entry.last_use = *uses;
       if now.saturating_duration_since(entry.checked) >= RECHECK {
@@ -419,6 +431,11 @@ impl Cache {
           if let Some(body) = entry.body.take() {
             *used = used.saturating_sub(body.len());
           }
+          match (entry.file.is_some(), file.is_some()) {
+            (true, false) => *misses = misses.wrapping_add(1),
+            (false, true) => *misses = misses.saturating_sub(1),
+            _ => {}
+          }
           entry.file = file;
         }
         entry.checked = now;
@@ -426,11 +443,19 @@ impl Cache {
       // Reborrowed: returning `entry` from inside the `if let` would hold `entries` borrowed.
       return entries.get_mut(key.as_str());
     }
+    let file = stat(root, key);
+    if file.is_none() {
+      if *misses >= MAX_MISSES {
+        entries.retain(|_, el| el.file.is_some());
+        *misses = 0;
+      }
+      *misses = misses.wrapping_add(1);
+    }
     if entries.len() >= MAX_ENTRIES {
       entries.clear();
+      *misses = usize::from(file.is_none());
       *used = 0;
     }
-    let file = stat(root, key);
     let entry = Entry { body: None, checked: now, file, last_use: *uses };
     Some(entries.entry(key.clone()).or_insert(entry))
   }

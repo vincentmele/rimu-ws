@@ -86,19 +86,21 @@ pub(crate) struct DriveParams {
   pub(crate) idle: Option<Duration>,
 }
 
-std::thread_local! {
-  /// The connections this thread drives, for a shutdown to reach.
-  static LIVE: RefCell<Vec<Weak<RefCell<ConnShared>>>> = const { RefCell::new(Vec::new()) };
-  /// This thread's server is shutting down: connections go away as they start.
-  static GOING_AWAY: Cell<bool> = const { Cell::new(false) };
+/// The connections one server drives on one thread, for that server's shutdown to reach: other
+/// servers on the thread keep serving.
+#[derive(Debug, Default)]
+pub(crate) struct ConnGroup {
+  /// The server is shutting down: connections go away as they start.
+  going_away: Cell<bool>,
+  live: RefCell<Vec<Weak<RefCell<ConnShared>>>>,
 }
 
-/// Starts a graceful shutdown of every connection this thread drives, and of those it starts from
-/// now on: GOAWAY (`NO_ERROR`), and the streams already open finish.
-pub(crate) fn go_away_local_conns() {
-  GOING_AWAY.set(true);
-  LIVE.with_borrow_mut(|live| {
-    live.retain(|el| {
+impl ConnGroup {
+  /// Starts a graceful shutdown of every connection of the group, and of those it starts from now
+  /// on: GOAWAY (`NO_ERROR`), and the streams already open finish.
+  pub(crate) fn go_away(&self) {
+    self.going_away.set(true);
+    self.live.borrow_mut().retain(|el| {
       let Some(shared) = el.upgrade() else {
         return false;
       };
@@ -111,12 +113,20 @@ pub(crate) fn go_away_local_conns() {
       }
       true
     });
-  });
-}
+  }
 
-/// Undoes [`go_away_local_conns`] for a server starting on this thread.
-pub(crate) fn reset_going_away() {
-  GOING_AWAY.set(false);
+  fn add(&self, shared: &Rc<RefCell<ConnShared>>) {
+    let mut live = self.live.borrow_mut();
+    // Pruned as it doubles, so it follows the connections open.
+    if live.len() >= 64 && live.len().is_power_of_two() {
+      live.retain(|el| el.strong_count() > 0);
+    }
+    live.push(Rc::downgrade(shared));
+  }
+
+  fn is_going_away(group: Option<&Rc<Self>>) -> bool {
+    group.is_some_and(|el| el.going_away.get())
+  }
 }
 
 /// Serves one connection until it closes. `conn` has queued its opening SETTINGS; `peer` is the
@@ -127,23 +137,21 @@ pub(crate) async fn drive_conn<S, D>(
   dispatcher: &D,
   peer: IpAddr,
   params: DriveParams,
+  group: Option<Rc<ConnGroup>>,
 ) -> crate::Result<()>
 where
   S: StreamReader + StreamWriter,
   D: StreamDispatcher,
 {
   let _ = peer;
-  if GOING_AWAY.get() {
+  let _open = OpenConn::new();
+  if ConnGroup::is_going_away(group.as_ref()) {
     conn.go_away(Http2ErrorCode::NoError);
   }
   let shared = ConnShared::new(conn);
-  LIVE.with_borrow_mut(|live| {
-    // Pruned as it doubles, so it follows the connections open.
-    if live.len() >= 64 && live.len().is_power_of_two() {
-      live.retain(|el| el.strong_count() > 0);
-    }
-    live.push(Rc::downgrade(&shared));
-  });
+  if let Some(elem) = &group {
+    elem.add(&shared);
+  }
   let handshake = match params.handshake {
     Some(elem) => Some(Sleep::new(elem)?),
     None => None,
@@ -154,6 +162,7 @@ where
     idle: params.idle,
     idle_expired: false,
     idle_sleep: None,
+    group,
     last_rx: now(),
     manual: HashSet::new(),
     shared: shared.clone(),
@@ -198,6 +207,8 @@ struct Driver<F, MT> {
   idle_expired: bool,
   /// Armed once the connection is first idle, and re-armed for what is left when it fires early.
   idle_sleep: Option<Sleep>,
+  /// The server's connections on this thread.
+  group: Option<Rc<ConnGroup>>,
   /// When bytes last arrived.
   last_rx: Duration,
   /// Streams served by manual-mode handlers.
@@ -263,7 +274,7 @@ where
         if self.handshake.is_some() && state.conn.peer_settings_seen() {
           self.handshake = None;
         }
-        if self.idle_expired || GOING_AWAY.get() {
+        if self.idle_expired || ConnGroup::is_going_away(self.group.as_ref()) {
           state.conn.go_away(Http2ErrorCode::NoError);
         }
         self.handle_events(state, dispatcher)?;
@@ -622,6 +633,34 @@ fn body_pool_give(mut body: VectorUsize<u8>) {
   });
 }
 
+std::thread_local! {
+  /// Connections the driver serves on this thread.
+  static OPEN_CONNS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Counts a connection as open on this thread; the last one to end empties the thread's pools,
+/// which after a burst would only hold its largest buffers.
+struct OpenConn;
+
+impl OpenConn {
+  fn new() -> Self {
+    OPEN_CONNS.set(OPEN_CONNS.get().wrapping_add(1));
+    Self
+  }
+}
+
+impl Drop for OpenConn {
+  fn drop(&mut self) {
+    let open = OPEN_CONNS.get().saturating_sub(1);
+    OPEN_CONNS.set(open);
+    if open == 0 {
+      BODY_POOL.with(|pool| pool.borrow_mut().clear());
+      OUTPUT_POOL.with(|pool| pool.borrow_mut().clear());
+      RX_POOL.with(|pool| pool.borrow_mut().clear());
+    }
+  }
+}
+
 /// Output buffers of connections with nothing to send, most recent last: a connection holds one
 /// only while it has output, so idle connections don't each keep the last output's buffer.
 /// Buffers above `OUTPUT_POOL_BUFFER_MAX` are freed.
@@ -676,6 +715,11 @@ fn rx_pool_give(buffer: VectorUsize<u8>) {
 std::thread_local! {
   /// Manual streams the driver still tracked when it last returned on this thread.
   static MANUAL_AT_EXIT: core::cell::Cell<usize> = const { core::cell::Cell::new(usize::MAX) };
+}
+
+#[cfg(test)]
+fn body_pool_len() -> usize {
+  BODY_POOL.with(|pool| pool.borrow().len())
 }
 
 #[cfg(test)]

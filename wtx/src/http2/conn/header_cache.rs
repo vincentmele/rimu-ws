@@ -24,6 +24,8 @@ struct Entry {
 /// Encoded header blocks by (status, fields).
 #[derive(Debug)]
 pub(crate) struct HeaderCache {
+  /// The fields of the last [`Self::get`] may be cached: none is sensitive.
+  cacheable: bool,
   entries: VectorUsize<Entry>,
   hits: u64,
   key: VectorUsize<u8>,
@@ -32,7 +34,13 @@ pub(crate) struct HeaderCache {
 
 impl HeaderCache {
   pub(crate) const fn new() -> Self {
-    Self { entries: VectorUsize::new(), hits: 0, key: VectorUsize::new(), uses: 0 }
+    Self {
+      cacheable: false,
+      entries: VectorUsize::new(),
+      hits: 0,
+      key: VectorUsize::new(),
+      uses: 0,
+    }
   }
 
   /// Entries held.
@@ -67,7 +75,10 @@ impl HeaderCache {
   ) -> crate::Result<Option<&[u8]>> {
     self.make_key(headers)?;
     self.uses = self.uses.wrapping_add(1);
-    let Self { entries, hits, key, uses } = self;
+    if !self.cacheable {
+      return Ok(None);
+    }
+    let Self { entries, hits, key, uses, .. } = self;
     let Some(entry) = entries.iter_mut().find(|el| {
       el.status == status && el.generation == generation && el.key.as_slice() == key.as_slice()
     }) else {
@@ -85,6 +96,9 @@ impl HeaderCache {
     block: &[u8],
     generation: u64,
   ) -> crate::Result<()> {
+    if !self.cacheable || block.len() > MAX_BLOCK_LEN {
+      return Ok(());
+    }
     // An entry encoded under an older table can never be replayed: reuse the least recently used
     // of those, buffers and all, before adding one.
     let stale = self
@@ -128,21 +142,44 @@ impl HeaderCache {
     Ok(())
   }
 
+  /// The key of the cached fields of `headers`: each field's name and value, length-prefixed, so
+  /// no two field sets share one. Also notes whether the fields may be cached at all.
   fn make_key(&mut self, headers: &Headers) -> crate::Result<()> {
     self.key.clear();
+    self.cacheable = true;
     for header in headers.iter().filter(Self::is_cached_field) {
-      let sensitive = [u8::from(header.is_sensitive)];
+      if header.is_sensitive || is_secret(header.name) {
+        self.cacheable = false;
+        return Ok(());
+      }
       let name_len = u32::try_from(header.name.len()).unwrap_or(u32::MAX).to_le_bytes();
+      let value_len = u32::try_from(header.value.len()).unwrap_or(u32::MAX).to_le_bytes();
       self.key.extend_from_copyable_slices([
-        &sensitive[..],
         &name_len[..],
         header.name.as_bytes(),
+        &value_len[..],
         header.value.as_bytes(),
-        &[0],
       ])?;
     }
     Ok(())
   }
+}
+
+/// Blocks above this are not cached: a response with that many header bytes rarely repeats them,
+/// and each entry would hold them.
+const MAX_BLOCK_LEN: usize = 512;
+
+/// Fields that carry credentials: a block holding one would keep it in memory, and a response
+/// that sets one rarely repeats it.
+fn is_secret(name: &str) -> bool {
+  let secret = match name.len() {
+    6 => KnownHeaderName::Cookie,
+    10 => KnownHeaderName::SetCookie,
+    13 => KnownHeaderName::Authorization,
+    19 => KnownHeaderName::ProxyAuthorization,
+    _ => return false,
+  };
+  name.as_bytes().eq_ignore_ascii_case(<&str>::from(secret).as_bytes())
 }
 
 #[cfg(test)]
@@ -169,5 +206,35 @@ mod tests {
       assert!(cache.get(StatusCode::Ok, &headers(date), generation).unwrap().is_some());
     }
     assert_eq!(cache.len(), 1);
+  }
+
+  // Two header sets never share a key: values are length-prefixed, so a value cannot mimic the
+  // start of the next field.
+  #[test]
+  fn header_cache_key_separates_fields() {
+    let mut cache = HeaderCache::new();
+    let mut two = Headers::new();
+    two.push_from_iter(Header::from_name_and_value("a", ["x"])).unwrap();
+    two.push_from_iter(Header::from_name_and_value("b", ["y"])).unwrap();
+    let mut one = Headers::new();
+    one.push_from_iter(Header::from_name_and_value("a", ["x\0\0\x01\0\0\0by"])).unwrap();
+    assert!(cache.get(StatusCode::Ok, &two, 1).unwrap().is_none());
+    cache.insert(StatusCode::Ok, &[0x88, 0xbe, 0xbf], 1).unwrap();
+    assert!(cache.get(StatusCode::Ok, &one, 1).unwrap().is_none(), "another field set's block");
+  }
+
+  // Blocks with sensitive fields (set-cookie and the like) or too big to be repeated are not
+  // kept: they would hold secrets, or memory, for blocks that never hit.
+  #[test]
+  fn header_cache_skips_sensitive_and_large_blocks() {
+    let mut cache = HeaderCache::new();
+    let mut cookie = Headers::new();
+    cookie.push_from_iter(Header::from_name_and_value("set-cookie", ["id=secret"])).unwrap();
+    assert!(cache.get(StatusCode::Ok, &cookie, 1).unwrap().is_none());
+    cache.insert(StatusCode::Ok, &[0x88, 0xbe], 1).unwrap();
+    assert_eq!(cache.len(), 0);
+    assert!(cache.get(StatusCode::Ok, &headers("a"), 1).unwrap().is_none());
+    cache.insert(StatusCode::Ok, &[0x40; 2000], 1).unwrap();
+    assert_eq!(cache.len(), 0);
   }
 }

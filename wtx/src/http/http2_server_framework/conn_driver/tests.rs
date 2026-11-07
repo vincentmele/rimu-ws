@@ -213,7 +213,7 @@ fn serve(hp: HttpRecvParams) -> Served {
       let mut counting = Counting { inner: stream, writes: writes.clone() };
       let conn = Http2Conn::<false>::new(hp, &mut Xorshift64::from(9u64));
       let dispatcher = TestDispatcher { dropped: server_dropped };
-      let rslt = drive_conn(&mut counting, conn, &dispatcher, peer.ip(), DriveParams::default()).await;
+      let rslt = drive_conn(&mut counting, conn, &dispatcher, peer.ip(), DriveParams::default(), None).await;
       tx.send((rslt, writes.get())).unwrap();
     });
   });
@@ -502,7 +502,7 @@ fn server_tls_preface_with_finished_uses_ktls() {
     let mut tls_stream = TlsAcceptor::new(&config, &mut rng, stream).accept().await.unwrap().tls_stream;
     let conn = Http2Conn::<false>::new(HttpRecvParams::with_default_params(), &mut Xorshift64::from(5u64));
     let dispatcher = TestDispatcher { dropped: Arc::new(AtomicBool::new(false)) };
-    let _rslt = drive_conn(&mut tls_stream, conn, &dispatcher, peer.ip(), DriveParams::default()).await;
+    let _rslt = drive_conn(&mut tls_stream, conn, &dispatcher, peer.ip(), DriveParams::default(), None).await;
     tls_stream.is_kernel_tls()
   });
   assert_eq!(client.join().unwrap(), 8);
@@ -567,7 +567,7 @@ fn server_userspace_tls_parked_handler_answers() {
       let mut tls_stream = TlsAcceptor::new(&config, &mut rng, stream).accept().await.unwrap().tls_stream;
       let conn = Http2Conn::<false>::new(HttpRecvParams::with_default_params(), &mut Xorshift64::from(5u64));
       let dispatcher = TestDispatcher { dropped: Arc::new(AtomicBool::new(false)) };
-      let _rslt = drive_conn(&mut tls_stream, conn, &dispatcher, peer.ip(), DriveParams::default()).await;
+      let _rslt = drive_conn(&mut tls_stream, conn, &dispatcher, peer.ip(), DriveParams::default(), None).await;
     });
   });
   assert!(done_rx.recv_timeout(Duration::from_secs(5)).is_ok(), "no response to the parked handler");
@@ -746,7 +746,7 @@ fn idle_connection_returns_its_buffers() {
       );
       let conn = Http2Conn::<false>::new(HttpRecvParams::with_default_params(), &mut Xorshift64::from(9u64));
       let dispatcher = TestDispatcher { dropped: Arc::new(AtomicBool::new(false)) };
-      let _rslt = drive_conn(&mut stream, conn, &dispatcher, peer.ip(), DriveParams::default()).await;
+      let _rslt = drive_conn(&mut stream, conn, &dispatcher, peer.ip(), DriveParams::default(), None).await;
     });
   });
   ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -792,7 +792,7 @@ fn manual_streams_that_end_leave_the_driver() {
       let (mut stream, peer) = listener.accept(TcpParams::default()).await.unwrap();
       let conn = Http2Conn::<false>::new(HttpRecvParams::with_default_params(), &mut Xorshift64::from(9u64));
       let dispatcher = TestDispatcher { dropped: Arc::new(AtomicBool::new(false)) };
-      let _rslt = drive_conn(&mut stream, conn, &dispatcher, peer.ip(), DriveParams::default()).await;
+      let _rslt = drive_conn(&mut stream, conn, &dispatcher, peer.ip(), DriveParams::default(), None).await;
       len_tx.send(super::MANUAL_AT_EXIT.get()).unwrap();
     });
   });
@@ -806,4 +806,38 @@ fn manual_streams_that_end_leave_the_driver() {
   drop(client);
   let len = len_rx.recv_timeout(Duration::from_secs(5)).unwrap();
   assert!(len <= 1, "{len} ended manual streams still tracked");
+}
+
+// Once a thread has no connection left, the buffers its pools kept for the next connections go:
+// after a burst they would only hold its largest outputs.
+#[test]
+fn no_connection_left_keeps_no_pooled_buffers() {
+  let uri = _uri();
+  let addr = String::from(uri.hostname_with_implied_port().0) + ":" + &uri.port().unwrap().to_string();
+  let (ready_tx, ready_rx) = mpsc::channel();
+  let (pools_tx, pools_rx) = mpsc::channel();
+  let server_addr = addr.clone();
+  let _jh = std::thread::spawn(move || {
+    let runtime = UringRuntime::with_params(UringParams::default()).unwrap();
+    runtime.block_on(async move {
+      let listener =
+        UringTcpListener::bind(server_addr.as_str(), TcpParams::default().set_reuse_port(Some(false)))
+          .await
+          .unwrap();
+      ready_tx.send(()).unwrap();
+      let (mut stream, peer) = listener.accept(TcpParams::default()).await.unwrap();
+      let conn = Http2Conn::<false>::new(HttpRecvParams::with_default_params(), &mut Xorshift64::from(9u64));
+      let dispatcher = TestDispatcher { dropped: Arc::new(AtomicBool::new(false)) };
+      let _rslt = drive_conn(&mut stream, conn, &dispatcher, peer.ip(), DriveParams::default(), None).await;
+      pools_tx.send((super::output_pool_len(), super::rx_pool_len(), super::body_pool_len())).unwrap();
+    });
+  });
+  ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+  let mut client = Client::connect(&addr, &[]);
+  client.send(&headers_req(1, "GET", "/", &[], true));
+  let frames = client.read_until(Duration::from_secs(5), |frames| ended(frames).len() == 1);
+  assert_eq!(ended(&frames), [1]);
+  drop(client);
+  let pools = pools_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+  assert_eq!(pools, (0, 0, 0), "(output, read, body) buffers kept with no connection left");
 }

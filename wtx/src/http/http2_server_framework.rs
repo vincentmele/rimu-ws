@@ -279,8 +279,7 @@ mod uring {
       http2_server_framework::{
         Endpoint as _, EndpointNode, Http2ServerFramework, HttpRouter, Middleware, RouteMatch,
         conn_driver::{
-          AutoOutput, DriveParams, Route, StreamDispatcher, drive_conn, go_away_local_conns,
-          reset_going_away,
+          AutoOutput, ConnGroup, DriveParams, Route, StreamDispatcher, drive_conn,
         },
       },
       misc::{
@@ -446,7 +445,8 @@ mod uring {
       )
       .await?;
       let mut xorshift = Xorshift64::from_simple_seed()?;
-      reset_going_away();
+      // This server's connections on this thread: its shutdown reaches them alone.
+      let group = alloc::rc::Rc::new(ConnGroup::default());
       loop {
         let accept = listener.accept(self.tcp_params);
         let Some(rslt) = accept_or_shutdown(accept, self.shutdown.as_ref().map(|el| &el.0)).await
@@ -476,6 +476,7 @@ mod uring {
             runtime: runtime.clone(),
           },
           drive_params: self.drive_params,
+          group: group.clone(),
           hrc: self.hrc,
           rng: RNG::from_crypto_rng(&mut self.rng)?,
           tls_config: self.tls_config.clone(),
@@ -488,7 +489,7 @@ mod uring {
         }
       }
       drop(listener);
-      go_away_local_conns();
+      group.go_away();
       if let (Some((_, drain)), Some(active)) = (&self.shutdown, &self.active) {
         drain_connections(active, *drain).await;
       }
@@ -506,6 +507,8 @@ mod uring {
   struct ConnTask<DA, EC, EN, ER, M, RNG, TCX> {
     dispatcher: FwDispatcher<DA, EC, EN, ER, M>,
     drive_params: DriveParams,
+    /// The server's connections on this thread.
+    group: alloc::rc::Rc<ConnGroup>,
     hrc: HttpRecvParams,
     rng: RNG,
     tls_config: Arc<TlsConfig<TCX>>,
@@ -536,7 +539,7 @@ mod uring {
         let mut params = self.drive_params;
         let spent = |el: Duration| el.saturating_sub(begin.elapsed().unwrap_or(el));
         params.handshake = params.handshake.map(spent);
-        drive_conn(&mut tls_stream, conn, &self.dispatcher, peer, params).await
+        drive_conn(&mut tls_stream, conn, &self.dispatcher, peer, params, Some(self.group)).await
       }
       .await;
       if let Err(err) = rslt {
