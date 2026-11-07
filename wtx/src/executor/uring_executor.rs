@@ -2811,7 +2811,10 @@ impl Reactor {
       return Err(io_err(conn.tx_err.into()));
     }
     let len = bytes.iter().map(|el| el.len()).sum();
-    reserve_send(&mut conn.tx_pending, len, self.params.tx_high_water);
+    // No floor: copied writes are mostly small (WebSocket echoes, HTTP/2 control frames), and small
+    // buffers let thousands of connections share pages. A 32 KiB floor here cost WebSocket echo
+    // about 10% more user cycles per frame.
+    reserve_send(&mut conn.tx_pending, len, 0);
     for elem in bytes {
       conn.tx_pending.extend_from_slice(elem);
     }
@@ -2865,7 +2868,7 @@ impl Reactor {
         if conn.tx_pending.len() >= self.params.tx_high_water {
           return Ok(false);
         }
-        reserve_send(&mut conn.tx_pending, len, self.params.tx_high_water);
+        reserve_send(&mut conn.tx_pending, len, self.params.tx_high_water.saturating_mul(2));
         let before = conn.tx_pending.len();
         if let Err(err) = write(&mut conn.tx_pending) {
           conn.tx_pending.truncate(before);
@@ -2875,7 +2878,7 @@ impl Reactor {
       }
       // A buffer too small would be grown by a copy of its whole capacity: start a new one.
       let mut buffer = self.send_pool.borrow_mut().pop().unwrap_or_default();
-      reserve_send(&mut buffer, len, self.params.tx_high_water);
+      reserve_send(&mut buffer, len, self.params.tx_high_water.saturating_mul(2));
       if let Err(err) = write(&mut buffer) {
         self.recycle_send_buffer(buffer);
         return Err(err);
@@ -2919,7 +2922,7 @@ impl Reactor {
         if conn.tx_pending.len() >= self.params.tx_high_water {
           return Ok(false);
         }
-        reserve_send(&mut conn.tx_pending, bytes.len(), self.params.tx_high_water);
+        reserve_send(&mut conn.tx_pending, bytes.len(), self.params.tx_high_water.saturating_mul(2));
         conn.tx_pending.extend_from_slice(bytes);
         bytes.clear();
         return Ok(true);
@@ -3435,15 +3438,15 @@ fn drop_sent(conn: &mut Conn) {
   conn.tx_done = 0;
 }
 
-/// Room in `buf` for `additional` more bytes, in a size class (a power of two, at least twice
-/// `tx_high_water`), so that buffers settle at sizes later outputs fit rather than grow by a few
-/// bytes now and then. An empty buffer is replaced, not grown: growing copies its whole capacity.
-fn reserve_send(buf: &mut Vec<u8>, additional: usize, tx_high_water: usize) {
+/// Room in `buf` for `additional` more bytes, in a size class (a power of two, at least `floor`),
+/// so that buffers settle at sizes later outputs fit rather than grow by a few bytes now and then.
+/// An empty buffer is replaced, not grown: growing copies its whole capacity.
+fn reserve_send(buf: &mut Vec<u8>, additional: usize, floor: usize) {
   let want = buf.len().saturating_add(additional);
   if buf.capacity() >= want {
     return;
   }
-  let class = want.max(tx_high_water.saturating_mul(2)).checked_next_power_of_two().unwrap_or(want);
+  let class = want.max(floor).checked_next_power_of_two().unwrap_or(want);
   if buf.is_empty() {
     *buf = Vec::with_capacity(class);
   } else {
@@ -4106,6 +4109,39 @@ mod tests {
       crate::Error::Io(elem) => elem.raw_os_error(),
       _ => None,
     }
+  }
+
+  // Small copied writes (a WebSocket echo) keep small send buffers: thousands of connections
+  // then share pages and cache lines instead of each holding a buffer of its own pages.
+  #[test]
+  fn small_copied_writes_keep_small_send_buffers() {
+    use crate::net::{StreamReader, StreamWriter};
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let client = std::thread::spawn(move || {
+      let mut stream = connect(&client_addr);
+      let mut got = [0; 100];
+      for _ in 0..10 {
+        Write::write_all(&mut stream, &[7; 100]).unwrap();
+        stream.read_exact(&mut got).unwrap();
+      }
+    });
+    let runtime = UringRuntime::new().unwrap();
+    let largest = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+      let mut buf = alloc::vec![0; 4096];
+      let mut largest = 0;
+      while let Some(len) = stream.read(buf.as_mut_slice().into()).await.unwrap() {
+        stream.write_all_vectored(&[&buf[..1], &buf[1..len.get()]]).await.unwrap();
+        largest = largest.max(super::with_reactor(|reactor| {
+          Ok(reactor.conns.borrow().iter().map(|el| el.tx_pending.capacity().max(el.tx_inflight.capacity())).max().unwrap_or(0))
+        }).unwrap());
+      }
+      largest
+    });
+    client.join().unwrap();
+    assert!(largest > 0 && largest <= 1024, "send buffers of {largest} bytes for 100-byte writes");
   }
 
   /// The receive and send state of every open connection, for a test that stalls.
