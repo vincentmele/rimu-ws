@@ -4108,6 +4108,34 @@ mod tests {
     }
   }
 
+  /// The receive and send state of every open connection, for a test that stalls.
+  fn conn_states() -> alloc::string::String {
+    super::with_reactor(|reactor| {
+      let mut out = alloc::string::String::new();
+      for (idx, el) in reactor.conns.borrow().iter().enumerate().filter(|(_, el)| el.in_use) {
+        out.push_str(&alloc::format!(
+          "conn {idx}: unread {} paused {} armed {} eof {} rx_err {} reader {} | pending {} \
+           inflight {} done {} sending {} tx_err {} writer {} closing {}\n",
+          el.rx.len() - el.rx_off as usize,
+          el.rx_paused,
+          el.recv_armed,
+          el.rx_eof,
+          el.rx_err,
+          el.reader.is_some(),
+          el.tx_pending.len(),
+          el.tx_inflight.len(),
+          el.tx_done,
+          el.sending,
+          el.tx_err,
+          el.writer.is_some(),
+          el.closing,
+        ));
+      }
+      Ok(out)
+    })
+    .unwrap()
+  }
+
   /// The most unread bytes any connection holds.
   fn max_unread() -> usize {
     super::with_reactor(|reactor| {
@@ -4166,8 +4194,15 @@ mod tests {
       let handle =
         crate::executor::Executor::spawn_local(&UringExecutor::default(), echo, &runtime_ref());
       let mut peak = 0;
+      // A stall fails with the connection's state instead of hanging the suite.
+      let deadline = std::time::Instant::now() + core::time::Duration::from_secs(60);
       while !client.is_finished() {
         peak = peak.max(max_unread());
+        assert!(
+          std::time::Instant::now() < deadline,
+          "stalled after 60 s (peak {peak}):\n{}",
+          conn_states()
+        );
         yield_once().await;
       }
       handle.await.unwrap();
