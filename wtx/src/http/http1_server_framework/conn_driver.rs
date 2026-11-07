@@ -614,20 +614,22 @@ pub(crate) fn peer_gone(err: &crate::Error) -> bool {
 /// are freed, not kept.
 const POOL_MAX: usize = 64;
 const POOL_BUFFER_MAX: usize = 1 << 20;
-/// Bytes the connection pool of a thread holds at most: a set of buffers that would go past it is
-/// freed.
+/// Bytes the connection pool of a thread holds at most, and its read buffer pool: a set of buffers
+/// (or a buffer) that would go past it is freed.
 const CONN_POOL_BYTES_MAX: usize = 16 << 20;
+const RX_POOL_BYTES_MAX: usize = 16 << 20;
 /// Entries a pool keeps once its thread has no connection open: the most recent, enough for
-/// connections that come one after the other. The others, which after a burst would only hold its
-/// largest buffers, are freed.
+/// connections that come one after the other, and of at most `POOL_IDLE_BYTES` in all. The others,
+/// which after a burst would only hold its largest buffers, are freed.
 const POOL_IDLE_KEEP: usize = 4;
+const POOL_IDLE_BYTES: usize = 2 << 20;
 
 std::thread_local! {
   static CONN_POOL: RefCell<ConnPool> =
     const { RefCell::new(ConnPool { bytes: 0, sets: Vec::new() }) };
   /// Connections the driver serves on this thread.
   static OPEN_CONNS: Cell<usize> = const { Cell::new(0) };
-  static RX_POOL: RefCell<Vec<VectorUsize<u8>>> = const { RefCell::new(Vec::new()) };
+  static RX_POOL: RefCell<RxPool> = const { RefCell::new(RxPool { bytes: 0, buffers: Vec::new() }) };
 }
 
 /// The buffers of a connection but its read buffer (which goes back to [`RX_POOL`] whenever it is
@@ -657,8 +659,31 @@ struct ConnPool {
   sets: Vec<ConnBuffers>,
 }
 
+/// The read buffers of the thread's ended connections.
+#[derive(Debug)]
+struct RxPool {
+  /// Their capacity.
+  bytes: usize,
+  buffers: Vec<VectorUsize<u8>>,
+}
+
+/// How many of the newest of `sizes` (oldest first) to keep: at most `POOL_IDLE_KEEP`, of at
+/// most `POOL_IDLE_BYTES` in all.
+fn idle_keep(sizes: impl DoubleEndedIterator<Item = usize>) -> usize {
+  let mut total = 0usize;
+  let mut kept = 0usize;
+  for size in sizes.rev() {
+    total = total.saturating_add(size);
+    if kept == POOL_IDLE_KEEP || total > POOL_IDLE_BYTES {
+      break;
+    }
+    kept = kept.wrapping_add(1);
+  }
+  kept
+}
+
 /// Counts a connection as open on this thread; the last one to end trims the thread's pools to
-/// [`POOL_IDLE_KEEP`] entries.
+/// their most recent entries (see [`POOL_IDLE_KEEP`]).
 struct OpenConn;
 
 impl OpenConn {
@@ -675,15 +700,19 @@ impl Drop for OpenConn {
     if open == 0 {
       let _rslt = CONN_POOL.try_with(|pool| {
         let mut pool = pool.borrow_mut();
-        let excess = pool.sets.len().saturating_sub(POOL_IDLE_KEEP);
+        let keep = idle_keep(pool.sets.iter().map(ConnBuffers::capacity));
+        let excess = pool.sets.len().wrapping_sub(keep);
         let freed =
           pool.sets.drain(..excess).fold(0usize, |acc, el| acc.wrapping_add(el.capacity()));
         pool.bytes = pool.bytes.saturating_sub(freed);
       });
       let _rslt = RX_POOL.try_with(|pool| {
         let mut pool = pool.borrow_mut();
-        let excess = pool.len().saturating_sub(POOL_IDLE_KEEP);
-        let _ = pool.drain(..excess);
+        let keep = idle_keep(pool.buffers.iter().map(VectorUsize::capacity));
+        let excess = pool.buffers.len().wrapping_sub(keep);
+        let freed =
+          pool.buffers.drain(..excess).fold(0usize, |acc, el| acc.wrapping_add(el.capacity()));
+        pool.bytes = pool.bytes.saturating_sub(freed);
       });
     }
   }
@@ -729,7 +758,15 @@ fn conn_pool_give(mut set: ConnBuffers) {
 }
 
 fn rx_pool_take() -> Option<VectorUsize<u8>> {
-  RX_POOL.try_with(|pool| pool.borrow_mut().pop()).ok().flatten()
+  RX_POOL
+    .try_with(|pool| {
+      let mut pool = pool.borrow_mut();
+      let buffer = pool.buffers.pop()?;
+      pool.bytes = pool.bytes.saturating_sub(buffer.capacity());
+      Some(buffer)
+    })
+    .ok()
+    .flatten()
 }
 
 fn rx_pool_give(mut buffer: VectorUsize<u8>) {
@@ -740,8 +777,9 @@ fn rx_pool_give(mut buffer: VectorUsize<u8>) {
   buffer.clear();
   let _rslt = RX_POOL.try_with(|pool| {
     let mut pool = pool.borrow_mut();
-    if pool.len() < POOL_MAX {
-      pool.push(buffer);
+    if pool.buffers.len() < POOL_MAX && pool.bytes.saturating_add(capacity) <= RX_POOL_BYTES_MAX {
+      pool.bytes = pool.bytes.wrapping_add(capacity);
+      pool.buffers.push(buffer);
     }
   });
 }
@@ -1064,15 +1102,18 @@ mod tests {
   // while busy too.
   #[test]
   fn idle_pools_keep_few_bytes() {
-    use super::{ConnBuffers, OpenConn, RX_POOL, conn_pool_give, rx_pool_give};
+    use super::{
+      ConnBuffers, OpenConn, POOL_IDLE_BYTES as IDLE_BYTES, RX_POOL, RX_POOL_BYTES_MAX as RX_BYTES,
+      conn_pool_give, rx_pool_give,
+    };
     use crate::collections::VectorUsize;
-    const IDLE_BYTES: usize = 2 << 20;
-    const RX_BYTES: usize = 16 << 20;
     let conn_pool = || super::CONN_POOL.with(|el| (el.borrow().sets.len(), el.borrow().bytes));
     let rx_pool = || {
       RX_POOL.with(|el| {
         let pool = el.borrow();
-        (pool.len(), pool.iter().map(VectorUsize::capacity).sum::<usize>())
+        let bytes = pool.buffers.iter().map(VectorUsize::capacity).sum::<usize>();
+        assert_eq!(bytes, pool.bytes);
+        (pool.buffers.len(), bytes)
       })
     };
     let open = OpenConn::new();
