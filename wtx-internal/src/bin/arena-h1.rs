@@ -58,10 +58,27 @@ fn endpoint_baseline11(_: &mut (), req: &Http1Req<'_>, res: &mut Http1Res) -> ri
   }
   let body = (req.method() == Method::Post).then(|| req.body());
   let sum = baseline11_sum(a, b, body);
-  std::io::Write::write_fmt(res.body_mut(), format_args!("{sum}"))?;
+  push_i64(res.body_mut(), sum);
   res.set_content_type("text/plain");
   res.set_status(StatusCode::Ok);
   Ok(())
+}
+
+/// Append `n` as decimal ASCII to `out`, without the `core::fmt` machinery.
+fn push_i64(out: &mut Vec<u8>, n: i64) {
+  let mut buf = [0u8; 20];
+  let mut i = buf.len();
+  let neg = n < 0;
+  // use unsigned magnitude to handle i64::MIN safely
+  let mut m = (n as i128).unsigned_abs() as u128;
+  loop {
+    i -= 1;
+    buf[i] = b'0' + (m % 10) as u8;
+    m /= 10;
+    if m == 0 { break; }
+  }
+  if neg { i -= 1; buf[i] = b'-'; }
+  out.extend_from_slice(&buf[i..]);
 }
 
 #[cfg(test)]
