@@ -5,7 +5,7 @@
 //! are zero-copy views into the input.
 
 use crate::{
-  http::{HttpError, Method, StatusCode},
+  http::{HttpError, Method, StatusCode, Version},
   http1::{BodyKind, Http1Request, MAX_HEADERS},
   misc::from_utf8_basic,
 };
@@ -215,7 +215,15 @@ pub fn parse_request<'b>(
   let headers: &'b [(&'b str, &'b str)] =
     unsafe { core::slice::from_raw_parts(scratch.headers.as_ptr().cast::<Header>(), len) };
   Ok(ParseOutcome::Complete {
-    request: Http1Request { method, path, query, headers, body_kind, keep_alive },
+    request: Http1Request {
+      method,
+      version: if http10 { Version::Http1 } else { Version::Http1_1 },
+      path,
+      query,
+      headers,
+      body_kind,
+      keep_alive,
+    },
     head_len: head_len.wrapping_add(skip),
   })
 }
@@ -448,7 +456,7 @@ fn has_ctl_scalar(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
   use crate::{
-    http::{Method, StatusCode},
+    http::{Method, StatusCode, Version},
     http1::{
       BodyKind, MAX_HEADERS,
       parser::{ParseOutcome, ParseScratch, error_status, parse_request},
@@ -710,6 +718,19 @@ mod tests {
     assert_eq!(target("http://h?x"), ("/".into(), "x".into()));
     assert_eq!(target("/http://h/x"), ("/http://h/x".into(), "".into()));
     assert_eq!(err_status(b"GET http:///x HTTP/1.1\r\nHost: a\r\n\r\n"), StatusCode::BadRequest);
+  }
+
+  #[test]
+  fn version_is_reported() {
+    let version = |raw: &[u8]| {
+      let mut scratch = ParseScratch::new();
+      match parse_request(raw, &mut scratch).unwrap() {
+        ParseOutcome::Complete { request, .. } => request.version,
+        ParseOutcome::Partial => panic!("partial"),
+      }
+    };
+    assert_eq!(version(b"GET / HTTP/1.0\r\n\r\n"), Version::Http1);
+    assert_eq!(version(GET), Version::Http1_1);
   }
 
   #[test]

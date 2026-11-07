@@ -6,7 +6,7 @@ mod conn;
 mod parser;
 mod response;
 
-use crate::http::Method;
+use crate::http::{Method, Version};
 
 pub use body::{BodyDecoder, BodyStatus};
 pub use conn::{Http1Conn, Http1Event};
@@ -32,6 +32,8 @@ pub enum BodyKind {
 pub struct Http1Request<'b> {
   /// Request method.
   pub method: Method,
+  /// [`Version::Http1`] for HTTP/1.0, [`Version::Http1_1`] for HTTP/1.1.
+  pub version: Version,
   /// Percent-encoded path, without the query.
   pub path: &'b str,
   /// Everything after `?`, or an empty string.

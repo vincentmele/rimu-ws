@@ -1,7 +1,7 @@
 //! Sans-I/O keep-alive HTTP/1.1 connection core.
 
 use crate::{
-  http::{HttpRecvParams, StatusCode},
+  http::{HttpRecvParams, Method, StatusCode, Version},
   http1::{
     BodyDecoder, BodyKind, BodyStatus, Http1Request, ParseOutcome, ParseScratch, error_status,
     parse_request, write_response,
@@ -66,7 +66,7 @@ enum Phase {
   Body { decoder: BodyDecoder, head_len: usize, raw: usize },
   /// A complete request awaits `respond`. Its head and what is left of its body in the buffer
   /// (all of it unless it arrived over several feeds) occupy `buf[start..start + len]`.
-  Ready { len: usize, keep_alive: bool },
+  Ready { len: usize, keep_alive: bool, method: Method, version: Version },
 }
 
 /// Outcome of looking at the head in the buffer.
@@ -141,7 +141,12 @@ impl Http1Conn {
         Head::Bodyless(request, head_len) => {
           self.body.clear();
           self.view = Some(request);
-          self.phase = Phase::Ready { len: head_len, keep_alive: request.keep_alive };
+          self.phase = Phase::Ready {
+            len: head_len,
+            keep_alive: request.keep_alive,
+            method: request.method,
+            version: request.version,
+          };
           return Http1Event::RequestReady;
         }
         Head::WithBody(kind, head_len) => (kind, head_len),
@@ -186,11 +191,16 @@ impl Http1Conn {
       BodyStatus::Complete { consumed } => {
         // The body stays in the buffer: `respond` moves `start` past it, so the pipelined
         // input after it is never moved.
-        let keep_alive = match self.set_view() {
-          Ok(keep_alive) => keep_alive,
+        let request = match self.set_view() {
+          Ok(request) => request,
           Err(_) => return self.fail(StatusCode::BadRequest),
         };
-        self.phase = Phase::Ready { len: head_len.wrapping_add(consumed), keep_alive };
+        self.phase = Phase::Ready {
+          len: head_len.wrapping_add(consumed),
+          keep_alive: request.keep_alive,
+          method: request.method,
+          version: request.version,
+        };
         Http1Event::RequestReady
       }
     }
@@ -216,12 +226,15 @@ impl Http1Conn {
 
   /// Queues the response of the current request and moves on to the next buffered one.
   /// Does nothing if no request is ready.
+  ///
+  /// The request's method and version shape the response as [`write_response`] describes: no
+  /// body for `HEAD`, no content for 1xx / 204 / 304, `Connection: keep-alive` for HTTP/1.0.
   #[inline]
   pub fn respond(&mut self, status: StatusCode, content_type: &str, body: &[u8]) {
-    let Phase::Ready { len, keep_alive } = self.phase else {
+    let Phase::Ready { len, keep_alive, method, version } = self.phase else {
       return;
     };
-    write_response(&mut self.out, status, content_type, body, keep_alive);
+    write_response(&mut self.out, method, version, status, content_type, body, keep_alive);
     self.view = None;
     self.body.clear();
     self.phase = Phase::Head;
@@ -287,8 +300,8 @@ impl Http1Conn {
     }
   }
 
-  /// Parses the head again to set `view`, returning its `keep_alive`.
-  fn set_view(&mut self) -> crate::Result<bool> {
+  /// Parses the head again to set `view`, returning it.
+  fn set_view(&mut self) -> crate::Result<Http1Request<'static>> {
     let input = self.buf.get(self.start..).unwrap_or_default();
     let scratch = self.scratch.first_mut().ok_or(crate::http::HttpError::BadRequest)?;
     match parse_request(input, scratch)? {
@@ -297,7 +310,7 @@ impl Http1Conn {
         let request =
           unsafe { core::mem::transmute::<Http1Request<'_>, Http1Request<'static>>(request) };
         self.view = Some(request);
-        Ok(request.keep_alive)
+        Ok(request)
       }
       ParseOutcome::Partial => Err(crate::http::HttpError::BadRequest.into()),
     }
@@ -305,7 +318,7 @@ impl Http1Conn {
 
   /// Answers with an error, stops reading and starts closing.
   fn fail(&mut self, status: StatusCode) -> Http1Event {
-    write_response(&mut self.out, status, "text/plain", b"", false);
+    write_response(&mut self.out, Method::Get, Version::Http1_1, status, "text/plain", b"", false);
     self.view = None;
     self.body.clear();
     self.buf.clear();
@@ -684,6 +697,55 @@ mod tests {
       assert_eq!(c.poll_event(), Http1Event::RequestReady);
       assert_eq!(c.request().unwrap().headers[0], ("Host", "a"));
       answer(&mut c);
+    }
+  }
+
+  #[test]
+  fn http10_keep_alive_is_announced() {
+    let answered = |raw: &[u8]| {
+      let mut c = conn();
+      c.feed(raw).unwrap();
+      assert_eq!(c.poll_event(), Http1Event::RequestReady);
+      answer(&mut c);
+      alloc::string::String::from_utf8(output(&mut c)).unwrap()
+    };
+    let out = answered(b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n");
+    assert!(out.contains("\r\nConnection: keep-alive\r\n"), "{out}");
+    let out = answered(b"POST / HTTP/1.0\r\nConnection: keep-alive\r\nContent-Length: 1\r\n\r\nx");
+    assert!(out.contains("\r\nConnection: keep-alive\r\n"), "{out}");
+    let out = answered(b"GET / HTTP/1.0\r\n\r\n");
+    assert!(out.contains("\r\nConnection: close\r\n"), "{out}");
+    let out = answered(GET);
+    assert!(!out.contains("Connection:"), "{out}");
+  }
+
+  #[test]
+  fn head_response_has_length_but_no_body() {
+    let mut c = conn();
+    c.feed(&[b"HEAD /x HTTP/1.1\r\nHost: a\r\n\r\n".as_slice(), GET].concat()).unwrap();
+    assert_eq!(c.poll_event(), Http1Event::RequestReady);
+    assert_eq!(c.request().unwrap().method, Method::Head);
+    c.respond(StatusCode::Ok, "text/plain", b"hello");
+    assert_eq!(c.poll_event(), Http1Event::RequestReady);
+    c.respond(StatusCode::Ok, "text/plain", b"hello");
+    assert_eq!(
+      output(&mut c),
+      b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\n\
+        HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello"
+    );
+  }
+
+  #[test]
+  fn no_content_and_not_modified_have_no_body_nor_length() {
+    for (status, line) in [
+      (StatusCode::NoContent, &b"HTTP/1.1 204 No Content\r\n"[..]),
+      (StatusCode::NotModified, b"HTTP/1.1 304 Not Modified\r\n"),
+    ] {
+      let mut c = conn();
+      c.feed(GET).unwrap();
+      assert_eq!(c.poll_event(), Http1Event::RequestReady);
+      c.respond(status, "text/plain", b"ignored");
+      assert_eq!(output(&mut c), [line, b"\r\n"].concat());
     }
   }
 

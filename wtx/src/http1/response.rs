@@ -1,16 +1,25 @@
 //! HTTP/1.1 response writer.
 
-use crate::http::StatusCode;
+use crate::http::{Method, StatusCode, Version};
 use alloc::vec::Vec;
 
-/// Appends a complete response to `out`.
+/// Appends a complete response to the request of `method` and `version` to `out`.
 ///
-/// Emits the status line, `Content-Type`, `Content-Length`, `Connection: close` only when
-/// `keep_alive` is `false`, the blank line and then `body`. No `Date` or `Server` header is
+/// Emits the status line (always `HTTP/1.1`), `Content-Type`, `Content-Length`, the
+/// `Connection` header, the blank line and then `body`. No `Date` or `Server` header is
 /// written.
+///
+/// - `Connection: close` when `keep_alive` is `false`; `Connection: keep-alive` when it is
+///   `true` and `version` is [`Version::Http1`] (HTTP/1.0, where closing is the default).
+/// - 1xx, 204 and 304 responses never have content: `content_type` and `body` are ignored and
+///   neither `Content-Type` nor `Content-Length` is written (RFC 9110 §8.6, RFC 9112 §6.3).
+/// - A response to [`Method::Head`] has the `Content-Length` of `body` but not `body` itself
+///   (RFC 9110 §9.3.2).
 #[inline]
 pub fn write_response(
   out: &mut Vec<u8>,
+  method: Method,
+  version: Version,
   status: StatusCode,
   content_type: &str,
   body: &[u8],
@@ -23,16 +32,24 @@ pub fn write_response(
   out.push(b'0' + (code % 10) as u8);
   out.push(b' ');
   out.extend_from_slice(reason_phrase(status).as_bytes());
-  out.extend_from_slice(b"\r\nContent-Type: ");
-  out.extend_from_slice(content_type.as_bytes());
-  out.extend_from_slice(b"\r\nContent-Length: ");
-  push_decimal(out, body.len());
   out.extend_from_slice(b"\r\n");
+  let has_content = code >= 200 && code != 204 && code != 304;
+  if has_content {
+    out.extend_from_slice(b"Content-Type: ");
+    out.extend_from_slice(content_type.as_bytes());
+    out.extend_from_slice(b"\r\nContent-Length: ");
+    push_decimal(out, body.len());
+    out.extend_from_slice(b"\r\n");
+  }
   if !keep_alive {
     out.extend_from_slice(b"Connection: close\r\n");
+  } else if version == Version::Http1 {
+    out.extend_from_slice(b"Connection: keep-alive\r\n");
   }
   out.extend_from_slice(b"\r\n");
-  out.extend_from_slice(body);
+  if has_content && method != Method::Head {
+    out.extend_from_slice(body);
+  }
 }
 
 /// Appends `value` in decimal without going through `core::fmt`.
@@ -117,13 +134,30 @@ const fn reason_phrase(status: StatusCode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-  use crate::{http::StatusCode, http1::response::write_response};
+  use crate::{
+    http::{Method, StatusCode, Version},
+    http1::response::write_response,
+  };
   use alloc::{string::String, vec::Vec};
+
+  fn write(method: Method, version: Version, status: StatusCode, keep_alive: bool) -> String {
+    let mut out = Vec::new();
+    write_response(&mut out, method, version, status, "text/plain", b"55", keep_alive);
+    String::from_utf8(out).unwrap()
+  }
 
   #[test]
   fn writes_keep_alive_200() {
     let mut out = Vec::new();
-    write_response(&mut out, StatusCode::Ok, "text/plain", b"55", true);
+    write_response(
+      &mut out,
+      Method::Get,
+      Version::Http1_1,
+      StatusCode::Ok,
+      "text/plain",
+      b"55",
+      true,
+    );
     assert_eq!(out, b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\n55");
     let text = core::str::from_utf8(&out).unwrap();
     assert!(!text.contains("Connection:"));
@@ -133,9 +167,39 @@ mod tests {
 
   #[test]
   fn writes_connection_close() {
-    let mut out = Vec::new();
-    write_response(&mut out, StatusCode::Ok, "text/plain", b"55", false);
-    let text = String::from_utf8(out).unwrap();
+    let text = write(Method::Get, Version::Http1_1, StatusCode::Ok, false);
     assert!(text.contains("Connection: close\r\n"));
+    let text = write(Method::Get, Version::Http1, StatusCode::Ok, false);
+    assert!(text.contains("Connection: close\r\n"));
+  }
+
+  #[test]
+  fn writes_keep_alive_for_http10() {
+    assert_eq!(
+      write(Method::Get, Version::Http1, StatusCode::Ok, true),
+      "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n55"
+    );
+  }
+
+  #[test]
+  fn head_and_bodiless_statuses() {
+    assert_eq!(
+      write(Method::Head, Version::Http1_1, StatusCode::Ok, true),
+      "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\n"
+    );
+    for (status, line) in [
+      (StatusCode::Continue, "HTTP/1.1 100 Continue\r\n"),
+      (StatusCode::EarlyHints, "HTTP/1.1 103 Early Hints\r\n"),
+      (StatusCode::NoContent, "HTTP/1.1 204 No Content\r\n"),
+      (StatusCode::NotModified, "HTTP/1.1 304 Not Modified\r\n"),
+    ] {
+      for method in [Method::Get, Method::Head] {
+        assert_eq!(write(method, Version::Http1_1, status, true), alloc::format!("{line}\r\n"));
+      }
+    }
+    assert_eq!(
+      write(Method::Get, Version::Http1_1, StatusCode::NoContent, false),
+      "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"
+    );
   }
 }
