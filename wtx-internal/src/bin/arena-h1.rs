@@ -8,7 +8,9 @@
 //! `POST /echo` (8gbit), which answers with the request body verbatim.
 //!
 //! `/json` serializes the dataset on every request and compresses those bytes on every request by
-//! the request's `Accept-Encoding`: brotli (quality 2), else gzip, else none. Nothing is cached.
+//! the request's `Accept-Encoding` lines: gzip (level 6) if offered, else brotli (quality 2), else
+//! none; with `Vary: Accept-Encoding`, and 406 if identity is refused and nothing else is
+//! acceptable. Nothing is cached.
 //!
 //! Environment: `ARENA_LOG_ERRORS` prints the errors the server reports to stderr; `DATASET_PATH`
 //! (default `/data/dataset.json`) is the dataset `/json` serves.
@@ -32,7 +34,7 @@ const BROTLI_QUALITY: i32 = 2;
 /// Brotli window bits. The default 22 makes the encoder allocate and clear multi-megabyte tables on
 /// every call (about 100 us for a 4 KiB body); 16 covers the largest body (8.4 KB) with identical output.
 const BROTLI_LGWIN: i32 = 16;
-/// zlib level of the gzip fallback.
+/// zlib level of gzip, the preferred coding.
 const GZIP_LEVEL: i32 = 6;
 /// gzip framing for zlib: a window of 15 bits plus 16.
 const GZIP_WINDOW_BITS: i32 = 31;
@@ -188,12 +190,20 @@ fn query_m(query: &str) -> rimu_ws::Result<i64> {
 }
 
 /// Serializes the dataset for `{count}` and `m`, then compresses those bytes by the request's
-/// `Accept-Encoding`. Both happen on every request: the body is never kept.
+/// `Accept-Encoding` lines. Both happen on every request: the body is never kept.
 fn endpoint_json(_: &mut (), req: &Http1Req<'_>, res: &mut Http1Res) -> rimu_ws::Result<()> {
   let count: usize = req.param("count").unwrap_or("0").parse()?;
   let m = query_m(req.query())?;
   let dataset = DATASET.get().map_or(&[][..], |el| el.as_slice());
-  let encoding = req.header("accept-encoding").map_or(Encoding::Identity, choose_encoding);
+  let accepts = req.headers().iter().filter(|el| el.0.eq_ignore_ascii_case("accept-encoding"));
+  // The response depends on `Accept-Encoding`, so every one says so (RFC 9110 §12.5.5)
+  res.push_header("vary", "Accept-Encoding")?;
+  let Some(encoding) = choose_encoding(accepts.map(|el| el.1)) else {
+    res.body_mut().extend_from_slice(b"no acceptable content coding");
+    res.set_content_type("text/plain");
+    res.set_status(StatusCode::NotAcceptable);
+    return Ok(());
+  };
   JSON_BUF.with(|cell| -> rimu_ws::Result<()> {
     let mut json = cell.borrow_mut();
     json.clear();
@@ -325,32 +335,45 @@ enum Encoding {
   Identity,
 }
 
-/// The encoding for an `Accept-Encoding` value: gzip if offered, else brotli, else none. A coding
-/// listed with `q=0` is not offered. gzip is preferred over brotli because, measured on this
-/// dataset, zlib level 6 produces a body about the same size as brotli q2 at a fraction of the CPU,
-/// so it wins the bandwidth-penalised json-comp score (eff = rps x (min_bytes/own_bytes)^2).
-fn choose_encoding(accept: &str) -> Encoding {
+/// The encoding for the `Accept-Encoding` header lines of a request (none if it has no such
+/// header): gzip if offered, else brotli, else none. A coding listed with `q=0` is not offered.
+/// gzip is preferred over brotli because, measured on this dataset, zlib level 6 produces a body
+/// about the same size as brotli q2 at a fraction of the CPU, so it wins the bandwidth-penalised
+/// json-comp score (eff = rps x (min_bytes/own_bytes)^2).
+///
+/// `None` if no coding is acceptable: neither gzip nor brotli is offered and the identity coding is
+/// refused, by `identity;q=0` or by `*;q=0` without an `identity` of its own (RFC 9110 §12.5.3).
+/// The answer is then 406. `*` otherwise does not offer a coding: the identity one is sent.
+fn choose_encoding<'a>(lines: impl IntoIterator<Item = &'a str>) -> Option<Encoding> {
   let (mut brotli, mut gzip) = (false, false);
-  for item in accept.split(',') {
+  // Whether `identity` and `*` were listed, and if with a nonzero `q`
+  let (mut identity, mut star): (Option<bool>, Option<bool>) = (None, None);
+  for item in lines.into_iter().flat_map(|line| line.split(',')) {
     let (token, params) = item.split_once(';').unwrap_or((item, ""));
-    let refused = params.split(';').any(|param| {
+    let offered = !params.split(';').any(|param| {
       param.trim().split_once('=').is_some_and(|(k, v)| {
         k.trim().eq_ignore_ascii_case("q") && v.trim().parse::<f32>() == Ok(0.0)
       })
     });
-    if refused {
-      continue;
-    }
     let token = token.trim();
-    brotli |= token.eq_ignore_ascii_case("br");
-    gzip |= token.eq_ignore_ascii_case("gzip");
+    if token.eq_ignore_ascii_case("br") {
+      brotli |= offered;
+    } else if token.eq_ignore_ascii_case("gzip") {
+      gzip |= offered;
+    } else if token.eq_ignore_ascii_case("identity") {
+      identity = Some(identity.unwrap_or(false) | offered);
+    } else if token == "*" {
+      star = Some(star.unwrap_or(false) | offered);
+    }
   }
   if gzip {
-    Encoding::Gzip
+    Some(Encoding::Gzip)
   } else if brotli {
-    Encoding::Brotli
+    Some(Encoding::Brotli)
+  } else if identity.or(star) == Some(false) {
+    None
   } else {
-    Encoding::Identity
+    Some(Encoding::Identity)
   }
 }
 
@@ -431,30 +454,69 @@ mod tests {
     done.to_vec()
   }
 
+  /// The encoding for one `Accept-Encoding` header line.
+  fn choose(accept: &str) -> Option<Encoding> {
+    choose_encoding([accept])
+  }
+
   #[test]
   fn prefers_gzip_when_offered() {
     // gzip is preferred over brotli (cheaper CPU, same size on this dataset → higher json-comp eff).
-    assert_eq!(choose_encoding("gzip, br"), Encoding::Gzip);
-    assert_eq!(choose_encoding("gzip, deflate, br, zstd"), Encoding::Gzip);
-    assert_eq!(choose_encoding("BR;q=0.5, gzip;q=1.0"), Encoding::Gzip);
-    assert_eq!(choose_encoding("gzip"), Encoding::Gzip);
-    assert_eq!(choose_encoding("deflate, gzip;q=0.8"), Encoding::Gzip);
+    assert_eq!(choose("gzip, br"), Some(Encoding::Gzip));
+    assert_eq!(choose("gzip, deflate, br, zstd"), Some(Encoding::Gzip));
+    assert_eq!(choose("BR;q=0.5, gzip;q=1.0"), Some(Encoding::Gzip));
+    assert_eq!(choose("gzip"), Some(Encoding::Gzip));
+    assert_eq!(choose("deflate, gzip;q=0.8"), Some(Encoding::Gzip));
   }
 
   #[test]
   fn chooses_brotli_only_when_gzip_absent() {
-    assert_eq!(choose_encoding("br"), Encoding::Brotli);
-    assert_eq!(choose_encoding("deflate, br, zstd"), Encoding::Brotli);
-    assert_eq!(choose_encoding("br, gzip;q=0"), Encoding::Brotli);
+    assert_eq!(choose("br"), Some(Encoding::Brotli));
+    assert_eq!(choose("deflate, br, zstd"), Some(Encoding::Brotli));
+    assert_eq!(choose("br, gzip;q=0"), Some(Encoding::Brotli));
   }
 
   #[test]
   fn chooses_identity_otherwise() {
-    assert_eq!(choose_encoding(""), Encoding::Identity);
-    assert_eq!(choose_encoding("identity"), Encoding::Identity);
-    assert_eq!(choose_encoding("deflate, zstd"), Encoding::Identity);
-    assert_eq!(choose_encoding("gzip;q=0, br;q=0"), Encoding::Identity);
-    assert_eq!(choose_encoding("brotli"), Encoding::Identity);
+    assert_eq!(choose(""), Some(Encoding::Identity));
+    assert_eq!(choose("identity"), Some(Encoding::Identity));
+    assert_eq!(choose("deflate, zstd"), Some(Encoding::Identity));
+    assert_eq!(choose("gzip;q=0, br;q=0"), Some(Encoding::Identity));
+    assert_eq!(choose("brotli"), Some(Encoding::Identity));
+    assert_eq!(choose("*"), Some(Encoding::Identity));
+    assert_eq!(choose("*;q=0, identity"), Some(Encoding::Identity));
+    assert_eq!(choose("*;q=0, identity;q=0.5"), Some(Encoding::Identity));
+    assert_eq!(choose("identity;q=1, gzip;q=0"), Some(Encoding::Identity));
+    // No header at all
+    assert_eq!(choose_encoding([]), Some(Encoding::Identity));
+  }
+
+  // RFC 9110 §12.5.3: with identity refused and nothing else acceptable there is no response.
+  #[test]
+  fn refused_identity_without_another_coding_is_not_acceptable() {
+    assert_eq!(choose("identity;q=0"), None);
+    assert_eq!(choose("identity;q=0.0, deflate"), None);
+    assert_eq!(choose("*;q=0"), None);
+    assert_eq!(choose("*;q=0, deflate"), None);
+    assert_eq!(choose("gzip;q=0, identity;q=0"), None);
+    assert_eq!(choose("gzip;q=0, *;q=0"), None);
+    assert_eq!(choose("br;q=0, identity;q=0, gzip;q=0"), None);
+    // ...but another coding that is acceptable serves it
+    assert_eq!(choose("identity;q=0, gzip"), Some(Encoding::Gzip));
+    assert_eq!(choose("*;q=0, gzip"), Some(Encoding::Gzip));
+    assert_eq!(choose("*;q=0, br"), Some(Encoding::Brotli));
+    assert_eq!(choose("identity;q=0, br, gzip"), Some(Encoding::Gzip));
+  }
+
+  // Every `Accept-Encoding` line counts, not just the first.
+  #[test]
+  fn all_accept_encoding_lines_count() {
+    assert_eq!(choose_encoding(["deflate", "gzip"]), Some(Encoding::Gzip));
+    assert_eq!(choose_encoding(["br", "gzip;q=0"]), Some(Encoding::Brotli));
+    assert_eq!(choose_encoding(["", "br"]), Some(Encoding::Brotli));
+    assert_eq!(choose_encoding(["deflate", "identity;q=0"]), None);
+    assert_eq!(choose_encoding(["identity;q=0", "gzip"]), Some(Encoding::Gzip));
+    assert_eq!(choose_encoding(["gzip;q=0", "*;q=0"]), None);
   }
 
   #[test]
