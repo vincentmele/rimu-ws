@@ -343,9 +343,11 @@ enum Encoding {
 ///
 /// `None` if no coding is acceptable: neither gzip nor brotli is offered and the identity coding is
 /// refused, by `identity;q=0` or by `*;q=0` without an `identity` of its own (RFC 9110 §12.5.3).
-/// The answer is then 406. `*` otherwise does not offer a coding: the identity one is sent.
+/// The answer is then 406. A `*` with a nonzero `q` offers the codings that are not listed, but is
+/// only consulted when identity is refused: otherwise identity is sent.
 fn choose_encoding<'a>(lines: impl IntoIterator<Item = &'a str>) -> Option<Encoding> {
-  let (mut brotli, mut gzip) = (false, false);
+  // Whether `br` and `gzip` were listed, and if with a nonzero `q`
+  let (mut brotli, mut gzip): (Option<bool>, Option<bool>) = (None, None);
   // Whether `identity` and `*` were listed, and if with a nonzero `q`
   let (mut identity, mut star): (Option<bool>, Option<bool>) = (None, None);
   for item in lines.into_iter().flat_map(|line| line.split(',')) {
@@ -357,21 +359,28 @@ fn choose_encoding<'a>(lines: impl IntoIterator<Item = &'a str>) -> Option<Encod
     });
     let token = token.trim();
     if token.eq_ignore_ascii_case("br") {
-      brotli |= offered;
+      brotli = Some(brotli.unwrap_or(false) | offered);
     } else if token.eq_ignore_ascii_case("gzip") {
-      gzip |= offered;
+      gzip = Some(gzip.unwrap_or(false) | offered);
     } else if token.eq_ignore_ascii_case("identity") {
       identity = Some(identity.unwrap_or(false) | offered);
     } else if token == "*" {
       star = Some(star.unwrap_or(false) | offered);
     }
   }
-  if gzip {
+  if gzip == Some(true) {
     Some(Encoding::Gzip)
-  } else if brotli {
+  } else if brotli == Some(true) {
     Some(Encoding::Brotli)
   } else if identity.or(star) == Some(false) {
-    None
+    // Identity is refused: `*` with a nonzero `q` offers the codings that are not listed
+    if star == Some(true) && gzip.is_none() {
+      Some(Encoding::Gzip)
+    } else if star == Some(true) && brotli.is_none() {
+      Some(Encoding::Brotli)
+    } else {
+      None
+    }
   } else {
     Some(Encoding::Identity)
   }
@@ -489,6 +498,24 @@ mod tests {
     assert_eq!(choose("identity;q=1, gzip;q=0"), Some(Encoding::Identity));
     // No header at all
     assert_eq!(choose_encoding([]), Some(Encoding::Identity));
+  }
+
+  // RFC 9110 §12.5.3: `*` with a nonzero `q` makes every coding not listed acceptable, which
+  // rescues a request that refuses identity.
+  #[test]
+  fn star_offers_unlisted_codings_when_identity_is_refused() {
+    assert_eq!(choose("identity;q=0, *"), Some(Encoding::Gzip));
+    assert_eq!(choose("identity;q=0, *;q=0.5"), Some(Encoding::Gzip));
+    assert_eq!(choose("*;q=0.5, identity;q=0"), Some(Encoding::Gzip));
+    // an explicit `gzip;q=0` keeps gzip out, `*` still offers brotli
+    assert_eq!(choose("identity;q=0, gzip;q=0, *"), Some(Encoding::Brotli));
+    assert_eq!(choose("identity;q=0, br;q=0, *"), Some(Encoding::Gzip));
+    // nothing is left for `*` to offer
+    assert_eq!(choose("identity;q=0, gzip;q=0, br;q=0, *"), None);
+    // `*;q=0` offers nothing
+    assert_eq!(choose("identity;q=0, *;q=0"), None);
+    // `*` alone does not ask for compression: identity is acceptable
+    assert_eq!(choose("*"), Some(Encoding::Identity));
   }
 
   // RFC 9110 §12.5.3: with identity refused and nothing else acceptable there is no response.
