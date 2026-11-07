@@ -33,7 +33,14 @@ fn error_cb(err: rimu_ws::Error) {
 /// No spin: the latency profiles charge it to the score, and the rest measure level with it. The
 /// peer address is not used by any handler.
 fn runtime() -> rimu_ws::Result<UringRuntime> {
-  UringRuntime::with_params(UringParams::new().set_peer_addrs(false).set_spin(Duration::ZERO))
+  UringRuntime::with_params(
+    UringParams::new()
+      .set_peer_addrs(false)
+      .set_spin(Duration::ZERO)
+      .set_recv_buffers(2048, 4096)
+      .set_direct_files(16384)
+      .set_ring_entries(4096, 16384),
+  )
 }
 
 /// `a + b`, plus the body of a POST. An empty or non-numeric body counts as zero, so the response
