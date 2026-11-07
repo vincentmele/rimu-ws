@@ -7,7 +7,7 @@ use crate::{
     parse_request, write_response,
   },
 };
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 
 /// Maximum number of bytes buffered between two `poll_event` calls.
 const BUF_CAP: usize = 256 * 1024;
@@ -50,7 +50,9 @@ pub struct Http1Conn {
   inflight: usize,
   max_body_len: usize,
   phase: Phase,
-  scratch: Box<ParseScratch>,
+  /// Exactly one element. A `Vec` and not a `Box`: moving a `Box` retags its pointee as unique,
+  /// which invalidates the header slice `view` points to; moving a `Vec` does not.
+  scratch: Vec<ParseScratch>,
   /// Points into `buf` and `scratch`; `Some` only while neither changed since it was set.
   view: Option<Http1Request<'static>>,
   closing: bool,
@@ -87,7 +89,7 @@ impl Http1Conn {
       inflight: 0,
       max_body_len: usize::try_from(params.max_body_len()).unwrap_or(usize::MAX),
       phase: Phase::Head,
-      scratch: Box::new(ParseScratch::new()),
+      scratch: alloc::vec![ParseScratch::new()],
       view: None,
       closing: false,
     }
@@ -265,13 +267,17 @@ impl Http1Conn {
   /// Parses the head at the front of the live input.
   fn parse_head(&mut self) -> Head {
     let input = self.buf.get(self.start..).unwrap_or_default();
-    match parse_request(input, &mut self.scratch) {
+    let Some(scratch) = self.scratch.first_mut() else {
+      return Head::Bad(StatusCode::InternalServerError);
+    };
+    match parse_request(input, scratch) {
       Err(err) => Head::Bad(error_status(&err)),
       Ok(ParseOutcome::Partial) => Head::Partial,
       Ok(ParseOutcome::Complete { request, head_len }) => match request.body_kind {
         BodyKind::None | BodyKind::ContentLength(0) => {
-          // SAFETY: `request` points into `self.buf` and `self.scratch` (heap data that does
-          // not move with `self`). `self.view` is cleared before either changes.
+          // SAFETY: `request` points into `self.buf` and `self.scratch`, heap data that does not
+          // move, and is not retagged, when `self` moves (both are `Vec`s). `self.view` is
+          // cleared before either changes.
           let request =
             unsafe { core::mem::transmute::<Http1Request<'_>, Http1Request<'static>>(request) };
           Head::Bodyless(request, head_len)
@@ -284,7 +290,8 @@ impl Http1Conn {
   /// Parses the head again to set `view`, returning its `keep_alive`.
   fn set_view(&mut self) -> crate::Result<bool> {
     let input = self.buf.get(self.start..).unwrap_or_default();
-    match parse_request(input, &mut self.scratch)? {
+    let scratch = self.scratch.first_mut().ok_or(crate::http::HttpError::BadRequest)?;
+    match parse_request(input, scratch)? {
       ParseOutcome::Complete { request, .. } => {
         // SAFETY: same as in `parse_head`.
         let request =
@@ -656,6 +663,28 @@ mod tests {
     assert!(c.wants_close());
     assert!(output(&mut c).starts_with(b"HTTP/1.1 501 "));
     assert_eq!(c.poll_event(), Http1Event::Closed);
+  }
+
+  /// Run it under Miri with Stacked Borrows: moving the connection while a request view is live
+  /// must not invalidate the view.
+  #[test]
+  fn moving_the_conn_keeps_the_view_valid() {
+    #[inline(never)]
+    fn pass(conn: Http1Conn) -> Http1Conn {
+      conn
+    }
+    for raw in [GET, POST_CL] {
+      let mut c = conn();
+      c.feed(raw).unwrap();
+      assert_eq!(c.poll_event(), Http1Event::RequestReady);
+      let c = pass(c);
+      let mut c = *alloc::boxed::Box::new(c);
+      let request = c.request().unwrap();
+      assert_eq!(request.headers[0], ("Host", "a"));
+      assert_eq!(c.poll_event(), Http1Event::RequestReady);
+      assert_eq!(c.request().unwrap().headers[0], ("Host", "a"));
+      answer(&mut c);
+    }
   }
 
   #[test]
