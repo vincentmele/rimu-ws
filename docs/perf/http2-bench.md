@@ -518,3 +518,36 @@ Found and fixed during the gate:
 Open: `peer_that_stops_reading_is_held_at_the_high_water_mark` hung in two consecutive full
 runs during the gate and in none of the 28+ runs since (under gdb, alone, and in the full
 suite); it now fails after 60 s with every connection's receive and send state (059d5f30).
+
+## Local composite (7 Nov, Task 18; HttpArena entry at 2bbec273)
+
+All four servers on every scored profile in one session, interleaved per profile (plod, viltrum,
+aegon, rimu), best of 3 runs of 5 s as HttpArena runs them; box loaded by other work (load average
+3 at the start, 13 at the end). rimu is the HttpArena entry binary (standard mode).
+
+| profile | conns | rimu | plod | viltrum | aegon | rimu vs best rival | load CPU % (rimu/plod/viltrum/aegon) | rimu user cyc/req |
+|---|---|---|---|---|---|---|---|---|
+| baseline-h2 | 256 | 5856k | 5254k | 4636k | 2936k | +11.5% | 100/98/76/48 | 2835 |
+| baseline-h2 | 1024 | 4955k | 4444k | 4364k | 2770k | +11.5% | 100/98/83/50 | 3045 |
+| static-h2 | 256 | 493k | 369k | 207k | 204k | +33.7% | 99/77/60/80 | 35156 |
+| static-h2 | 1024 | 444k | 363k | 0k | 160k | +22.3% | 97/73/51/68 | 40214 |
+| baseline-h2c | 256 | 6256k | 5479k | 4798k | 3121k | +14.2% | 100/96/74/46 | 2733 |
+| baseline-h2c | 1024 | 5521k | 5187k | 4711k | 3016k | +6.4% | 100/100/78/50 | 2828 |
+| baseline-h2c | 4096 | 4936k | 4872k | 4655k | 2955k | +1.3% | 100/100/86/48 | 2871 |
+| json-h2c | 1024 | 2042k | 1461k | 1051k | 744k | +39.8% | 99/53/36/38 | 10923 |
+| json-h2c | 4096 | 1615k | 1411k | 1025k | 695k | +14.5% | 100/62/42/43 | 10882 |
+
+viltrum's static-h2 1024 runs all failed (0 req/s). No profile is generator-capped by the plan's rule
+(every server's load side above 90%): viltrum and aegon never load h2load that far.
+
+`h2-composite.py`:
+
+```
+server     composite           baseline-h2             static-h2          baseline-h2c              json-h2c
+rimu            4000        5406k (1000)         468k (1000)        5571k (1000)        1828k (1000)
+plod            3393        4849k ( 897)         366k ( 781)        5179k ( 930)        1436k ( 785)
+viltrum         2469        4500k ( 832)         104k ( 221)        4722k ( 848)        1038k ( 568)
+aegon           1854        2853k ( 528)         182k ( 388)        3031k ( 544)         720k ( 394)
+```
+
+rimu leads every profile, so Steps 2-3 (finding a losing profile's cost) had nothing to act on.
