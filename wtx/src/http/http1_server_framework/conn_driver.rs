@@ -124,6 +124,7 @@ where
     max_delay: params.max_delay,
     midreq: false,
     offset: 0,
+    peer_eof: false,
     queued: 0,
     reads_async: false,
     res: Http1Res::new(bytes_pool_take()),
@@ -150,6 +151,9 @@ struct Driver {
   midreq: bool,
   /// How much of `rx` was fed.
   offset: usize,
+  /// The peer is done sending (or its server is going away): what was received is answered and
+  /// then the connection closes.
+  peer_eof: bool,
   /// Bytes of response queued in the core since the last flush.
   queued: usize,
   /// The stream's reads are awaited (it can't read without waiting).
@@ -181,7 +185,9 @@ impl Driver {
       {
         self.rx = buffer;
       }
-      let eof = self.read_available(stream, member).await?;
+      if self.read_available(stream, member).await? {
+        self.peer_eof = true;
+      }
       let got = !self.rx.is_empty();
       self.answered = 0;
       loop {
@@ -198,7 +204,8 @@ impl Driver {
       if got {
         self.midreq = self.answered == 0;
       }
-      if eof {
+      // Also when the end of the input was seen while a response was delayed.
+      if self.peer_eof {
         return Ok(());
       }
       if self.rx.is_empty() && !self.reads_async {
@@ -355,9 +362,12 @@ impl Driver {
   }
 
   /// Waits for `delay` while watching the socket. What arrives is appended to `rx`, to be fed
-  /// after the delayed response, in order. A peer that closes or resets the connection ends it at
-  /// once: the timer is cancelled with the connection's future, and the connection's slot, buffers
-  /// and count are released instead of being held for the rest of the delay.
+  /// after the delayed response, in order. A peer that resets the connection (any read error)
+  /// ends it at once: the timer is cancelled with the connection's future, and the connection's
+  /// slot, buffers and count are released instead of being held for the rest of the delay. A peer
+  /// that only half-closes it is done sending, not reading: the socket is no longer watched, the
+  /// delay runs out, and the delayed response and those of the complete requests received before
+  /// leave before the connection closes.
   ///
   /// A stream that reads only by awaiting (TLS) is not watched: its reads can't be stopped in the
   /// middle of a record, so one that arrives in pieces (or a KeyUpdate, after which the read waits
@@ -370,9 +380,9 @@ impl Driver {
   {
     let mut sleep = Sleep::new(delay)?;
     loop {
-      // Not watched (see above), or enough is waiting to be fed: the peer is slowed down by TCP
-      // until the response is out.
-      if self.reads_async || self.rx.len() >= RX_MAX {
+      // Not watched (see above), nothing more to come, or enough is waiting to be fed: the peer
+      // is slowed down by TCP until the response is out.
+      if self.reads_async || self.peer_eof || self.rx.len() >= RX_MAX {
         return (&mut sleep).await;
       }
       let readable = {
@@ -389,7 +399,7 @@ impl Driver {
         return Ok(());
       }
       if self.read_available(stream, None).await? {
-        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        self.peer_eof = true;
       }
     }
   }

@@ -123,8 +123,10 @@ impl Http1Res {
   /// Responses of the same connection stay in order. Cleared for every request. A delay longer
   /// than the server's maximum ([`Http1ServerFramework::set_max_delay`]) is cut to it.
   ///
-  /// A plaintext connection's socket is watched while it waits: a peer that goes away ends the
-  /// connection at once, and requests that arrive meanwhile are answered after this response. A
+  /// A plaintext connection's socket is watched while it waits: a peer that resets the
+  /// connection ends it at once, and requests that arrive meanwhile are answered after this
+  /// response. A peer that half-closes it still gets this response (and those of the complete
+  /// requests it sent before), and then the connection closes. A
   /// TLS connection is not (its reads can't stop in the middle of a record): its response leaves
   /// on time, and a peer gone meanwhile is noticed after it.
   #[inline]
@@ -1718,14 +1720,67 @@ mod tests {
     let elapsed = time_to_serve_another(&addr);
     assert!(elapsed < Duration::from_millis(1000), "{elapsed:?}");
     assert_eq!(ERRORS.load(Ordering::Relaxed), 0, "a reset peer was reported as an error");
-    // The same for a peer that only closes
-    let mut first = connect(&addr);
-    first.write_all(b"GET /delay/3000 HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
-    std::thread::sleep(Duration::from_millis(100));
-    drop(first);
-    let elapsed = time_to_serve_another(&addr);
-    assert!(elapsed < Duration::from_millis(1000), "{elapsed:?}");
-    assert_eq!(ERRORS.load(Ordering::Relaxed), 0, "a closed peer was reported as an error");
+  }
+
+  /// The rest of what `stream` receives until the server closes it.
+  fn read_to_end(stream: &mut TcpStream) -> Vec<u8> {
+    let mut got = Vec::new();
+    let _len = stream.read_to_end(&mut got).unwrap();
+    got
+  }
+
+  // A peer that only half-closes (it is done sending, not reading) still gets its delayed
+  // response, and those of the complete requests it pipelined before, and then the connection
+  // closes. Whether the end of its input arrives during the delay or with the request.
+  #[test]
+  fn half_closed_peer_gets_its_delayed_response() {
+    use std::net::Shutdown;
+    let addr = server(|_| {});
+    for together in [false, true] {
+      let mut stream = connect(&addr);
+      let begin = std::time::Instant::now();
+      stream
+        .write_all(
+          b"GET /delay/300 HTTP/1.1\r\nHost: x\r\n\r\nGET /ping HTTP/1.1\r\nHost: x\r\n\r\nGET /pi",
+        )
+        .unwrap();
+      if !together {
+        std::thread::sleep(Duration::from_millis(100));
+      }
+      stream.shutdown(Shutdown::Write).unwrap();
+      let (head, body) = read_response(&mut stream);
+      let elapsed = begin.elapsed();
+      assert!(head.starts_with("http/1.1 200 ok\r\n"), "{together}: {head}");
+      assert_eq!(body, b"300", "{together}");
+      assert!(elapsed >= Duration::from_millis(295), "{together}: {elapsed:?}");
+      assert_eq!(read_response(&mut stream).1, b"pong", "{together}");
+      // The incomplete request is not answered: the connection closes
+      assert_eq!(read_to_end(&mut stream), b"", "{together}");
+    }
+  }
+
+  // Over TLS too.
+  #[cfg(feature = "crypto-ring")]
+  #[test]
+  fn half_closed_tls_peer_gets_its_delayed_response() {
+    use crate::{executor::StdRuntime, net::StreamWriter as _};
+    use std::net::Shutdown;
+    let (uri, _done) = tls_server(|_| {}, None, None, HS, MD);
+    StdRuntime::new().block_on(async move {
+      for together in [false, true] {
+        let mut stream = tls_connect(&uri).await;
+        let begin = std::time::Instant::now();
+        stream.write_all(b"GET /delay/300 HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        if !together {
+          std::thread::sleep(Duration::from_millis(100));
+        }
+        stream.stream().shutdown(Shutdown::Write).unwrap();
+        assert!(tls_read_until(&mut stream, b"300").await.is_some(), "{together}");
+        let elapsed = begin.elapsed();
+        assert!(elapsed >= Duration::from_millis(295), "{together}: {elapsed:?}");
+        assert!(tls_read_until(&mut stream, b"pong").await.is_none(), "{together}");
+      }
+    });
   }
 
   // What arrives while a response is delayed is kept: a request pipelined during the delay is
