@@ -491,3 +491,30 @@ against one knob off:
 Spin's limited gain comes with ~1,000 more user cycles per frame (3828/4279 against 2782/2733).
 None of the knobs becomes a default: each either needs a deployment shape (dedicated cores, clients
 that speak first) or measured level.
+
+## Gate (7 Nov, Task 17)
+
+| step | result |
+|---|---|
+| h2spec | low and high, plaintext, kernel TLS and user-space TLS: 139/139 in all six |
+| full suite ×3 | `$FEAT` + `web-socket`, `web-socket-server-framework`, `postgres`, `json-writer`: lib 404, doc tests 160, integration binaries, all pass three times; the 17 postgres integration tests are skipped (they need a Postgres server and `wtx_database_uri_postgres`; this branch does not touch the database client) |
+| ASan | `--lib http2`, 105 tests pass, no memory errors. LeakSanitizer reports 1.8 KB in 40 allocations, all from tasks still alive at exit: framework test servers that never stop (routers, their connections' buffers and HPACK strings), the `connections` tests' proxy threads, and the client pool's live connection to google.com/github.com. Every group whose runtime ends (`http2::conn`, `http2::hpack`, the connection driver, static files) is leak-free |
+| Miri | `--features http2 --lib http2::conn` with `-Zmiri-disable-isolation` (the core reads the wall clock): 53 pass. Excluded: `differential_fixed_seeds`, which runs for hours under Miri; it runs natively and under ASan |
+| interop | curl, nghttp and the Go client over h2c and h2/TLS against `arena-h2` and the HttpArena entry: all pass. rimu-ws's client pool against nginx (h2c): 20 sequential and 64 concurrent requests, all correct |
+| Autobahn | drain, uring and uring-direct: 512 OK / 2 non-strict / 3 informational each |
+| WebSocket A/B against cc847160 | p=1 559k vs 559k fr/s, p=16 8.52M vs 8.56M, limited 346–380k vs 343–370k; user cycles per frame 684 vs 666 and 107 vs 105 |
+
+Found and fixed during the gate:
+
+- `cargo test --features http2` did not build: `http2/tests/connections.rs` uses the server
+  framework and the client pool (e9590e6a).
+- `server_steady_state_no_alloc` failed about once in 8 to 25 runs: a new `date` second in the
+  measured window grew the HPACK encoder's table storage and added a header-cache entry
+  (8cb78454).
+- WebSocket echo spent about 10% more user cycles per frame than cc847160 (pipeline 116 against
+  106): 95c0017b gave copied writes a 32 KiB size-class floor, so each connection held buffers of
+  its own pages. Bisected to that commit; copied writes have no floor now (2720c6de).
+
+Open: `peer_that_stops_reading_is_held_at_the_high_water_mark` hung in two consecutive full
+runs during the gate and in none of the 28+ runs since (under gdb, alone, and in the full
+suite); it now fails after 60 s with every connection's receive and send state (059d5f30).
