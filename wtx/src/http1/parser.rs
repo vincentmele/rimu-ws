@@ -109,12 +109,12 @@ pub fn parse_request<'b>(
   if target.is_empty() {
     return Err(bad());
   }
-  let (origin, absolute) = origin_part(target)?;
+  let (origin, authority) = origin_part(target)?;
   let (mut path, query) = match find_byte(origin.as_bytes(), b'?') {
     Some(idx) => (origin.get(..idx).ok_or_else(bad)?, origin.get(idx + 1..).ok_or_else(bad)?),
     None => (origin, ""),
   };
-  if absolute && path.is_empty() {
+  if authority.is_some() && path.is_empty() {
     path = "/";
   }
 
@@ -150,7 +150,7 @@ pub fn parse_request<'b>(
     if name.is_empty() || !name.bytes().all(is_tchar) {
       return Err(bad());
     }
-    let value = hline.get(colon + 1..).ok_or_else(bad)?.trim_matches([' ', '\t']);
+    let mut value = hline.get(colon + 1..).ok_or_else(bad)?.trim_matches([' ', '\t']);
     match name.len() {
       4 if name.eq_ignore_ascii_case("host") => {
         // RFC 9112 §3.2: more than one is a bad request.
@@ -158,6 +158,10 @@ pub fn parse_request<'b>(
           return Err(bad());
         }
         has_host = true;
+        // RFC 9112 §3.2.3: an absolute-form target's authority replaces `Host`.
+        if let Some(authority) = authority {
+          value = authority;
+        }
       }
       10 if name.eq_ignore_ascii_case("connection") => {
         for token in value.split(',') {
@@ -246,18 +250,18 @@ fn bad() -> crate::Error {
 }
 
 /// The origin-form part (path and query) of an absolute-form target such as
-/// `http://authority/path?query`, which a server must accept (RFC 9112 §3.2.2), and if `target`
-/// was in that form. Any other target is returned as it is. The authority is not compared with
-/// `Host`.
+/// `http://authority/path?query`, which a server must accept (RFC 9112 §3.2.2), and its authority.
+/// Any other target is returned as it is, with no authority. The authority takes the place of the
+/// value of `Host` (RFC 9112 §3.2.3).
 #[inline]
-fn origin_part(target: &str) -> crate::Result<(&str, bool)> {
+fn origin_part(target: &str) -> crate::Result<(&str, Option<&str>)> {
   let bytes = target.as_bytes();
   let scheme_len = if bytes.get(..7).is_some_and(|el| el.eq_ignore_ascii_case(b"http://")) {
     7
   } else if bytes.get(..8).is_some_and(|el| el.eq_ignore_ascii_case(b"https://")) {
     8
   } else {
-    return Ok((target, false));
+    return Ok((target, None));
   };
   let rest = target.get(scheme_len..).ok_or_else(bad)?;
   let authority_len =
@@ -265,7 +269,7 @@ fn origin_part(target: &str) -> crate::Result<(&str, bool)> {
   if authority_len == 0 {
     return Err(bad());
   }
-  Ok((rest.get(authority_len..).ok_or_else(bad)?, true))
+  Ok((rest.get(authority_len..).ok_or_else(bad)?, rest.get(..authority_len)))
 }
 
 /// Accepts a `Transfer-Encoding` value that is exactly `chunked`, the only coding supported.
@@ -718,6 +722,34 @@ mod tests {
     assert_eq!(target("http://h?x"), ("/".into(), "x".into()));
     assert_eq!(target("/http://h/x"), ("/http://h/x".into(), "".into()));
     assert_eq!(err_status(b"GET http:///x HTTP/1.1\r\nHost: a\r\n\r\n"), StatusCode::BadRequest);
+  }
+
+  // RFC 9112 §3.2.3: for an absolute-form target the server ignores `Host` and uses the target's
+  // authority, which is what the request's `host` header then reports.
+  #[test]
+  fn absolute_form_authority_replaces_host() {
+    let host = |raw: &str| {
+      let (.., headers, _, _, _) = complete(raw.as_bytes());
+      headers.into_iter().filter(|el| el.0.eq_ignore_ascii_case("host")).collect::<Vec<_>>()
+    };
+    assert_eq!(
+      host("GET http://evil/x?q=1 HTTP/1.1\r\nHost: a\r\nAccept: b\r\n\r\n"),
+      [("Host".into(), "evil".into())]
+    );
+    assert_eq!(
+      host("GET HTTPS://h:8080?x HTTP/1.1\r\nAccept: b\r\nhost: a\r\n\r\n"),
+      [("host".into(), "h:8080".into())]
+    );
+    assert_eq!(host("GET http://h HTTP/1.0\r\n\r\n"), []);
+    // Origin-form: Host is untouched
+    assert_eq!(
+      host("GET /x HTTP/1.1\r\nHost: a\r\n\r\n"),
+      [("Host".into(), "a".into())]
+    );
+    assert_eq!(
+      host("GET /http://h/x HTTP/1.1\r\nHost: a\r\n\r\n"),
+      [("Host".into(), "a".into())]
+    );
   }
 
   #[test]

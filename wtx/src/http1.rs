@@ -38,7 +38,8 @@ pub struct Http1Request<'b> {
   pub path: &'b str,
   /// Everything after `?`, or an empty string.
   pub query: &'b str,
-  /// Header name and value pairs.
+  /// Header name and value pairs. For an absolute-form target (`GET http://authority/path`) the
+  /// value of `Host` is the target's authority, not what the header said (RFC 9112 §3.2.3).
   pub headers: &'b [(&'b str, &'b str)],
   /// Framing of the body.
   pub body_kind: BodyKind,
