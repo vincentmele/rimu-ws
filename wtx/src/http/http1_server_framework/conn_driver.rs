@@ -174,7 +174,7 @@ impl Driver {
       {
         self.rx = buffer;
       }
-      let eof = self.read_available(stream).await?;
+      let eof = self.read_available(stream, member).await?;
       let got = !self.rx.is_empty();
       self.answered = 0;
       loop {
@@ -203,17 +203,28 @@ impl Driver {
     }
   }
 
-  /// Reads until the stream would block. Returns whether the peer closed it.
-  async fn read_available<S>(&mut self, stream: &mut S) -> crate::Result<bool>
+  /// Reads until the stream would block. Returns whether the connection should end: the peer
+  /// closed it, or, for a stream that reads only by awaiting, its server is shutting down while
+  /// it waits between requests.
+  async fn read_available<S>(
+    &mut self,
+    stream: &mut S,
+    member: Option<&Member<'_>>,
+  ) -> crate::Result<bool>
   where
     S: StreamReader,
   {
-    self.read_into(stream, false).await
+    self.read_into(stream, member, false).await
   }
 
-  /// [`Self::read_available`], also when the stream reads only by awaiting and `rx` already holds
-  /// bytes: `ready` says that the stream has something to report, so the read won't wait long.
-  async fn read_into<S>(&mut self, stream: &mut S, ready: bool) -> crate::Result<bool>
+  /// [`Self::read_available`]. With `ready`, the stream has something to report, so a stream that
+  /// reads only by awaiting is read even if `rx` already holds bytes: the read won't wait long.
+  async fn read_into<S>(
+    &mut self,
+    stream: &mut S,
+    member: Option<&Member<'_>>,
+    ready: bool,
+  ) -> crate::Result<bool>
   where
     S: StreamReader,
   {
@@ -237,8 +248,15 @@ impl Driver {
         TryRead::Pending => return Ok(false),
         TryRead::Unsupported => {
           self.reads_async = true;
-          if !ready && !self.rx.is_empty() {
-            return Ok(false);
+          if !ready {
+            if !self.rx.is_empty() {
+              return Ok(false);
+            }
+            // The read would wait for as long as the connection is idle: it waits for input
+            // here instead, which the server's shutdown can cut short.
+            if self.ready(stream, member).await? {
+              return Ok(true);
+            }
           }
           // Nothing is waiting to be sent: every round ends with a flush.
           let (init, uninit) = self.rx.split_at_spare_mut();
@@ -369,7 +387,7 @@ impl Driver {
       if !readable {
         return Ok(());
       }
-      if self.read_into(stream, true).await? {
+      if self.read_into(stream, None, true).await? {
         return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
       }
     }
@@ -408,18 +426,32 @@ impl Driver {
 
   /// Waits for bytes to read. Returns whether the connection should end instead: its server is
   /// shutting down and it is between requests.
+  ///
+  /// A stream that reads only by awaiting waits in [`Self::read_available`], which calls
+  /// [`Self::ready`] before its read.
   async fn wait<S>(&mut self, stream: &mut S, member: Option<&Member<'_>>) -> crate::Result<bool>
   where
     S: StreamReader,
   {
     let idle = !self.midreq;
-    let going_away = || member.is_some_and(|el| el.group.going_away.get());
-    if going_away() && idle {
+    if idle && member.is_some_and(|el| el.group.going_away.get()) {
       return Ok(true);
     }
     if self.reads_async {
       return Ok(false);
     }
+    self.ready(stream, member).await
+  }
+
+  /// Waits until the stream has something to report: bytes, the end of the stream or an error.
+  /// Returns `true` instead when the connection should end: its server is shutting down and it
+  /// is between requests.
+  async fn ready<S>(&self, stream: &mut S, member: Option<&Member<'_>>) -> crate::Result<bool>
+  where
+    S: StreamReader,
+  {
+    let idle = !self.midreq;
+    let going_away = || member.is_some_and(|el| el.group.going_away.get());
     let mut readable = pin!(stream.readable());
     poll_fn(|cx| {
       if let Some(member) = member

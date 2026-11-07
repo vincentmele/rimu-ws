@@ -1363,6 +1363,31 @@ mod tests {
     });
   }
 
+  // A triggered shutdown reaches an idle TLS keep-alive connection too: it is closed at once and
+  // `run_in_threads` returns well before the drain time.
+  #[cfg(feature = "crypto-ring")]
+  #[test]
+  fn shutdown_closes_idle_tls_connections() {
+    use crate::{executor::StdRuntime, net::StreamWriter as _};
+    let signal = crate::http::ShutdownSignal::new();
+    let (uri, done) = tls_server(|_| {}, None, Some((signal.clone(), Duration::from_secs(4))));
+    StdRuntime::new().block_on(async move {
+      let mut stream = tls_connect(&uri).await;
+      stream.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+      assert!(tls_read_until(&mut stream, b"pong").await.is_some());
+      std::thread::sleep(Duration::from_millis(100));
+      let begin = std::time::Instant::now();
+      signal.trigger();
+      assert_eq!(done.recv_timeout(Duration::from_secs(6)), Ok(true));
+      let elapsed = begin.elapsed();
+      assert!(elapsed < Duration::from_millis(1000), "{elapsed:?}");
+      assert!(
+        tls_read_until(&mut stream, b"pong").await.is_none(),
+        "the idle connection stayed open"
+      );
+    });
+  }
+
   // The response leaves only after the handler's delay, and the next response of the same
   // connection, which asks for none, is not held back.
   #[test]
