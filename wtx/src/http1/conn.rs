@@ -101,14 +101,14 @@ impl Http1Conn {
     if self.closing {
       return Ok(input.len());
     }
+    // Cleared before `buf` is touched in any way, even by an empty feed.
+    self.view = None;
     if self.start > 0 {
       let _ = self.buf.drain(..self.start);
       self.start = 0;
     }
     let take = input.len().min(BUF_CAP.saturating_sub(self.buf.len()));
     if take > 0 {
-      // The append may move `buf`.
-      self.view = None;
       self.buf.extend_from_slice(input.get(..take).unwrap_or_default());
     }
     Ok(take)
@@ -462,6 +462,21 @@ mod tests {
     answer(&mut c);
     assert_eq!(c.poll_event(), Http1Event::RequestReady);
     assert_eq!(c.request().unwrap().method, Method::Get);
+  }
+
+  #[test]
+  fn empty_feed_midpipeline_clears_view() {
+    let second: &[u8] = b"GET /second HTTP/1.1\r\nHost: a\r\n\r\n";
+    let mut c = conn();
+    c.feed(&[GET, second].concat()).unwrap();
+    assert_eq!(c.poll_event(), Http1Event::RequestReady);
+    answer(&mut c);
+    assert_eq!(c.poll_event(), Http1Event::RequestReady);
+    assert_eq!(c.request().unwrap().path, "/second");
+    assert_eq!(c.feed(&[]).unwrap(), 0);
+    assert!(c.request().is_none());
+    assert_eq!(c.poll_event(), Http1Event::RequestReady);
+    assert_eq!(c.request().unwrap().path, "/second");
   }
 
   #[test]
