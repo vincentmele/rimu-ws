@@ -252,7 +252,8 @@ fn bad() -> crate::Error {
 /// The origin-form part (path and query) of an absolute-form target such as
 /// `http://authority/path?query`, which a server must accept (RFC 9112 §3.2.2), and its authority.
 /// Any other target is returned as it is, with no authority. The authority takes the place of the
-/// value of `Host` (RFC 9112 §3.2.3).
+/// value of `Host` (RFC 9112 §3.2.3). An authority with userinfo (`@`) or a fragment (`#`) is a
+/// bad request.
 #[inline]
 fn origin_part(target: &str) -> crate::Result<(&str, Option<&str>)> {
   let bytes = target.as_bytes();
@@ -266,10 +267,12 @@ fn origin_part(target: &str) -> crate::Result<(&str, Option<&str>)> {
   let rest = target.get(scheme_len..).ok_or_else(bad)?;
   let authority_len =
     rest.bytes().position(|byte| byte == b'/' || byte == b'?').unwrap_or(rest.len());
-  if authority_len == 0 {
+  let authority = rest.get(..authority_len).ok_or_else(bad)?;
+  // No userinfo (RFC 9110 §4.2.4) and no fragment: a request target has neither
+  if authority.is_empty() || authority.bytes().any(|byte| byte == b'@' || byte == b'#') {
     return Err(bad());
   }
-  Ok((rest.get(authority_len..).ok_or_else(bad)?, rest.get(..authority_len)))
+  Ok((rest.get(authority_len..).ok_or_else(bad)?, Some(authority)))
 }
 
 /// Accepts a `Transfer-Encoding` value that is exactly `chunked`, the only coding supported.
@@ -750,6 +753,34 @@ mod tests {
       host("GET /http://h/x HTTP/1.1\r\nHost: a\r\n\r\n"),
       [("Host".into(), "a".into())]
     );
+  }
+
+  // RFC 9110 §4.2.4: an authority with userinfo is refused, and a fragment is not part of a
+  // request target.
+  #[test]
+  fn absolute_form_authority_with_userinfo_or_fragment_is_refused() {
+    for target in [
+      "http://user:pw@evil/x",
+      "http://user@evil",
+      "https://@h/x",
+      "http://u@h?q=1",
+      "http://h#f",
+      "http://h#f/x",
+      "HTTP://h:80#f?x",
+    ] {
+      let raw = format!("GET {target} HTTP/1.1\r\nHost: a\r\n\r\n");
+      assert_eq!(err_status(raw.as_bytes()), StatusCode::BadRequest, "{target}");
+    }
+    // `@` and `#` after the authority are the path's or the query's, not the authority's
+    let (_, path, query, ..) =
+      complete(b"GET http://h/a@b?x=y@z HTTP/1.1\r\nHost: a\r\n\r\n");
+    assert_eq!((path.as_str(), query.as_str()), ("/a@b", "x=y@z"));
+    // A head that is still incomplete is not judged yet
+    let mut scratch = ParseScratch::new();
+    assert!(matches!(
+      parse_request(b"GET http://u@h/x HTTP/1.1\r\nHost: a\r\n", &mut scratch),
+      Ok(ParseOutcome::Partial)
+    ));
   }
 
   #[test]
