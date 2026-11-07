@@ -123,8 +123,10 @@ impl Http1Res {
   /// Responses of the same connection stay in order. Cleared for every request. A delay longer
   /// than the server's maximum ([`Http1ServerFramework::set_max_delay`]) is cut to it.
   ///
-  /// The connection's socket is watched while it waits: a peer that goes away ends the
-  /// connection at once, and requests that arrive meanwhile are answered after this response.
+  /// A plaintext connection's socket is watched while it waits: a peer that goes away ends the
+  /// connection at once, and requests that arrive meanwhile are answered after this response. A
+  /// TLS connection is not (its reads can't stop in the middle of a record): its response leaves
+  /// on time, and a peer gone meanwhile is noticed after it.
   #[inline]
   pub fn delay(&self) -> Option<core::time::Duration> {
     self.delay
@@ -1287,6 +1289,10 @@ mod tests {
   #[cfg(feature = "crypto-ring")]
   const HS: Option<Duration> = Some(Duration::from_secs(10));
 
+  /// The maximum delay of most TLS test servers.
+  #[cfg(feature = "crypto-ring")]
+  const MD: Duration = Duration::from_secs(5);
+
   /// A one-runtime TLS server; returns its address, and a receiver of whether `run_in_threads`
   /// returned `Ok`.
   #[cfg(feature = "crypto-ring")]
@@ -1295,6 +1301,7 @@ mod tests {
     max_connections: Option<core::num::NonZeroUsize>,
     shutdown: Option<(crate::http::ShutdownSignal, Duration)>,
     handshake_timeout: Option<Duration>,
+    max_delay: Duration,
   ) -> (crate::net::UriString, std::sync::mpsc::Receiver<bool>) {
     use crate::{
       rng::{ChaCha20, CryptoSeedableRng as _},
@@ -1318,7 +1325,8 @@ mod tests {
       .set_local_runtime_cb(|| UringRuntime::with_params(UringParams::new()))
       .set_local_runtimes(core::num::NonZeroUsize::new(1))
       .set_max_connections(max_connections)
-      .set_handshake_timeout(handshake_timeout);
+      .set_handshake_timeout(handshake_timeout)
+      .set_max_delay(max_delay);
       let fw = match shutdown {
         Some((signal, drain)) => fw.set_shutdown(signal, drain),
         None => fw,
@@ -1378,20 +1386,22 @@ mod tests {
     Some(got)
   }
 
-  // Over TLS too, a peer that resets its connection while its response is delayed ends it at
-  // once.
+  // Over TLS a delayed response doesn't read: the TLS reader can't be stopped in the middle of
+  // a record, and what it reads could close the stream for writing too. A peer that resets the
+  // connection holds it for the delay, which the server's maximum bounds.
   #[cfg(feature = "crypto-ring")]
   #[test]
-  fn delayed_tls_response_notices_a_reset_peer() {
+  fn delayed_tls_response_of_a_reset_peer_is_bounded_by_max_delay() {
     use crate::{executor::StdRuntime, net::StreamWriter as _};
-    let (uri, _done) = tls_server(|_| {}, core::num::NonZeroUsize::new(1), None, HS);
+    let (uri, _done) =
+      tls_server(|_| {}, core::num::NonZeroUsize::new(1), None, HS, Duration::from_secs(1));
     StdRuntime::new().block_on(async move {
       let mut first = tls_connect(&uri).await;
+      let begin = std::time::Instant::now();
       first.write_all(b"GET /delay/3000 HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
       std::thread::sleep(Duration::from_millis(100));
       socket2::SockRef::from(first.stream()).set_linger(Some(Duration::ZERO)).unwrap();
       drop(first);
-      let begin = std::time::Instant::now();
       loop {
         assert!(begin.elapsed() < Duration::from_secs(5), "never served");
         let mut next = tls_connect(&uri).await;
@@ -1404,7 +1414,58 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
       }
       let elapsed = begin.elapsed();
+      assert!(elapsed < Duration::from_millis(2000), "{elapsed:?}");
+    });
+  }
+
+  // A TLS record that arrives in pieces during a delay, one byte every 1.5 s, doesn't hold the
+  // delayed response back.
+  #[cfg(feature = "crypto-ring")]
+  #[test]
+  fn tls_record_trickled_during_a_delay_does_not_hold_the_response() {
+    use crate::{executor::StdRuntime, net::StreamWriter as _};
+    let (uri, _done) = tls_server(|_| {}, None, None, HS, Duration::from_secs(1));
+    StdRuntime::new().block_on(async move {
+      let mut stream = tls_connect(&uri).await;
+      let begin = std::time::Instant::now();
+      stream.write_all(b"GET /delay/300 HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+      std::thread::sleep(Duration::from_millis(50));
+      // The first byte of an application data record, straight on the socket
+      (&mut &*stream.stream()).write_all(&[0x17]).unwrap();
+      let trickle = stream.stream().try_clone().unwrap();
+      let _trickle = std::thread::spawn(move || {
+        for byte in [3u8, 3] {
+          std::thread::sleep(Duration::from_millis(1500));
+          if (&trickle).write_all(&[byte]).is_err() {
+            break;
+          }
+        }
+      });
+      assert!(tls_read_until(&mut stream, b"300").await.is_some());
+      let elapsed = begin.elapsed();
+      assert!(elapsed >= Duration::from_millis(295), "{elapsed:?}");
       assert!(elapsed < Duration::from_millis(1000), "{elapsed:?}");
+    });
+  }
+
+  // A KeyUpdate during a delay doesn't hold the delayed response back, and is answered after it.
+  #[cfg(feature = "crypto-ring")]
+  #[test]
+  fn tls_key_update_during_a_delay_does_not_hold_the_response() {
+    use crate::{executor::StdRuntime, net::StreamWriter as _};
+    let (uri, _done) = tls_server(|_| {}, None, None, HS, Duration::from_secs(1));
+    StdRuntime::new().block_on(async move {
+      let mut stream = tls_connect(&uri).await;
+      let begin = std::time::Instant::now();
+      stream.write_all(b"GET /delay/300 HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+      std::thread::sleep(Duration::from_millis(50));
+      stream.refresh_traffic_keys().await.unwrap();
+      assert!(tls_read_until(&mut stream, b"300").await.is_some());
+      let elapsed = begin.elapsed();
+      assert!(elapsed >= Duration::from_millis(295), "{elapsed:?}");
+      assert!(elapsed < Duration::from_millis(1000), "{elapsed:?}");
+      stream.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+      assert!(tls_read_until(&mut stream, b"pong").await.is_some());
     });
   }
 
@@ -1415,7 +1476,8 @@ mod tests {
   fn shutdown_closes_idle_tls_connections() {
     use crate::{executor::StdRuntime, net::StreamWriter as _};
     let signal = crate::http::ShutdownSignal::new();
-    let (uri, done) = tls_server(|_| {}, None, Some((signal.clone(), Duration::from_secs(4))), HS);
+    let (uri, done) =
+      tls_server(|_| {}, None, Some((signal.clone(), Duration::from_secs(4))), HS, MD);
     StdRuntime::new().block_on(async move {
       let mut stream = tls_connect(&uri).await;
       stream.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
@@ -1486,6 +1548,7 @@ mod tests {
       None,
       None,
       HS,
+      MD,
     );
     let hello = client_hello();
     let (host, port) = uri.hostname_with_implied_port();
@@ -1522,7 +1585,7 @@ mod tests {
       executor::StdRuntime,
       net::{ConnectionState, StreamReader as _, StreamWriter as _},
     };
-    let (uri, _done) = tls_server(|_| {}, None, None, HS);
+    let (uri, _done) = tls_server(|_| {}, None, None, HS, MD);
     StdRuntime::new().block_on(async move {
       let mut stream = tls_connect(&uri).await;
       stream
@@ -1569,6 +1632,7 @@ mod tests {
       None,
       None,
       Some(Duration::from_millis(300)),
+      MD,
     );
     let hello = client_hello();
     let (host, port) = uri.hostname_with_implied_port();
@@ -1589,7 +1653,7 @@ mod tests {
   #[test]
   fn tls_handshake_timeout_covers_the_first_request_head() {
     use crate::{executor::StdRuntime, net::StreamWriter as _};
-    let (uri, _done) = tls_server(|_| {}, None, None, Some(Duration::from_millis(300)));
+    let (uri, _done) = tls_server(|_| {}, None, None, Some(Duration::from_millis(300)), MD);
     StdRuntime::new().block_on(async move {
       let begin = std::time::Instant::now();
       let mut stream = tls_connect(&uri).await;

@@ -12,8 +12,8 @@
 //!    is only valid right after `RequestReady`.
 //! 3. `feed` may take fewer bytes than offered when its buffer is full. The rest is fed again
 //!    after the requests it made room for were answered.
-//! 4. While a response is delayed the socket is still watched: what arrives is kept for after
-//!    the response, and a peer that goes away ends the connection at once.
+//! 4. While a response is delayed a plaintext socket is still watched: what arrives is kept for
+//!    after the response, and a peer that goes away ends the connection at once.
 //! 5. A connection with a first-head deadline (TLS) races it in every wait until its first
 //!    request is ready.
 
@@ -221,20 +221,6 @@ impl Driver {
   where
     S: StreamReader,
   {
-    self.read_into(stream, member, false).await
-  }
-
-  /// [`Self::read_available`]. With `ready`, the stream has something to report, so a stream that
-  /// reads only by awaiting is read even if `rx` already holds bytes: the read won't wait long.
-  async fn read_into<S>(
-    &mut self,
-    stream: &mut S,
-    member: Option<&Member<'_>>,
-    ready: bool,
-  ) -> crate::Result<bool>
-  where
-    S: StreamReader,
-  {
     loop {
       if self.rx.len() >= RX_MAX {
         return Ok(false);
@@ -255,15 +241,13 @@ impl Driver {
         TryRead::Pending => return Ok(false),
         TryRead::Unsupported => {
           self.reads_async = true;
-          if !ready {
-            if !self.rx.is_empty() {
-              return Ok(false);
-            }
-            // The read would wait for as long as the connection is idle: it waits for input
-            // here instead, which the server's shutdown can cut short.
-            if self.ready(stream, member).await? {
-              return Ok(true);
-            }
+          if !self.rx.is_empty() {
+            return Ok(false);
+          }
+          // The read would wait for as long as the connection is idle: it waits for input here
+          // instead, which the server's shutdown can cut short.
+          if self.ready(stream, member).await? {
+            return Ok(true);
           }
           // Nothing is waiting to be sent: every round ends with a flush.
           let (init, uninit) = self.rx.split_at_spare_mut();
@@ -375,17 +359,20 @@ impl Driver {
   /// once: the timer is cancelled with the connection's future, and the connection's slot, buffers
   /// and count are released instead of being held for the rest of the delay.
   ///
-  /// A stream that reads only by awaiting (TLS) is read once it is readable, and that read is not
-  /// cut short by the timer, so a record that arrives in pieces may hold the response back until
-  /// it is whole: late, never early.
+  /// A stream that reads only by awaiting (TLS) is not watched: its reads can't be stopped in the
+  /// middle of a record, so one that arrives in pieces (or a KeyUpdate, after which the read waits
+  /// for data) would hold the response back for as long as the peer likes. Its delayed response
+  /// leaves on time, and a peer that went away meanwhile is noticed after it; the server's
+  /// maximum delay bounds how long such a connection is held.
   async fn sleep_watching<S>(&mut self, stream: &mut S, delay: Duration) -> crate::Result<()>
   where
     S: StreamReader,
   {
     let mut sleep = Sleep::new(delay)?;
     loop {
-      // Enough is waiting to be fed: the peer is slowed down by TCP until the response is out.
-      if self.rx.len() >= RX_MAX {
+      // Not watched (see above), or enough is waiting to be fed: the peer is slowed down by TCP
+      // until the response is out.
+      if self.reads_async || self.rx.len() >= RX_MAX {
         return (&mut sleep).await;
       }
       let readable = {
@@ -401,7 +388,7 @@ impl Driver {
       if !readable {
         return Ok(());
       }
-      if self.read_into(stream, None, true).await? {
+      if self.read_available(stream, None).await? {
         return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
       }
     }
