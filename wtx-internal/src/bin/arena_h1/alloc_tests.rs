@@ -1,12 +1,14 @@
-//! Steady-state allocation tests of the arena-h1 servers: after a warm-up, a keep-alive
-//! connection's requests allocate nothing on the server's runtime thread.
+//! Allocation tests of the arena-h1 servers, after a warm-up, on the server's runtime thread:
+//! a keep-alive connection's requests allocate nothing (steady state), and neither does opening,
+//! serving and closing a connection (churn), but for the share of the executor and of TLS.
 //!
 //! A counting global allocator counts the allocations of the threads that were told to (the
 //! runtime thread of each test server, from its local-runtime callback), each server in its own
 //! counters, so the clients and the tests running alongside are not counted.
 //!
 //! `ALLOC_TRACE=n` prints the backtraces of the first `n` allocations of every measured window,
-//! to find where they come from. `alloc_table` (ignored) prints the allocations of every path.
+//! to find where they come from. `alloc_table` (ignored) prints the allocations of every path,
+//! `churn_table` (ignored) those of a connection of every profile, by [`Owner`].
 //!
 //! The JSON tests need the arena dataset (`DATASET_PATH`), the TLS ones its certificate pair
 //! (`CERT_DIR`): without them they fail, instead of passing on nothing.
@@ -25,6 +27,7 @@ use rimu_ws::{
   sync::{AtomicBool, AtomicU64},
   tls::TlsConnectorBuilder,
 };
+use std::collections::BTreeMap;
 
 /// Requests sent before counting, so that every buffer has reached its size.
 const WARMUP: usize = 200;
@@ -39,6 +42,10 @@ const DATASET_FILE: &str = "/mnt/nvme1tb/claude-tmp/arena-main/data/dataset.json
 struct Counts {
   allocs: AtomicU64,
   bytes: AtomicU64,
+  /// While set, every allocation is charged to its [`Owner`] in `sites`.
+  classify: AtomicBool,
+  /// The allocations charged: owner, the frame charged and size.
+  sites: std::sync::Mutex<Vec<(Owner, String, u64)>>,
   /// Backtraces left to print, while a window is measured.
   trace: AtomicU64,
   tracing: AtomicBool,
@@ -49,6 +56,8 @@ impl Counts {
     Box::leak(Box::new(Self {
       allocs: AtomicU64::new(0),
       bytes: AtomicU64::new(0),
+      classify: AtomicBool::new(false),
+      sites: std::sync::Mutex::new(Vec::new()),
       trace: AtomicU64::new(0),
       tracing: AtomicBool::new(false),
     }))
@@ -75,6 +84,12 @@ impl CountingAlloc {
     }
     let _ = counts.allocs.fetch_add(1, Ordering::SeqCst);
     let _ = counts.bytes.fetch_add(size as u64, Ordering::SeqCst);
+    if counts.classify.load(Ordering::SeqCst) {
+      IN_TRACE.set(true);
+      let (owner, site) = Owner::of_backtrace(&std::backtrace::Backtrace::force_capture());
+      counts.sites.lock().unwrap().push((owner, site, size as u64));
+      IN_TRACE.set(false);
+    }
     if counts.tracing.load(Ordering::SeqCst)
       && counts.trace.try_update(Ordering::SeqCst, Ordering::SeqCst, |el| el.checked_sub(1)).is_ok()
     {
@@ -670,4 +685,420 @@ fn brotli_pool_serves_the_rotation_after_a_sweep() {
   assert!(swept <= BROTLI_POOL_MAX, "{swept}");
   assert_eq!(after.0 - before.0, 0, "allocations of 300 encodes, {} bytes", after.1 - before.1);
   assert_eq!(unbrotli(&out), rotation[2]);
+}
+
+// Connection churn: after a warm-up, a new connection is opened, sends a profile's requests and is
+// closed, `CHURN_CONNS` times, one after the other. What the server's thread allocates for them is
+// charged to an `Owner` by the backtrace of every allocation.
+//
+// Two cases. `Beside`: another connection stays open on the thread meanwhile, as under a load,
+// where a thread serves many. `Alone`: the thread has no other connection, and drops to none
+// between two of them, which is when the pools trim themselves: the driver's to a few sets, the
+// executor's send pool to nothing. The driver's buffers go through that send pool (an owned send
+// swaps the buffer sent for one of the pool's), so the executor's trim costs the core and the
+// driver an allocation or a few per connection, which D3 owns: `Alone` is held to zero once D3
+// keeps send buffers at idle (`connection_churn_alone_allocates_nothing`, ignored until then).
+
+/// Connections opened before counting, so that the thread's pools have filled.
+const CHURN_WARMUP: usize = 30;
+/// Connections counted.
+const CHURN_CONNS: usize = 100;
+
+/// Owners a churn test lets allocate, per connection: D3's (the executor's task of the connection
+/// and TLS state). D3 empties this, and every churn test then holds the whole connection to zero.
+const CHURN_ALLOWED: &[Owner] = &[Owner::Executor, Owner::Tls];
+
+/// Who an allocation is charged to: the innermost frame of its backtrace that belongs to one of
+/// these. D2 owns the HTTP/1.1 core, the framework, its connection driver and the arena's code; D3
+/// the executor (a connection's task, its timers and sockets) and TLS (a connection's session).
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Owner {
+  Core,
+  Framework,
+  Driver,
+  App,
+  Executor,
+  Tls,
+  /// None of the above: the site is the innermost frame outside the standard library.
+  Other,
+}
+
+impl Owner {
+  /// The owner of a frame of the function `path` (without its generics), if any.
+  fn of_path(path: &str) -> Option<Self> {
+    const OWNERS: [(&str, Owner); 6] = [
+      ("rimu_ws::http1::", Owner::Core),
+      ("rimu_ws::http::http1_server_framework::conn_driver::", Owner::Driver),
+      ("rimu_ws::http::http1_server_framework::", Owner::Framework),
+      ("rimu_ws::executor::", Owner::Executor),
+      ("rimu_ws::tls::", Owner::Tls),
+      ("arena_h1::", Owner::App),
+    ];
+    if path.starts_with("arena_h1::alloc_tests::") {
+      return None;
+    }
+    OWNERS.iter().find(|el| path.starts_with(el.0)).map(|el| el.1)
+  }
+
+  /// The owner of the allocation `bt` was captured in, and the frame charged.
+  fn of_backtrace(bt: &std::backtrace::Backtrace) -> (Self, String) {
+    let text = bt.to_string();
+    let mut first = None;
+    for line in text.lines() {
+      let Some((idx, name)) = line.trim_start().split_once(": ") else { continue };
+      if idx.is_empty() || !idx.bytes().all(|el| el.is_ascii_digit()) {
+        continue;
+      }
+      // `<rimu_ws::tls::TlsStream<..> as ..>::read` is charged as `rimu_ws::tls::TlsStream`
+      let name = name.trim_start_matches('<');
+      let path = name.split(['<', ' ']).next().unwrap_or(name);
+      let path = path.replace('>', "");
+      let path = path.trim_end_matches(':');
+      if let Some(owner) = Self::of_path(path) {
+        return (owner, path.to_owned());
+      }
+      let ours = !["std::", "core::", "alloc::", "__rust", "arena_h1::alloc_tests::"]
+        .iter()
+        .any(|el| path.starts_with(el));
+      if first.is_none() && ours {
+        first = Some(path.to_owned());
+      }
+    }
+    (Self::Other, first.unwrap_or_default())
+  }
+}
+
+/// What a churn connection is asked to do.
+enum Op<'a> {
+  /// Sends the requests, if any, and returns the next response.
+  Exchange(Option<&'a [u8]>),
+  /// Ends the connection, and returns once the server closed its side.
+  Close,
+}
+
+/// What a churn window allocated on the server's thread.
+struct Churn {
+  allocs: u64,
+  bytes: u64,
+  conns: usize,
+  /// Allocations and bytes by owner and site.
+  sites: BTreeMap<(Owner, String), (u64, u64)>,
+}
+
+impl Churn {
+  /// Allocations and bytes by owner.
+  fn owners(&self) -> BTreeMap<Owner, (u64, u64)> {
+    let mut out = BTreeMap::new();
+    for ((owner, _), (allocs, bytes)) in &self.sites {
+      let elem = out.entry(*owner).or_insert((0, 0));
+      elem.0 += allocs;
+      elem.1 += bytes;
+    }
+    out
+  }
+
+  /// The allocations of the owners `CHURN_ALLOWED` does not let through.
+  fn charged(&self) -> u64 {
+    self.sites.iter().filter(|el| !CHURN_ALLOWED.contains(&el.0.0)).map(|el| el.1.0).sum()
+  }
+
+  /// Per connection, by owner, then every site.
+  fn report(&self, name: &str) -> String {
+    let conns = self.conns as f64;
+    let mut out = format!(
+      "{name}: {:.2} allocations, {:.0} bytes per connection ({} over {} connections)\n",
+      self.allocs as f64 / conns,
+      self.bytes as f64 / conns,
+      self.allocs,
+      self.conns
+    );
+    for (owner, (allocs, bytes)) in self.owners() {
+      out.push_str(&format!(
+        "  {owner:?}: {:.2} allocations, {:.0} bytes per connection\n",
+        allocs as f64 / conns,
+        bytes as f64 / conns
+      ));
+    }
+    for ((owner, site), (allocs, bytes)) in &self.sites {
+      out.push_str(&format!("    {owner:?} {site}: {allocs} allocations, {bytes} bytes\n"));
+    }
+    out
+  }
+}
+
+/// What else the server's thread serves during a churn test.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Neighbor {
+  /// Nothing.
+  Alone,
+  /// A connection that answered a request and stays open.
+  Beside,
+}
+
+/// Sends `cases` on `conn`, every response checked.
+fn send_cases<C>(conn: &mut C, cases: &[Case])
+where
+  C: FnMut(Op<'_>) -> Option<Response>,
+{
+  for case in cases {
+    (case.check)(&conn(Op::Exchange(Some(&case.req))).unwrap());
+    for _ in 1..case.responses {
+      (case.check)(&conn(Op::Exchange(None)).unwrap());
+    }
+  }
+}
+
+/// `conns` connections from `open`, one after the other, each sending `cases` in turn and then
+/// closing, after `warm` of them; every response checked, every allocation of the counted ones
+/// charged to its owner.
+fn measure_churn<C>(
+  counts: &'static Counts,
+  mut open: impl FnMut() -> C,
+  cases: &[Case],
+  neighbor: Neighbor,
+  (warm, conns): (usize, usize),
+) -> Churn
+where
+  C: FnMut(Op<'_>) -> Option<Response>,
+{
+  let mut kept = (neighbor == Neighbor::Beside).then(|| {
+    let mut conn = open();
+    send_cases(&mut conn, &cases[..1]);
+    conn
+  });
+  let mut serve_one = || {
+    let mut conn = open();
+    send_cases(&mut conn, cases);
+    let _ = conn(Op::Close);
+  };
+  for _ in 0..warm {
+    serve_one();
+  }
+  // The symbols are loaded once here, not in the middle of a connection of the server
+  let _ = std::backtrace::Backtrace::force_capture().to_string();
+  counts.sites.lock().unwrap().clear();
+  counts.trace.store(trace_budget(), Ordering::SeqCst);
+  counts.tracing.store(true, Ordering::SeqCst);
+  counts.classify.store(true, Ordering::SeqCst);
+  let before = counts.snapshot();
+  for _ in 0..conns {
+    serve_one();
+  }
+  let after = counts.snapshot();
+  counts.classify.store(false, Ordering::SeqCst);
+  counts.tracing.store(false, Ordering::SeqCst);
+  if let Some(conn) = &mut kept {
+    let _ = conn(Op::Close);
+  }
+  let mut sites = BTreeMap::new();
+  for (owner, site, bytes) in counts.sites.lock().unwrap().drain(..) {
+    let elem = sites.entry((owner, site)).or_insert((0, 0));
+    elem.0 += 1;
+    elem.1 += bytes;
+  }
+  Churn { allocs: after.0 - before.0, bytes: after.1 - before.1, conns, sites }
+}
+
+/// Churn of `cases` on a new plaintext server. A connection half-closes, and waits for the
+/// server to close it.
+fn churn_plain(cases: &[Case], neighbor: Neighbor) -> Churn {
+  let counts = Counts::leak();
+  let addr = plain_server(counts);
+  let open = || {
+    let mut stream = std::net::TcpStream::connect(&addr).unwrap();
+    stream.set_nodelay(true).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut buf = Vec::new();
+    let mut chunk = vec![0u8; 256 * 1024];
+    move |op: Op<'_>| match op {
+      Op::Exchange(req) => {
+        if let Some(elem) = req {
+          std::io::Write::write_all(&mut stream, elem).unwrap();
+        }
+        loop {
+          if let Some(elem) = take_response(&mut buf) {
+            return Some(elem);
+          }
+          let len = std::io::Read::read(&mut stream, &mut chunk).unwrap();
+          assert_ne!(len, 0, "the server closed the connection");
+          buf.extend_from_slice(&chunk[..len]);
+        }
+      }
+      Op::Close => {
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        while std::io::Read::read(&mut stream, &mut chunk).is_ok_and(|el| el > 0) {}
+        None
+      }
+    }
+  };
+  measure_churn(counts, open, cases, neighbor, (CHURN_WARMUP, CHURN_CONNS))
+}
+
+/// Churn of `cases` on a new TLS server, `None` without the certificate pair. A connection sends
+/// its close_notify, and waits for the server's.
+fn churn_tls(cases: &[Case], neighbor: Neighbor) -> Option<Churn> {
+  let counts = Counts::leak();
+  let addr = tls_server(counts)?;
+  let uri = rimu_ws::net::UriString::new(format!("https://{addr}"));
+  let mut config = TlsConfig::unverified();
+  config
+    .alpn_mut()
+    .get_or_insert_default()
+    .protocol_name_list
+    .push(b"http/1.1".as_slice().try_into().unwrap())
+    .unwrap();
+  let rt = StdRuntime::new();
+  let mut rng = ChaCha20::from_std_random().unwrap();
+  let open = || {
+    let mut tls_stream = rt.block_on(async {
+      for _ in 0..500 {
+        if let Ok(elem) = TlsConnectorBuilder::std(uri.clone()).build(&config, &mut rng).await {
+          return elem.connect().await.unwrap().tls_stream;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+      }
+      panic!("the TLS server did not start");
+    });
+    let mut buf = Vec::new();
+    let mut chunk = vec![0u8; 256 * 1024];
+    let rt = &rt;
+    move |op: Op<'_>| {
+      rt.block_on(async {
+        match op {
+          Op::Exchange(req) => {
+            if let Some(elem) = req {
+              tls_stream.write_all(elem).await.unwrap();
+            }
+            loop {
+              if let Some(elem) = take_response(&mut buf) {
+                return Some(elem);
+              }
+              let len = tls_stream.read(chunk.as_mut_slice().into()).await.unwrap();
+              let len = len.expect("the server closed the connection").get();
+              buf.extend_from_slice(&chunk[..len]);
+            }
+          }
+          Op::Close => {
+            tls_stream.send_close_notify().await.unwrap();
+            while let Ok(Some(_)) = tls_stream.read(chunk.as_mut_slice().into()).await {}
+            None
+          }
+        }
+      })
+    }
+  };
+  Some(measure_churn(counts, open, cases, neighbor, (CHURN_WARMUP, CHURN_CONNS)))
+}
+
+/// The profiles of the churn tests: a name and the cases (see [`cases`]) a connection sends.
+fn churn_profiles() -> Vec<(String, Vec<Case>)> {
+  let profiles: [(&str, fn(&str) -> bool); 7] = [
+    ("baseline", |el| el.starts_with("baseline ")),
+    ("async", |el| el.starts_with("async ")),
+    ("json-comp identity", |el| el.starts_with("json-comp ") && el.ends_with(" identity")),
+    ("json-comp gzip", |el| el.starts_with("json-comp ") && el.ends_with(" gzip")),
+    ("json-comp br", |el| el.starts_with("json-comp ") && el.ends_with(" br")),
+    ("json-tls", |el| el.starts_with("json-tls ")),
+    ("8gbit", |el| el.starts_with("8gbit ")),
+  ];
+  let mut out: Vec<(String, Vec<Case>)> =
+    profiles.iter().map(|el| (el.0.into(), Vec::new())).collect();
+  for case in cases() {
+    if let Some(idx) = profiles.iter().position(|el| (el.1)(&case.name)) {
+      out[idx].1.push(case);
+    }
+  }
+  out.retain(|el| !el.1.is_empty());
+  out
+}
+
+fn run_churn(name: &str, cases: &[Case], neighbor: Neighbor) -> Churn {
+  if cases[0].tls {
+    churn_tls(cases, neighbor)
+      .unwrap_or_else(|| panic!("{name}: no certificate pair in {}: set CERT_DIR", cert_dir()))
+  } else {
+    churn_plain(cases, neighbor)
+  }
+}
+
+/// Prints what a connection of every profile allocates, by owner, beside another connection and
+/// alone: `cargo test ... --bin arena-h1 churn_table -- --ignored --nocapture --test-threads 1`.
+#[test]
+#[ignore = "prints a table"]
+fn churn_table() {
+  let filter = std::env::var("ALLOC_CASE").unwrap_or_default();
+  for neighbor in [Neighbor::Beside, Neighbor::Alone] {
+    println!("## {neighbor:?}\n");
+    for (name, cases) in churn_profiles() {
+      if name.contains(&filter) {
+        println!("{}", run_churn(&name, &cases, neighbor).report(&name));
+      }
+    }
+  }
+}
+
+/// Asserts that the connections of `profile` allocate nothing on the server's thread after the
+/// warm-up, but for the owners in [`CHURN_ALLOWED`], whose share is printed.
+fn assert_churn_free(profile: &str, neighbor: Neighbor) {
+  let Some((name, cases)) = churn_profiles().into_iter().find(|el| el.0 == profile) else {
+    panic!("no case of the profile {profile}");
+  };
+  let churn = run_churn(&name, &cases, neighbor);
+  let report = churn.report(&format!("{name} ({neighbor:?})"));
+  eprintln!("{report}");
+  assert!(churn.allocs > 0 || churn.sites.is_empty());
+  assert_eq!(
+    churn.charged(),
+    0,
+    "allocations outside {CHURN_ALLOWED:?} after the warm-up:\n{report}"
+  );
+}
+
+#[test]
+fn baseline_connection_churn_allocates_nothing() {
+  assert_churn_free("baseline", Neighbor::Beside);
+}
+
+#[test]
+fn async_connection_churn_allocates_nothing() {
+  assert_churn_free("async", Neighbor::Beside);
+}
+
+#[test]
+fn json_comp_identity_connection_churn_allocates_nothing() {
+  need_dataset();
+  assert_churn_free("json-comp identity", Neighbor::Beside);
+}
+
+#[test]
+fn json_comp_gzip_connection_churn_allocates_nothing() {
+  need_dataset();
+  assert_churn_free("json-comp gzip", Neighbor::Beside);
+}
+
+#[test]
+fn json_comp_br_connection_churn_allocates_nothing() {
+  need_dataset();
+  assert_churn_free("json-comp br", Neighbor::Beside);
+}
+
+#[test]
+fn json_tls_connection_churn_allocates_nothing() {
+  need_dataset();
+  assert_churn_free("json-tls", Neighbor::Beside);
+}
+
+#[test]
+fn echo_tls_connection_churn_allocates_nothing() {
+  assert_churn_free("8gbit", Neighbor::Beside);
+}
+
+// A thread with no other connection: see the comment above `CHURN_WARMUP`.
+#[test]
+#[ignore = "D3: the executor empties its send pool when its thread has no connection open"]
+fn connection_churn_alone_allocates_nothing() {
+  need_dataset();
+  for (name, _) in churn_profiles() {
+    assert_churn_free(&name, Neighbor::Alone);
+  }
 }
