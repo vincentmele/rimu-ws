@@ -134,6 +134,8 @@ fn step(state: State, byte: u8) -> crate::Result<State> {
     State::Ext { value } => {
       if byte == b'\r' {
         State::SizeLf { value }
+      } else if byte == b'\n' {
+        return Err(bad_request());
       } else {
         State::Ext { value }
       }
@@ -159,6 +161,8 @@ fn step(state: State, byte: u8) -> crate::Result<State> {
     State::TrailerStart => {
       if byte == b'\r' {
         State::FinalLf
+      } else if byte == b'\n' {
+        return Err(bad_request());
       } else {
         State::TrailerLine
       }
@@ -166,6 +170,8 @@ fn step(state: State, byte: u8) -> crate::Result<State> {
     State::TrailerLine => {
       if byte == b'\r' {
         State::TrailerLf
+      } else if byte == b'\n' {
+        return Err(bad_request());
       } else {
         State::TrailerLine
       }
@@ -305,6 +311,32 @@ mod tests {
       BodyStatus::Complete { consumed: input.len() - 5 }
     );
     assert_eq!(out, b"abc0123456789");
+  }
+
+  #[test]
+  fn chunked_split_multidigit_size() {
+    let input = b"10\r\n0123456789abcdef\r\n0\r\n\r\n";
+    let (out, total) = byte_wise(input);
+    assert_eq!(out, b"0123456789abcdef");
+    assert_eq!(total, input.len());
+  }
+
+  #[test]
+  fn rejects_bare_lf_in_chunk_ext() {
+    let mut decoder = BodyDecoder::new(BodyKind::Chunked);
+    assert!(decoder.feed(b"2;ext\n=1\r\n20\r\n0\r\n\r\n", &mut Vec::new()).is_err());
+  }
+
+  #[test]
+  fn rejects_bare_lf_in_trailer() {
+    let mut decoder = BodyDecoder::new(BodyKind::Chunked);
+    assert!(decoder.feed(b"0\r\nX: a\nY: b\r\n\r\n", &mut Vec::new()).is_err());
+  }
+
+  #[test]
+  fn rejects_bare_lf_at_trailer_start() {
+    let mut decoder = BodyDecoder::new(BodyKind::Chunked);
+    assert!(decoder.feed(b"0\r\n\n", &mut Vec::new()).is_err());
   }
 
   #[test]
