@@ -176,7 +176,8 @@ impl Http1Res {
     self.content_type = value;
   }
 
-  /// Sets the status code. Defaults to 200.
+  /// Sets the status code. Defaults to 200. It must be final (2xx to 5xx): the response ends the
+  /// request, and a 1xx would be read by the client as an interim one.
   #[inline]
   pub const fn set_status(&mut self, value: StatusCode) {
     self.status = value;
@@ -638,6 +639,10 @@ impl<DA, EC, EX, RC, RNG, TCX> Http1ServerFramework<DA, EC, EX, RC, RNG, TCX> {
   /// The longest delay a response may ask for ([`Http1Res::set_delay`]): longer ones are cut to
   /// it, so that a handler fed a client's number can't hold a connection for as long as the client
   /// likes. Defaults to 5 s.
+  ///
+  /// A shutdown ([`Self::set_shutdown`]) whose drain is shorter than the time a delayed response
+  /// still has to wait cuts that response: the connection is closed with the runtime when the drain
+  /// ends, before the response is sent.
   ///
   /// Keep it below the runtime's handshake timeout (see [`crate::executor::UringParams`], 10 s by
   /// default), less the time a client may take to send its first request: that timeout runs until
@@ -1799,15 +1804,22 @@ mod tests {
       for together in [false, true] {
         let mut stream = tls_connect(&uri).await;
         let begin = std::time::Instant::now();
-        stream.write_all(b"GET /delay/300 HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        // A ping is pipelined behind the delayed request
+        stream
+          .write_all(b"GET /delay/300 HTTP/1.1\r\nHost: x\r\n\r\nGET /ping HTTP/1.1\r\nHost: x\r\n\r\n")
+          .await
+          .unwrap();
         if !together {
           std::thread::sleep(Duration::from_millis(100));
         }
         stream.stream().shutdown(Shutdown::Write).unwrap();
-        assert!(tls_read_until(&mut stream, b"300").await.is_some(), "{together}");
+        // The ping, sent before the half-close, is answered after the delayed response
+        let got = tls_read_until(&mut stream, b"pong").await.unwrap();
         let elapsed = begin.elapsed();
+        let got = String::from_utf8(got).unwrap();
+        let delayed = got.find("\r\n\r\n300").unwrap_or_else(|| panic!("{together}: {got}"));
+        assert!(delayed < got.rfind("pong").unwrap(), "{together}: {got}");
         assert!(elapsed >= Duration::from_millis(295), "{together}: {elapsed:?}");
-        assert!(tls_read_until(&mut stream, b"pong").await.is_none(), "{together}");
       }
     });
   }
