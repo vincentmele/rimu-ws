@@ -39,6 +39,8 @@ pub mod futures;
 pub mod grpc;
 #[cfg(feature = "http")]
 pub mod http;
+#[cfg(feature = "http1-server-framework")]
+pub mod http1;
 #[cfg(feature = "http2")]
 pub mod http2;
 pub mod misc;
