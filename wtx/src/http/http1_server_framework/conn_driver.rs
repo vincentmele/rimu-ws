@@ -690,6 +690,7 @@ fn conn_pool_take() -> ConnBuffers {
 /// `POOL_BUFFER_MAX` freed.
 fn conn_pool_give(mut set: ConnBuffers) {
   set.core.free_larger_than(POOL_BUFFER_MAX);
+  set.core.clear();
   for buffer in [&mut set.res_body, &mut set.res_headers, &mut set.spare, &mut set.wire] {
     if buffer.capacity() > POOL_BUFFER_MAX {
       *buffer = Vec::new();
@@ -917,5 +918,96 @@ mod tests {
     assert_eq!(after - before, 0, "allocations of 32 rounds of members");
     group.go_away();
     assert!(group.going_away.get());
+  }
+
+  /// Gives its input once, then never anything again; never takes a write.
+  struct Stuck {
+    input: Vec<u8>,
+  }
+
+  impl StreamCommon for Stuck {}
+
+  impl StreamReader for Stuck {
+    async fn read(&mut self, _: MaybeUninitSlice<'_, u8>) -> crate::Result<Option<NonZeroUsize>> {
+      core::future::pending().await
+    }
+
+    fn try_read(&mut self, mut bytes: MaybeUninitSlice<'_, u8>) -> crate::Result<TryRead> {
+      let dst = bytes.initialize_all_bytes();
+      let len = dst.len().min(self.input.len());
+      let Some(len) = NonZeroUsize::new(len) else {
+        return Ok(TryRead::Pending);
+      };
+      dst[..len.get()].copy_from_slice(&self.input[..len.get()]);
+      let _ = self.input.drain(..len.get());
+      Ok(TryRead::Read(len))
+    }
+
+    fn readable(&mut self) -> impl Future<Output = crate::Result<()>> {
+      core::future::pending()
+    }
+  }
+
+  impl StreamWriter for Stuck {
+    async fn write_all(&mut self, _: &[u8]) -> crate::Result<()> {
+      core::future::pending().await
+    }
+
+    async fn write_all_vectored(&mut self, _: &[&[u8]]) -> crate::Result<()> {
+      core::future::pending().await
+    }
+  }
+
+  /// Delays `/slow` by 10 s, answers the rest with `pong`.
+  struct Slow;
+
+  impl Http1Service for Slow {
+    fn call(&mut self, head: Http1Request<'_>, _: &[u8], res: &mut Http1Res) {
+      if head.path == "/slow" {
+        res.set_delay(Duration::from_secs(10));
+      }
+      res.body_mut().extend_from_slice(b"pong");
+    }
+  }
+
+  // A connection whose future is dropped while it answers a request (its request view live)
+  // gives its buffers back to the pool, and the next connection, served on them, sees nothing of
+  // that request. Run under Miri too, for the view into the recycled input buffer.
+  #[test]
+  fn connection_dropped_mid_request_gives_its_buffers_back() {
+    use super::CONN_POOL;
+    use core::{
+      pin::pin,
+      task::{Context, Poll, Waker},
+    };
+    let params = DriveParams {
+      first_head: None,
+      hrc: HttpRecvParams::with_default_params(),
+      max_delay: Duration::from_secs(10),
+    };
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut service = Slow;
+    let pooled =
+      || CONN_POOL.with(|el| el.borrow().sets.iter().map(|el| el.core.capacity()).sum::<usize>());
+    let before = pooled();
+    {
+      let mut stream = Stuck { input: b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n".to_vec() };
+      let fut = pin!(drive_conn(&mut stream, &mut service, &params, None));
+      assert!(fut.poll(&mut cx).is_pending());
+    }
+    let after = pooled();
+    assert!(after > before, "{before} {after}");
+    let mut stream = Scripted {
+      input: b"GET /ping HTTP/1.1\r\nHost: y\r\n\r\n".to_vec(),
+      output: Vec::new(),
+      writes: 0,
+    };
+    {
+      let fut = pin!(drive_conn(&mut stream, &mut service, &params, None));
+      assert!(matches!(fut.poll(&mut cx), Poll::Ready(Ok(()))));
+    }
+    assert!(stream.output.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(stream.output.ends_with(b"pong"));
+    assert_eq!(stream.output.windows(4).filter(|el| el == b"pong").count(), 1);
   }
 }

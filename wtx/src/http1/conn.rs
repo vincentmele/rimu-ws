@@ -82,8 +82,9 @@ enum Head {
 /// [`Http1Conn::into_parts`] returns and [`Http1Conn::from_parts`] takes, so that a server can
 /// keep them in a pool and open connections without allocating.
 ///
-/// Every buffer is empty and keeps its capacity. The default is a set of empty buffers, which a
-/// connection grows as it needs.
+/// The buffers keep their capacity. What they hold is dropped by [`Self::clear`] or by
+/// [`Http1Conn::from_parts`]. The default is a set of empty buffers, which a connection grows as
+/// it needs.
 #[derive(Debug, Default)]
 pub struct Http1ConnParts {
   buf: Vec<u8>,
@@ -103,6 +104,14 @@ impl Http1ConnParts {
       .saturating_add(self.body.capacity())
       .saturating_add(self.out.capacity())
       .saturating_add(scratch)
+  }
+
+  /// Empties the buffers, keeping their capacity.
+  #[inline]
+  pub fn clear(&mut self) {
+    self.buf.clear();
+    self.body.clear();
+    self.out.clear();
   }
 
   /// Frees every byte buffer whose capacity is above `max`, so that a pool keeps none that a
@@ -141,16 +150,16 @@ impl Http1Conn {
     }
   }
 
-  /// Ends the connection, returning its buffers emptied, capacity kept, for
-  /// [`Self::from_parts`]. What is left of its input and output is discarded.
+  /// Ends the connection, returning its buffers for [`Self::from_parts`]. What is left of its
+  /// input and output is discarded, by `from_parts` or [`Http1ConnParts::clear`].
   ///
-  /// No view of a request survives: a request borrows the connection, which this consumes.
+  /// No view of a request survives: a request borrows the connection, which this consumes. The
+  /// buffers are moved, not emptied, here: `self` is an argument and the request view it may
+  /// hold points into them, so writing to them before this returns would invalidate that view
+  /// while it is protected (Stacked Borrows).
   #[inline]
   pub fn into_parts(self) -> Http1ConnParts {
-    let Self { mut buf, mut body, mut out, scratch, .. } = self;
-    buf.clear();
-    body.clear();
-    out.clear();
+    let Self { buf, body, out, scratch, .. } = self;
     Http1ConnParts { buf, body, out, scratch }
   }
 
@@ -923,6 +932,11 @@ mod tests {
         assert_eq!(c.poll_event(), Http1Event::NeedMore);
       }
       parts = pass(c.into_parts());
+      if round == 2 {
+        // As a pool does it, with the view gone
+        parts.clear();
+        parts.free_larger_than(64);
+      }
     }
     let mut c = Http1Conn::from_parts(&params, parts);
     c.feed(GET).unwrap();
@@ -944,6 +958,7 @@ mod tests {
     assert_eq!(c.body().len(), 70_000);
     answer(&mut c);
     let mut parts = c.into_parts();
+    parts.clear();
     assert!(parts.buf.capacity() >= 70_000 && parts.body.capacity() >= 70_000);
     assert!(parts.buf.is_empty() && parts.body.is_empty() && parts.out.is_empty());
     let out = parts.out.capacity();
