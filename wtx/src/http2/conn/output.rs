@@ -115,6 +115,10 @@ impl Output {
 
   /// Takes the queued bytes as one buffer when they are a single unwritten run of own bytes (the
   /// usual case), leaving `spare`, cleared, in its place. Otherwise returns `spare`.
+  #[cfg_attr(
+    not(feature = "http2-server-framework"),
+    allow(dead_code, reason = "used by the server driver")
+  )]
   pub(crate) fn take_bytes(&mut self, spare: Vec<u8>) -> Result<Vec<u8>, Vec<u8>> {
     let whole = matches!(
       (self.chunks.len(), self.chunks.get(0)),
@@ -135,6 +139,10 @@ impl Output {
   }
 
   /// Puts back the bytes [`Self::take_bytes`] took, with nothing queued since; returns the spare.
+  #[cfg_attr(
+    not(feature = "http2-server-framework"),
+    allow(dead_code, reason = "used by the server driver")
+  )]
   pub(crate) fn untake_bytes(&mut self, bytes: Vec<u8>) -> Vec<u8> {
     let len = bytes.len();
     let Ok(restored) = VectorUsize::from_vec(bytes) else {
@@ -150,6 +158,10 @@ impl Output {
 
   /// Writes the next bytes into `buffer` (cleared) when nothing is queued and the current buffer
   /// holds no memory: a recycled, cache-warm buffer instead of a fresh allocation.
+  #[cfg_attr(
+    not(feature = "http2-server-framework"),
+    allow(dead_code, reason = "used by the server driver")
+  )]
   pub(crate) fn give_buffer(&mut self, buffer: Vec<u8>) {
     if self.pending != 0 || self.bytes.capacity() != 0 {
       return;

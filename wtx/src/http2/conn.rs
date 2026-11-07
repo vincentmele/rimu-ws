@@ -310,16 +310,28 @@ impl<const IS_CLIENT: bool> Http2Conn<IS_CLIENT> {
   /// The queued bytes as one buffer, taken without a copy, when they are a single run of own
   /// bytes; `spare` takes their place. `Err(spare)` otherwise: use [`Self::output`]. Call
   /// [`Self::has_output`] first.
+  #[cfg_attr(
+    not(feature = "http2-server-framework"),
+    allow(dead_code, reason = "used by the server driver")
+  )]
   pub(crate) fn take_output(&mut self, spare: Vec<u8>) -> Result<Vec<u8>, Vec<u8>> {
     self.out.take_bytes(spare)
   }
 
   /// Undoes [`Self::take_output`] when the bytes could not be handed on; returns the spare.
+  #[cfg_attr(
+    not(feature = "http2-server-framework"),
+    allow(dead_code, reason = "used by the server driver")
+  )]
   pub(crate) fn untake_output(&mut self, bytes: Vec<u8>) -> Vec<u8> {
     self.out.untake_bytes(bytes)
   }
 
   /// A recycled buffer to queue the next output into, used if the output holds none.
+  #[cfg_attr(
+    not(feature = "http2-server-framework"),
+    allow(dead_code, reason = "used by the server driver")
+  )]
   pub(crate) fn give_output_buffer(&mut self, buffer: Vec<u8>) {
     self.out.give_buffer(buffer);
   }

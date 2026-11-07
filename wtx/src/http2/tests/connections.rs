@@ -209,6 +209,7 @@ fn client_many_concurrent_streams() {
 }
 
 // 10 requests through a pool of one go over a single TCP connection.
+#[cfg(feature = "http2-client-pool")]
 #[cfg_attr(miri, ignore)]
 #[test]
 fn client_pool_reuses_connection() {
