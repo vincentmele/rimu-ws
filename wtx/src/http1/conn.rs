@@ -61,8 +61,9 @@ enum Phase {
   Head,
   /// Head parsed (it stays at `buf[start..start + head_len]`), decoding the body.
   Body { decoder: BodyDecoder, head_len: usize, raw: usize },
-  /// A complete request awaits `respond`.
-  Ready { head_len: usize, keep_alive: bool },
+  /// A complete request awaits `respond`. Its head and what is left of its body in the buffer
+  /// (all of it unless it arrived over several feeds) occupy `buf[start..start + len]`.
+  Ready { len: usize, keep_alive: bool },
 }
 
 /// Outcome of looking at the head in the buffer.
@@ -137,7 +138,7 @@ impl Http1Conn {
         Head::Bodyless(request, head_len) => {
           self.body.clear();
           self.view = Some(request);
-          self.phase = Phase::Ready { head_len, keep_alive: request.keep_alive };
+          self.phase = Phase::Ready { len: head_len, keep_alive: request.keep_alive };
           return Http1Event::RequestReady;
         }
         Head::WithBody(kind, head_len) => (kind, head_len),
@@ -161,7 +162,12 @@ impl Http1Conn {
       Ok(status) => status,
       Err(_) => return self.fail(StatusCode::BadRequest),
     };
-    *raw = raw.wrapping_add(input_len);
+    // Only what belongs to this body counts, not the pipelined requests after it.
+    let taken = match status {
+      BodyStatus::NeedMore => input_len,
+      BodyStatus::Complete { consumed } => consumed,
+    };
+    *raw = raw.wrapping_add(taken);
     let overhead = raw.saturating_sub(self.body.len());
     let too_large = self.body.len() > self.max_body_len
       || overhead > FRAMING_BUDGET.saturating_add(self.body.len() / 4);
@@ -175,12 +181,13 @@ impl Http1Conn {
         Http1Event::NeedMore
       }
       BodyStatus::Complete { consumed } => {
-        let _ = self.buf.drain(head_end..head_end.wrapping_add(consumed));
+        // The body stays in the buffer: `respond` moves `start` past it, so the pipelined
+        // input after it is never moved.
         let keep_alive = match self.set_view() {
           Ok(keep_alive) => keep_alive,
           Err(_) => return self.fail(StatusCode::BadRequest),
         };
-        self.phase = Phase::Ready { head_len, keep_alive };
+        self.phase = Phase::Ready { len: head_len.wrapping_add(consumed), keep_alive };
         Http1Event::RequestReady
       }
     }
@@ -208,7 +215,7 @@ impl Http1Conn {
   /// Does nothing if no request is ready.
   #[inline]
   pub fn respond(&mut self, status: StatusCode, content_type: &str, body: &[u8]) {
-    let Phase::Ready { head_len, keep_alive } = self.phase else {
+    let Phase::Ready { len, keep_alive } = self.phase else {
       return;
     };
     write_response(&mut self.out, status, content_type, body, keep_alive);
@@ -216,7 +223,7 @@ impl Http1Conn {
     self.body.clear();
     self.phase = Phase::Head;
     if keep_alive {
-      self.start = self.start.wrapping_add(head_len);
+      self.start = self.start.wrapping_add(len);
       if self.start >= self.buf.len() {
         self.buf.clear();
         self.start = 0;
@@ -551,6 +558,71 @@ mod tests {
     c.poll_event();
     assert!(c.wants_close());
     assert!(output(&mut c).starts_with(b"HTTP/1.1 400 "));
+  }
+
+  /// Answers every ready request, returning how many there were.
+  fn answer_all(conn: &mut Http1Conn) -> usize {
+    let mut answered = 0;
+    while conn.poll_event() == Http1Event::RequestReady {
+      answered += 1;
+      answer(conn);
+    }
+    answered
+  }
+
+  #[test]
+  fn body_then_large_pipeline_is_not_too_large() {
+    let get: &[u8] = b"GET /ping HTTP/1.1\r\nHost: a\r\n\r\n";
+    let n = 17 * 1024 / get.len() + 1;
+    for first in [POST_CL, POST_CHUNKED] {
+      let mut input = first.to_vec();
+      for _ in 0..n {
+        input.extend_from_slice(get);
+      }
+      let mut c = conn();
+      assert_eq!(c.feed(&input).unwrap(), input.len());
+      assert_eq!(answer_all(&mut c), n + 1);
+      assert!(!c.wants_close());
+      let out = output(&mut c);
+      assert_eq!(count(&out, b"HTTP/1.1 200 OK\r\n"), n + 1);
+      assert_eq!(count(&out, b" 413 "), 0);
+    }
+  }
+
+  #[test]
+  fn many_pipelined_small_posts_are_all_answered() {
+    let post: &[u8] = b"POST /e HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\n\r\nx";
+    let mut input = Vec::new();
+    while input.len() + post.len() < 250 * 1024 {
+      input.extend_from_slice(post);
+    }
+    let n = input.len() / post.len();
+    let mut c = conn();
+    assert_eq!(c.feed(&input).unwrap(), input.len());
+    assert_eq!(answer_all(&mut c), n);
+    assert!(!c.wants_close());
+    assert_eq!(count(&output(&mut c), b"HTTP/1.1 200 OK\r\n"), n);
+  }
+
+  #[test]
+  fn pipelined_bodies_do_not_move_the_tail() {
+    // Every request is answered in place: nothing of the buffered input is moved per request,
+    // which would make a large batch quadratic.
+    let mut input = Vec::new();
+    for _ in 0..64 {
+      input.extend_from_slice(POST_CL);
+      input.extend_from_slice(POST_CHUNKED);
+    }
+    let mut c = conn();
+    c.feed(&input).unwrap();
+    let mut answered = 0;
+    while c.poll_event() == Http1Event::RequestReady {
+      assert_eq!(c.buf.len(), input.len(), "request {answered}");
+      assert_eq!(c.body(), b"20");
+      answered += 1;
+      answer(&mut c);
+    }
+    assert_eq!(answered, 128);
   }
 
   #[test]
