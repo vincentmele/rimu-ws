@@ -9,7 +9,7 @@ mod response;
 use crate::http::{Method, Version};
 
 pub use body::{BodyDecoder, BodyStatus};
-pub use conn::{Http1Conn, Http1Event};
+pub use conn::{Http1Conn, Http1ConnParts, Http1Event};
 pub use parser::{ParseOutcome, ParseScratch, error_status, parse_request};
 pub use response::write_response;
 

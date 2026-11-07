@@ -50,8 +50,9 @@ pub struct Http1Conn {
   inflight: usize,
   max_body_len: usize,
   phase: Phase,
-  /// Exactly one element. A `Vec` and not a `Box`: moving a `Box` retags its pointee as unique,
-  /// which invalidates the header slice `view` points to; moving a `Vec` does not.
+  /// One element once a head was parsed, none before (see [`Self::scratch`]). A `Vec` and not a
+  /// `Box`: moving a `Box` retags its pointee as unique, which invalidates the header slice
+  /// `view` points to; moving a `Vec` does not.
   scratch: Vec<ParseScratch>,
   /// Points into `buf` and `scratch`; `Some` only while neither changed since it was set.
   view: Option<Http1Request<'static>>,
@@ -77,22 +78,86 @@ enum Head {
   WithBody(BodyKind, usize),
 }
 
-impl Http1Conn {
-  /// New connection.
+/// The buffers of an [`Http1Conn`], to serve another connection with: what
+/// [`Http1Conn::into_parts`] returns and [`Http1Conn::from_parts`] takes, so that a server can
+/// keep them in a pool and open connections without allocating.
+///
+/// Every buffer is empty and keeps its capacity. The default is a set of empty buffers, which a
+/// connection grows as it needs.
+#[derive(Debug, Default)]
+pub struct Http1ConnParts {
+  buf: Vec<u8>,
+  body: Vec<u8>,
+  out: Vec<u8>,
+  scratch: Vec<ParseScratch>,
+}
+
+impl Http1ConnParts {
+  /// Bytes the buffers hold room for.
   #[inline]
-  pub fn new(params: &HttpRecvParams) -> Self {
+  pub fn capacity(&self) -> usize {
+    let scratch = self.scratch.capacity().saturating_mul(size_of::<ParseScratch>());
+    self
+      .buf
+      .capacity()
+      .saturating_add(self.body.capacity())
+      .saturating_add(self.out.capacity())
+      .saturating_add(scratch)
+  }
+
+  /// Frees every byte buffer whose capacity is above `max`, so that a pool keeps none that a
+  /// large request or response grew. The parse scratch, of a fixed size, is kept.
+  #[inline]
+  pub fn free_larger_than(&mut self, max: usize) {
+    for buffer in [&mut self.buf, &mut self.body, &mut self.out] {
+      if buffer.capacity() > max {
+        *buffer = Vec::new();
+      }
+    }
+  }
+}
+
+impl Http1Conn {
+  /// New connection on the buffers of an earlier one (see [`Self::into_parts`]): it allocates
+  /// nothing until a request or a response needs more room than they have.
+  #[inline]
+  pub fn from_parts(params: &HttpRecvParams, parts: Http1ConnParts) -> Self {
+    let Http1ConnParts { mut buf, mut body, mut out, mut scratch } = parts;
+    buf.clear();
+    body.clear();
+    out.clear();
+    scratch.truncate(1);
     Self {
-      buf: Vec::new(),
+      buf,
       start: 0,
-      body: Vec::new(),
-      out: Vec::new(),
+      body,
+      out,
       inflight: 0,
       max_body_len: usize::try_from(params.max_body_len()).unwrap_or(usize::MAX),
       phase: Phase::Head,
-      scratch: alloc::vec![ParseScratch::new()],
+      scratch,
       view: None,
       closing: false,
     }
+  }
+
+  /// Ends the connection, returning its buffers emptied, capacity kept, for
+  /// [`Self::from_parts`]. What is left of its input and output is discarded.
+  ///
+  /// No view of a request survives: a request borrows the connection, which this consumes.
+  #[inline]
+  pub fn into_parts(self) -> Http1ConnParts {
+    let Self { mut buf, mut body, mut out, scratch, .. } = self;
+    buf.clear();
+    body.clear();
+    out.clear();
+    Http1ConnParts { buf, body, out, scratch }
+  }
+
+  /// New connection. Its buffers, the parse scratch included, are allocated as it needs them.
+  #[inline]
+  pub fn new(params: &HttpRecvParams) -> Self {
+    Self::from_parts(params, Http1ConnParts::default())
   }
 
   /// Buffers `input`, returning how many bytes were consumed.
@@ -288,10 +353,19 @@ impl Http1Conn {
     self.closing
   }
 
+  /// The parse scratch, made by the first head of a connection that has none. Called with no
+  /// view set, as a push would move the scratch the view points to.
+  fn scratch(scratch: &mut Vec<ParseScratch>) -> Option<&mut ParseScratch> {
+    if scratch.is_empty() {
+      scratch.push(ParseScratch::new());
+    }
+    scratch.first_mut()
+  }
+
   /// Parses the head at the front of the live input.
   fn parse_head(&mut self) -> Head {
     let input = self.buf.get(self.start..).unwrap_or_default();
-    let Some(scratch) = self.scratch.first_mut() else {
+    let Some(scratch) = Self::scratch(&mut self.scratch) else {
       return Head::Bad(StatusCode::InternalServerError);
     };
     match parse_request(input, scratch) {
@@ -314,7 +388,7 @@ impl Http1Conn {
   /// Parses the head again to set `view`, returning it.
   fn set_view(&mut self) -> crate::Result<Http1Request<'static>> {
     let input = self.buf.get(self.start..).unwrap_or_default();
-    let scratch = self.scratch.first_mut().ok_or(crate::http::HttpError::BadRequest)?;
+    let scratch = Self::scratch(&mut self.scratch).ok_or(crate::http::HttpError::BadRequest)?;
     match parse_request(input, scratch)? {
       ParseOutcome::Complete { request, .. } => {
         // SAFETY: same as in `parse_head`.
@@ -344,9 +418,9 @@ impl Http1Conn {
 mod tests {
   use crate::{
     http::{HttpRecvParams, Method, StatusCode},
-    http1::{BodyKind, Http1Conn, Http1Event},
+    http1::{BodyKind, Http1Conn, Http1ConnParts, Http1Event},
   };
-  use alloc::{vec, vec::Vec};
+  use alloc::{boxed::Box, vec, vec::Vec};
 
   const GET: &[u8] = b"GET /plaintext?x=1 HTTP/1.1\r\nHost: a\r\n\r\n";
   const POST_CL: &[u8] = b"POST /upload HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\n20";
@@ -767,5 +841,115 @@ mod tests {
     let taken = c.feed(&big).unwrap();
     assert!(taken < big.len());
     assert_eq!(c.feed(&big).unwrap(), 0);
+  }
+
+  /// GET, POST with a Content-Length and chunked, a pipelined `pair` and a closing GET, all
+  /// answered, the output taken with `spare`.
+  fn serve_all(conn: &mut Http1Conn, pair: &[u8], spare: &mut Vec<u8>) -> usize {
+    let mut answered = 0;
+    for raw in [GET, POST_CL, POST_CHUNKED, pair, CLOSE] {
+      assert_eq!(conn.feed(raw).unwrap(), raw.len());
+      answered += answer_all(conn);
+      if let Ok(out) = conn.take_output(core::mem::take(spare)) {
+        conn.advance_output(out.len());
+        *spare = out;
+      }
+    }
+    answered
+  }
+
+  // A connection made of the parts of an earlier one, all of whose buffers have reached their
+  // size, serves the same requests without allocating.
+  #[cfg(not(miri))]
+  #[test]
+  fn recycled_parts_allocate_nothing() {
+    use crate::{sync::AtomicU64, tests::_count_allocations_in};
+    use core::sync::atomic::Ordering;
+    static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+    let params = HttpRecvParams::with_default_params();
+    let pair = [GET, POST_CL].concat();
+    let mut spare = Vec::new();
+    let mut parts = Http1ConnParts::default();
+    for _ in 0..3 {
+      let mut c = Http1Conn::from_parts(&params, parts);
+      assert_eq!(serve_all(&mut c, &pair, &mut spare), 6);
+      parts = c.into_parts();
+    }
+    _count_allocations_in(&ALLOCATIONS);
+    let before = ALLOCATIONS.load(Ordering::SeqCst);
+    for _ in 0..20 {
+      let mut c = Http1Conn::from_parts(&params, parts);
+      let _ = serve_all(&mut c, &pair, &mut spare);
+      parts = c.into_parts();
+    }
+    let after = ALLOCATIONS.load(Ordering::SeqCst);
+    assert_eq!(after - before, 0, "allocations of 20 connections on recycled parts");
+  }
+
+  // Parts taken from a connection whose request view is live, or in the middle of a body, and
+  // moved around, make a connection that sees none of the earlier requests: no view, no body, no
+  // input, no output; its own requests are seen whole. Run under Miri, for the views into the
+  // recycled buffers.
+  #[test]
+  fn recycled_parts_hold_no_stale_view() {
+    fn pass(parts: Http1ConnParts) -> Http1ConnParts {
+      let boxed = Box::new(parts);
+      *boxed
+    }
+    let params = HttpRecvParams::with_default_params();
+    let second: &[u8] = b"GET /second?y=2 HTTP/1.1\r\nHost: b\r\nX: z\r\n\r\n";
+    let partial_body: &[u8] =
+      b"POST /upload HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\n12345";
+    let mut parts = Http1ConnParts::default();
+    for round in 0..3 {
+      let mut c = Http1Conn::from_parts(&params, parts);
+      assert!(c.request().is_none());
+      assert!(c.body().is_empty());
+      assert_eq!(c.poll_event(), Http1Event::NeedMore);
+      assert!(c.take_output(Vec::new()).is_err());
+      c.feed(&[POST_CL, second].concat()).unwrap();
+      assert_eq!(c.poll_event(), Http1Event::RequestReady);
+      assert_eq!(c.request().unwrap().path, "/upload");
+      assert_eq!(c.body(), b"20");
+      answer(&mut c);
+      assert_eq!(c.poll_event(), Http1Event::RequestReady);
+      let request = c.request().unwrap();
+      assert_eq!((request.path, request.query), ("/second", "y=2"));
+      assert_eq!(request.headers[1], ("X", "z"));
+      if round == 1 {
+        // In the middle of a body instead, the view cleared by the feed
+        answer(&mut c);
+        c.feed(partial_body).unwrap();
+        assert_eq!(c.poll_event(), Http1Event::NeedMore);
+      }
+      parts = pass(c.into_parts());
+    }
+    let mut c = Http1Conn::from_parts(&params, parts);
+    c.feed(GET).unwrap();
+    assert_eq!(c.poll_event(), Http1Event::RequestReady);
+    let c = Box::new(c);
+    assert_eq!(c.request().unwrap().headers[0], ("Host", "a"));
+  }
+
+  // A buffer above the cap is freed, the others keep their capacity.
+  #[test]
+  fn free_larger_than_frees_only_the_large_buffers() {
+    let params = HttpRecvParams::with_default_params();
+    let mut c = Http1Conn::new(&params);
+    let big =
+      [&b"POST /upload HTTP/1.1\r\nHost: a\r\nContent-Length: 70000\r\n\r\n"[..], &[b'x'; 70_000]]
+        .concat();
+    c.feed(&big).unwrap();
+    assert_eq!(c.poll_event(), Http1Event::RequestReady);
+    assert_eq!(c.body().len(), 70_000);
+    answer(&mut c);
+    let mut parts = c.into_parts();
+    assert!(parts.buf.capacity() >= 70_000 && parts.body.capacity() >= 70_000);
+    assert!(parts.buf.is_empty() && parts.body.is_empty() && parts.out.is_empty());
+    let out = parts.out.capacity();
+    assert!(out > 0 && out < 1024, "{out}");
+    parts.free_larger_than(1024);
+    assert_eq!((parts.buf.capacity(), parts.body.capacity(), parts.out.capacity()), (0, 0, out));
+    assert_eq!(parts.scratch.len(), 1);
   }
 }
