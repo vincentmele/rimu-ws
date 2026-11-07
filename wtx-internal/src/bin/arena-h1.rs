@@ -508,7 +508,8 @@ const BROTLI_POOL_MAX: usize = 2 << 20;
 ///
 /// A block that must be allocated gets up to an eighth more room than asked for, so that a
 /// slightly longer request later still fits. Past [`BROTLI_POOL_MAX`] the smallest blocks go back
-/// to the allocator first. Without the thread's pool (during the thread's teardown) blocks are
+/// to the allocator first, if the blocks smaller than the one freed make room for it; if they
+/// don't, the one freed goes back instead. Without the thread's pool (during the thread's teardown) blocks are
 /// plain allocations.
 #[derive(Clone, Copy, Debug, Default)]
 struct BrotliPool;
@@ -565,20 +566,21 @@ where
     let mut data = Some(data);
     let _rslt = BROTLI_FREE.try_with(|cell| {
       let mut free = cell.borrow_mut();
-      // Room is made by the smallest blocks, but not for a block smaller than all of them
+      // Room is made by evicting blocks smaller than this one, smallest first, and only if they
+      // make enough: else this one is dropped and the pool kept as it is
+      if free.bytes.saturating_add(bytes) > BROTLI_POOL_MAX {
+        let smaller: usize =
+          free.blocks.iter().filter(|el| el.bytes < bytes).map(|el| el.bytes).sum();
+        if free.bytes.saturating_sub(smaller).saturating_add(bytes) > BROTLI_POOL_MAX {
+          return;
+        }
+      }
       while free.bytes.saturating_add(bytes) > BROTLI_POOL_MAX {
-        let Some((idx, smallest)) = free
-          .blocks
-          .iter()
-          .enumerate()
-          .min_by_key(|(_, el)| el.bytes)
-          .map(|(idx, el)| (idx, el.bytes))
+        let Some(idx) =
+          free.blocks.iter().enumerate().min_by_key(|(_, el)| el.bytes).map(|(idx, _)| idx)
         else {
           break;
         };
-        if smallest >= bytes {
-          return;
-        }
         let evicted = free.blocks.swap_remove(idx);
         free.bytes = free.bytes.saturating_sub(evicted.bytes);
         // SAFETY: `drop` is the one of the block's type and capacity
@@ -822,21 +824,21 @@ mod tests {
     assert_eq!(ungzip(&out), SAMPLE.as_bytes());
   }
 
-  fn test_dataset() -> Option<VectorUsize<DatasetItem>> {
+  /// The arena dataset, or the test fails: a missing dataset must not pass for a good one.
+  fn test_dataset() -> VectorUsize<DatasetItem> {
     let path = std::env::var("DATASET_PATH")
       .unwrap_or_else(|_| "/mnt/nvme1tb/claude-tmp/arena-main/data/dataset.json".into());
     let Ok(text) = std::fs::read_to_string(&path) else {
-      eprintln!("no dataset at {path}: skipped");
-      return None;
+      panic!("no arena dataset at {path}: set DATASET_PATH");
     };
-    Some(serde_json::from_str(&text).unwrap())
+    serde_json::from_str(&text).unwrap()
   }
 
   /// The dataset's numbers are integers and stay integers: the body sizes HttpArena computes for
   /// its seven (count, m) pairs, the same bytes `arena-h2` writes.
   #[test]
   fn json_has_the_reference_sizes() {
-    let Some(dataset) = test_dataset() else { return };
+    let dataset = test_dataset();
     let pairs: [(usize, i32, usize); 7] = [
       (1, 3, 203),
       (5, 7, 888),
@@ -925,6 +927,47 @@ mod tests {
     }
   }
 
+  /// The capacities, in bytes, of the blocks of this thread's brotli pool, smallest first.
+  fn pooled_blocks() -> Vec<usize> {
+    let mut out: Vec<usize> =
+      BROTLI_FREE.with(|el| el.borrow().blocks.iter().map(|el| el.bytes).collect());
+    out.sort_unstable();
+    out
+  }
+
+  /// Blocks of `u8` of these lengths, new (the pool has none that fits them).
+  fn new_blocks(lens: &[usize]) -> Vec<BrotliBlock<u8>> {
+    lens.iter().map(|&len| brotli::Allocator::<u8>::alloc_cell(&mut BrotliPool, len)).collect()
+  }
+
+  // A full pool that can't make room for a freed block by evicting the blocks smaller than it
+  // keeps them, and drops that block: evicting them would lose them and the block both.
+  #[test]
+  fn brotli_pool_evicts_only_when_it_makes_room() {
+    std::thread::spawn(|| {
+      // 106,496 and 1,835,008 bytes are kept (1,941,504, below the cap), then 425,984 is freed
+      let [small, large, freed]: [BrotliBlock<u8>; 3] =
+        new_blocks(&[100_000, 1_800_000, 400_000]).try_into().ok().unwrap();
+      let caps = [small.buf.len(), large.buf.len(), freed.buf.len()];
+      assert!(caps[0] + caps[1] <= BROTLI_POOL_MAX && caps[1] + caps[2] > BROTLI_POOL_MAX);
+      brotli::Allocator::<u8>::free_cell(&mut BrotliPool, small);
+      brotli::Allocator::<u8>::free_cell(&mut BrotliPool, large);
+      brotli::Allocator::<u8>::free_cell(&mut BrotliPool, freed);
+      assert_eq!(pooled_blocks(), [caps[0], caps[1]]);
+      // Here evicting the two small blocks is enough: they go, smallest first, as far as needed
+      let rest: Vec<BrotliBlock<u8>> = new_blocks(&[50_000, 60_000, 150_000]);
+      let rest_caps: Vec<usize> = rest.iter().map(|el| el.buf.len()).collect();
+      for block in rest {
+        brotli::Allocator::<u8>::free_cell(&mut BrotliPool, block);
+      }
+      let pooled = pooled_blocks();
+      assert!(pooled.iter().sum::<usize>() <= BROTLI_POOL_MAX, "{pooled:?}");
+      assert!(pooled.contains(&caps[1]) && pooled.contains(&rest_caps[2]), "{pooled:?}");
+    })
+    .join()
+    .unwrap();
+  }
+
   /// Thread-local destructors that ran their encodes, see [`EncodeOnDrop`].
   static TEARDOWN_ENCODES: rimu_ws::sync::AtomicUsize = rimu_ws::sync::AtomicUsize::new(0);
 
@@ -966,7 +1009,7 @@ mod tests {
 
   #[test]
   fn dataset_json_round_trips_compressed() {
-    let Some(dataset) = test_dataset() else { return };
+    let dataset = test_dataset();
     for (count, m) in [(1, 3), (10, 2), (50, 6)] {
       let mut json = VectorUsize::new();
       write_json(&mut json, &dataset, count, m).unwrap();
