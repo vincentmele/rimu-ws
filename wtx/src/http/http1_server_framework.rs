@@ -1432,6 +1432,46 @@ mod tests {
     });
   }
 
+  // A TLS peer that resets its connection while its response is delayed ends the connection at
+  // once, as a plaintext one does: the socket is watched for the end of its input without being
+  // read, and its slot is free for the next client long before the delay (and the maximum delay)
+  // is over.
+  #[cfg(feature = "crypto-ring")]
+  #[test]
+  fn delayed_tls_response_notices_a_reset_peer() {
+    use crate::{executor::StdRuntime, net::StreamWriter as _, sync::AtomicUsize};
+    use core::sync::atomic::Ordering;
+    static ERRORS: AtomicUsize = AtomicUsize::new(0);
+    let error_cb = |err| {
+      if !matches!(err, crate::Error::TooManyConnections) {
+        let _prev = ERRORS.fetch_add(1, Ordering::Relaxed);
+      }
+    };
+    let (uri, _done) = tls_server(error_cb, core::num::NonZeroUsize::new(1), None, HS, MD);
+    StdRuntime::new().block_on(async move {
+      let mut first = tls_connect(&uri).await;
+      first.write_all(b"GET /delay/3000 HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+      std::thread::sleep(Duration::from_millis(100));
+      let begin = std::time::Instant::now();
+      socket2::SockRef::from(first.stream()).set_linger(Some(Duration::ZERO)).unwrap();
+      drop(first);
+      loop {
+        assert!(begin.elapsed() < Duration::from_secs(5), "never served");
+        let mut next = tls_connect(&uri).await;
+        next.stream().set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        if next.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n").await.is_ok()
+          && tls_read_until(&mut next, b"pong").await.is_some()
+        {
+          break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+      }
+      let elapsed = begin.elapsed();
+      assert!(elapsed < Duration::from_millis(1000), "{elapsed:?}");
+    });
+    assert_eq!(ERRORS.load(Ordering::Relaxed), 0, "a reset peer was reported as an error");
+  }
+
   // A TLS record that arrives in pieces during a delay, one byte every 1.5 s, doesn't hold the
   // delayed response back.
   #[cfg(feature = "crypto-ring")]

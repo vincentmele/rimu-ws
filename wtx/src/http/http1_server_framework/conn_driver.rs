@@ -1010,4 +1010,65 @@ mod tests {
     assert!(stream.output.ends_with(b"pong"));
     assert_eq!(stream.output.windows(4).filter(|el| el == b"pong").count(), 1);
   }
+
+  // A member in a slot an earlier member freed is woken when the group goes away, and the
+  // member that left is not: the slot holds the waker of whoever has it now.
+  #[test]
+  fn a_member_in_a_reused_slot_is_woken_by_go_away() {
+    use crate::http::http1_server_framework::conn_driver::{ConnGroup, Member};
+    use core::{sync::atomic::Ordering, task::Waker};
+    use std::{sync::Arc, task::Wake};
+    struct Count(crate::sync::AtomicUsize);
+    impl Wake for Count {
+      fn wake(self: Arc<Self>) {
+        let _prev = self.0.fetch_add(1, Ordering::SeqCst);
+      }
+    }
+    let count = || Arc::new(Count(crate::sync::AtomicUsize::new(0)));
+    let (left, other, reused) = (count(), count(), count());
+    let group = ConnGroup::default();
+    let first = Member::new(&group);
+    first.register(&Waker::from(left.clone()));
+    let second = Member::new(&group);
+    second.register(&Waker::from(other.clone()));
+    let freed = first.slot;
+    drop(first);
+    let third = Member::new(&group);
+    assert_eq!(third.slot, freed, "the freed slot was not reused");
+    third.register(&Waker::from(reused.clone()));
+    group.go_away();
+    let woken = |el: &Arc<Count>| el.0.load(Ordering::SeqCst);
+    assert_eq!((woken(&left), woken(&other), woken(&reused)), (0, 1, 1));
+    drop((second, third));
+  }
+
+  // At idle the pools keep a few of their most recent entries and at most 2 MiB each: after a
+  // burst of large transfers a quiet thread holds little. The read buffer pool is bounded in bytes
+  // while busy too.
+  #[test]
+  fn idle_pools_keep_few_bytes() {
+    use super::{ConnBuffers, OpenConn, RX_POOL, conn_pool_give, rx_pool_give};
+    use crate::collections::VectorUsize;
+    const IDLE_BYTES: usize = 2 << 20;
+    const RX_BYTES: usize = 16 << 20;
+    let conn_pool = || super::CONN_POOL.with(|el| (el.borrow().sets.len(), el.borrow().bytes));
+    let rx_pool = || {
+      RX_POOL.with(|el| {
+        let pool = el.borrow();
+        (pool.len(), pool.iter().map(VectorUsize::capacity).sum::<usize>())
+      })
+    };
+    let open = OpenConn::new();
+    for _ in 0..64 {
+      conn_pool_give(ConnBuffers { wire: Vec::with_capacity(900 << 10), ..ConnBuffers::default() });
+      rx_pool_give(VectorUsize::with_capacity(900 << 10).unwrap());
+    }
+    let (_, busy_rx) = rx_pool();
+    assert!(busy_rx <= RX_BYTES, "{busy_rx} bytes in the read buffer pool");
+    drop(open);
+    let ((sets, set_bytes), (rxs, rx_bytes)) = (conn_pool(), rx_pool());
+    assert!(sets > 0 && rxs > 0, "nothing kept for the next connection");
+    assert!(set_bytes <= IDLE_BYTES, "{sets} sets of {set_bytes} bytes kept at idle");
+    assert!(rx_bytes <= IDLE_BYTES, "{rxs} read buffers of {rx_bytes} bytes kept at idle");
+  }
 }

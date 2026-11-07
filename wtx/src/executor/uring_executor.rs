@@ -3661,6 +3661,33 @@ mod tests {
     assert_eq!(out, 7);
   }
 
+  // A task that ended gives its allocation back to the runtime's thread, and the next task of
+  // its size takes it: a server that spawns a task per connection allocates nothing for it once
+  // warm.
+  #[test]
+  fn spawned_tasks_reuse_the_allocations_of_ended_ones() {
+    use crate::{sync::AtomicU64, tests::_count_allocations_in};
+    use core::sync::atomic::Ordering;
+    static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+    let task = |seed: u8| async move {
+      let state = [seed; 4096];
+      yield_once().await;
+      core::hint::black_box(&state)[4095]
+    };
+    let allocations = UringRuntime::new().unwrap().block_on(async move {
+      for seed in 0..4 {
+        assert_eq!(super::spawn_on_current(task(seed)).await.unwrap(), seed);
+      }
+      _count_allocations_in(&ALLOCATIONS);
+      let before = ALLOCATIONS.load(Ordering::SeqCst);
+      for seed in 0..100 {
+        assert_eq!(super::spawn_on_current(task(seed)).await.unwrap(), seed);
+      }
+      ALLOCATIONS.load(Ordering::SeqCst) - before
+    });
+    assert_eq!(allocations, 0, "allocations of 100 spawned tasks");
+  }
+
   async fn yield_once() {
     let mut yielded = false;
     poll_fn(|cx| {

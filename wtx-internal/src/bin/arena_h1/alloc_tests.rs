@@ -1,6 +1,7 @@
 //! Allocation tests of the arena-h1 servers, after a warm-up, on the server's runtime thread:
 //! a keep-alive connection's requests allocate nothing (steady state), and neither does opening,
-//! serving and closing a connection (churn), but for the share of the executor and of TLS.
+//! serving and closing a connection (churn), accept and TLS handshake included, but for what the
+//! crypto backend allocates inside its RSA signature (see [`CRYPTO_PER_HANDSHAKE`]).
 //!
 //! A counting global allocator counts the allocations of the threads that were told to (the
 //! runtime thread of each test server, from its local-runtime callback), each server in its own
@@ -170,10 +171,16 @@ fn cert_dir() -> String {
 
 /// A one-runtime plaintext arena server whose runtime thread is counted; returns its address.
 fn plain_server(counts: &'static Counts) -> String {
+  plain_server_counted(counts, true)
+}
+
+/// [`plain_server`], with its runtime thread counted in `counts` only if `counted`.
+fn plain_server_counted(counts: &'static Counts, counted: bool) -> String {
   let addr = free_addr();
   let server_addr = addr.clone();
   let _jh = std::thread::spawn(move || {
-    serve_plain(&server_addr, NonZeroUsize::new(1), counted_runtime(counts))
+    let rc = counted_runtime(counts);
+    serve_plain(&server_addr, NonZeroUsize::new(1), move || if counted { rc() } else { runtime() })
   });
   for _ in 0..500 {
     if std::net::TcpStream::connect(&addr).is_ok() {
@@ -693,24 +700,31 @@ fn brotli_pool_serves_the_rotation_after_a_sweep() {
 //
 // Two cases. `Beside`: another connection stays open on the thread meanwhile, as under a load,
 // where a thread serves many. `Alone`: the thread has no other connection, and drops to none
-// between two of them, which is when the pools trim themselves: the driver's to a few sets, the
-// executor's send pool to nothing. The driver's buffers go through that send pool (an owned send
-// swaps the buffer sent for one of the pool's), so the executor's trim costs the core and the
-// driver an allocation or a few per connection, which D3 owns: `Alone` is held to zero once D3
-// keeps send buffers at idle (`connection_churn_alone_allocates_nothing`, ignored until then).
+// between two of them, which is when the pools trim themselves (the driver's, the executor's and
+// TLS's) to a few entries: enough for connections that come one after the other.
+//
+// Counting is shown to be live on the server's thread: the warm-up, which fills the pools, must
+// count allocations (see `assert_counted`), else a thread that is not counted would pass.
 
 /// Connections opened before counting, so that the thread's pools have filled.
 const CHURN_WARMUP: usize = 30;
 /// Connections counted.
 const CHURN_CONNS: usize = 100;
 
-/// Owners a churn test lets allocate, per connection: D3's (the executor's task of the connection
-/// and TLS state). D3 empties this, and every churn test then holds the whole connection to zero.
-const CHURN_ALLOWED: &[Owner] = &[Owner::Executor, Owner::Tls];
+/// Owners a churn test lets allocate, per connection: none, the whole connection is held to zero,
+/// but for [`CRYPTO_PER_HANDSHAKE`].
+const CHURN_ALLOWED: &[Owner] = &[];
+
+/// What the crypto backend (ring) allocates inside one RSA signature, the server's
+/// CertificateVerify: its big-number arithmetic boxes its limbs (`BoxedLimbs`), 9 of them per
+/// signature with the arena's 2048-bit key. That is ring's own code, which cannot be changed without
+/// forking it, so a TLS connection is held to exactly this many and no more; a plaintext one to 0.
+const CRYPTO_PER_HANDSHAKE: u64 = 9;
 
 /// Who an allocation is charged to: the innermost frame of its backtrace that belongs to one of
 /// these. D2 owns the HTTP/1.1 core, the framework, its connection driver and the arena's code; D3
 /// the executor (a connection's task, its timers and sockets) and TLS (a connection's session).
+/// The crypto backend's own frames are charged to it, not to the TLS code that called it.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Owner {
   Core,
@@ -719,6 +733,8 @@ enum Owner {
   App,
   Executor,
   Tls,
+  /// Inside the crypto backend (ring).
+  Crypto,
   /// None of the above: the site is the innermost frame outside the standard library.
   Other,
 }
@@ -726,7 +742,8 @@ enum Owner {
 impl Owner {
   /// The owner of a frame of the function `path` (without its generics), if any.
   fn of_path(path: &str) -> Option<Self> {
-    const OWNERS: [(&str, Owner); 6] = [
+    const OWNERS: [(&str, Owner); 7] = [
+      ("ring::", Owner::Crypto),
       ("rimu_ws::http1::", Owner::Core),
       ("rimu_ws::http::http1_server_framework::conn_driver::", Owner::Driver),
       ("rimu_ws::http::http1_server_framework::", Owner::Framework),
@@ -781,6 +798,8 @@ struct Churn {
   allocs: u64,
   bytes: u64,
   conns: usize,
+  /// Allocations of the warm-up: never 0 on a thread that is counted, as it fills the pools.
+  warm_allocs: u64,
   /// Allocations and bytes by owner and site.
   sites: BTreeMap<(Owner, String), (u64, u64)>,
 }
@@ -871,9 +890,11 @@ where
     send_cases(&mut conn, cases);
     let _ = conn(Op::Close);
   };
+  let warm_before = counts.snapshot();
   for _ in 0..warm {
     serve_one();
   }
+  let warm_allocs = counts.snapshot().0 - warm_before.0;
   // The symbols are loaded once here, not in the middle of a connection of the server
   let _ = std::backtrace::Backtrace::force_capture().to_string();
   counts.sites.lock().unwrap().clear();
@@ -896,14 +917,19 @@ where
     elem.0 += 1;
     elem.1 += bytes;
   }
-  Churn { allocs: after.0 - before.0, bytes: after.1 - before.1, conns, sites }
+  Churn { allocs: after.0 - before.0, bytes: after.1 - before.1, conns, sites, warm_allocs }
 }
 
 /// Churn of `cases` on a new plaintext server. A connection half-closes, and waits for the
 /// server to close it.
 fn churn_plain(cases: &[Case], neighbor: Neighbor) -> Churn {
+  churn_plain_counted(cases, neighbor, true)
+}
+
+/// [`churn_plain`] on a server whose thread is counted only if `counted`.
+fn churn_plain_counted(cases: &[Case], neighbor: Neighbor, counted: bool) -> Churn {
   let counts = Counts::leak();
-  let addr = plain_server(counts);
+  let addr = plain_server_counted(counts, counted);
   let open = || {
     let mut stream = std::net::TcpStream::connect(&addr).unwrap();
     stream.set_nodelay(true).unwrap();
@@ -1037,8 +1063,18 @@ fn churn_table() {
   }
 }
 
+/// Panics unless the server's thread was counted: its warm-up, which fills every pool, allocated.
+/// A window of 0 allocations on a thread nobody counts would pass every churn test.
+fn assert_counted(churn: &Churn) {
+  assert!(
+    churn.warm_allocs > 0,
+    "the warm-up of a fresh server counted no allocation: its thread is not counted"
+  );
+}
+
 /// Asserts that the connections of `profile` allocate nothing on the server's thread after the
-/// warm-up, but for the owners in [`CHURN_ALLOWED`], whose share is printed.
+/// warm-up, but for the owners in [`CHURN_ALLOWED`] and, over TLS, the crypto backend's
+/// [`CRYPTO_PER_HANDSHAKE`] per connection.
 fn assert_churn_free(profile: &str, neighbor: Neighbor) {
   let Some((name, cases)) = churn_profiles().into_iter().find(|el| el.0 == profile) else {
     panic!("no case of the profile {profile}");
@@ -1046,12 +1082,28 @@ fn assert_churn_free(profile: &str, neighbor: Neighbor) {
   let churn = run_churn(&name, &cases, neighbor);
   let report = churn.report(&format!("{name} ({neighbor:?})"));
   eprintln!("{report}");
-  assert!(churn.allocs > 0 || churn.sites.is_empty());
+  assert_counted(&churn);
+  let crypto = churn.owners().get(&Owner::Crypto).map_or(0, |el| el.0);
+  let crypto_allowed = if cases[0].tls { CRYPTO_PER_HANDSHAKE * churn.conns as u64 } else { 0 };
+  assert_eq!(crypto, crypto_allowed, "the crypto backend's allocations:\n{report}");
   assert_eq!(
-    churn.charged(),
+    churn.charged() - crypto,
     0,
     "allocations outside {CHURN_ALLOWED:?} after the warm-up:\n{report}"
   );
+  assert_eq!(churn.allocs, crypto_allowed, "allocations after the warm-up:\n{report}");
+}
+
+// The check that counting is live fails on a server whose thread is not counted: there, the
+// churn would count nothing, warm-up or not.
+#[test]
+fn an_uncounted_server_fails_the_churn_check() {
+  let (_, cases) = churn_profiles().into_iter().find(|el| el.0 == "baseline").unwrap();
+  let churn = churn_plain_counted(&cases, Neighbor::Beside, false);
+  assert_eq!((churn.allocs, churn.warm_allocs), (0, 0));
+  assert!(std::panic::catch_unwind(|| assert_counted(&churn)).is_err());
+  let counted = churn_plain_counted(&cases, Neighbor::Beside, true);
+  assert_counted(&counted);
 }
 
 #[test]
@@ -1095,7 +1147,6 @@ fn echo_tls_connection_churn_allocates_nothing() {
 
 // A thread with no other connection: see the comment above `CHURN_WARMUP`.
 #[test]
-#[ignore = "D3: the executor empties its send pool when its thread has no connection open"]
 fn connection_churn_alone_allocates_nothing() {
   need_dataset();
   for (name, _) in churn_profiles() {
