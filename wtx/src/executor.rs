@@ -21,7 +21,7 @@ pub use tokio_executor::{TokioExecutor, TokioSpawnFutureFuture};
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 pub(crate) use uring_executor::UringSleep;
 #[cfg(all(test, feature = "io-uring", target_os = "linux"))]
-pub(crate) use uring_executor::spawn_on_current;
+pub(crate) use uring_executor::{sqes_pushed, spawn_on_current};
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 pub use uring_executor::{
   UringExecutor, UringJoinHandle, UringParams, UringReadHalf, UringRuntime, UringStats,

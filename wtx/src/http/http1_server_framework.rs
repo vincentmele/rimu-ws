@@ -945,6 +945,21 @@ mod tests {
         res.body_mut().extend_from_slice(ms.as_bytes());
         Ok(())
       })
+      // What the runtime holds: timers pending, timer slots, waiting readers, open connections
+      // and submissions queued so far.
+      .get("/stats", |_, _, res| {
+        let stats = crate::executor::uring_stats().unwrap_or_default();
+        let sqes = crate::executor::sqes_pushed().unwrap_or_default();
+        let line = std::format!(
+          "{} {} {} {} {sqes}",
+          stats.timers_pending,
+          stats.timer_slots,
+          stats.waiting_readers,
+          stats.open_connections
+        );
+        res.body_mut().extend_from_slice(line.as_bytes());
+        Ok(())
+      })
       .get("/boom", |_, _, _| Err(crate::Error::ClosedHttpConnection))
       .get("/teapot", |_, _, res| {
         res.set_status(StatusCode::Created);
@@ -1402,7 +1417,8 @@ mod tests {
 
   // Over TLS a delayed response doesn't read: the TLS reader can't be stopped in the middle of
   // a record, and what it reads could close the stream for writing too. A peer that resets the
-  // connection holds it for the delay, which the server's maximum bounds.
+  // connection is still noticed (see `delayed_tls_response_notices_a_reset_peer`), and in any case
+  // held no longer than the server's maximum delay, which cuts the one asked for here.
   #[cfg(feature = "crypto-ring")]
   #[test]
   fn delayed_tls_response_of_a_reset_peer_is_bounded_by_max_delay() {
@@ -1860,6 +1876,96 @@ mod tests {
         assert!(elapsed >= Duration::from_millis(295), "{together}: {elapsed:?}");
       }
     });
+  }
+
+  /// `/stats` of a server: timers pending, timer slots, waiting readers, open connections and
+  /// submissions queued so far (the stats connection itself among them).
+  fn stats(addr: &str) -> [u64; 5] {
+    let mut stream = connect(addr);
+    stream.write_all(b"GET /stats HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+    let body = String::from_utf8(read_response(&mut stream).1).unwrap();
+    let mut out = [0; 5];
+    for (slot, value) in out.iter_mut().zip(body.split(' ')) {
+      *slot = value.parse().unwrap();
+    }
+    out
+  }
+
+  /// `/stats` once the server has no timer pending and only the stats connection open, within
+  /// 3 s: well before a timer of a 5 s delay would fire on its own.
+  fn settled_stats(addr: &str) -> [u64; 5] {
+    let begin = std::time::Instant::now();
+    loop {
+      let elem = stats(addr);
+      if elem[0] == 0 && elem[3] == 1 {
+        return elem;
+      }
+      assert!(begin.elapsed() < Duration::from_secs(3), "never settled: {elem:?}");
+      std::thread::sleep(Duration::from_millis(50));
+    }
+  }
+
+  // Delayed responses whose peers vanish, resetting or closing, leave nothing behind: every timer
+  // is removed, those of reset peers long before they would have fired (the removal of a dropped
+  // timer confirmed by the kernel), every connection closed, and a second round reuses the timer
+  // slots of the first instead of adding to them.
+  #[test]
+  fn delays_whose_peers_vanish_leave_no_timers_behind() {
+    let addr = server(|_| {});
+    let round = || {
+      // A reset ends its connection at once, a close after its (short) delay: a half-closed peer
+      // still gets its response.
+      let streams: Vec<_> = (0..48)
+        .map(|idx| {
+          let mut stream = connect(&addr);
+          let ms = if idx % 3 == 0 { 5000 } else { 300 };
+          let req = std::format!("GET /delay/{ms} HTTP/1.1\r\nHost: x\r\n\r\n");
+          stream.write_all(req.as_bytes()).unwrap();
+          stream
+        })
+        .collect();
+      std::thread::sleep(Duration::from_millis(100));
+      let busy = stats(&addr);
+      assert!(busy[0] >= 48, "{busy:?}");
+      for (idx, stream) in streams.into_iter().enumerate() {
+        match idx % 3 {
+          0 => reset(stream),
+          1 => stream.shutdown(std::net::Shutdown::Both).unwrap(),
+          _ => drop(stream),
+        }
+      }
+      settled_stats(&addr)
+    };
+    let first = round();
+    let second = round();
+    // The stats connection's own reader, at most
+    assert!(first[2] <= 1 && second[2] <= 1, "readers left waiting: {first:?} {second:?}");
+    assert!(first[1] <= 64, "{first:?}");
+    assert_eq!(first[1], second[1], "the second round added timer slots: {first:?} {second:?}");
+  }
+
+  // A delay that is woken again and again by input (each time a new `readable` future is made)
+  // queues no submission per wake and keeps one timer.
+  #[test]
+  fn waking_a_delay_again_and_again_submits_nothing() {
+    let addr = server(|_| {});
+    let mut stream = connect(&addr);
+    stream.write_all(b"GET /delay/1500 HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    let before = stats(&addr);
+    // An incomplete head, one byte at a time: each wakes the delayed connection once
+    for byte in b"GET /ping HTTP/1.1\r\nHost: x\r\nX-Padding: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+      stream.write_all(&[*byte]).unwrap();
+      std::thread::sleep(Duration::from_millis(5));
+    }
+    let after = stats(&addr);
+    // The stats connections: a recv, a send and a close each, give or take a cancel
+    assert!(after[4] - before[4] <= 8, "{before:?} {after:?}");
+    assert_eq!((before[0], after[0]), (1, 1), "{before:?} {after:?}");
+    assert!(after[2] <= 2, "{after:?}");
+    stream.write_all(b"\r\n\r\n").unwrap();
+    assert_eq!(read_response(&mut stream).1, b"1500");
+    assert_eq!(read_response(&mut stream).1, b"pong");
   }
 
   // What arrives while a response is delayed is kept: a request pipelined during the delay is

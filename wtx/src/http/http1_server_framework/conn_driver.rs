@@ -12,8 +12,9 @@
 //!    is only valid right after `RequestReady`.
 //! 3. `feed` may take fewer bytes than offered when its buffer is full. The rest is fed again
 //!    after the requests it made room for were answered.
-//! 4. While a response is delayed a plaintext socket is still watched: what arrives is kept for
-//!    after the response, and a peer that goes away ends the connection at once.
+//! 4. While a response is delayed the socket is still watched: a peer that goes away ends the
+//!    connection at once. A plaintext one is read meanwhile, and what arrives is kept for after the
+//!    response; a TLS one is not read, only watched for the end of its input.
 //! 5. A connection with a first-head deadline (TLS) races it in every wait until the head of its
 //!    first request is parsed.
 
@@ -421,16 +422,32 @@ impl Driver {
   /// delay runs out, and the delayed response and those of the complete requests received before
   /// leave before the connection closes.
   ///
-  /// A stream that reads only by awaiting (TLS) is not watched: its reads can't be stopped in the
+  /// A stream that reads only by awaiting (TLS) is not read: its reads can't be stopped in the
   /// middle of a record, so one that arrives in pieces (or a KeyUpdate, after which the read waits
-  /// for data) would hold the response back for as long as the peer likes. Its delayed response
-  /// leaves on time, and a peer that went away meanwhile is noticed after it; the server's
-  /// maximum delay bounds how long such a connection is held.
+  /// for data) would hold the response back for as long as the peer likes. It is watched for the
+  /// end of its input instead ([`StreamReader::peer_ended`]), which reads nothing: a reset ends the
+  /// connection at once, as above, and a half-close is let be, the delayed response leaving on
+  /// time and what was sent before being read after it.
   async fn sleep_watching<S>(&mut self, stream: &mut S, delay: Duration) -> crate::Result<()>
   where
     S: StreamReader,
   {
     let mut sleep = Sleep::new(delay)?;
+    if self.reads_async && !self.peer_eof {
+      let ended = {
+        let mut ended = pin!(stream.peer_ended());
+        poll_fn(|cx| {
+          if let Poll::Ready(rslt) = Pin::new(&mut sleep).poll(cx) {
+            return Poll::Ready(rslt.map(|()| false));
+          }
+          ended.as_mut().poll(cx).map(|rslt| rslt.map(|()| true))
+        })
+        .await?
+      };
+      if !ended {
+        return Ok(());
+      }
+    }
     loop {
       // Not watched (see above), nothing more to come, or enough is waiting to be fed: the peer
       // is slowed down by TCP until the response is out.

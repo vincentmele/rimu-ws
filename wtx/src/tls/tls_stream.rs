@@ -456,6 +456,12 @@ where
   /// The stream's own readiness, but ready at once when user space holds input the socket can't
   /// show: decrypted bytes not read yet, or a whole record read from the socket along with an
   /// earlier one (a `read` decrypts one record).
+  /// The stream's own: records the peer sent before it ended its side stay to be read.
+  #[inline]
+  fn peer_ended(&mut self) -> impl Future<Output = crate::Result<()>> {
+    self.stream.peer_ended()
+  }
+
   #[inline]
   fn readable(&mut self) -> impl Future<Output = crate::Result<()>> {
     let buffered = !TCX::TY.is_plain_text() && !self.kernel_tls && self.has_buffered_input();

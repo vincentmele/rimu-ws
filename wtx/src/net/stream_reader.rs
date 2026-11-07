@@ -47,6 +47,15 @@ pub trait StreamReader: StreamCommon {
     Err(std::io::Error::from(std::io::ErrorKind::Unsupported).into())
   }
 
+  /// Resolves once the peer is known to have stopped sending, without reading anything: `Ok`
+  /// once it ended its side of the connection, an error once the connection failed or was reset.
+  /// Lets a caller that can't read now (a TLS stream while its response is delayed) notice a peer
+  /// that went away. Whatever arrived before stays to be read. The default never resolves.
+  #[inline]
+  fn peer_ended(&mut self) -> impl Future<Output = crate::Result<()>> {
+    core::future::pending()
+  }
+
   /// Reads and at the same time discards exactly `len` bytes.
   #[inline]
   fn read_skip(&mut self, len: usize) -> impl Future<Output = crate::Result<()>> {
@@ -91,6 +100,11 @@ where
   #[inline]
   fn read_kernel_tls_record(&mut self, buffer: &mut [u8]) -> crate::Result<(u8, usize)> {
     (**self).read_kernel_tls_record(buffer)
+  }
+
+  #[inline]
+  fn peer_ended(&mut self) -> impl Future<Output = crate::Result<()>> {
+    (**self).peer_ended()
   }
 }
 

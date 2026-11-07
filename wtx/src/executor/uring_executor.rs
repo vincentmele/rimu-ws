@@ -366,6 +366,22 @@ pub struct UringStats {
   pub task_panics: u64,
   /// Connections cut off by a handshake, idle or close timeout.
   pub timeouts: u64,
+  /// Timers ([`crate::futures::Sleep`]) on the ring now: armed, or dropped and waiting for the
+  /// kernel to confirm their removal. Back to 0 once nothing waits.
+  pub timers_pending: u64,
+  /// Slots of the table of timers, which follows the most timers ever pending at once.
+  pub timer_slots: u64,
+  /// Open connections with a reader waiting on them (a read, `readable` or `peer_ended`): at most
+  /// one each, however many times their futures are made again.
+  pub waiting_readers: u64,
+}
+
+/// Submissions the runtime running on this thread has queued, if any.
+#[cfg(test)]
+pub(crate) fn sqes_pushed() -> Option<u64> {
+  let reactor = CURRENT.with(Cell::get);
+  // SAFETY: set by `block_on`, which outlives everything it polls
+  unsafe { reactor.as_ref() }.map(|el| el.sqes_pushed.get())
 }
 
 /// The [`UringStats`] of the runtime running on this thread, if any.
@@ -836,6 +852,11 @@ impl StreamReader for UringTcpStream {
     readable(self.conn)
   }
 
+  #[inline]
+  fn peer_ended(&mut self) -> impl Future<Output = crate::Result<()>> {
+    peer_ended(self.conn)
+  }
+
   #[cfg(feature = "tls")]
   #[inline]
   fn read_kernel_tls_record(&mut self, buffer: &mut [u8]) -> crate::Result<(u8, usize)> {
@@ -972,6 +993,11 @@ impl StreamReader for UringReadHalf {
   #[inline]
   fn readable(&mut self) -> impl Future<Output = crate::Result<()>> {
     readable(self.conn)
+  }
+
+  #[inline]
+  fn peer_ended(&mut self) -> impl Future<Output = crate::Result<()>> {
+    peer_ended(self.conn)
   }
 
   #[cfg(feature = "tls")]
@@ -1244,6 +1270,12 @@ fn read_kernel_tls_record(conn: ConnRef, buffer: &mut [u8]) -> crate::Result<(u8
 fn readable(conn: ConnRef) -> impl Future<Output = crate::Result<()>> {
   poll_fn(move |cx| {
     poll_own_reactor(conn.runtime, |reactor| reactor.poll_readable(conn.idx, conn.generation, cx))
+  })
+}
+
+fn peer_ended(conn: ConnRef) -> impl Future<Output = crate::Result<()>> {
+  poll_fn(move |cx| {
+    poll_own_reactor(conn.runtime, |reactor| reactor.poll_peer_ended(conn.idx, conn.generation, cx))
   })
 }
 
@@ -1787,6 +1819,9 @@ struct Reactor {
   doorbell: core::cell::UnsafeCell<u64>,
   #[cfg(test)]
   accept_arms: Cell<usize>,
+  // Submissions queued, for tests that pin a path as submitting nothing
+  #[cfg(test)]
+  sqes_pushed: Cell<u64>,
   // Accepted sockets closed because setting them up failed
   #[cfg(test)]
   accept_setup_failures: Cell<usize>,
@@ -1936,6 +1971,8 @@ impl Reactor {
       #[cfg(test)]
       accept_arms: Cell::new(0),
       #[cfg(test)]
+      sqes_pushed: Cell::new(0),
+      #[cfg(test)]
       accept_setup_failures: Cell::new(0),
       backoff_ts: types::Timespec::new().nsec(100_000_000),
       tick_ts: types::Timespec::from(period),
@@ -1971,6 +2008,9 @@ impl Reactor {
     let counters = &self.counters;
     let open = self.conns.borrow().len().saturating_sub(self.free_conns.borrow().len());
     let cq_overflows = core::mem::ManuallyDrop::new(self.ring.borrow_mut().completion()).overflow();
+    let sleeps = self.sleeps.borrow();
+    let pending = |el: &&SleepSlot| matches!(el.state, SleepState::Armed | SleepState::Dropped);
+    let waiting = |el: &&Conn| el.in_use && el.reader.is_some();
     UringStats {
       accepted: counters.accepted.get(),
       accept_errors: counters.accept_errors.get(),
@@ -1983,6 +2023,9 @@ impl Reactor {
       submit_errors: counters.submit_errors.get(),
       task_panics: counters.task_panics.get(),
       timeouts: counters.timeouts.get(),
+      timers_pending: sleeps.iter().filter(pending).count() as u64,
+      timer_slots: sleeps.len() as u64,
+      waiting_readers: self.conns.borrow().iter().filter(waiting).count() as u64,
     }
   }
 
@@ -2345,6 +2388,8 @@ impl Reactor {
   // submit and a retry, is handled out of line.
   #[inline(always)]
   fn push_sqe(&self, sqe: &squeue::Entry) {
+    #[cfg(test)]
+    self.sqes_pushed.set(self.sqes_pushed.get().wrapping_add(1));
     let mut ring = self.ring.borrow_mut();
     // SAFETY: every buffer an entry points to lives in a `Conn` or `BufRing` until its completion
     if unsafe { ring.submission().push(sqe) }.is_err() {
@@ -2943,6 +2988,30 @@ impl Reactor {
       return Poll::Ready(Err(io_err(libc::EBADF)));
     };
     if conn.rx_off as usize != conn.rx.len() || conn.rx_err != 0 || conn.rx_eof {
+      return Poll::Ready(Ok(()));
+    }
+    deferred.stale[0] = set_waker(&mut conn.reader, cx);
+    Poll::Pending
+  }
+
+  /// Ready once the peer ended its side (`Ok`) or the connection failed (its error), whatever is
+  /// left to read. A connection whose receive is paused (see `pause_recv`) notices neither until
+  /// its reads take it under the mark again.
+  fn poll_peer_ended(
+    &self,
+    idx: u32,
+    generation: u32,
+    cx: &mut Context<'_>,
+  ) -> Poll<crate::Result<()>> {
+    let mut deferred = Deferred::default();
+    let mut conns = self.conns.borrow_mut();
+    let Some(conn) = conns.get_mut(idx as usize).filter(|el| el.generation == generation) else {
+      return Poll::Ready(Err(io_err(libc::EBADF)));
+    };
+    if conn.rx_err != 0 {
+      return Poll::Ready(Err(io_err(conn.rx_err.into())));
+    }
+    if conn.rx_eof {
       return Poll::Ready(Ok(()));
     }
     deferred.stale[0] = set_waker(&mut conn.reader, cx);
