@@ -113,14 +113,11 @@ pub struct Http1Res {
 }
 
 impl Http1Res {
-  pub(crate) fn new(body: Vec<u8>) -> Self {
-    Self {
-      body,
-      content_type: "text/plain",
-      delay: None,
-      headers: Vec::new(),
-      status: StatusCode::Ok,
-    }
+  /// A response written into the buffers of an earlier one (see [`Self::take_parts`]).
+  pub(crate) fn new(mut body: Vec<u8>, mut headers: Vec<u8>) -> Self {
+    body.clear();
+    headers.clear();
+    Self { body, content_type: "text/plain", delay: None, headers, status: StatusCode::Ok }
   }
 
   /// Time the connection waits, without blocking its thread, before this response is sent.
@@ -205,8 +202,9 @@ impl Http1Res {
     self.status = StatusCode::Ok;
   }
 
-  pub(crate) fn take_body(&mut self) -> Vec<u8> {
-    core::mem::take(&mut self.body)
+  /// The body and header buffers, for another connection's responses.
+  pub(crate) fn take_parts(&mut self) -> (Vec<u8>, Vec<u8>) {
+    (core::mem::take(&mut self.body), core::mem::take(&mut self.headers))
   }
 }
 

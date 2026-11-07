@@ -21,11 +21,11 @@ use crate::{
   collections::VectorUsize,
   futures::Sleep,
   http::{HttpRecvParams, http1_server_framework::Http1Res},
-  http1::{Http1Conn, Http1Event, Http1Request},
+  http1::{Http1Conn, Http1ConnParts, Http1Event, Http1Request},
   net::{NetError, StreamReader, StreamWriter, TryRead},
   tls::TlsError,
 };
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::vec::Vec;
 use core::{
   cell::{Cell, RefCell},
   future::poll_fn,
@@ -63,12 +63,16 @@ pub(crate) trait Http1Service {
 
 /// The connections one server drives on one thread, for that server's shutdown to reach: other
 /// servers on the thread keep serving.
+///
+/// Its members have slots, which the next members reuse: once it has held as many connections
+/// at once, joining and leaving it allocate nothing.
 #[derive(Debug, Default)]
 pub(crate) struct ConnGroup {
+  /// Slots of `waiting` no member has.
+  free: RefCell<Vec<usize>>,
   going_away: Cell<bool>,
-  next_id: Cell<u64>,
-  /// Connections waiting for a request, to be woken when the group goes away.
-  waiting: RefCell<BTreeMap<u64, Waker>>,
+  /// By slot, the connections waiting for a request, to be woken when the group goes away.
+  waiting: RefCell<Vec<Option<Waker>>>,
 }
 
 impl ConnGroup {
@@ -76,30 +80,55 @@ impl ConnGroup {
   /// one close after answering it.
   pub(crate) fn go_away(&self) {
     self.going_away.set(true);
-    let waiting = mem::take(&mut *self.waiting.borrow_mut());
-    for waker in waiting.into_values() {
-      waker.wake();
+    let mut slot = 0;
+    loop {
+      // Not borrowed while it wakes: a waker may reach the group.
+      let waker = {
+        let mut waiting = self.waiting.borrow_mut();
+        let Some(elem) = waiting.get_mut(slot) else {
+          break;
+        };
+        elem.take()
+      };
+      if let Some(elem) = waker {
+        elem.wake();
+      }
+      slot = slot.wrapping_add(1);
     }
   }
 }
 
-/// A connection's entry in its group, removed when the connection ends.
+/// A connection's slot in its group, freed when the connection ends.
 struct Member<'group> {
   group: &'group ConnGroup,
-  id: u64,
+  slot: usize,
 }
 
 impl<'group> Member<'group> {
   fn new(group: &'group ConnGroup) -> Self {
-    let id = group.next_id.get();
-    group.next_id.set(id.wrapping_add(1));
-    Self { group, id }
+    let slot = group.free.borrow_mut().pop().unwrap_or_else(|| {
+      let mut waiting = group.waiting.borrow_mut();
+      waiting.push(None);
+      waiting.len().wrapping_sub(1)
+    });
+    Self { group, slot }
+  }
+
+  /// Has `waker` woken when the group goes away.
+  fn register(&self, waker: &Waker) {
+    let mut waiting = self.group.waiting.borrow_mut();
+    if let Some(elem) = waiting.get_mut(self.slot)
+      && elem.as_ref().is_none_or(|el| !el.will_wake(waker))
+    {
+      *elem = Some(waker.clone());
+    }
   }
 }
 
 impl Drop for Member<'_> {
   fn drop(&mut self) {
-    let _waker = self.group.waiting.borrow_mut().remove(&self.id);
+    let _waker = self.group.waiting.borrow_mut().get_mut(self.slot).and_then(Option::take);
+    self.group.free.borrow_mut().push(self.slot);
   }
 }
 
@@ -116,28 +145,27 @@ where
   S: StreamReader + StreamWriter,
   V: Http1Service,
 {
+  // Declared first, dropped last: the driver's buffers are in the pools by then.
   let _open = OpenConn::new();
+  let deadline = params.first_head.map(Sleep::new).transpose()?;
+  let buffers = conn_pool_take();
   let mut driver = Driver {
     answered: 0,
-    conn: Http1Conn::new(&params.hrc),
-    deadline: params.first_head.map(Sleep::new).transpose()?,
+    conn: Http1Conn::from_parts(&params.hrc, buffers.core),
+    deadline,
     max_delay: params.max_delay,
     midreq: false,
     offset: 0,
     peer_eof: false,
     queued: 0,
     reads_async: false,
-    res: Http1Res::new(bytes_pool_take()),
+    res: Http1Res::new(buffers.res_body, buffers.res_headers),
     rx: VectorUsize::new(),
-    spare: bytes_pool_take(),
-    wire: Vec::new(),
+    spare: buffers.spare,
+    wire: buffers.wire,
   };
   let member = group.map(Member::new);
-  let rslt = driver.run(stream, service, member.as_ref()).await;
-  rx_pool_give(mem::take(&mut driver.rx));
-  bytes_pool_give(mem::take(&mut driver.spare));
-  bytes_pool_give(driver.res.take_body());
-  rslt
+  driver.run(stream, service, member.as_ref()).await
 }
 
 struct Driver {
@@ -165,6 +193,23 @@ struct Driver {
   /// Output taken out of the core to splice headers into responses, ahead of what the core still
   /// holds.
   wire: Vec<u8>,
+}
+
+/// The buffers go back to the thread's pools, also when the connection's future is dropped
+/// before its end.
+impl Drop for Driver {
+  fn drop(&mut self) {
+    rx_pool_give(mem::take(&mut self.rx));
+    let conn = mem::replace(&mut self.conn, Http1Conn::new(&HttpRecvParams::with_default_params()));
+    let (res_body, res_headers) = self.res.take_parts();
+    conn_pool_give(ConnBuffers {
+      core: conn.into_parts(),
+      res_body,
+      res_headers,
+      spare: mem::take(&mut self.spare),
+      wire: mem::take(&mut self.wire),
+    });
+  }
 }
 
 impl Driver {
@@ -480,11 +525,7 @@ impl Driver {
       if let Some(member) = member
         && idle
       {
-        let mut waiting = member.group.waiting.borrow_mut();
-        let replace = waiting.get(&member.id).is_none_or(|el| !el.will_wake(cx.waker()));
-        if replace {
-          let _prev = waiting.insert(member.id, cx.waker().clone());
-        }
+        member.register(cx.waker());
       }
       if idle && going_away() {
         return Poll::Ready(Ok(true));
@@ -552,19 +593,55 @@ pub(crate) fn peer_gone(err: &crate::Error) -> bool {
 }
 
 /// Buffers released on this thread, most recent last, so the next connection uses ones that are
-/// still in cache. Buffers above `POOL_BUFFER_MAX` are freed.
+/// still in cache. A pool holds at most `POOL_MAX` entries, and buffers above `POOL_BUFFER_MAX`
+/// are freed, not kept.
 const POOL_MAX: usize = 64;
 const POOL_BUFFER_MAX: usize = 1 << 20;
+/// Bytes the connection pool of a thread holds at most: a set of buffers that would go past it is
+/// freed.
+const CONN_POOL_BYTES_MAX: usize = 16 << 20;
+/// Entries a pool keeps once its thread has no connection open: the most recent, enough for
+/// connections that come one after the other. The others, which after a burst would only hold its
+/// largest buffers, are freed.
+const POOL_IDLE_KEEP: usize = 4;
 
 std::thread_local! {
-  static BYTES_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+  static CONN_POOL: RefCell<ConnPool> =
+    const { RefCell::new(ConnPool { bytes: 0, sets: Vec::new() }) };
   /// Connections the driver serves on this thread.
   static OPEN_CONNS: Cell<usize> = const { Cell::new(0) };
   static RX_POOL: RefCell<Vec<VectorUsize<u8>>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Counts a connection as open on this thread; the last one to end empties the thread's pools,
-/// which after a burst would only hold its largest buffers.
+/// The buffers of a connection but its read buffer (which goes back to [`RX_POOL`] whenever it is
+/// empty): taken from [`CONN_POOL`] when the connection opens, given back when it ends.
+#[derive(Debug, Default)]
+struct ConnBuffers {
+  core: Http1ConnParts,
+  res_body: Vec<u8>,
+  res_headers: Vec<u8>,
+  spare: Vec<u8>,
+  wire: Vec<u8>,
+}
+
+impl ConnBuffers {
+  fn capacity(&self) -> usize {
+    [&self.res_body, &self.res_headers, &self.spare, &self.wire]
+      .iter()
+      .fold(self.core.capacity(), |acc, el| acc.saturating_add(el.capacity()))
+  }
+}
+
+/// The sets of buffers of the thread's ended connections.
+#[derive(Debug)]
+struct ConnPool {
+  /// Their capacity.
+  bytes: usize,
+  sets: Vec<ConnBuffers>,
+}
+
+/// Counts a connection as open on this thread; the last one to end trims the thread's pools to
+/// [`POOL_IDLE_KEEP`] entries.
 struct OpenConn;
 
 impl OpenConn {
@@ -579,32 +656,62 @@ impl Drop for OpenConn {
     let open = OPEN_CONNS.get().saturating_sub(1);
     OPEN_CONNS.set(open);
     if open == 0 {
-      BYTES_POOL.with(|pool| pool.borrow_mut().clear());
-      RX_POOL.with(|pool| pool.borrow_mut().clear());
+      let _rslt = CONN_POOL.try_with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let excess = pool.sets.len().saturating_sub(POOL_IDLE_KEEP);
+        let freed =
+          pool.sets.drain(..excess).fold(0usize, |acc, el| acc.wrapping_add(el.capacity()));
+        pool.bytes = pool.bytes.saturating_sub(freed);
+      });
+      let _rslt = RX_POOL.try_with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let excess = pool.len().saturating_sub(POOL_IDLE_KEEP);
+        let _ = pool.drain(..excess);
+      });
     }
   }
 }
 
-fn bytes_pool_take() -> Vec<u8> {
-  BYTES_POOL.with(|pool| pool.borrow_mut().pop()).unwrap_or_default()
+/// The buffers of an ended connection, or new empty ones.
+fn conn_pool_take() -> ConnBuffers {
+  CONN_POOL
+    .try_with(|pool| {
+      let mut pool = pool.borrow_mut();
+      let set = pool.sets.pop()?;
+      pool.bytes = pool.bytes.saturating_sub(set.capacity());
+      Some(set)
+    })
+    .ok()
+    .flatten()
+    .unwrap_or_default()
 }
 
-fn bytes_pool_give(mut buffer: Vec<u8>) {
-  let capacity = buffer.capacity();
-  if capacity == 0 || capacity > POOL_BUFFER_MAX {
+/// Keeps the buffers of an ended connection for the next one, emptied, those above
+/// `POOL_BUFFER_MAX` freed.
+fn conn_pool_give(mut set: ConnBuffers) {
+  set.core.free_larger_than(POOL_BUFFER_MAX);
+  for buffer in [&mut set.res_body, &mut set.res_headers, &mut set.spare, &mut set.wire] {
+    if buffer.capacity() > POOL_BUFFER_MAX {
+      *buffer = Vec::new();
+    }
+    buffer.clear();
+  }
+  let capacity = set.capacity();
+  if capacity == 0 {
     return;
   }
-  buffer.clear();
-  BYTES_POOL.with(|pool| {
+  // During the thread's teardown, without the pool, the set is freed.
+  let _rslt = CONN_POOL.try_with(|pool| {
     let mut pool = pool.borrow_mut();
-    if pool.len() < POOL_MAX {
-      pool.push(buffer);
+    if pool.sets.len() < POOL_MAX && pool.bytes.saturating_add(capacity) <= CONN_POOL_BYTES_MAX {
+      pool.bytes = pool.bytes.wrapping_add(capacity);
+      pool.sets.push(set);
     }
   });
 }
 
 fn rx_pool_take() -> Option<VectorUsize<u8>> {
-  RX_POOL.with(|pool| pool.borrow_mut().pop())
+  RX_POOL.try_with(|pool| pool.borrow_mut().pop()).ok().flatten()
 }
 
 fn rx_pool_give(mut buffer: VectorUsize<u8>) {
@@ -613,7 +720,7 @@ fn rx_pool_give(mut buffer: VectorUsize<u8>) {
     return;
   }
   buffer.clear();
-  RX_POOL.with(|pool| {
+  let _rslt = RX_POOL.try_with(|pool| {
     let mut pool = pool.borrow_mut();
     if pool.len() < POOL_MAX {
       pool.push(buffer);
@@ -711,5 +818,104 @@ mod tests {
     assert_eq!(answered, count);
     assert!(stream.output.len() < 64 * 1024, "{}", stream.output.len());
     assert_eq!(stream.writes, 1, "{} bytes in {} writes", stream.output.len(), stream.writes);
+  }
+
+  /// Answers with the request's body, or `pong`, with one extra header.
+  struct EchoWithHeader;
+
+  impl Http1Service for EchoWithHeader {
+    fn call(&mut self, head: Http1Request<'_>, body: &[u8], res: &mut Http1Res) {
+      res.push_header("server", "rimu-ws").unwrap();
+      if head.path == "/echo" {
+        res.body_mut().extend_from_slice(body);
+      } else {
+        res.body_mut().extend_from_slice(b"pong");
+      }
+    }
+  }
+
+  /// A connection's input: a GET, a 4 KiB POST, a chunked one and a pipelined pair.
+  fn churn_input() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n");
+    out.extend_from_slice(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 4096\r\n\r\n");
+    out.extend(core::iter::repeat_n(b'e', 4096));
+    out.extend_from_slice(
+      b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+    );
+    out.extend_from_slice(
+      b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\nGET /ping HTTP/1.1\r\nHost: x\r\n\r\n",
+    );
+    out
+  }
+
+  // After a warm-up, a connection that opens, sends its requests and closes allocates nothing in
+  // the driver, the core or the response: their buffers come from the thread's pool and go back
+  // to it. The streams (and their output) are made before counting.
+  #[test]
+  fn connection_churn_allocates_nothing() {
+    use crate::{sync::AtomicU64, tests::_count_allocations_in};
+    use core::sync::atomic::Ordering;
+    static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+    let (warm, counted) = (10, 50);
+    let input = churn_input();
+    let mut streams: Vec<Scripted> = (0..warm + counted)
+      .map(|_| Scripted { input: input.clone(), output: Vec::with_capacity(64 * 1024), writes: 0 })
+      .collect();
+    let params = DriveParams {
+      first_head: None,
+      hrc: HttpRecvParams::with_default_params(),
+      max_delay: Duration::from_secs(10),
+    };
+    let (warm_streams, counted_streams) = streams.split_at_mut(warm);
+    let allocations = StdRuntime::new().block_on(async {
+      for stream in warm_streams.iter_mut() {
+        drive_conn(stream, &mut EchoWithHeader, &params, None).await.unwrap();
+      }
+      _count_allocations_in(&ALLOCATIONS);
+      let before = ALLOCATIONS.load(Ordering::SeqCst);
+      for stream in counted_streams.iter_mut() {
+        drive_conn(stream, &mut EchoWithHeader, &params, None).await.unwrap();
+      }
+      ALLOCATIONS.load(Ordering::SeqCst) - before
+    });
+    assert_eq!(allocations, 0, "allocations of {counted} connections");
+    for stream in &streams {
+      let answered = stream.output.windows(14).filter(|el| el == b"server: rimu-w").count();
+      assert_eq!(answered, 5);
+    }
+  }
+
+  // Connections that join a group, wait in it and leave it allocate nothing once the group has
+  // held as many at once.
+  #[test]
+  fn group_membership_allocates_nothing() {
+    use crate::{
+      http::http1_server_framework::conn_driver::{ConnGroup, Member},
+      sync::AtomicU64,
+      tests::_count_allocations_in,
+    };
+    use core::{sync::atomic::Ordering, task::Waker};
+    static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+    let group = ConnGroup::default();
+    let round = |count: usize| {
+      let members: [Option<Member<'_>>; 16] =
+        core::array::from_fn(|idx| (idx < count).then(|| Member::new(&group)));
+      for member in members.iter().flatten() {
+        member.register(Waker::noop());
+      }
+    };
+    for count in 1..=16 {
+      round(count);
+    }
+    _count_allocations_in(&ALLOCATIONS);
+    let before = ALLOCATIONS.load(Ordering::SeqCst);
+    for count in (1..=16).chain((1..=16).rev()) {
+      round(count);
+    }
+    let after = ALLOCATIONS.load(Ordering::SeqCst);
+    assert_eq!(after - before, 0, "allocations of 32 rounds of members");
+    group.go_away();
+    assert!(group.going_away.get());
   }
 }
