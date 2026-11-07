@@ -2,7 +2,8 @@
 //!
 //! One runtime per thread, each with its own `SO_REUSEPORT` listener. Requests are routed by path
 //! through the protocol-agnostic radix [`Router`], and answered by synchronous handlers, so a
-//! request costs no allocation and no boxed future. The MVP is plaintext.
+//! request costs no allocation and no boxed future. The server is plaintext, or TLS through
+//! [`Http1ServerFramework::new_tls`] (user-space TLS, ALPN `http/1.1`).
 
 mod conn_driver;
 
@@ -14,7 +15,9 @@ use crate::{
   },
   http1::Http1Request,
   net::{TcpListener as _, TcpParams, Uri},
+  rng::{ChaCha20, CryptoRng, CryptoSeedableRng},
   sync::Arc,
+  tls::{PlaintextCtx, TlsAcceptor, TlsConfig, TlsCtxSk},
 };
 use alloc::{boxed::Box, rc::Rc, string::String, vec::Vec};
 use conn_driver::{ConnGroup, Http1Service, drive_conn};
@@ -339,7 +342,7 @@ impl<DA, ER, M> core::fmt::Debug for Http1Router<DA, ER, M> {
 
 /// HTTP/1.1 Server Framework
 #[derive(Debug)]
-pub struct Http1ServerFramework<DA, EC, EX, RC> {
+pub struct Http1ServerFramework<DA, EC, EX, RC, RNG = ChaCha20, TCX = PlaintextCtx> {
   data: DA,
   error_cb: EC,
   executor: EX,
@@ -349,10 +352,19 @@ pub struct Http1ServerFramework<DA, EC, EX, RC> {
   max_connections: Option<NonZeroUsize>,
   shutdown: Option<(ShutdownSignal, Duration)>,
   tcp_params: TcpParams,
+  /// The generator and the configuration of the TLS connections, if the server is a TLS one.
+  tls: Option<(RNG, Arc<TlsConfig<TCX>>)>,
 }
 
 impl<ER, EX>
-  Http1ServerFramework<(), fn(ER), EX, fn() -> Result<<EX as Executor>::LocalRuntime, ER>>
+  Http1ServerFramework<
+    (),
+    fn(ER),
+    EX,
+    fn() -> Result<<EX as Executor>::LocalRuntime, ER>,
+    ChaCha20,
+    PlaintextCtx,
+  >
 where
   ER: From<crate::Error>,
   EX: Executor,
@@ -375,14 +387,62 @@ where
       max_connections: None,
       shutdown: None,
       tcp_params: TcpParams::default(),
+      tls: None,
     })
   }
 }
 
-impl<DA, EC, EX, RC> Http1ServerFramework<DA, EC, EX, RC> {
+impl<ER, EX, RNG, TCX>
+  Http1ServerFramework<
+    (),
+    fn(ER),
+    EX,
+    fn() -> Result<<EX as Executor>::LocalRuntime, ER>,
+    RNG,
+    TCX,
+  >
+where
+  ER: From<crate::Error>,
+  EX: Executor,
+{
+  /// TLS server; taking aside the provided parameters, everything else is set to default values.
+  ///
+  /// The "http/1.1" ALPN will always be pushed into the TLS configuration, and kernel TLS turned
+  /// off ([`TlsConfig::kernel_tls`]): connections seal their records in user space, as the
+  /// HTTP/2 server does. `rng` seeds the generator of each thread and, from it, those of the
+  /// connections.
+  ///
+  /// Unlike the plaintext server, a TLS handshake is not bounded by anything but the runtime's
+  /// idle timeout (see [`Self::new`]).
+  #[inline]
+  pub fn new_tls(executor: EX, rng: RNG, mut tls_config: TlsConfig<TCX>) -> crate::Result<Self> {
+    tls_config
+      .alpn_mut()
+      .get_or_insert_default()
+      .protocol_name_list
+      .push(b"http/1.1".as_slice().try_into()?)?;
+    *tls_config.kernel_tls_mut() = false;
+    let error_cb: fn(_) = |_| {};
+    let local_runtime_cb: fn() -> _ = || Ok(EX::LocalRuntime::new()?);
+    Ok(Self {
+      data: (),
+      error_cb,
+      executor,
+      hrc: HttpRecvParams::with_default_params(),
+      local_runtime_cb,
+      local_runtimes: None,
+      max_connections: None,
+      shutdown: None,
+      tcp_params: TcpParams::default(),
+      tls: Some((rng, tls_config.into())),
+    })
+  }
+}
+
+impl<DA, EC, EX, RC, RNG, TCX> Http1ServerFramework<DA, EC, EX, RC, RNG, TCX> {
   /// Shared data that is cloned for each connection.
   #[inline]
-  pub fn set_data<_DA>(self, value: _DA) -> Http1ServerFramework<_DA, EC, EX, RC> {
+  pub fn set_data<_DA>(self, value: _DA) -> Http1ServerFramework<_DA, EC, EX, RC, RNG, TCX> {
     Http1ServerFramework {
       data: value,
       error_cb: self.error_cb,
@@ -393,12 +453,13 @@ impl<DA, EC, EX, RC> Http1ServerFramework<DA, EC, EX, RC> {
       max_connections: self.max_connections,
       shutdown: self.shutdown,
       tcp_params: self.tcp_params,
+      tls: self.tls,
     }
   }
 
   /// Sets the error callback function. A peer that goes away is not an error.
   #[inline]
-  pub fn set_error_cb<_EC>(self, value: _EC) -> Http1ServerFramework<DA, _EC, EX, RC> {
+  pub fn set_error_cb<_EC>(self, value: _EC) -> Http1ServerFramework<DA, _EC, EX, RC, RNG, TCX> {
     Http1ServerFramework {
       data: self.data,
       error_cb: value,
@@ -409,6 +470,7 @@ impl<DA, EC, EX, RC> Http1ServerFramework<DA, EC, EX, RC> {
       max_connections: self.max_connections,
       shutdown: self.shutdown,
       tcp_params: self.tcp_params,
+      tls: self.tls,
     }
   }
 
@@ -422,7 +484,7 @@ impl<DA, EC, EX, RC> Http1ServerFramework<DA, EC, EX, RC> {
 
   /// Allows the tweaking of the chosen runtime.
   #[inline]
-  pub fn set_local_runtime_cb<_RC>(self, value: _RC) -> Http1ServerFramework<DA, EC, EX, _RC> {
+  pub fn set_local_runtime_cb<_RC>(self, value: _RC) -> Http1ServerFramework<DA, EC, EX, _RC, RNG, TCX> {
     Http1ServerFramework {
       data: self.data,
       error_cb: self.error_cb,
@@ -433,6 +495,7 @@ impl<DA, EC, EX, RC> Http1ServerFramework<DA, EC, EX, RC> {
       max_connections: self.max_connections,
       shutdown: self.shutdown,
       tcp_params: self.tcp_params,
+      tls: self.tls,
     }
   }
 
@@ -474,13 +537,15 @@ impl<DA, EC, EX, RC> Http1ServerFramework<DA, EC, EX, RC> {
   }
 }
 
-impl<DA, EC, ER, EX, RC> Http1ServerFramework<DA, EC, EX, RC>
+impl<DA, EC, ER, EX, RC, RNG, TCX> Http1ServerFramework<DA, EC, EX, RC, RNG, TCX>
 where
   DA: Clone + 'static,
   EC: Clone + Fn(ER) + 'static,
   ER: From<crate::Error> + 'static,
   EX: Clone + Executor + 'static,
   RC: Clone + Fn() -> Result<EX::LocalRuntime, ER> + 'static,
+  RNG: CryptoRng + CryptoSeedableRng + 'static,
+  TCX: TlsCtxSk + 'static,
 {
   /// Starts the server using a runtime-per-thread architecture: each thread has its own runtime
   /// and its own `SO_REUSEPORT` listener on `addr`.
@@ -489,7 +554,11 @@ where
   /// other threads are left running, so call this from the main thread. After a shutdown (see
   /// [`Self::set_shutdown`]), returns `Ok` once every thread has drained.
   #[inline]
-  pub fn run_in_threads<M>(self, addr: &str, mut router: Http1Router<DA, ER, M>) -> Result<(), ER>
+  pub fn run_in_threads<M>(
+    mut self,
+    addr: &str,
+    mut router: Http1Router<DA, ER, M>,
+  ) -> Result<(), ER>
   where
     DA: Send,
     EC: Send,
@@ -497,6 +566,8 @@ where
     EX: Send,
     M: Http1Middleware<DA, ER> + Send + Sync + 'static,
     RC: Send,
+    RNG: Send,
+    TCX: Send + Sync,
   {
     let runtimes = if let Some(elem) = self.local_runtimes {
       elem.get()
@@ -509,6 +580,10 @@ where
     // One count for every runtime, so that the limit is the server's
     let active = counter(self.shutdown.as_ref(), self.max_connections);
     for _ in 0..runtimes {
+      let tls = match &mut self.tls {
+        Some((rng, tls_config)) => Some((RNG::from_crypto_rng(rng)?, tls_config.clone())),
+        None => None,
+      };
       let thread = ThreadServer {
         active: active.clone(),
         data: self.data.clone(),
@@ -518,6 +593,7 @@ where
         router: router.clone(),
         shutdown: self.shutdown.clone(),
         tcp_params: self.tcp_params,
+        tls,
       };
       let executor = self.executor.clone();
       let local_runtime_cb = self.local_runtime_cb.clone();
@@ -548,7 +624,7 @@ where
 }
 
 /// What one runtime thread serves.
-struct ThreadServer<DA, EC, ER, M> {
+struct ThreadServer<DA, EC, ER, M, RNG, TCX> {
   active: Option<Arc<crate::sync::AtomicUsize>>,
   data: DA,
   error_cb: EC,
@@ -557,17 +633,20 @@ struct ThreadServer<DA, EC, ER, M> {
   router: Arc<Http1Router<DA, ER, M>>,
   shutdown: Option<(ShutdownSignal, Duration)>,
   tcp_params: TcpParams,
+  tls: Option<(RNG, Arc<TlsConfig<TCX>>)>,
 }
 
-impl<DA, EC, ER, M> ThreadServer<DA, EC, ER, M>
+impl<DA, EC, ER, M, RNG, TCX> ThreadServer<DA, EC, ER, M, RNG, TCX>
 where
   DA: Clone + 'static,
   EC: Clone + Fn(ER) + 'static,
   ER: From<crate::Error> + 'static,
   M: Http1Middleware<DA, ER> + 'static,
+  RNG: CryptoRng + CryptoSeedableRng + 'static,
+  TCX: TlsCtxSk + 'static,
 {
   async fn serve<EX>(
-    self,
+    mut self,
     executor: &EX,
     lc: &EX::LocalRuntime,
     addr: &Uri<String>,
@@ -604,7 +683,11 @@ where
         error_cb: self.error_cb.clone(),
         router: self.router.clone(),
       };
-      let fut = conn_fut(stream, service, self.hrc, group.clone());
+      let tls = match &mut self.tls {
+        Some((rng, tls_config)) => Some((RNG::from_crypto_rng(rng)?, tls_config.clone())),
+        None => None,
+      };
+      let fut = conn_fut(stream, service, self.hrc, group.clone(), tls);
       if let Some(active) = &self.active {
         let _jh = executor.spawn_local(tracked(fut, active.clone()), lc);
       } else {
@@ -622,18 +705,34 @@ where
   }
 }
 
-async fn conn_fut<DA, EC, ER, M, S>(
+async fn conn_fut<DA, EC, ER, M, RNG, S, TCX>(
   mut stream: S,
   mut service: RouterService<DA, EC, ER, M>,
   hrc: HttpRecvParams,
   group: Option<Rc<ConnGroup>>,
+  tls: Option<(RNG, Arc<TlsConfig<TCX>>)>,
 ) where
   EC: Fn(ER),
   ER: From<crate::Error>,
   M: Http1Middleware<DA, ER>,
-  S: crate::net::StreamReader + crate::net::StreamWriter,
+  RNG: CryptoRng,
+  S: crate::net::Stream,
+  TCX: TlsCtxSk,
 {
-  if let Err(err) = drive_conn(&mut stream, &mut service, &hrc, group.as_deref()).await {
+  let rslt = match tls {
+    None => drive_conn(&mut stream, &mut service, &hrc, group.as_deref()).await,
+    // The stream is never split: the core drives the TLS stream as it drives a plain one.
+    Some((mut rng, tls_config)) => {
+      match TlsAcceptor::new(&*tls_config, &mut rng, stream).accept().await {
+        Ok(accepted) => {
+          let mut tls_stream = accepted.tls_stream;
+          drive_conn(&mut tls_stream, &mut service, &hrc, group.as_deref()).await
+        }
+        Err(err) => Err(err),
+      }
+    }
+  };
+  if let Err(err) = rslt {
     (service.error_cb)(err.into());
   }
 }
@@ -892,4 +991,68 @@ mod tests {
     let mut rest = [0; 8];
     assert_eq!(stream.read(&mut rest).unwrap(), 0, "the idle connection stayed open");
   }
+  // A TLS client that offers only "http/1.1" completes the handshake (a server without that ALPN
+  // would reject it) and is served by the same core as a plaintext one, keep-alive included.
+  #[cfg(feature = "crypto-ring")]
+  #[test]
+  fn serves_one_get_over_tls() {
+    use crate::{
+      executor::StdRuntime,
+      net::{StreamReader as _, StreamWriter as _},
+      rng::{ChaCha20, CryptoSeedableRng as _},
+      tests::{_PUBLIC_KEY, _ROOT_CA, _SECRET_KEY},
+      tls::{TlsConfig, TlsConnectorBuilder},
+    };
+    let uri = _uri();
+    let (host, port) = uri.hostname_with_implied_port();
+    let addr = std::format!("{host}:{port}");
+    let server_addr = addr.clone();
+    let _server = std::thread::spawn(move || {
+      let config = TlsConfig::from_keys_pem(_PUBLIC_KEY, _SECRET_KEY).unwrap();
+      let rng = ChaCha20::from_std_random().unwrap();
+      Http1ServerFramework::<(), fn(crate::Error), UringExecutor, _, _, _>::new_tls(
+        UringExecutor::default(),
+        rng,
+        config,
+      )
+      .unwrap()
+      .set_local_runtime_cb(|| UringRuntime::with_params(UringParams::new()))
+      .set_local_runtimes(core::num::NonZeroUsize::new(1))
+      .run_in_threads(&server_addr, router().set_middleware(Http1ServerHeader("rimu-ws")))
+    });
+    let (head, body) = StdRuntime::new().block_on(async move {
+      let mut rng = ChaCha20::from_std_random().unwrap();
+      let mut config = TlsConfig::from_trust_anchors_pem([_ROOT_CA]).unwrap();
+      config
+        .alpn_mut()
+        .get_or_insert_default()
+        .protocol_name_list
+        .push(b"http/1.1".as_slice().try_into().unwrap())
+        .unwrap();
+      let mut tls_stream = loop {
+        let connector = TlsConnectorBuilder::std(uri.clone()).build(&config, &mut rng).await;
+        if let Ok(elem) = connector {
+          break elem.connect().await.unwrap().tls_stream;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+      };
+      let mut got = Vec::new();
+      let mut buf = [0u8; 4096];
+      // Two requests on one connection
+      for _ in 0..2 {
+        got.clear();
+        tls_stream.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        while !got.ends_with(b"pong") {
+          let len = tls_stream.read(buf.as_mut_slice().into()).await.unwrap().unwrap();
+          got.extend_from_slice(&buf[..len.get()]);
+        }
+      }
+      let at = got.windows(4).position(|el| el == b"\r\n\r\n").unwrap();
+      (String::from_utf8(got[..at].to_vec()).unwrap().to_ascii_lowercase(), got[at + 4..].to_vec())
+    });
+    assert!(head.starts_with("http/1.1 200 ok\r\n"), "{head}");
+    assert!(head.contains("server: rimu-ws"), "{head}");
+    assert_eq!(body, b"pong");
+  }
+
 }
