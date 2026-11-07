@@ -534,10 +534,10 @@ pub(crate) fn peer_gone(err: &crate::Error) -> bool {
         | ErrorKind::TimedOut
         | ErrorKind::UnexpectedEof
     ),
-    // Closed in the middle of a TLS record or handshake, or a handshake the peer ended with an
-    // alert (a client that doesn't trust the certificate, say).
+    // Closed in the middle of a TLS record or handshake. A client that rejects the certificate
+    // is not among these: its alert fails the handshake as a `TlsErrorReply`, which is reported.
     crate::Error::Net(NetError::AbruptDisconnect)
-    | crate::Error::Tls(TlsError::AbruptDisconnect | TlsError::AbortedHandshake(_)) => true,
+    | crate::Error::Tls(TlsError::AbruptDisconnect) => true,
     // The handshake timeout, the server's own version of the runtime's `TimedOut`.
     crate::Error::ExpiredFuture => true,
     _ => false,
