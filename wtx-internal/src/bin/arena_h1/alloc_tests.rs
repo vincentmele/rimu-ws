@@ -7,6 +7,9 @@
 //!
 //! `ALLOC_TRACE=n` prints the backtraces of the first `n` allocations of every measured window,
 //! to find where they come from. `alloc_table` (ignored) prints the allocations of every path.
+//!
+//! The JSON tests need the arena dataset (`DATASET_PATH`), the TLS ones its certificate pair
+//! (`CERT_DIR`): without them they fail, instead of passing on nothing.
 
 #![allow(clippy::disallowed_methods, reason = "a test harness: responses are parsed as text")]
 
@@ -27,7 +30,9 @@ use rimu_ws::{
 const WARMUP: usize = 200;
 /// Requests counted.
 const MEASURED: usize = 1000;
+/// Where the certificate pair of the TLS tests is, unless `CERT_DIR` says.
 const CERT_DIR: &str = "/mnt/nvme1tb/claude-tmp/arena-main/certs";
+/// The dataset of the JSON tests, unless `DATASET_PATH` says.
 const DATASET_FILE: &str = "/mnt/nvme1tb/claude-tmp/arena-main/data/dataset.json";
 
 /// The allocations of one server's runtime thread.
@@ -143,6 +148,11 @@ fn load_test_dataset() -> bool {
 
 static DATASET_LOADED: OnceLock<()> = OnceLock::new();
 
+/// The directory of the TLS tests' certificate pair.
+fn cert_dir() -> String {
+  std::env::var("CERT_DIR").unwrap_or_else(|_| CERT_DIR.into())
+}
+
 /// A one-runtime plaintext arena server whose runtime thread is counted; returns its address.
 fn plain_server(counts: &'static Counts) -> String {
   let addr = free_addr();
@@ -159,10 +169,12 @@ fn plain_server(counts: &'static Counts) -> String {
   panic!("the plaintext server did not start");
 }
 
-/// A one-runtime TLS arena server whose runtime thread is counted; returns its address.
+/// A one-runtime TLS arena server whose runtime thread is counted; returns its address, `None`
+/// without the certificate pair.
 fn tls_server(counts: &'static Counts) -> Option<String> {
-  let cert = std::fs::read(format!("{CERT_DIR}/server.crt")).ok()?;
-  let key = std::fs::read(format!("{CERT_DIR}/server.key")).ok()?;
+  let dir = cert_dir();
+  let cert = std::fs::read(format!("{dir}/server.crt")).ok()?;
+  let key = std::fs::read(format!("{dir}/server.key")).ok()?;
   let addr = free_addr();
   let server_addr = addr.clone();
   let _jh = std::thread::spawn(move || {
@@ -171,27 +183,28 @@ fn tls_server(counts: &'static Counts) -> Option<String> {
   Some(addr)
 }
 
-/// The end of a response's head, its status and its `Content-Length`, once `buf` holds the head.
-fn parse_head(buf: &[u8]) -> Option<(usize, u16, usize)> {
+/// A response as the client read it.
+struct Response {
+  body: Vec<u8>,
+  /// `Content-Encoding`, lower-cased.
+  encoding: Option<String>,
+  status: u16,
+}
+
+/// One response read off `buf` once it is complete; `buf` keeps what follows.
+fn take_response(buf: &mut Vec<u8>) -> Option<Response> {
   let end = buf.windows(4).position(|el| el == b"\r\n\r\n")? + 4;
   let head = core::str::from_utf8(&buf[..end]).unwrap().to_ascii_lowercase();
   let status = head.get(9..12).unwrap().parse().unwrap();
-  let len = head
-    .lines()
-    .find_map(|el| el.strip_prefix("content-length:"))
-    .map_or(0, |el| el.trim().parse().unwrap());
-  Some((end, status, len))
-}
-
-/// One response read off `buf` once it is complete: its status and body; `buf` keeps what follows.
-fn take_response(buf: &mut Vec<u8>) -> Option<(u16, Vec<u8>)> {
-  let (end, status, len) = parse_head(buf)?;
+  let field = |name: &str| head.lines().find_map(|el| el.strip_prefix(name)).map(str::trim);
+  let len = field("content-length:").map_or(0, |el| el.parse().unwrap());
+  let encoding = field("content-encoding:").map(String::from);
   if buf.len() < end + len {
     return None;
   }
   let body = buf[end..end + len].to_vec();
   let _ = buf.drain(..end + len);
-  Some((status, body))
+  Some(Response { body, encoding, status })
 }
 
 /// The bytes of a request: `head` (without its final empty line) and, if any, `body`, sent with
@@ -217,12 +230,12 @@ fn request(head: &str, body: Option<(&[u8], bool)>) -> Vec<u8> {
   out
 }
 
-/// What a measured path allocated per request on the server's thread.
+/// What a measured window allocated on the server's thread.
 #[derive(Debug)]
 struct Measured {
   allocs: u64,
   bytes: u64,
-  /// Requests measured: [`MEASURED`], or more for pipelined batches.
+  /// Requests measured.
   requests: usize,
   /// Allocations of the server's thread from its start to the end of the window, so that a
   /// thread that is not counted shows.
@@ -239,44 +252,45 @@ fn trace_budget() -> u64 {
   std::env::var("ALLOC_TRACE").ok().and_then(|el| el.parse().ok()).unwrap_or(0)
 }
 
-/// Sends the requests of `case` [`WARMUP`] times and then [`MEASURED`] times on one keep-alive
-/// connection, by `exchange` (which sends them and returns the next response), checking every
-/// response, and counts what the server allocated over the measured requests.
+/// Sends `cases` in turn, as a load generator rotating requests does, on one keep-alive
+/// connection: `warm` requests, then `measured` counted ones, every response checked. `exchange`
+/// sends the requests it is given, if any, and returns the next response.
 fn measure(
   counts: &'static Counts,
-  mut exchange: impl FnMut(Option<&[u8]>) -> (u16, Vec<u8>),
-  case: &Case,
+  mut exchange: impl FnMut(Option<&[u8]>) -> Response,
+  cases: &[Case],
+  warm: usize,
+  measured: usize,
 ) -> Measured {
-  let mut round = || {
-    let (status, body) = exchange(Some(&case.req));
-    (case.check)(status, &body);
+  let mut next = 0usize;
+  // One case's requests; returns how many were sent
+  let mut step = || {
+    let case = &cases[next % cases.len()];
+    next = next.wrapping_add(1);
+    (case.check)(&exchange(Some(&case.req)));
     for _ in 1..case.responses {
-      let (status, body) = exchange(None);
-      (case.check)(status, &body);
+      (case.check)(&exchange(None));
     }
+    case.responses
   };
-  for _ in 0..WARMUP.div_ceil(case.responses) {
-    round();
+  let mut sent = 0;
+  while sent < warm {
+    sent += step();
   }
-  let rounds = MEASURED.div_ceil(case.responses);
   counts.trace.store(trace_budget(), Ordering::SeqCst);
   counts.tracing.store(true, Ordering::SeqCst);
   let before = counts.snapshot();
-  for _ in 0..rounds {
-    round();
+  let mut requests = 0;
+  while requests < measured {
+    requests += step();
   }
   let after = counts.snapshot();
   counts.tracing.store(false, Ordering::SeqCst);
-  Measured {
-    allocs: after.0 - before.0,
-    bytes: after.1 - before.1,
-    requests: rounds * case.responses,
-    total: after.0,
-  }
+  Measured { allocs: after.0 - before.0, bytes: after.1 - before.1, requests, total: after.0 }
 }
 
-/// Measures `case` on a new plaintext server.
-fn measure_plain(case: &Case) -> Measured {
+/// Measures `cases` on a new plaintext server.
+fn measure_plain(cases: &[Case], warm: usize, measured: usize) -> Measured {
   let counts = Counts::leak();
   let addr = plain_server(counts);
   let mut stream = std::net::TcpStream::connect(&addr).unwrap();
@@ -284,27 +298,24 @@ fn measure_plain(case: &Case) -> Measured {
   stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
   let mut buf = Vec::new();
   let mut chunk = vec![0u8; 256 * 1024];
-  measure(
-    counts,
-    |req| {
-      if let Some(elem) = req {
-        std::io::Write::write_all(&mut stream, elem).unwrap();
+  let exchange = |req: Option<&[u8]>| {
+    if let Some(elem) = req {
+      std::io::Write::write_all(&mut stream, elem).unwrap();
+    }
+    loop {
+      if let Some(elem) = take_response(&mut buf) {
+        return elem;
       }
-      loop {
-        if let Some(elem) = take_response(&mut buf) {
-          return elem;
-        }
-        let len = std::io::Read::read(&mut stream, &mut chunk).unwrap();
-        assert_ne!(len, 0, "the server closed the connection");
-        buf.extend_from_slice(&chunk[..len]);
-      }
-    },
-    case,
-  )
+      let len = std::io::Read::read(&mut stream, &mut chunk).unwrap();
+      assert_ne!(len, 0, "the server closed the connection");
+      buf.extend_from_slice(&chunk[..len]);
+    }
+  };
+  measure(counts, exchange, cases, warm, measured)
 }
 
-/// Measures `case` on a new TLS server, `None` without the certificate.
-fn measure_tls(case: &Case) -> Option<Measured> {
+/// Measures `cases` on a new TLS server, `None` without the certificate pair.
+fn measure_tls(cases: &[Case], warm: usize, measured: usize) -> Option<Measured> {
   let counts = Counts::leak();
   let addr = tls_server(counts)?;
   let uri = rimu_ws::net::UriString::new(format!("https://{addr}"));
@@ -329,25 +340,22 @@ fn measure_tls(case: &Case) -> Option<Measured> {
   });
   let mut buf = Vec::new();
   let mut chunk = vec![0u8; 256 * 1024];
-  Some(measure(
-    counts,
-    |req| {
-      rt.block_on(async {
-        if let Some(elem) = req {
-          tls_stream.write_all(elem).await.unwrap();
+  let exchange = |req: Option<&[u8]>| {
+    rt.block_on(async {
+      if let Some(elem) = req {
+        tls_stream.write_all(elem).await.unwrap();
+      }
+      loop {
+        if let Some(elem) = take_response(&mut buf) {
+          return elem;
         }
-        loop {
-          if let Some(elem) = take_response(&mut buf) {
-            return elem;
-          }
-          let len = tls_stream.read(chunk.as_mut_slice().into()).await.unwrap();
-          let len = len.expect("the server closed the connection").get();
-          buf.extend_from_slice(&chunk[..len]);
-        }
-      })
-    },
-    case,
-  ))
+        let len = tls_stream.read(chunk.as_mut_slice().into()).await.unwrap();
+        let len = len.expect("the server closed the connection").get();
+        buf.extend_from_slice(&chunk[..len]);
+      }
+    })
+  };
+  Some(measure(counts, exchange, cases, warm, measured))
 }
 
 /// The JSON of `/json/{count}?m={m}`.
@@ -377,7 +385,7 @@ fn unbrotli(data: &[u8]) -> Vec<u8> {
 /// A path measured.
 struct Case {
   /// Checks every response.
-  check: Box<dyn Fn(u16, &[u8])>,
+  check: Box<dyn Fn(&Response)>,
   name: String,
   /// The requests, sent at once.
   req: Vec<u8>,
@@ -387,39 +395,54 @@ struct Case {
 }
 
 impl Case {
-  fn new(name: impl Into<String>, tls: bool, req: Vec<u8>, check: Box<dyn Fn(u16, &[u8])>) -> Self {
+  fn new(name: impl Into<String>, tls: bool, req: Vec<u8>, check: Box<dyn Fn(&Response)>) -> Self {
     Self { check, name: name.into(), req, responses: 1, tls }
   }
 }
 
-/// `/json/{count}?m={m}` with `accept` as `Accept-Encoding`, on the plaintext server.
-fn json_case(count: usize, m: i64, accept: Option<&str>) -> Case {
+/// `/json/{count}?m={m}` on the plaintext server, answered with `coding`: asked for as the
+/// json-comp load asks (`gzip, br`) for gzip, by `br` alone for brotli (gzip is preferred), with
+/// no `Accept-Encoding` for none. The response must say its coding and decode to the JSON.
+fn json_case(count: usize, m: i64, coding: Encoding) -> Case {
   let mut head = format!("GET /json/{count}?m={m} HTTP/1.1\r\nhost: x\r\n");
+  let (accept, name, encoding, decode): (_, _, _, fn(&[u8]) -> Vec<u8>) = match coding {
+    Encoding::Brotli => (Some("br"), "br", Some("br"), unbrotli),
+    Encoding::Gzip => (Some("gzip, br"), "gzip", Some("gzip"), ungzip),
+    Encoding::Identity => (None, "identity", None, <[u8]>::to_vec),
+  };
   if let Some(elem) = accept {
     head.push_str(&format!("accept-encoding: {elem}\r\n"));
   }
   let expected = json(count, m);
-  let decode: fn(&[u8]) -> Vec<u8> = match accept {
-    Some("gzip") => ungzip,
-    Some("br") => unbrotli,
-    _ => <[u8]>::to_vec,
+  let check = move |res: &Response| {
+    assert_eq!(res.status, 200);
+    assert_eq!(res.encoding.as_deref(), encoding);
+    assert_eq!(decode(&res.body), expected);
   };
-  let check = move |status: u16, body: &[u8]| {
-    assert_eq!(status, 200);
-    assert_eq!(decode(body), expected);
-  };
-  let name = format!("json-comp /json/{count}?m={m} {}", accept.unwrap_or("identity"));
-  Case::new(name, false, request(&head, None), Box::new(check))
+  Case::new(
+    format!("json-comp /json/{count}?m={m} {name}"),
+    false,
+    request(&head, None),
+    Box::new(check),
+  )
+}
+
+/// The json-comp rotation of the load (`json-gzip-25.raw,json-gzip-40.raw,json-gzip-50.raw`).
+const JSON_ROTATION: [(usize, i64); 3] = [(25, 4), (40, 8), (50, 6)];
+
+/// Loads the dataset, or fails the test.
+fn need_dataset() {
+  assert!(load_test_dataset(), "no arena dataset: set DATASET_PATH (default {DATASET_FILE})");
 }
 
 /// The paths measured.
 fn cases() -> Vec<Case> {
   let mut out = Vec::new();
   let base = "POST /baseline11?a=1&b=2 HTTP/1.1\r\nhost: x\r\n";
-  let sum = |expected: &'static [u8]| -> Box<dyn Fn(u16, &[u8])> {
-    Box::new(move |status, body| {
-      assert_eq!(status, 200);
-      assert_eq!(body, expected);
+  let sum = |expected: &'static [u8]| -> Box<dyn Fn(&Response)> {
+    Box::new(move |res| {
+      assert_eq!(res.status, 200);
+      assert_eq!(res.body, expected);
     })
   };
   let get = request("GET /baseline11?a=1&b=2 HTTP/1.1\r\nhost: x\r\n", None);
@@ -447,12 +470,12 @@ fn cases() -> Vec<Case> {
     sum(b"1"),
   ));
   if load_test_dataset() {
-    for (count, m) in [(25, 4), (40, 8), (50, 6)] {
-      for accept in [None, Some("gzip"), Some("br")] {
-        out.push(json_case(count, m, accept));
+    for (count, m) in JSON_ROTATION {
+      for coding in [Encoding::Identity, Encoding::Gzip, Encoding::Brotli] {
+        out.push(json_case(count, m, coding));
       }
     }
-    let mut tls = json_case(25, 4, None);
+    let mut tls = json_case(25, 4, Encoding::Identity);
     tls.name = "json-tls /json/25?m=4".into();
     tls.tls = true;
     out.push(tls);
@@ -463,9 +486,9 @@ fn cases() -> Vec<Case> {
       let req = request("POST /echo HTTP/1.1\r\nhost: x\r\n", Some((&body, chunked)));
       let name =
         format!("8gbit POST /echo {len} B {}", if chunked { "chunked" } else { "content-length" });
-      let check: Box<dyn Fn(u16, &[u8])> = Box::new(move |status, got| {
-        assert_eq!(status, 200);
-        assert_eq!(got, body.as_slice());
+      let check: Box<dyn Fn(&Response)> = Box::new(move |res| {
+        assert_eq!(res.status, 200);
+        assert_eq!(res.body, body.as_slice());
       });
       out.push(Case::new(name, true, req, check));
     }
@@ -473,8 +496,14 @@ fn cases() -> Vec<Case> {
   out
 }
 
-fn run_case(case: &Case) -> Option<Measured> {
-  if case.tls { measure_tls(case) } else { Some(measure_plain(case)) }
+fn run_case(case: Case) -> Option<Measured> {
+  let tls = case.tls;
+  let cases = [case];
+  if tls {
+    measure_tls(&cases, WARMUP, MEASURED)
+  } else {
+    Some(measure_plain(&cases, WARMUP, MEASURED))
+  }
 }
 
 /// Prints the allocations per request of every path:
@@ -485,11 +514,11 @@ fn alloc_table() {
   println!("| path | allocs/req | bytes/req | thread total |\n|---|---|---|---|");
   let filter = std::env::var("ALLOC_CASE").unwrap_or_default();
   for case in cases() {
-    let name = &case.name;
+    let name = case.name.clone();
     if !name.contains(&filter) {
       continue;
     }
-    let Some(measured) = run_case(&case) else {
+    let Some(measured) = run_case(case) else {
       println!("| {name} | skipped (no certificate) | | |");
       continue;
     };
@@ -498,88 +527,147 @@ fn alloc_table() {
   }
 }
 
-/// Asserts that every path whose name starts with `prefix` allocates nothing on the server's
-/// thread over [`MEASURED`] requests after the warm-up.
-fn assert_no_alloc(prefix: &str) {
-  let mut ran = 0;
+/// Asserts that every path `select` picks allocates nothing on the server's thread after the
+/// warm-up; fails if it picks none or one could not run.
+fn assert_no_alloc(select: impl Fn(&str) -> bool) {
+  let mut ran = Vec::new();
   let mut failed = Vec::new();
   for case in cases() {
-    let name = &case.name;
-    if !name.starts_with(prefix) {
+    let name = case.name.clone();
+    if !select(&name) {
       continue;
     }
-    let Some(measured) = run_case(&case) else {
-      eprintln!("{name}: skipped, no certificate in {CERT_DIR}");
-      continue;
+    let Some(measured) = run_case(case) else {
+      panic!("{name}: no certificate pair in {}: set CERT_DIR", cert_dir());
     };
-    ran += 1;
     if measured.allocs != 0 {
       failed.push(format!(
         "{name}: {} allocations, {} bytes over {} requests",
         measured.allocs, measured.bytes, measured.requests
       ));
     }
+    ran.push(name);
   }
+  assert!(!ran.is_empty(), "no path ran");
   assert!(failed.is_empty(), "allocations after the warm-up:\n{}", failed.join("\n"));
-  eprintln!("{prefix}: {ran} paths allocate nothing");
+  eprintln!("{} paths allocate nothing: {}", ran.len(), ran.join(", "));
 }
 
-// baseline, limited-conn, latency-1m/10k: GET, and POST with a Content-Length and a chunked body.
+// baseline, limited-conn, latency-1m/10k: GET, POST with a Content-Length and a chunked body,
+// and pipelined GETs.
 #[test]
 fn baseline_steady_state_allocates_nothing() {
-  assert_no_alloc("baseline ");
+  assert_no_alloc(|el| el.starts_with("baseline "));
 }
 
 #[test]
 fn async_delay_steady_state_allocates_nothing() {
-  assert_no_alloc("async ");
+  assert_no_alloc(|el| el.starts_with("async "));
 }
 
 #[test]
 fn json_comp_identity_steady_state_allocates_nothing() {
-  assert_no_alloc_json("identity");
+  need_dataset();
+  assert_no_alloc(|el| el.starts_with("json-comp ") && el.ends_with(" identity"));
 }
 
 #[test]
 fn json_comp_gzip_steady_state_allocates_nothing() {
-  assert_no_alloc_json("gzip");
+  need_dataset();
+  assert_no_alloc(|el| el.starts_with("json-comp ") && el.ends_with(" gzip"));
 }
 
 #[test]
 fn json_comp_br_steady_state_allocates_nothing() {
-  assert_no_alloc_json("br");
-}
-
-/// [`assert_no_alloc`] for the json-comp paths of one coding; skipped without the dataset.
-fn assert_no_alloc_json(coding: &str) {
-  if !load_test_dataset() {
-    eprintln!("skipped: no dataset");
-    return;
-  }
-  let mut failed = Vec::new();
-  for case in cases() {
-    let name = &case.name;
-    if !name.starts_with("json-comp ") || !name.ends_with(&format!(" {coding}")) {
-      continue;
-    }
-    let measured = run_case(&case).unwrap();
-    if measured.allocs != 0 {
-      failed.push(format!(
-        "{name}: {} allocations, {} bytes over {} requests",
-        measured.allocs, measured.bytes, measured.requests
-      ));
-    }
-  }
-  assert!(failed.is_empty(), "allocations after the warm-up:\n{}", failed.join("\n"));
+  need_dataset();
+  assert_no_alloc(|el| el.starts_with("json-comp ") && el.ends_with(" br"));
 }
 
 #[test]
 fn json_tls_steady_state_allocates_nothing() {
-  assert_no_alloc("json-tls ");
+  need_dataset();
+  assert_no_alloc(|el| el.starts_with("json-tls "));
 }
 
 // 8gbit: 1 B, 10 KiB and 100 KiB bodies, with a Content-Length and chunked.
 #[test]
 fn echo_tls_steady_state_allocates_nothing() {
-  assert_no_alloc("8gbit ");
+  assert_no_alloc(|el| el.starts_with("8gbit "));
+}
+
+/// Fails if `measured` allocated.
+fn assert_zero(what: &str, measured: &Measured) {
+  assert_eq!(
+    measured.allocs, 0,
+    "{what}: {} allocations, {} bytes over {} requests",
+    measured.allocs, measured.bytes, measured.requests
+  );
+}
+
+// The load rotates 25/40/50 on every connection: the bodies of the three sizes take turns in the
+// same buffers and the same compressor state.
+#[test]
+fn json_comp_rotation_allocates_nothing() {
+  need_dataset();
+  for coding in [Encoding::Identity, Encoding::Gzip, Encoding::Brotli] {
+    let cases: Vec<Case> =
+      JSON_ROTATION.iter().map(|&(count, m)| json_case(count, m, coding)).collect();
+    assert_zero(&format!("rotation {coding:?}"), &measure_plain(&cases, 300, 3000));
+  }
+}
+
+/// `count` 1..=50 and `m` 1..=97 drawn from `seed`, as the validator draws them.
+fn random_json(seed: u32, len: usize) -> Vec<(usize, i64)> {
+  let mut seed = seed;
+  let mut next = |modulo: u32| {
+    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+    (seed >> 16) % modulo
+  };
+  (0..len).map(|_| (1 + next(50) as usize, 1 + i64::from(next(97)))).collect()
+}
+
+// Brotli over bodies of every size, on one connection: after a warm-up of the same draws, none
+// asks for a block the thread's pool can't give.
+#[test]
+fn json_comp_br_random_sizes_allocate_nothing() {
+  need_dataset();
+  let cases: Vec<Case> = random_json(12_345, 400)
+    .into_iter()
+    .map(|(count, m)| json_case(count, m, Encoding::Brotli))
+    .collect();
+  assert_zero("random brotli", &measure_plain(&cases, 1000, 2000));
+}
+
+// On the thread itself: a sweep of every size (as a validator run leaves the pool), then the
+// load's rotation finds its blocks, and the pool stays within its bound.
+#[test]
+fn brotli_pool_serves_the_rotation_after_a_sweep() {
+  need_dataset();
+  let counts = Counts::leak();
+  let rotation: Vec<Vec<u8>> = JSON_ROTATION.iter().map(|&(count, m)| json(count, m)).collect();
+  let sweep: Vec<Vec<u8>> =
+    (1..=50).flat_map(|count| [1, 2, 5, 8, 13, 40, 97].map(|m| json(count, m))).collect();
+  let mut out = Vec::new();
+  COUNTS.set(Some(counts));
+  for input in &sweep {
+    encode(Encoding::Brotli, input, &mut out).unwrap();
+  }
+  let swept = BROTLI_FREE.with(|el| el.borrow().bytes);
+  for _ in 0..10 {
+    for input in &rotation {
+      encode(Encoding::Brotli, input, &mut out).unwrap();
+    }
+  }
+  let before = counts.snapshot();
+  for _ in 0..100 {
+    for input in &rotation {
+      encode(Encoding::Brotli, input, &mut out).unwrap();
+    }
+  }
+  let after = counts.snapshot();
+  COUNTS.set(None);
+  eprintln!("brotli pool after the sweep: {swept} bytes");
+  assert!(swept <= BROTLI_POOL_MAX, "{swept}");
+  assert_eq!(after.0 - before.0, 0, "allocations of 300 encodes, {} bytes", after.1 - before.1);
+  assert_eq!(unbrotli(&out), rotation[2]);
 }
