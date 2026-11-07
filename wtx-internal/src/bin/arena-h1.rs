@@ -1,4 +1,4 @@
-//! HttpArena HTTP/1.1 server: `GET|POST /baseline11?a=&b=` on plaintext 8080, served by the
+//! HttpArena HTTP/1.1 server: `GET|POST /baseline11?a=&b=` and `GET /delay/{ms}` on plaintext 8080, served by the
 //! HTTP/1.1 server framework on the io_uring executor.
 //!
 //! The runtimes do not spin: the latency profiles charge spin to the score.
@@ -15,7 +15,8 @@ use rimu_ws::{
 fn main() -> rimu_ws::Result<()> {
   let router = Http1Router::new()
     .route(Some(Method::Get), "/baseline11", endpoint_baseline11)
-    .route(Some(Method::Post), "/baseline11", endpoint_baseline11);
+    .route(Some(Method::Post), "/baseline11", endpoint_baseline11)
+    .route(Some(Method::Get), "/delay/{ms}", endpoint_delay);
   Http1ServerFramework::<(), fn(rimu_ws::Error), UringExecutor, _>::new(UringExecutor::default())?
     .set_error_cb(error_cb)
     // Every client speaks first
@@ -71,6 +72,29 @@ fn endpoint_baseline11(_: &mut (), req: &Http1Req<'_>, res: &mut Http1Res) -> ri
   Ok(())
 }
 
+/// The delay in milliseconds from the `{ms}` path segment. Anything but a plain unsigned decimal
+/// is `None`.
+fn delay_ms(param: Option<&str>) -> Option<u64> {
+  let param = param?;
+  if param.is_empty() || !param.bytes().all(|el| el.is_ascii_digit()) {
+    return None;
+  }
+  param.parse().ok()
+}
+
+/// Waits `ms` milliseconds, then answers with `ms`. The delay is read from this request's path, so
+/// concurrent requests wait independently. The framework sends nothing before the delay elapses.
+fn endpoint_delay(_: &mut (), req: &Http1Req<'_>, res: &mut Http1Res) -> rimu_ws::Result<()> {
+  let ms = delay_ms(req.param("ms")).unwrap_or(0);
+  push_i64(res.body_mut(), i64::try_from(ms).unwrap_or(i64::MAX));
+  res.set_content_type("text/plain");
+  res.set_status(StatusCode::Ok);
+  if ms > 0 {
+    res.set_delay(Duration::from_millis(ms));
+  }
+  Ok(())
+}
+
 /// Append `n` as decimal ASCII to `out`, without the `core::fmt` machinery.
 fn push_i64(out: &mut Vec<u8>, n: i64) {
   let mut buf = [0u8; 20];
@@ -91,6 +115,18 @@ fn push_i64(out: &mut Vec<u8>, n: i64) {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn delay_ms_parses_the_segment() {
+    assert_eq!(delay_ms(Some("10")), Some(10));
+    assert_eq!(delay_ms(Some("0")), Some(0));
+    assert_eq!(delay_ms(Some("499")), Some(499));
+    assert_eq!(delay_ms(None), None);
+    assert_eq!(delay_ms(Some("abc")), None);
+    assert_eq!(delay_ms(Some("")), None);
+    assert_eq!(delay_ms(Some("-5")), None);
+    assert_eq!(delay_ms(Some("1.5")), None);
+  }
 
   #[test]
   fn get_sums_the_query() {
