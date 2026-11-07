@@ -5,7 +5,7 @@
 //! are zero-copy views into the input.
 
 use crate::{
-  http::{HttpError, Method},
+  http::{HttpError, Method, StatusCode},
   http1::{BodyKind, Http1Request, MAX_HEADERS},
   misc::from_utf8_basic,
 };
@@ -56,6 +56,10 @@ impl Default for ParseScratch {
 
 /// Parses the head of a request found in `buf`.
 ///
+/// Errors are [`HttpError::BadRequest`], [`HttpError::RequestHeaderFieldsTooLarge`] (head over
+/// 16 KiB or more than [`MAX_HEADERS`] headers) or [`HttpError::UnsupportedTransferCoding`];
+/// [`error_status`] gives the status code each one is answered with.
+///
 /// Returns [`ParseOutcome::Partial`], never an error, while the blank line that ends the head
 /// has not arrived (unless the head is already larger than the 16 KiB limit). The function is
 /// pure over `buf`, so it can simply be called again after more bytes were appended.
@@ -72,7 +76,7 @@ pub fn parse_request<'b>(
   let window = buf.get(..MAX_HEAD_LEN).unwrap_or(buf);
   let Some(head_len) = find_head_end(window) else {
     if buf.len() > MAX_HEAD_LEN {
-      return Err(bad());
+      return Err(HttpError::RequestHeaderFieldsTooLarge.into());
     }
     return Ok(ParseOutcome::Partial);
   };
@@ -173,7 +177,7 @@ pub fn parse_request<'b>(
       _ => {}
     }
     let Some(slot) = scratch.headers.get_mut(len) else {
-      return Err(bad());
+      return Err(HttpError::RequestHeaderFieldsTooLarge.into());
     };
     // SAFETY: the stored references are only read back below, within this call and while `'b`
     // (the lifetime of `buf`) is alive. The `'static` is just a placeholder so that the
@@ -203,6 +207,18 @@ pub fn parse_request<'b>(
     request: Http1Request { method, path, query, headers, body_kind, keep_alive },
     head_len: head_len.wrapping_add(skip),
   })
+}
+
+/// Status code a [`parse_request`] error is answered with: 431, 501 or else 400.
+#[inline]
+pub fn error_status(error: &crate::Error) -> StatusCode {
+  match error {
+    crate::Error::Http(HttpError::RequestHeaderFieldsTooLarge) => {
+      StatusCode::RequestHeaderFieldsTooLarge
+    }
+    crate::Error::Http(HttpError::UnsupportedTransferCoding) => StatusCode::NotImplemented,
+    _ => StatusCode::BadRequest,
+  }
 }
 
 #[inline]
@@ -367,10 +383,10 @@ fn has_ctl_scalar(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
   use crate::{
-    http::Method,
+    http::{Method, StatusCode},
     http1::{
       BodyKind, MAX_HEADERS,
-      parser::{ParseOutcome, ParseScratch, parse_request},
+      parser::{ParseOutcome, ParseScratch, error_status, parse_request},
     },
   };
   use alloc::{format, string::String, vec::Vec};
@@ -401,6 +417,12 @@ mod tests {
   fn is_err(buf: &[u8]) -> bool {
     let mut scratch = ParseScratch::new();
     parse_request(buf, &mut scratch).is_err()
+  }
+
+  /// Status code the parse error of `buf` is answered with.
+  fn err_status(buf: &[u8]) -> StatusCode {
+    let mut scratch = ParseScratch::new();
+    error_status(&parse_request(buf, &mut scratch).unwrap_err())
   }
 
   #[test]
@@ -495,16 +517,17 @@ mod tests {
       buf
     };
     assert!(!is_err(&build(MAX_HEADERS)));
-    assert!(is_err(&build(MAX_HEADERS + 1)));
+    assert_eq!(err_status(&build(MAX_HEADERS + 1)), StatusCode::RequestHeaderFieldsTooLarge);
   }
 
   #[test]
   fn rejects_oversized_head() {
     let mut buf = b"GET / HTTP/1.1\r\nX: ".to_vec();
     buf.resize(20_000, b'a');
-    assert!(is_err(&buf));
+    assert_eq!(err_status(&buf), StatusCode::RequestHeaderFieldsTooLarge);
     buf.extend_from_slice(b"\r\n\r\n");
-    assert!(is_err(&buf));
+    assert_eq!(err_status(&buf), StatusCode::RequestHeaderFieldsTooLarge);
+    assert_eq!(err_status(b"GET  / HTTP/1.1\r\n\r\n"), StatusCode::BadRequest);
   }
 
   #[test]

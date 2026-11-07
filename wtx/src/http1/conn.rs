@@ -3,8 +3,8 @@
 use crate::{
   http::{HttpRecvParams, StatusCode},
   http1::{
-    BodyDecoder, BodyKind, BodyStatus, Http1Request, ParseOutcome, ParseScratch, parse_request,
-    write_response,
+    BodyDecoder, BodyKind, BodyStatus, Http1Request, ParseOutcome, ParseScratch, error_status,
+    parse_request, write_response,
   },
 };
 use alloc::{boxed::Box, vec::Vec};
@@ -34,9 +34,10 @@ pub enum Http1Event {
 /// [`Http1Event::Closed`].
 ///
 /// Memory is bounded: at most 256 KiB of unparsed input is buffered, a head is limited to 16 KiB
-/// by the parser, and a decoded body to [`HttpRecvParams::max_body_len`]. A request that breaks
-/// a limit or is malformed is answered with a `Connection: close` 413 / 400 response and the
-/// connection then reports [`Http1Event::Closed`] once that response is flushed.
+/// (and [`crate::http1::MAX_HEADERS`] headers) by the parser, and a decoded body to
+/// [`HttpRecvParams::max_body_len`]. A request that breaks a limit, is malformed or uses an
+/// unsupported transfer coding is answered with a `Connection: close` 413 / 431 / 400 / 501
+/// response and the connection then reports [`Http1Event::Closed`] once that response is flushed.
 #[derive(Debug)]
 pub struct Http1Conn {
   /// Unparsed input; the live part is `buf[start..]`.
@@ -68,7 +69,7 @@ enum Phase {
 
 /// Outcome of looking at the head in the buffer.
 enum Head {
-  Bad,
+  Bad(StatusCode),
   Partial,
   Bodyless(Http1Request<'static>, usize),
   WithBody(BodyKind, usize),
@@ -133,7 +134,7 @@ impl Http1Conn {
     }
     if let Phase::Head = self.phase {
       let (kind, head_len) = match self.parse_head() {
-        Head::Bad => return self.fail(StatusCode::BadRequest),
+        Head::Bad(status) => return self.fail(status),
         Head::Partial => return Http1Event::NeedMore,
         Head::Bodyless(request, head_len) => {
           self.body.clear();
@@ -265,7 +266,7 @@ impl Http1Conn {
   fn parse_head(&mut self) -> Head {
     let input = self.buf.get(self.start..).unwrap_or_default();
     match parse_request(input, &mut self.scratch) {
-      Err(_) => Head::Bad,
+      Err(err) => Head::Bad(error_status(&err)),
       Ok(ParseOutcome::Partial) => Head::Partial,
       Ok(ParseOutcome::Complete { request, head_len }) => match request.body_kind {
         BodyKind::None | BodyKind::ContentLength(0) => {
@@ -543,21 +544,36 @@ mod tests {
   }
 
   #[test]
-  fn malformed_and_oversized_heads_get_400() {
+  fn malformed_heads_get_400() {
     let mut c = conn();
     c.feed(b"NOPE\r\n\r\n").unwrap();
     assert_eq!(c.poll_event(), Http1Event::NeedMore);
     assert!(c.wants_close());
     assert!(output(&mut c).starts_with(b"HTTP/1.1 400 "));
     assert_eq!(c.poll_event(), Http1Event::Closed);
+  }
 
+  #[test]
+  fn oversized_heads_get_431() {
     let mut c = conn();
-    let mut head = b"GET / HTTP/1.1\r\nX: ".to_vec();
+    let mut head = b"GET / HTTP/1.1\r\nHost: a\r\nX: ".to_vec();
     head.resize(20 * 1024, b'a');
     c.feed(&head).unwrap();
     c.poll_event();
     assert!(c.wants_close());
-    assert!(output(&mut c).starts_with(b"HTTP/1.1 400 "));
+    assert!(output(&mut c).starts_with(b"HTTP/1.1 431 "));
+    assert_eq!(c.poll_event(), Http1Event::Closed);
+
+    let mut c = conn();
+    let mut head = b"GET / HTTP/1.1\r\nHost: a\r\n".to_vec();
+    for i in 0..crate::http1::MAX_HEADERS {
+      head.extend_from_slice(alloc::format!("X-{i}: v\r\n").as_bytes());
+    }
+    head.extend_from_slice(b"\r\n");
+    c.feed(&head).unwrap();
+    c.poll_event();
+    assert!(c.wants_close());
+    assert!(output(&mut c).starts_with(b"HTTP/1.1 431 "));
   }
 
   /// Answers every ready request, returning how many there were.

@@ -18,6 +18,8 @@ pub enum HttpError {
   ),
   /// Received request does not contain a method field
   MissingRequestMethod,
+  /// HTTP/1.1 request head over the size limit or with too many headers (answered with 431)
+  RequestHeaderFieldsTooLarge,
   /// Received response does not contain a status code field
   MissingResponseStatusCode,
   /// The URI doesn't have any placeholder
@@ -41,6 +43,8 @@ pub enum HttpError {
     /// Received length
     length: u32,
   },
+  /// HTTP/1.1 `Transfer-Encoding` with a coding other than `chunked` (answered with 501)
+  UnsupportedTransferCoding,
   /// Unknown `WebAuthn` Algorithm
   UnknownWebAuthnAlg,
   /// URI mismatch

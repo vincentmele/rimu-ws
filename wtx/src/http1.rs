@@ -10,7 +10,7 @@ use crate::http::Method;
 
 pub use body::{BodyDecoder, BodyStatus};
 pub use conn::{Http1Conn, Http1Event};
-pub use parser::{ParseOutcome, ParseScratch, parse_request};
+pub use parser::{ParseOutcome, ParseScratch, error_status, parse_request};
 pub use response::write_response;
 
 /// Maximum number of headers of a request.
