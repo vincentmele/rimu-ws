@@ -1,4 +1,9 @@
 [[bin]]
+name = "arena-h1"
+path = "src/bin/arena-h1.rs"
+required-features = ["arena-h1"]
+
+[[bin]]
 name = "arena-h2"
 path = "src/bin/arena-h2.rs"
 required-features = ["arena-h2"]
@@ -90,6 +95,7 @@ tokio = { default-features = false, features = ["macros", "net", "rt-multi-threa
 rimu-ws = { default-features = false, features = ["optimizations-std"], path = "../wtx" }
 
 [features]
+arena-h1 = ["rimu-ws/http1-server-framework", "rimu-ws/io-uring"]
 arena-h2 = ["serde/derive", "serde_json/std", "rimu-ws/crypto-ring", "rimu-ws/http2-server-framework", "rimu-ws/io-uring", "rimu-ws/json-writer", "rimu-ws/macros", "rimu-ws/serde", "rimu-ws/serde_json"]
 autobahn-client = ["tokio", "rimu-ws/tokio", "rimu-ws/web-socket", "rimu-ws/zlib-rs"]
 autobahn-client-concurrent = ["tokio",  "rimu-ws/tokio", "rimu-ws/web-socket", "rimu-ws/zlib-rs"]
