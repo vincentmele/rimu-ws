@@ -96,13 +96,33 @@ impl<'a> Http1Req<'a> {
 pub struct Http1Res {
   body: Vec<u8>,
   content_type: &'static str,
+  delay: Option<core::time::Duration>,
   headers: Vec<u8>,
   status: StatusCode,
 }
 
 impl Http1Res {
   pub(crate) fn new(body: Vec<u8>) -> Self {
-    Self { body, content_type: "text/plain", headers: Vec::new(), status: StatusCode::Ok }
+    Self {
+      body,
+      content_type: "text/plain",
+      delay: None,
+      headers: Vec::new(),
+      status: StatusCode::Ok,
+    }
+  }
+
+  /// Time the connection waits, without blocking its thread, before this response is sent.
+  /// Responses of the same connection stay in order. Cleared for every request.
+  #[inline]
+  pub fn delay(&self) -> Option<core::time::Duration> {
+    self.delay
+  }
+
+  /// Asks for the response to be sent only after `delay`.
+  #[inline]
+  pub const fn set_delay(&mut self, delay: core::time::Duration) {
+    self.delay = Some(delay);
   }
 
   /// Body written so far.
@@ -160,6 +180,7 @@ impl Http1Res {
   pub(crate) fn reset(&mut self) {
     self.body.clear();
     self.content_type = "text/plain";
+    self.delay = None;
     self.headers.clear();
     self.status = StatusCode::Ok;
   }
@@ -788,6 +809,12 @@ mod tests {
         res.body_mut().extend_from_slice(req.param("id").unwrap_or_default().as_bytes());
         Ok(())
       })
+      .get("/delay/{ms}", |_, req, res| {
+        let ms = req.param("ms").unwrap_or("0");
+        res.set_delay(Duration::from_millis(ms.parse().unwrap_or(0)));
+        res.body_mut().extend_from_slice(ms.as_bytes());
+        Ok(())
+      })
       .get("/boom", |_, _, _| Err(crate::Error::ClosedHttpConnection))
       .get("/teapot", |_, _, res| {
         res.set_status(StatusCode::Created);
@@ -1055,4 +1082,52 @@ mod tests {
     assert_eq!(body, b"pong");
   }
 
+  // The response leaves only after the handler's delay, and the next response of the same
+  // connection, which asks for none, is not held back.
+  #[test]
+  fn delayed_response_waits_not_early() {
+    let addr = server(|_| {});
+    let mut stream = connect(&addr);
+    let begin = std::time::Instant::now();
+    stream.write_all(b"GET /delay/60 HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let (head, body) = read_response(&mut stream);
+    let elapsed = begin.elapsed();
+    assert!(head.starts_with("http/1.1 200 ok\r\n"), "{head}");
+    assert_eq!(body, b"60");
+    assert!(elapsed >= Duration::from_millis(55), "{elapsed:?}");
+    // The delay does not leak into the next response
+    let begin = std::time::Instant::now();
+    stream.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    assert_eq!(read_response(&mut stream).1, b"pong");
+    assert!(begin.elapsed() < Duration::from_millis(40), "{:?}", begin.elapsed());
+  }
+
+  // Delays overlap: the one runtime thread serves every connection while they wait.
+  #[test]
+  fn concurrent_distinct_delays() {
+    let addr = server(|_| {});
+    let begin = std::time::Instant::now();
+    let handles: Vec<_> = [40u64, 80, 120, 40, 80, 120]
+      .into_iter()
+      .map(|ms| {
+        let addr = addr.clone();
+        std::thread::spawn(move || {
+          let mut stream = connect(&addr);
+          let sent = std::time::Instant::now();
+          stream
+            .write_all(std::format!("GET /delay/{ms} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            .unwrap();
+          let (_, body) = read_response(&mut stream);
+          assert_eq!(body, std::format!("{ms}").as_bytes());
+          let elapsed = sent.elapsed();
+          assert!(elapsed >= Duration::from_millis(ms) * 9 / 10, "{ms}: {elapsed:?}");
+        })
+      })
+      .collect();
+    for handle in handles {
+      handle.join().unwrap();
+    }
+    // Serialized they would take 480 ms
+    assert!(begin.elapsed() < Duration::from_millis(300), "{:?}", begin.elapsed());
+  }
 }

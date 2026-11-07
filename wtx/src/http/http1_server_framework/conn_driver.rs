@@ -15,6 +15,7 @@
 
 use crate::{
   collections::VectorUsize,
+  futures::Sleep,
   http::{HttpRecvParams, http1_server_framework::Http1Res},
   http1::{Http1Conn, Http1Event, Http1Request},
   net::{StreamReader, StreamWriter, TryRead},
@@ -164,7 +165,7 @@ impl Driver {
       let got = !self.rx.is_empty();
       self.answered = 0;
       loop {
-        let done = self.process(service)?;
+        let done = self.process(stream, service).await?;
         // Whatever the requests produced leaves before anything waits for more input.
         self.flush(stream).await?;
         if self.conn.wants_close() {
@@ -235,8 +236,9 @@ impl Driver {
 
   /// Feeds what was received to the core and answers every request it completes. Returns `false`
   /// when it stopped early to let the queued responses out.
-  fn process<V>(&mut self, service: &mut V) -> crate::Result<bool>
+  async fn process<S, V>(&mut self, stream: &mut S, service: &mut V) -> crate::Result<bool>
   where
+    S: StreamWriter,
     V: Http1Service,
   {
     loop {
@@ -247,7 +249,7 @@ impl Driver {
       loop {
         match self.conn.poll_event() {
           Http1Event::RequestReady => {
-            self.answer(service);
+            self.answer(stream, service).await?;
             if self.queued >= OUT_HIGH_WATER {
               return Ok(false);
             }
@@ -268,8 +270,13 @@ impl Driver {
   }
 
   /// Runs the handler of the request that is ready and queues its response in the core.
-  fn answer<V>(&mut self, service: &mut V)
+  ///
+  /// A response with a delay waits for it here, before it is queued: what was answered earlier
+  /// leaves first and nothing of this response is sent before the delay is over. Only this
+  /// connection's future waits, the thread keeps running the others.
+  async fn answer<S, V>(&mut self, stream: &mut S, service: &mut V) -> crate::Result<()>
   where
+    S: StreamWriter,
     V: Http1Service,
   {
     self.answered = self.answered.wrapping_add(1);
@@ -278,10 +285,16 @@ impl Driver {
       Some(head) => service.call(head, self.conn.body(), &mut self.res),
       None => self.res.set_status(crate::http::StatusCode::InternalServerError),
     }
+    if let Some(delay) = self.res.delay()
+      && !delay.is_zero()
+    {
+      self.flush(stream).await?;
+      Sleep::new(delay)?.await?;
+    }
     if self.res.extra_headers().is_empty() {
       self.conn.respond(self.res.status(), self.res.content_type(), self.res.body());
       self.queued = self.queued.wrapping_add(self.res.body().len()).wrapping_add(128);
-      return;
+      return Ok(());
     }
     // The core writes no header but its own: this response is taken out as soon as it is queued
     // and the headers are put after its status line.
@@ -297,6 +310,7 @@ impl Driver {
       self.spare = taken;
     }
     self.queued = self.queued.wrapping_add(self.wire.len());
+    Ok(())
   }
 
   /// Moves what the core holds to the end of `wire`.
