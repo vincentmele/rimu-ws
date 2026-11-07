@@ -299,6 +299,8 @@ impl Driver {
     // The core writes no header but its own: this response is taken out as soon as it is queued
     // and the headers are put after its status line.
     self.pull_core();
+    // What `wire` already holds was counted when it was queued.
+    let before = self.wire.len();
     self.conn.respond(self.res.status(), self.res.content_type(), self.res.body());
     if let Ok(taken) = self.conn.take_output(mem::take(&mut self.spare)) {
       let line_end =
@@ -309,7 +311,7 @@ impl Driver {
       self.conn.advance_output(taken.len());
       self.spare = taken;
     }
-    self.queued = self.queued.wrapping_add(self.wire.len());
+    self.queued = self.queued.wrapping_add(self.wire.len().wrapping_sub(before));
     Ok(())
   }
 
@@ -476,4 +478,93 @@ fn rx_pool_give(mut buffer: VectorUsize<u8>) {
       pool.push(buffer);
     }
   });
+}
+
+#[cfg(test)]
+mod tests {
+  use crate::{
+    collections::MaybeUninitSlice,
+    executor::StdRuntime,
+    http::{
+      HttpRecvParams,
+      http1_server_framework::{
+        Http1Res,
+        conn_driver::{Http1Service, drive_conn},
+      },
+    },
+    http1::Http1Request,
+    net::{StreamCommon, StreamReader, StreamWriter, TryRead},
+  };
+  use alloc::vec::Vec;
+  use core::num::NonZeroUsize;
+
+  /// Gives its input at once, then reports the end of the stream; counts the writes.
+  struct Scripted {
+    input: Vec<u8>,
+    output: Vec<u8>,
+    writes: usize,
+  }
+
+  impl StreamCommon for Scripted {}
+
+  impl StreamReader for Scripted {
+    async fn read(&mut self, _: MaybeUninitSlice<'_, u8>) -> crate::Result<Option<NonZeroUsize>> {
+      Ok(None)
+    }
+
+    fn try_read(&mut self, mut bytes: MaybeUninitSlice<'_, u8>) -> crate::Result<TryRead> {
+      let dst = bytes.initialize_all_bytes();
+      let len = dst.len().min(self.input.len());
+      let Some(len) = NonZeroUsize::new(len) else {
+        return Ok(TryRead::Closed);
+      };
+      dst[..len.get()].copy_from_slice(&self.input[..len.get()]);
+      let _ = self.input.drain(..len.get());
+      Ok(TryRead::Read(len))
+    }
+  }
+
+  impl StreamWriter for Scripted {
+    async fn write_all(&mut self, bytes: &[u8]) -> crate::Result<()> {
+      self.writes += 1;
+      self.output.extend_from_slice(bytes);
+      Ok(())
+    }
+
+    async fn write_all_vectored(&mut self, bytes: &[&[u8]]) -> crate::Result<()> {
+      self.writes += 1;
+      for elem in bytes {
+        self.output.extend_from_slice(elem);
+      }
+      Ok(())
+    }
+  }
+
+  /// Answers `pong` with one extra header.
+  struct WithHeader;
+
+  impl Http1Service for WithHeader {
+    fn call(&mut self, _: Http1Request<'_>, _: &[u8], res: &mut Http1Res) {
+      res.push_header("server", "rimu-ws").unwrap();
+      res.body_mut().extend_from_slice(b"pong");
+    }
+  }
+
+  // A batch of small pipelined responses with an extra header is far below the high-water mark
+  // and leaves in one write: each response counts its own bytes, not everything spliced so far.
+  #[test]
+  fn extra_headers_count_their_own_bytes() {
+    let count = 300;
+    let mut input = Vec::new();
+    for _ in 0..count {
+      input.extend_from_slice(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n");
+    }
+    let mut stream = Scripted { input, output: Vec::new(), writes: 0 };
+    let hrc = HttpRecvParams::with_default_params();
+    StdRuntime::new().block_on(drive_conn(&mut stream, &mut WithHeader, &hrc, None)).unwrap();
+    let answered = stream.output.windows(4).filter(|el| el == b"pong").count();
+    assert_eq!(answered, count);
+    assert!(stream.output.len() < 64 * 1024, "{}", stream.output.len());
+    assert_eq!(stream.writes, 1, "{} bytes in {} writes", stream.output.len(), stream.writes);
+  }
 }
