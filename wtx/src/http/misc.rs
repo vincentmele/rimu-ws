@@ -95,7 +95,11 @@ pub(crate) async fn accept_or_shutdown<T>(
 }
 
 /// `fut`'s output, or [`crate::Error::ExpiredFuture`] if `timeout` passes first.
-#[cfg(any(feature = "http2-server-framework", feature = "web-socket-server-framework"))]
+#[cfg(any(
+  feature = "http1-server-framework",
+  feature = "http2-server-framework",
+  feature = "web-socket-server-framework"
+))]
 pub(crate) async fn within<T>(
   fut: impl Future<Output = crate::Result<T>>,
   timeout: Option<Duration>,

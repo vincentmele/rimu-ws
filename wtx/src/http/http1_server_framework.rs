@@ -11,7 +11,9 @@ use crate::{
   executor::{Executor, Runtime as _},
   http::{
     HttpRecvParams, Method, Router, RouterError, RouterMatch, ShutdownSignal, StatusCode,
-    misc::{accept_or_shutdown, admit, counter, drain_connections, on_accept_error, tracked},
+    misc::{
+      accept_or_shutdown, admit, counter, drain_connections, on_accept_error, tracked, within,
+    },
   },
   http1::Http1Request,
   net::{TcpListener as _, TcpParams, Uri},
@@ -20,9 +22,11 @@ use crate::{
   tls::{PlaintextCtx, TlsAcceptor, TlsConfig, TlsCtxSk},
 };
 use alloc::{boxed::Box, rc::Rc, string::String, vec::Vec};
-use conn_driver::{ConnGroup, DriveParams, Http1Service, drive_conn};
+use conn_driver::{ConnGroup, DriveParams, Http1Service, drive_conn, peer_gone};
 use core::{num::NonZeroUsize, ops::ControlFlow, time::Duration};
 
+/// Default of [`Http1ServerFramework::set_handshake_timeout`].
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default of [`Http1ServerFramework::set_max_delay`].
 const DEFAULT_MAX_DELAY: Duration = Duration::from_secs(10);
 
@@ -426,6 +430,7 @@ pub struct Http1ServerFramework<DA, EC, EX, RC, RNG = ChaCha20, TCX = PlaintextC
   data: DA,
   error_cb: EC,
   executor: EX,
+  handshake_timeout: Option<Duration>,
   hrc: HttpRecvParams,
   local_runtime_cb: RC,
   local_runtimes: Option<NonZeroUsize>,
@@ -462,6 +467,7 @@ where
       data: (),
       error_cb,
       executor,
+      handshake_timeout: Some(DEFAULT_HANDSHAKE_TIMEOUT),
       hrc: HttpRecvParams::with_default_params(),
       local_runtime_cb,
       local_runtimes: None,
@@ -494,8 +500,8 @@ where
   /// HTTP/2 server does. `rng` seeds the generator of each thread and, from it, those of the
   /// connections.
   ///
-  /// Unlike the plaintext server, a TLS handshake is not bounded by anything but the runtime's
-  /// idle timeout (see [`Self::new`]).
+  /// The handshake and the head of the first request are bounded by
+  /// [`Self::set_handshake_timeout`].
   #[inline]
   pub fn new_tls(executor: EX, rng: RNG, mut tls_config: TlsConfig<TCX>) -> crate::Result<Self> {
     tls_config
@@ -510,6 +516,7 @@ where
       data: (),
       error_cb,
       executor,
+      handshake_timeout: Some(DEFAULT_HANDSHAKE_TIMEOUT),
       hrc: HttpRecvParams::with_default_params(),
       local_runtime_cb,
       local_runtimes: None,
@@ -530,6 +537,7 @@ impl<DA, EC, EX, RC, RNG, TCX> Http1ServerFramework<DA, EC, EX, RC, RNG, TCX> {
       data: value,
       error_cb: self.error_cb,
       executor: self.executor,
+      handshake_timeout: self.handshake_timeout,
       hrc: self.hrc,
       local_runtime_cb: self.local_runtime_cb,
       local_runtimes: self.local_runtimes,
@@ -548,6 +556,7 @@ impl<DA, EC, EX, RC, RNG, TCX> Http1ServerFramework<DA, EC, EX, RC, RNG, TCX> {
       data: self.data,
       error_cb: value,
       executor: self.executor,
+      handshake_timeout: self.handshake_timeout,
       hrc: self.hrc,
       local_runtime_cb: self.local_runtime_cb,
       local_runtimes: self.local_runtimes,
@@ -557,6 +566,19 @@ impl<DA, EC, EX, RC, RNG, TCX> Http1ServerFramework<DA, EC, EX, RC, RNG, TCX> {
       tcp_params: self.tcp_params,
       tls: self.tls,
     }
+  }
+
+  /// TLS servers only: how long a connection has, from its accept, to complete the TLS handshake
+  /// and then send the head of its first request. Past that it is closed, which is not reported
+  /// as an error. The runtime's own handshake timeout (see [`crate::executor::UringParams`]) ends
+  /// once the server sends anything, its ServerHello for a TLS connection, so it can't bound the
+  /// rest of the handshake; a plaintext connection sends nothing before its first response, and
+  /// that timeout bounds it. `None` sets no limit. Defaults to 10 s.
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub const fn set_handshake_timeout(mut self, value: Option<Duration>) -> Self {
+    self.handshake_timeout = value;
+    self
   }
 
   /// Only [`HttpRecvParams::max_body_len`] applies to HTTP/1.1.
@@ -574,6 +596,7 @@ impl<DA, EC, EX, RC, RNG, TCX> Http1ServerFramework<DA, EC, EX, RC, RNG, TCX> {
       data: self.data,
       error_cb: self.error_cb,
       executor: self.executor,
+      handshake_timeout: self.handshake_timeout,
       hrc: self.hrc,
       local_runtime_cb: value,
       local_runtimes: self.local_runtimes,
@@ -684,7 +707,8 @@ where
         active: active.clone(),
         data: self.data.clone(),
         error_cb: self.error_cb.clone(),
-        params: DriveParams { hrc: self.hrc, max_delay: self.max_delay },
+        handshake_timeout: self.handshake_timeout,
+        params: DriveParams { first_head: None, hrc: self.hrc, max_delay: self.max_delay },
         max_connections: self.max_connections,
         router: router.clone(),
         shutdown: self.shutdown.clone(),
@@ -724,6 +748,7 @@ struct ThreadServer<DA, EC, ER, M, RNG, TCX> {
   active: Option<Arc<crate::sync::AtomicUsize>>,
   data: DA,
   error_cb: EC,
+  handshake_timeout: Option<Duration>,
   max_connections: Option<NonZeroUsize>,
   params: DriveParams,
   router: Arc<Http1Router<DA, ER, M>>,
@@ -783,6 +808,7 @@ where
         Some((rng, tls_config)) => Some((RNG::from_crypto_rng(rng)?, tls_config.clone())),
         None => None,
       };
+      let tls = tls.map(|(rng, tls_config)| (rng, tls_config, self.handshake_timeout));
       let fut = conn_fut(stream, service, self.params, group.clone(), tls);
       if let Some(active) = &self.active {
         let _jh = executor.spawn_local(tracked(fut, active.clone()), lc);
@@ -806,7 +832,7 @@ async fn conn_fut<DA, EC, ER, M, RNG, S, TCX>(
   mut service: RouterService<DA, EC, ER, M>,
   params: DriveParams,
   group: Option<Rc<ConnGroup>>,
-  tls: Option<(RNG, Arc<TlsConfig<TCX>>)>,
+  tls: Option<(RNG, Arc<TlsConfig<TCX>>, Option<Duration>)>,
 ) where
   EC: Fn(ER),
   ER: From<crate::Error>,
@@ -818,18 +844,31 @@ async fn conn_fut<DA, EC, ER, M, RNG, S, TCX>(
   let rslt = match tls {
     None => drive_conn(&mut stream, &mut service, &params, group.as_deref()).await,
     // The stream is never split: the core drives the TLS stream as it drives a plain one.
-    Some((mut rng, tls_config)) => {
-      match TlsAcceptor::new(&*tls_config, &mut rng, stream).accept().await {
+    Some((mut rng, tls_config, handshake_timeout)) => {
+      let begin = crate::calendar::Instant::new();
+      let accept = TlsAcceptor::new(&*tls_config, &mut rng, stream).accept();
+      match within(accept, handshake_timeout).await {
         Ok(accepted) => {
           let mut tls_stream = accepted.tls_stream;
-          drive_conn(&mut tls_stream, &mut service, &params, group.as_deref()).await
+          let mut params = params;
+          // What is left of the handshake timeout covers the head of the first request.
+          let left = |el: Duration| el.saturating_sub(begin.elapsed().unwrap_or(el));
+          params.first_head = handshake_timeout.map(left);
+          let rslt = drive_conn(&mut tls_stream, &mut service, &params, group.as_deref()).await;
+          // Ended by this side: the end of the stream is announced. A peer that closed was
+          // already answered (its close_notify), or can't be (a bare close).
+          if rslt.is_ok() && !tls_stream.connection_state().cannot_write() {
+            let _rslt = tls_stream.send_close_notify().await;
+          }
+          rslt
         }
         Err(err) => Err(err),
       }
     }
   };
-  if let Err(err) = rslt {
-    (service.error_cb)(err.into());
+  match rslt {
+    Err(err) if !peer_gone(&err) => (service.error_cb)(err.into()),
+    _ => {}
   }
 }
 
@@ -1244,6 +1283,10 @@ mod tests {
     assert_eq!(body, b"pong");
   }
 
+  /// The default handshake timeout.
+  #[cfg(feature = "crypto-ring")]
+  const HS: Option<Duration> = Some(Duration::from_secs(10));
+
   /// A one-runtime TLS server; returns its address, and a receiver of whether `run_in_threads`
   /// returned `Ok`.
   #[cfg(feature = "crypto-ring")]
@@ -1251,6 +1294,7 @@ mod tests {
     error_cb: fn(crate::Error),
     max_connections: Option<core::num::NonZeroUsize>,
     shutdown: Option<(crate::http::ShutdownSignal, Duration)>,
+    handshake_timeout: Option<Duration>,
   ) -> (crate::net::UriString, std::sync::mpsc::Receiver<bool>) {
     use crate::{
       rng::{ChaCha20, CryptoSeedableRng as _},
@@ -1273,7 +1317,8 @@ mod tests {
       .set_error_cb(error_cb)
       .set_local_runtime_cb(|| UringRuntime::with_params(UringParams::new()))
       .set_local_runtimes(core::num::NonZeroUsize::new(1))
-      .set_max_connections(max_connections);
+      .set_max_connections(max_connections)
+      .set_handshake_timeout(handshake_timeout);
       let fw = match shutdown {
         Some((signal, drain)) => fw.set_shutdown(signal, drain),
         None => fw,
@@ -1339,7 +1384,7 @@ mod tests {
   #[test]
   fn delayed_tls_response_notices_a_reset_peer() {
     use crate::{executor::StdRuntime, net::StreamWriter as _};
-    let (uri, _done) = tls_server(|_| {}, core::num::NonZeroUsize::new(1), None);
+    let (uri, _done) = tls_server(|_| {}, core::num::NonZeroUsize::new(1), None, HS);
     StdRuntime::new().block_on(async move {
       let mut first = tls_connect(&uri).await;
       first.write_all(b"GET /delay/3000 HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
@@ -1370,7 +1415,7 @@ mod tests {
   fn shutdown_closes_idle_tls_connections() {
     use crate::{executor::StdRuntime, net::StreamWriter as _};
     let signal = crate::http::ShutdownSignal::new();
-    let (uri, done) = tls_server(|_| {}, None, Some((signal.clone(), Duration::from_secs(4))));
+    let (uri, done) = tls_server(|_| {}, None, Some((signal.clone(), Duration::from_secs(4))), HS);
     StdRuntime::new().block_on(async move {
       let mut stream = tls_connect(&uri).await;
       stream.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
@@ -1385,6 +1430,184 @@ mod tests {
         tls_read_until(&mut stream, b"pong").await.is_none(),
         "the idle connection stayed open"
       );
+    });
+  }
+
+  /// The first flight of a TLS client (its ClientHello record), taken from a connection to a
+  /// listener that answers nothing.
+  #[cfg(feature = "crypto-ring")]
+  fn client_hello() -> Vec<u8> {
+    use crate::{
+      executor::StdRuntime,
+      rng::{ChaCha20, CryptoSeedableRng as _},
+      tests::_ROOT_CA,
+      tls::{TlsConfig, TlsConnectorBuilder},
+    };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let uri = crate::net::UriString::new(std::format!("http://127.0.0.1:{port}"));
+    let _client = std::thread::spawn(move || {
+      StdRuntime::new().block_on(async move {
+        let mut rng = ChaCha20::from_std_random().unwrap();
+        let mut config = TlsConfig::from_trust_anchors_pem([_ROOT_CA]).unwrap();
+        config
+          .alpn_mut()
+          .get_or_insert_default()
+          .protocol_name_list
+          .push(b"http/1.1".as_slice().try_into().unwrap())
+          .unwrap();
+        if let Ok(elem) = TlsConnectorBuilder::std(uri).build(&config, &mut rng).await {
+          let _rslt = elem.connect().await;
+        }
+      });
+    });
+    let (mut peer, _) = listener.accept().unwrap();
+    let mut record = std::vec![0; 5];
+    peer.read_exact(&mut record).unwrap();
+    let len = usize::from(u16::from_be_bytes([record[3], record[4]]));
+    record.resize(5 + len, 0);
+    peer.read_exact(&mut record[5..]).unwrap();
+    record
+  }
+
+  // A TLS handshake that the peer abandons (closed, reset, or closed after its ClientHello) is a
+  // peer that went away, as for plaintext, and not an error.
+  #[cfg(feature = "crypto-ring")]
+  #[test]
+  fn abandoned_tls_handshakes_are_not_errors() {
+    use crate::{executor::StdRuntime, sync::AtomicUsize};
+    use core::sync::atomic::Ordering;
+    static ERRORS: AtomicUsize = AtomicUsize::new(0);
+    let (uri, _done) = tls_server(
+      |err| {
+        std::eprintln!("reported: {err:?}");
+        let _prev = ERRORS.fetch_add(1, Ordering::Relaxed);
+      },
+      None,
+      None,
+      HS,
+    );
+    let hello = client_hello();
+    let (host, port) = uri.hostname_with_implied_port();
+    let addr = std::format!("{host}:{port}");
+    // Up and serving first
+    StdRuntime::new().block_on(async {
+      let mut stream = tls_connect(&uri).await;
+      let req = b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n";
+      crate::net::StreamWriter::write_all(&mut stream, req).await.unwrap();
+      assert!(tls_read_until(&mut stream, b"pong").await.is_some());
+    });
+    drop(connect(&addr));
+    reset(connect(&addr));
+    let mut stream = connect(&addr);
+    stream.write_all(&hello[..hello.len() / 2]).unwrap();
+    drop(stream);
+    let mut stream = connect(&addr);
+    stream.write_all(&hello).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    drop(stream);
+    let stream = connect(&addr);
+    stream.try_clone().unwrap().write_all(&hello).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    reset(stream);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(ERRORS.load(Ordering::Relaxed), 0);
+  }
+
+  // A TLS connection the server closes ends with a close_notify, not a bare TCP close.
+  #[cfg(feature = "crypto-ring")]
+  #[test]
+  fn tls_close_sends_close_notify() {
+    use crate::{
+      executor::StdRuntime,
+      net::{ConnectionState, StreamReader as _, StreamWriter as _},
+    };
+    let (uri, _done) = tls_server(|_| {}, None, None, HS);
+    StdRuntime::new().block_on(async move {
+      let mut stream = tls_connect(&uri).await;
+      stream
+        .write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+      assert!(tls_read_until(&mut stream, b"pong").await.is_some());
+      let mut buf = [0u8; 64];
+      let end = stream.read(buf.as_mut_slice().into()).await;
+      assert!(matches!(end, Ok(None)), "{end:?}");
+      assert_eq!(stream.connection_state(), ConnectionState::ClosedGracefully);
+    });
+  }
+
+  /// Counts the errors reported by TLS servers in the handshake timeout tests.
+  #[cfg(feature = "crypto-ring")]
+  static HANDSHAKE_ERRORS: crate::sync::AtomicUsize = crate::sync::AtomicUsize::new(0);
+
+  /// How long until the server ends `stream`, which sends nothing more, from `begin`.
+  fn time_to_close(stream: &mut TcpStream, begin: std::time::Instant) -> Duration {
+    stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut buf = [0; 4096];
+    loop {
+      match stream.read(&mut buf) {
+        Ok(0) => return begin.elapsed(),
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => return begin.elapsed(),
+        Err(err) => panic!("{err:?} after {:?}", begin.elapsed()),
+      }
+    }
+  }
+
+  // A client that stops in the middle of its TLS handshake, after the server's first flight
+  // (when the runtime's handshake timeout no longer applies), is closed by the server's
+  // handshake timeout, quietly.
+  #[cfg(feature = "crypto-ring")]
+  #[test]
+  fn tls_handshake_timeout_closes_a_stalled_handshake() {
+    use core::sync::atomic::Ordering;
+    let (uri, _done) = tls_server(
+      |_| {
+        let _prev = HANDSHAKE_ERRORS.fetch_add(1, Ordering::Relaxed);
+      },
+      None,
+      None,
+      Some(Duration::from_millis(300)),
+    );
+    let hello = client_hello();
+    let (host, port) = uri.hostname_with_implied_port();
+    let mut stream = connect(&std::format!("{host}:{port}"));
+    let begin = std::time::Instant::now();
+    stream.write_all(&hello).unwrap();
+    let elapsed = time_to_close(&mut stream, begin);
+    assert!(elapsed >= Duration::from_millis(250), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(HANDSHAKE_ERRORS.load(Ordering::Relaxed), 0);
+  }
+
+  // The handshake timeout runs on through the head of the first request: a client that
+  // completes the handshake and then trickles its request is closed. One that sent its first
+  // request in time is not held to it afterwards.
+  #[cfg(feature = "crypto-ring")]
+  #[test]
+  fn tls_handshake_timeout_covers_the_first_request_head() {
+    use crate::{executor::StdRuntime, net::StreamWriter as _};
+    let (uri, _done) = tls_server(|_| {}, None, None, Some(Duration::from_millis(300)));
+    StdRuntime::new().block_on(async move {
+      let begin = std::time::Instant::now();
+      let mut stream = tls_connect(&uri).await;
+      stream.write_all(b"GET /pi").await.unwrap();
+      assert!(tls_read_until(&mut stream, b"pong").await.is_none());
+      let elapsed = begin.elapsed();
+      assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+      // In time, then idle past the timeout, then a second request
+      let mut stream = tls_connect(&uri).await;
+      stream.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+      assert!(tls_read_until(&mut stream, b"pong").await.is_some());
+      std::thread::sleep(Duration::from_millis(500));
+      stream.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+      assert!(tls_read_until(&mut stream, b"pong").await.is_some());
+      // A delayed first response is not cut by the timeout either
+      let mut stream = tls_connect(&uri).await;
+      stream.write_all(b"GET /delay/500 HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+      assert!(tls_read_until(&mut stream, b"500").await.is_some());
     });
   }
 

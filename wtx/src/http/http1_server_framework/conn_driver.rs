@@ -14,13 +14,16 @@
 //!    after the requests it made room for were answered.
 //! 4. While a response is delayed the socket is still watched: what arrives is kept for after
 //!    the response, and a peer that goes away ends the connection at once.
+//! 5. A connection with a first-head deadline (TLS) races it in every wait until its first
+//!    request is ready.
 
 use crate::{
   collections::VectorUsize,
   futures::Sleep,
   http::{HttpRecvParams, http1_server_framework::Http1Res},
   http1::{Http1Conn, Http1Event, Http1Request},
-  net::{StreamReader, StreamWriter, TryRead},
+  net::{NetError, StreamReader, StreamWriter, TryRead},
+  tls::TlsError,
 };
 use alloc::{collections::BTreeMap, vec::Vec};
 use core::{
@@ -44,6 +47,9 @@ const OUT_HIGH_WATER: usize = 256 * 1024;
 /// What every connection of a server is driven with.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DriveParams {
+  /// Time the connection has for the head of its first request to arrive. Past that it fails
+  /// with [`crate::Error::ExpiredFuture`].
+  pub(crate) first_head: Option<Duration>,
   pub(crate) hrc: HttpRecvParams,
   /// Longest delay a response may ask for; longer ones are cut to it.
   pub(crate) max_delay: Duration,
@@ -97,8 +103,9 @@ impl Drop for Member<'_> {
   }
 }
 
-/// Serves one connection until it closes. A peer that goes away, in the middle of a request or
-/// not, is a normal close and not an error.
+/// Serves one connection until it closes. `Ok` when it ended normally: its peer closed it, a
+/// response closed it, or its server is shutting down. An error for which [`peer_gone`] holds is
+/// a normal close too, which the caller doesn't report.
 pub(crate) async fn drive_conn<S, V>(
   stream: &mut S,
   service: &mut V,
@@ -113,6 +120,7 @@ where
   let mut driver = Driver {
     answered: 0,
     conn: Http1Conn::new(&params.hrc),
+    deadline: params.first_head.map(Sleep::new).transpose()?,
     max_delay: params.max_delay,
     midreq: false,
     offset: 0,
@@ -128,16 +136,15 @@ where
   rx_pool_give(mem::take(&mut driver.rx));
   bytes_pool_give(mem::take(&mut driver.spare));
   bytes_pool_give(driver.res.take_body());
-  match rslt {
-    Err(err) if peer_gone(&err) => Ok(()),
-    elem => elem,
-  }
+  rslt
 }
 
 struct Driver {
   /// Requests answered in the current round.
   answered: usize,
   conn: Http1Conn,
+  /// Until the first request is ready: when the connection's time for it is over.
+  deadline: Option<Sleep>,
   max_delay: Duration,
   /// Bytes arrived and no response went out since: probably the middle of a request.
   midreq: bool,
@@ -261,7 +268,12 @@ impl Driver {
           // Nothing is waiting to be sent: every round ends with a flush.
           let (init, uninit) = self.rx.split_at_spare_mut();
           let init_len = init.len();
-          let Some(len) = stream.read(uninit.into()).await? else {
+          let read = stream.read(uninit.into());
+          let rslt = match &mut self.deadline {
+            None => read.await,
+            Some(deadline) => before(read, deadline).await,
+          };
+          let Some(len) = rslt? else {
             return Ok(true);
           };
           // SAFETY: `read` initialized `len` bytes of the spare capacity
@@ -321,6 +333,8 @@ impl Driver {
     V: Http1Service,
   {
     self.answered = self.answered.wrapping_add(1);
+    // The first request is here: its deadline is over, and its timer cancelled.
+    self.deadline = None;
     self.res.reset();
     match self.conn.request() {
       Some(head) => service.call(head, self.conn.body(), &mut self.res),
@@ -445,13 +459,14 @@ impl Driver {
 
   /// Waits until the stream has something to report: bytes, the end of the stream or an error.
   /// Returns `true` instead when the connection should end: its server is shutting down and it
-  /// is between requests.
-  async fn ready<S>(&self, stream: &mut S, member: Option<&Member<'_>>) -> crate::Result<bool>
+  /// is between requests. Fails once the first-head deadline is over.
+  async fn ready<S>(&mut self, stream: &mut S, member: Option<&Member<'_>>) -> crate::Result<bool>
   where
     S: StreamReader,
   {
     let idle = !self.midreq;
     let going_away = || member.is_some_and(|el| el.group.going_away.get());
+    let deadline = &mut self.deadline;
     let mut readable = pin!(stream.readable());
     poll_fn(|cx| {
       if let Some(member) = member
@@ -465,6 +480,11 @@ impl Driver {
       }
       if idle && going_away() {
         return Poll::Ready(Ok(true));
+      }
+      if let Some(elem) = deadline
+        && let Poll::Ready(rslt) = Pin::new(elem).poll(cx)
+      {
+        return Poll::Ready(rslt.and(Err(crate::Error::ExpiredFuture)));
       }
       readable.as_mut().poll(cx).map(|rslt| rslt.map(|()| false))
     })
@@ -484,22 +504,43 @@ where
   Ok(())
 }
 
-/// If the error only says the peer is gone, or that the runtime gave up on a quiet connection.
-fn peer_gone(err: &crate::Error) -> bool {
+/// `fut`'s output, or [`crate::Error::ExpiredFuture`] once `deadline` is over.
+async fn before<T>(
+  fut: impl Future<Output = crate::Result<T>>,
+  deadline: &mut Sleep,
+) -> crate::Result<T> {
+  let mut fut = pin!(fut);
+  poll_fn(|cx| {
+    if let Poll::Ready(elem) = fut.as_mut().poll(cx) {
+      return Poll::Ready(elem);
+    }
+    Pin::new(&mut *deadline).poll(cx).map(|elem| elem.and(Err(crate::Error::ExpiredFuture)))
+  })
+  .await
+}
+
+/// If the error only says the peer is gone, or that the runtime or the server gave up on a quiet
+/// or slow connection: a normal close, not reported.
+pub(crate) fn peer_gone(err: &crate::Error) -> bool {
   use std::io::ErrorKind;
-  matches!(
-    err,
-    crate::Error::Io(elem)
-      if matches!(
-        elem.kind(),
-        ErrorKind::BrokenPipe
-          | ErrorKind::ConnectionAborted
-          | ErrorKind::ConnectionReset
-          | ErrorKind::NotConnected
-          | ErrorKind::TimedOut
-          | ErrorKind::UnexpectedEof
-      )
-  )
+  match err {
+    crate::Error::Io(elem) => matches!(
+      elem.kind(),
+      ErrorKind::BrokenPipe
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::ConnectionReset
+        | ErrorKind::NotConnected
+        | ErrorKind::TimedOut
+        | ErrorKind::UnexpectedEof
+    ),
+    // Closed in the middle of a TLS record or handshake, or a handshake the peer ended with an
+    // alert (a client that doesn't trust the certificate, say).
+    crate::Error::Net(NetError::AbruptDisconnect)
+    | crate::Error::Tls(TlsError::AbruptDisconnect | TlsError::AbortedHandshake(_)) => true,
+    // The handshake timeout, the server's own version of the runtime's `TimedOut`.
+    crate::Error::ExpiredFuture => true,
+    _ => false,
+  }
 }
 
 /// Buffers released on this thread, most recent last, so the next connection uses ones that are
@@ -653,6 +694,7 @@ mod tests {
     }
     let mut stream = Scripted { input, output: Vec::new(), writes: 0 };
     let params = DriveParams {
+      first_head: None,
       hrc: HttpRecvParams::with_default_params(),
       max_delay: Duration::from_secs(10),
     };
