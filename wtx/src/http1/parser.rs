@@ -109,10 +109,14 @@ pub fn parse_request<'b>(
   if target.is_empty() {
     return Err(bad());
   }
-  let (path, query) = match find_byte(target.as_bytes(), b'?') {
-    Some(idx) => (target.get(..idx).ok_or_else(bad)?, target.get(idx + 1..).ok_or_else(bad)?),
-    None => (target, ""),
+  let (origin, absolute) = origin_part(target)?;
+  let (mut path, query) = match find_byte(origin.as_bytes(), b'?') {
+    Some(idx) => (origin.get(..idx).ok_or_else(bad)?, origin.get(idx + 1..).ok_or_else(bad)?),
+    None => (origin, ""),
   };
+  if absolute && path.is_empty() {
+    path = "/";
+  }
 
   // Headers
 
@@ -122,6 +126,7 @@ pub fn parse_request<'b>(
   let mut chunked = false;
   let mut close = false;
   let mut keep_alive_token = false;
+  let mut has_host = false;
   loop {
     let tail = head_bytes.get(pos..).ok_or_else(bad)?;
     let nl = find_byte(tail, b'\n').ok_or_else(bad)?;
@@ -147,6 +152,13 @@ pub fn parse_request<'b>(
     }
     let value = hline.get(colon + 1..).ok_or_else(bad)?.trim_matches([' ', '\t']);
     match name.len() {
+      4 if name.eq_ignore_ascii_case("host") => {
+        // RFC 9112 §3.2: more than one is a bad request.
+        if has_host {
+          return Err(bad());
+        }
+        has_host = true;
+      }
       10 if name.eq_ignore_ascii_case("connection") => {
         for token in value.split(',') {
           let token = token.trim_matches([' ', '\t']);
@@ -184,7 +196,8 @@ pub fn parse_request<'b>(
     len += 1;
   }
 
-  if chunked && content_length.is_some() {
+  // RFC 9112 §3.2: an HTTP/1.1 request without `Host` is a bad request.
+  if (chunked && content_length.is_some()) || (!http10 && !has_host) {
     return Err(bad());
   }
   let body_kind = if chunked {
@@ -222,6 +235,29 @@ pub fn error_status(error: &crate::Error) -> StatusCode {
 #[inline]
 fn bad() -> crate::Error {
   HttpError::BadRequest.into()
+}
+
+/// The origin-form part (path and query) of an absolute-form target such as
+/// `http://authority/path?query`, which a server must accept (RFC 9112 §3.2.2), and if `target`
+/// was in that form. Any other target is returned as it is. The authority is not compared with
+/// `Host`.
+#[inline]
+fn origin_part(target: &str) -> crate::Result<(&str, bool)> {
+  let bytes = target.as_bytes();
+  let scheme_len = if bytes.get(..7).is_some_and(|el| el.eq_ignore_ascii_case(b"http://")) {
+    7
+  } else if bytes.get(..8).is_some_and(|el| el.eq_ignore_ascii_case(b"https://")) {
+    8
+  } else {
+    return Ok((target, false));
+  };
+  let rest = target.get(scheme_len..).ok_or_else(bad)?;
+  let authority_len =
+    rest.bytes().position(|byte| byte == b'/' || byte == b'?').unwrap_or(rest.len());
+  if authority_len == 0 {
+    return Err(bad());
+  }
+  Ok((rest.get(authority_len..).ok_or_else(bad)?, true))
 }
 
 /// Accepts a `Transfer-Encoding` value that is exactly `chunked`, the only coding supported.
@@ -517,29 +553,38 @@ mod tests {
       complete(b"POST /x HTTP/1.1\r\nhost: a\r\ncontent-length: 7\r\n\r\n");
     assert_eq!(headers.len(), 2);
     assert_eq!(body_kind, BodyKind::ContentLength(7));
-    let (_, _, _, _, body_kind, keep_alive, _) =
-      complete(b"POST /x HTTP/1.1\r\nTRANSFER-ENCODING: Chunked\r\nCONNECTION: Close\r\n\r\n");
+    let (_, _, _, _, body_kind, keep_alive, _) = complete(
+      b"POST /x HTTP/1.1\r\nHost: a\r\nTRANSFER-ENCODING: Chunked\r\nCONNECTION: Close\r\n\r\n",
+    );
     assert_eq!(body_kind, BodyKind::Chunked);
     assert!(!keep_alive);
   }
 
   #[test]
   fn rejects_cl_and_te() {
-    assert!(is_err(b"POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n"));
-    assert!(is_err(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n"));
+    assert!(is_err(
+      b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n"
+    ));
+    assert!(is_err(
+      b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n"
+    ));
   }
 
   #[test]
   fn rejects_double_cl() {
-    assert!(is_err(b"POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n"));
-    assert!(is_err(b"POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n"));
+    assert!(is_err(
+      b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n"
+    ));
+    assert!(is_err(
+      b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n"
+    ));
   }
 
   #[test]
   fn rejects_too_many_headers() {
     let build = |n: usize| {
-      let mut buf = b"GET / HTTP/1.1\r\n".to_vec();
-      for i in 0..n {
+      let mut buf = b"GET / HTTP/1.1\r\nHost: a\r\n".to_vec();
+      for i in 1..n {
         buf.extend_from_slice(format!("X-H{i}: v\r\n").as_bytes());
       }
       buf.extend_from_slice(b"\r\n");
@@ -551,7 +596,7 @@ mod tests {
 
   #[test]
   fn rejects_oversized_head() {
-    let mut buf = b"GET / HTTP/1.1\r\nX: ".to_vec();
+    let mut buf = b"GET / HTTP/1.1\r\nHost: a\r\nX: ".to_vec();
     buf.resize(20_000, b'a');
     assert_eq!(err_status(&buf), StatusCode::RequestHeaderFieldsTooLarge);
     buf.extend_from_slice(b"\r\n\r\n");
@@ -563,19 +608,21 @@ mod tests {
   fn rejects_malformed() {
     assert!(is_err(b"GET / HTTP/2.0\r\n\r\n"));
     assert!(is_err(b"GET /\r\n\r\n"));
-    assert!(is_err(b"GET  / HTTP/1.1\r\n\r\n"));
-    assert!(is_err(b"BREW / HTTP/1.1\r\n\r\n"));
-    assert!(is_err(b"get / HTTP/1.1\r\n\r\n"));
-    assert!(is_err(b"GET / HTTP/1.1\r\nBad Name: v\r\n\r\n"));
-    assert!(is_err(b"GET / HTTP/1.1\r\nNoColon\r\n\r\n"));
-    assert!(is_err(b"GET / HTTP/1.1\r\n folded: v\r\n\r\n"));
-    assert!(is_err(b"GET / HTTP/1.1\r\nA: b\rc\r\n\r\n"));
-    assert!(is_err(b"GET / HTTP/1.1\r\nA: b\0c\r\n\r\n"));
-    assert!(is_err(b"GET / HTTP/1.1\r\nA: b\nc: d\r\n\r\n"));
-    assert!(is_err(b"POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n"));
-    assert!(is_err(b"POST / HTTP/1.1\r\nContent-Length: \r\n\r\n"));
-    assert!(is_err(b"POST / HTTP/1.1\r\nContent-Length: 99999999999999999999999\r\n\r\n"));
-    assert!(is_err(b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n"));
+    assert!(is_err(b"GET  / HTTP/1.1\r\nHost: a\r\n\r\n"));
+    assert!(is_err(b"BREW / HTTP/1.1\r\nHost: a\r\n\r\n"));
+    assert!(is_err(b"get / HTTP/1.1\r\nHost: a\r\n\r\n"));
+    assert!(is_err(b"GET / HTTP/1.1\r\nHost: a\r\nBad Name: v\r\n\r\n"));
+    assert!(is_err(b"GET / HTTP/1.1\r\nHost: a\r\nNoColon\r\n\r\n"));
+    assert!(is_err(b"GET / HTTP/1.1\r\nHost: a\r\n folded: v\r\n\r\n"));
+    assert!(is_err(b"GET / HTTP/1.1\r\nHost: a\r\nA: b\rc\r\n\r\n"));
+    assert!(is_err(b"GET / HTTP/1.1\r\nHost: a\r\nA: b\0c\r\n\r\n"));
+    assert!(is_err(b"GET / HTTP/1.1\r\nHost: a\r\nA: b\nc: d\r\n\r\n"));
+    assert!(is_err(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: -1\r\n\r\n"));
+    assert!(is_err(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: \r\n\r\n"));
+    assert!(is_err(
+      b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 99999999999999999999999\r\n\r\n"
+    ));
+    assert!(is_err(b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n"));
   }
 
   #[test]
@@ -632,29 +679,58 @@ mod tests {
 
   #[test]
   fn chunked_http10_does_not_keep_alive() {
-    let (_, _, _, _, body_kind, keep_alive, _) = complete(
-      b"POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
-    );
+    let (_, _, _, _, body_kind, keep_alive, _) =
+      complete(b"POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n");
     assert_eq!(body_kind, BodyKind::Chunked);
     assert!(!keep_alive);
   }
 
   #[test]
+  fn host_is_required_once() {
+    assert_eq!(err_status(b"GET / HTTP/1.1\r\n\r\n"), StatusCode::BadRequest);
+    assert_eq!(err_status(b"GET / HTTP/1.1\r\nX: y\r\n\r\n"), StatusCode::BadRequest);
+    assert_eq!(err_status(b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"), StatusCode::BadRequest);
+    assert_eq!(err_status(b"GET / HTTP/1.1\r\nhost: a\r\nHOST: a\r\n\r\n"), StatusCode::BadRequest);
+    assert_eq!(err_status(b"GET / HTTP/1.0\r\nHost: a\r\nHost: b\r\n\r\n"), StatusCode::BadRequest);
+    // HTTP/1.0 may leave it out; an empty one is allowed.
+    assert_eq!(complete(b"GET /x HTTP/1.0\r\n\r\n").1, "/x");
+    assert_eq!(complete(b"GET /x HTTP/1.1\r\nHost:\r\n\r\n").1, "/x");
+  }
+
+  #[test]
+  fn absolute_form_routes_on_path_and_query() {
+    let target = |t: &str| {
+      let (_, path, query, ..) =
+        complete(format!("GET {t} HTTP/1.1\r\nHost: a\r\n\r\n").as_bytes());
+      (path, query)
+    };
+    assert_eq!(target("http://evil/x?q=1"), ("/x".into(), "q=1".into()));
+    assert_eq!(target("HTTPS://h:8080/a/b"), ("/a/b".into(), "".into()));
+    assert_eq!(target("http://h"), ("/".into(), "".into()));
+    assert_eq!(target("http://h?x"), ("/".into(), "x".into()));
+    assert_eq!(target("/http://h/x"), ("/http://h/x".into(), "".into()));
+    assert_eq!(err_status(b"GET http:///x HTTP/1.1\r\nHost: a\r\n\r\n"), StatusCode::BadRequest);
+  }
+
+  #[test]
   fn keep_alive_rules() {
-    assert!(complete(b"GET / HTTP/1.1\r\n\r\n").5);
-    assert!(!complete(b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n").5);
+    assert!(complete(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").5);
+    assert!(!complete(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n").5);
     assert!(!complete(b"GET / HTTP/1.0\r\n\r\n").5);
     assert!(complete(b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n").5);
-    assert!(!complete(b"GET / HTTP/1.1\r\nConnection: keep-alive, close\r\n\r\n").5);
+    assert!(!complete(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: keep-alive, close\r\n\r\n").5);
   }
 
   #[test]
   fn value_whitespace_and_empty_value() {
     let (_, path, query, headers, _, _, _) =
-      complete(b"GET /p? HTTP/1.1\r\nA:\t x y \t\r\nB:\r\n\r\n");
+      complete(b"GET /p? HTTP/1.1\r\nHost: a\r\nA:\t x y \t\r\nB:\r\n\r\n");
     assert_eq!(path, "/p");
     assert_eq!(query, "");
-    assert_eq!(headers, [("A".into(), "x y".into()), ("B".into(), "".into())]);
+    assert_eq!(
+      headers,
+      [("Host".into(), "a".into()), ("A".into(), "x y".into()), ("B".into(), "".into())]
+    );
   }
 
   #[test]

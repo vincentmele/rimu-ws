@@ -272,9 +272,8 @@ impl Http1Conn {
         BodyKind::None | BodyKind::ContentLength(0) => {
           // SAFETY: `request` points into `self.buf` and `self.scratch` (heap data that does
           // not move with `self`). `self.view` is cleared before either changes.
-          let request = unsafe {
-            core::mem::transmute::<Http1Request<'_>, Http1Request<'static>>(request)
-          };
+          let request =
+            unsafe { core::mem::transmute::<Http1Request<'_>, Http1Request<'static>>(request) };
           Head::Bodyless(request, head_len)
         }
         kind => Head::WithBody(kind, head_len),
@@ -288,9 +287,8 @@ impl Http1Conn {
     match parse_request(input, &mut self.scratch)? {
       ParseOutcome::Complete { request, .. } => {
         // SAFETY: same as in `parse_head`.
-        let request = unsafe {
-          core::mem::transmute::<Http1Request<'_>, Http1Request<'static>>(request)
-        };
+        let request =
+          unsafe { core::mem::transmute::<Http1Request<'_>, Http1Request<'static>>(request) };
         self.view = Some(request);
         Ok(request.keep_alive)
       }
@@ -313,11 +311,11 @@ impl Http1Conn {
 
 #[cfg(test)]
 mod tests {
-  use alloc::{vec, vec::Vec};
   use crate::{
     http::{HttpRecvParams, Method, StatusCode},
     http1::{BodyKind, Http1Conn, Http1Event},
   };
+  use alloc::{vec, vec::Vec};
 
   const GET: &[u8] = b"GET /plaintext?x=1 HTTP/1.1\r\nHost: a\r\n\r\n";
   const POST_CL: &[u8] = b"POST /upload HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\n20";
@@ -503,7 +501,7 @@ mod tests {
   fn oversized_content_length_is_rejected_then_closes() {
     let params = HttpRecvParams::with_default_params().set_max_body_len(4);
     let mut c = Http1Conn::new(&params);
-    c.feed(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n").unwrap();
+    c.feed(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\n").unwrap();
     assert_eq!(c.poll_event(), Http1Event::NeedMore);
     assert!(c.wants_close());
     let out = output(&mut c);
@@ -515,7 +513,8 @@ mod tests {
   fn oversized_chunked_body_is_rejected() {
     let params = HttpRecvParams::with_default_params().set_max_body_len(4);
     let mut c = Http1Conn::new(&params);
-    c.feed(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n").unwrap();
+    c.feed(b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n")
+      .unwrap();
     assert_eq!(c.poll_event(), Http1Event::NeedMore);
     assert!(!c.wants_close());
     c.feed(b"3\r\ndef\r\n").unwrap();
@@ -528,7 +527,7 @@ mod tests {
   #[test]
   fn endless_trailer_is_bounded() {
     let mut c = conn();
-    c.feed(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n").unwrap();
+    c.feed(b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n").unwrap();
     let junk = [b'a'; 1024];
     let mut closed = false;
     for _ in 0..64 {
