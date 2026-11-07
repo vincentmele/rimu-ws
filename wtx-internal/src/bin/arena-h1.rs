@@ -610,7 +610,8 @@ fn brotli_block_cap(len: usize) -> usize {
   len.checked_add(mask).map_or(len, |el| el & !mask)
 }
 
-/// A block of a brotli encoder: the encoder sees the first `len` elements of `buf`.
+/// A block of a brotli encoder: the encoder sees the first `len` elements of `buf`. `len` is
+/// never more than `buf.len()`: [`BrotliPool::alloc_cell`] makes every block with room for it.
 struct BrotliBlock<T> {
   buf: Box<[T]>,
   len: usize,
@@ -622,15 +623,21 @@ impl<T> Default for BrotliBlock<T> {
   }
 }
 
+// The encoder takes its slices in its inner loops: without a bounds check (that costs brotli
+// about 2% of its throughput), on the invariant of `BrotliBlock`.
 impl<T> brotli::SliceWrapper<T> for BrotliBlock<T> {
   fn slice(&self) -> &[T] {
-    self.buf.get(..self.len).unwrap_or_default()
+    debug_assert!(self.len <= self.buf.len());
+    // SAFETY: `len` is at most `buf.len()` (see `BrotliBlock`)
+    unsafe { self.buf.get_unchecked(..self.len) }
   }
 }
 
 impl<T> brotli::SliceWrapperMut<T> for BrotliBlock<T> {
   fn slice_mut(&mut self) -> &mut [T] {
-    self.buf.get_mut(..self.len).unwrap_or_default()
+    debug_assert!(self.len <= self.buf.len());
+    // SAFETY: `len` is at most `buf.len()` (see `BrotliBlock`)
+    unsafe { self.buf.get_unchecked_mut(..self.len) }
   }
 }
 
