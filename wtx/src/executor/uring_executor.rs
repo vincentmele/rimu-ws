@@ -3196,8 +3196,9 @@ impl Reactor {
 
   /// Room in `buf` for `additional` more bytes, in a size class (a power of two, at least `floor`),
   /// so that buffers settle at sizes later outputs fit rather than grow by a few bytes now and then.
-  /// An empty buffer is replaced, not grown: growing copies its whole capacity. The replacement is
-  /// a pooled buffer of up to four times the class if there is one, a new one of the class if not.
+  /// An empty buffer is replaced, not grown: growing copies its whole capacity. The replacement of
+  /// one with no floor is a pooled buffer of up to four times the class if there is one, else a new
+  /// one of the class.
   #[inline]
   fn reserve_send(&self, buf: &mut Vec<u8>, additional: usize, floor: usize) {
     let want = buf.len().saturating_add(additional);
@@ -3215,7 +3216,11 @@ impl Reactor {
       buf.reserve_exact(class.saturating_sub(buf.len()));
       return;
     }
-    if let Some(elem) = self.take_send_buffer(want, class.saturating_mul(4)) {
+    // Only for copied writes (no floor): a pooled buffer behind a send in flight measured slower
+    // than a new one (static-h2 at 256 connections, -2.5% req/s).
+    if floor == 0
+      && let Some(elem) = self.take_send_buffer(want, class.saturating_mul(4))
+    {
       let old = core::mem::replace(buf, elem);
       self.recycle_send_buffer(old);
       return;
