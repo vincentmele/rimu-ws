@@ -40,6 +40,44 @@ where
   }
 }
 
+/// Writes `len` zero bytes at `ptr` with volatile stores (a word at a time where aligned), which
+/// the compiler may not remove or merge into a later write or free: memory that held a secret is
+/// cleared before it is handed back to an allocator or to a pool, even when it is freed right
+/// after. A plain `write_bytes` before a free is a dead store the optimizer may delete.
+///
+/// # Safety
+///
+/// `ptr` must be valid for writes of `len` bytes.
+#[inline(never)]
+pub(crate) unsafe fn zero_volatile(ptr: *mut u8, len: usize) {
+  let word = size_of::<usize>();
+  let head = ptr.align_offset(word).min(len);
+  let words = len.wrapping_sub(head) / word;
+  for idx in 0..head {
+    // SAFETY: within the `len` bytes the caller vouches for
+    unsafe { ptr::write_volatile(ptr.add(idx), 0) };
+  }
+  // SAFETY: `head` bytes in, the pointer is aligned for `usize`
+  let words_ptr = unsafe { ptr.add(head) }.cast::<usize>();
+  for idx in 0..words {
+    // SAFETY: aligned, and within the `len` bytes the caller vouches for
+    unsafe { ptr::write_volatile(words_ptr.add(idx), 0) };
+  }
+  for idx in head.wrapping_add(words.wrapping_mul(word))..len {
+    // SAFETY: within the `len` bytes the caller vouches for
+    unsafe { ptr::write_volatile(ptr.add(idx), 0) };
+  }
+  core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+  #[cfg(all(test, feature = "std"))]
+  ZEROED.with(|el| el.set(el.get().wrapping_add(len)));
+}
+
+#[cfg(all(test, feature = "std"))]
+std::thread_local! {
+  /// Bytes [`zero_volatile`] cleared on this thread, for tests that pin a path as clearing.
+  pub(crate) static ZEROED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
 /// Locks a chunk of data into RAM, preventing it from being paged to the swap area.
 ///
 /// # Safety

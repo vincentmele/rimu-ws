@@ -4009,6 +4009,30 @@ mod tests {
     assert_eq!(len, super::TASK_POOL_IDLE_KEEP);
   }
 
+  // Every block a task leaves is cleared with stores the compiler may not drop, whether it goes
+  // back to the pool, is freed because the pool is full, or was never pooled (too large).
+  #[test]
+  fn task_blocks_are_zeroed_on_every_free_path() {
+    use super::{TASK_POOL_MAX, TaskAlloc, trim_task_pool};
+    use crate::misc::ZEROED;
+    use alloc::rc::Rc;
+    let zeroed = || ZEROED.with(core::cell::Cell::get);
+    trim_task_pool(0, 0);
+    let before = zeroed();
+    drop(Rc::new_in([7u8; 100 << 10], TaskAlloc));
+    assert!(zeroed() - before >= 100 << 10, "a task block too large to pool was freed uncleared");
+    let many: Vec<_> = (0..TASK_POOL_MAX).map(|_| Rc::new_in([3u8; 100], TaskAlloc)).collect();
+    let extra = Rc::new_in([3u8; 100], TaskAlloc);
+    drop(many);
+    let before = zeroed();
+    drop(extra);
+    assert!(zeroed() - before >= 100, "a task block freed with the pool full was not cleared");
+    let before = zeroed();
+    drop(Rc::new_in([3u8; 100], TaskAlloc));
+    assert!(zeroed() - before >= 100, "a pooled task block was not cleared");
+    trim_task_pool(0, 0);
+  }
+
   async fn yield_once() {
     let mut yielded = false;
     poll_fn(|cx| {

@@ -1970,6 +1970,96 @@ mod tests {
     assert_eq!(read_response(&mut stream).1, b"pong");
   }
 
+  /// `/stats` of a TLS server (see `stats`), over a connection of its own.
+  #[cfg(feature = "crypto-ring")]
+  async fn tls_stats(uri: &crate::net::UriString) -> [u64; 5] {
+    use crate::net::{StreamReader as _, StreamWriter as _};
+    let mut stream = tls_connect(uri).await;
+    stream.write_all(b"GET /stats HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await.unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while let Ok(Some(len)) = stream.read(buf.as_mut_slice().into()).await {
+      got.extend_from_slice(&buf[..len.get()]);
+    }
+    let got = String::from_utf8(got).unwrap();
+    let body = got.split_once("\r\n\r\n").map(|el| el.1).unwrap_or_else(|| panic!("{got}"));
+    let mut out = [0; 5];
+    for (slot, value) in out.iter_mut().zip(body.split(' ')) {
+      *slot = value.parse().unwrap();
+    }
+    out
+  }
+
+  // Over TLS too: delayed responses whose peers reset (noticed through `peer_ended`, the socket
+  // not being read) leave no timer or reader behind, long before the delays would have run out,
+  // and a second round reuses the first one's timer slots. The stats connection's own first-head
+  // timer may still be waiting for its removal to complete: at most one pending.
+  #[cfg(feature = "crypto-ring")]
+  #[test]
+  fn delayed_tls_responses_whose_peers_reset_leave_no_timers_behind() {
+    use crate::{executor::StdRuntime, net::StreamWriter as _};
+    let (uri, _done) = tls_server(|_| {}, None, None, HS, MD);
+    StdRuntime::new().block_on(async move {
+      let mut rounds = Vec::new();
+      for _ in 0..2 {
+        let mut streams = Vec::new();
+        for _ in 0..32 {
+          let mut stream = tls_connect(&uri).await;
+          stream.write_all(b"GET /delay/5000 HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+          streams.push(stream);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let busy = tls_stats(&uri).await;
+        assert!(busy[0] >= 32 && busy[3] >= 33, "{busy:?}");
+        for stream in streams {
+          socket2::SockRef::from(stream.stream()).set_linger(Some(Duration::ZERO)).unwrap();
+          drop(stream);
+        }
+        let begin = std::time::Instant::now();
+        let settled = loop {
+          let elem = tls_stats(&uri).await;
+          if elem[0] <= 1 && elem[3] == 1 {
+            break elem;
+          }
+          assert!(begin.elapsed() < Duration::from_secs(3), "never settled: {elem:?}");
+          std::thread::sleep(Duration::from_millis(50));
+        };
+        rounds.push(settled);
+      }
+      let (first, second) = (rounds[0], rounds[1]);
+      assert!(first[2] <= 1 && second[2] <= 1, "readers left waiting: {first:?} {second:?}");
+      assert_eq!(first[1], second[1], "the second round added timer slots: {first:?} {second:?}");
+    });
+  }
+
+  // A delayed TLS response woken again and again (a record per byte of a pipelined request, each
+  // waking its `peer_ended` watch) queues no submission per wake and keeps its timer and reader.
+  #[cfg(feature = "crypto-ring")]
+  #[test]
+  fn waking_a_delayed_tls_response_again_and_again_submits_nothing() {
+    use crate::{executor::StdRuntime, net::StreamWriter as _};
+    let (uri, _done) = tls_server(|_| {}, None, None, HS, MD);
+    StdRuntime::new().block_on(async move {
+      let mut stream = tls_connect(&uri).await;
+      stream.write_all(b"GET /delay/1500 HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+      std::thread::sleep(Duration::from_millis(100));
+      let before = tls_stats(&uri).await;
+      let pipelined = b"GET /ping HTTP/1.1\r\nHost: x\r\nX-Padding: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n";
+      for byte in pipelined {
+        stream.write_all(&[*byte]).await.unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+      }
+      let after = tls_stats(&uri).await;
+      // The second stats connection's own: a handshake, a request, a close, give or take a cancel
+      assert!(after[4] - before[4] <= 16, "{before:?} {after:?}");
+      assert!(before[0] <= 2 && after[0] <= 2, "{before:?} {after:?}");
+      assert!(after[2] <= 2, "{after:?}");
+      let got = tls_read_until(&mut stream, b"pong").await.unwrap();
+      let got = String::from_utf8(got).unwrap();
+      assert!(got.contains("\r\n\r\n1500"), "{got}");
+    });
+  }
+
   // What arrives while a response is delayed is kept: a request pipelined during the delay is
   // answered after the delayed response, which still waits for the whole delay.
   #[test]

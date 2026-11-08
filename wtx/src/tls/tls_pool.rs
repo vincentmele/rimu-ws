@@ -265,6 +265,34 @@ mod tests {
     assert!(KS_POOL.with(|el| el.borrow().len()) == 1);
   }
 
+  // What leaves for the allocator is cleared too, with stores the compiler may not drop: a key
+  // schedule box when the pool is full, a buffer too large to pool.
+  #[test]
+  fn secrets_are_zeroed_on_every_free_path() {
+    use crate::{misc::ZEROED, tls::tls_pool::KS_POOL_MAX};
+    let zeroed = || ZEROED.with(core::cell::Cell::get);
+    KS_POOL.with(|el| el.borrow_mut().clear());
+    let boxes: alloc::vec::Vec<_> =
+      (0..=KS_POOL_MAX).map(|_| KsBox::new(KeySchedule::unset())).collect();
+    let before = zeroed();
+    drop(boxes);
+    let cleared = zeroed() - before;
+    assert_eq!(KS_POOL.with(|el| el.borrow().len()), KS_POOL_MAX);
+    assert_eq!(
+      cleared,
+      (KS_POOL_MAX + 1) * size_of::<KeySchedule>(),
+      "a key schedule box left uncleared"
+    );
+    BUF_POOL.with(|el| el.borrow_mut().pairs.clear());
+    let mut buffer = TlsBuffer::pooled();
+    buffer.writer_buffer.reserve(2 << 20).unwrap();
+    let capacity = buffer.writer_buffer.capacity();
+    let before = zeroed();
+    drop(buffer);
+    assert!(zeroed() - before >= capacity, "a buffer too large to pool was freed uncleared");
+    assert!(BUF_POOL.with(|el| el.borrow().pairs.is_empty()));
+  }
+
   // A stream's buffers come back zeroed in all of their capacity, and are the next one's.
   #[test]
   fn tls_buffers_come_back_zeroed() {
