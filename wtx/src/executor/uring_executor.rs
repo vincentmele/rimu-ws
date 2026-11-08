@@ -514,8 +514,9 @@ const TASK_BLOCK_MAX: usize = 64 << 10;
 
 /// Allocates the tasks spawned on a runtime from the blocks of the tasks that ended on its thread,
 /// so that a server that spawns a task per connection allocates nothing for it once warm (the
-/// tasks of one server are of one size). A block is zeroed when it comes back: a task's future may
-/// have held a connection's secrets, which the next task must not find.
+/// tasks of one server are of one size). Every block is zeroed when it comes back, whether it is
+/// pooled or freed (too large, aligned beyond `TASK_CLASS`, or the pool full): a task's future may
+/// have held a connection's secrets, which neither the next task nor the allocator must get.
 #[derive(Clone, Copy, Debug, Default)]
 struct TaskAlloc;
 
@@ -593,15 +594,16 @@ unsafe impl Allocator for TaskAlloc {
 
   #[inline]
   unsafe fn deallocate(&self, ptr: core::ptr::NonNull<u8>, layout: Layout) {
+    // Cleared on every path, pooled or freed, with stores the compiler may not drop
     let Some(class) = task_class(layout) else {
+      // SAFETY: the block has `layout.size()` bytes, all of them the caller's to give back
+      unsafe { crate::misc::zero_volatile(ptr.as_ptr(), layout.size()) };
       // SAFETY: allocated by `Global` with this layout, in `allocate`
       unsafe { Global.deallocate(ptr, layout) };
       return;
     };
     // SAFETY: the block has `class.size()` bytes, all of them the caller's to give back
-    unsafe { ptr.as_ptr().write_bytes(0, class.size()) };
-    // The zeroes are written before the block can be handed out again, whatever is inlined.
-    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    unsafe { crate::misc::zero_volatile(ptr.as_ptr(), class.size()) };
     let kept = TASK_POOL
       .try_with(|pool| {
         let Ok(mut pool) = pool.try_borrow_mut() else {

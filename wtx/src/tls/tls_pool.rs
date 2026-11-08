@@ -8,6 +8,7 @@
 
 use crate::{
   collections::VectorUsize,
+  misc::zero_volatile,
   net::BufStreamReader,
   tls::{KeySchedule, TlsBuffer},
 };
@@ -78,14 +79,13 @@ pub(crate) fn trim_idle_pools() {
   }
 }
 
-/// Zeroes all of `buffer`'s capacity, then empties it.
+/// Zeroes all of `buffer`'s capacity, with stores the compiler may not drop (whether the buffer is
+/// then pooled or freed), then empties it.
 fn zero_buffer(buffer: &mut VectorUsize<u8>) {
   let capacity = buffer.capacity();
   // SAFETY: the allocation has `capacity` bytes, written here as plain bytes
-  unsafe { buffer.as_ptr_mut().write_bytes(0, capacity) };
+  unsafe { zero_volatile(buffer.as_ptr_mut(), capacity) };
   buffer.clear();
-  // The zeroes are written before the buffer can be handed out again, whatever is inlined.
-  core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 /// A boxed [`KeySchedule`] whose box comes from, and goes back to, this thread's pool, zeroed.
@@ -123,9 +123,9 @@ impl KsBox {
 ///
 /// `raw` comes from `Box::into_raw` of a `Box<KeySchedule>` whose value is no longer used.
 unsafe fn give_back(raw: *mut MaybeUninit<KeySchedule>) {
-  // SAFETY: the allocation has room for a key schedule, written here as plain bytes
-  unsafe { raw.cast::<u8>().write_bytes(0, size_of::<KeySchedule>()) };
-  core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+  // SAFETY: the allocation has room for a key schedule, written here as plain bytes, with stores
+  // the compiler may not drop: the box is pooled or freed right after
+  unsafe { zero_volatile(raw.cast::<u8>(), size_of::<KeySchedule>()) };
   // SAFETY: `MaybeUninit<KeySchedule>` has the layout of `KeySchedule`, which `raw` was boxed with
   let elem = unsafe { Box::from_raw(raw) };
   #[cfg(feature = "std")]
