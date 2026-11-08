@@ -477,7 +477,7 @@ fn xor_packet_number(packet: &mut [u8], pn_offset: usize, pn_len: usize, mask: [
 
 /// Overwrites `bytes` with zeros in a way that the compiler cannot remove.
 #[inline]
-fn wipe(bytes: &mut [u8]) {
+pub(crate) fn wipe(bytes: &mut [u8]) {
   // SAFETY: the pointer and the length come from a slice
   unsafe { zero_volatile(bytes.as_mut_ptr(), bytes.len()) };
 }

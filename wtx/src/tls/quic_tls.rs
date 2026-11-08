@@ -129,6 +129,7 @@ where
 {
   /// The handshake of a server, which sends `local_transport_params` (encoded) in its
   /// EncryptedExtensions.
+  #[allow(dead_code, reason = "called by the endpoint, which opens connections")]
   #[inline]
   pub(crate) fn new(
     config: &Arc<TlsConfig<TCX>>,
@@ -193,12 +194,14 @@ where
   TCX: TlsCtxSk,
 {
   /// The negotiated application protocol (`h3`), empty until it is known.
+  #[allow(dead_code, reason = "for the application layer")]
   #[inline]
   pub(crate) fn alpn(&self) -> &[u8] {
     self.alpn.as_slice()
   }
 
   /// Marks the first `n` bytes of [`Self::output`] at `space` as sent.
+  #[allow(dead_code, reason = "the connection keeps its own offsets into the output, to resend")]
   #[inline]
   pub(crate) fn consume_output(&mut self, space: Space, n: usize) {
     let range = match space {
@@ -685,6 +688,7 @@ const fn level(space: Space) -> u8 {
   }
 }
 
+#[cfg(test)]
 fn missing_transport_params() -> crate::Error {
   crate::Error::TlsErrorReply(
     TlsError::MissingQuicTransportParameters,

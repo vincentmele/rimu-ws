@@ -15,17 +15,28 @@ const _: () = {
 pub enum QuicError {
   /// An ACK range reaches below packet number zero.
   AckRangeUnderflow,
+  /// An ACK frame acknowledges a packet number that was not sent.
+  AckOfUnsentPacket,
   /// An output buffer is too small for what should be written to it.
   BufferTooSmall,
   /// A connection ID has more bytes than QUIC version 1 allows (20) or than the wire format can
   /// express (255).
   CidTooLong,
+  /// A connection ID of the transport parameters of the peer is missing or differs from the one
+  /// that its packets carry (RFC 9000 section 7.3).
+  ConnectionIdMismatch,
   /// CRYPTO data arrived at an encryption level that TLS is not reading: an earlier one, whose
   /// data was complete (with [`TransportErrorCode::ProtocolViolation`]), or a later one, or any
   /// level once the handshake is over (with the `unexpected_message` alert).
   CryptoDataAtWrongLevel,
+  /// CRYPTO data starts more bytes ahead of what TLS has read than are buffered (4096).
+  CryptoDataTooFarAhead,
   /// The same transport parameter was sent more than once.
   DuplicateTransportParameter,
+  /// A packet has no frames (RFC 9000 section 12.4).
+  EmptyPacket,
+  /// A frame that only the other role sends, such as HANDSHAKE_DONE from a client.
+  FrameFromWrongRole,
   /// A frame type is not allowed in the type of the packet that carries it.
   FrameNotAllowed,
   /// A TLS handshake message is longer than the 16 KiB that are buffered for one.
@@ -40,6 +51,11 @@ pub enum QuicError {
   NonMinimalFrameType,
   /// A packet is too short to hold the sample that header protection requires.
   PacketTooShort,
+  /// A worker-wide pool is at its cap.
+  PoolExhausted,
+  /// The reserved bits of a header are not zero once protection is removed (RFC 9000 section
+  /// 17).
+  ReservedBitsSet,
   /// A client sent a transport parameter that only servers can send.
   ServerOnlyTransportParameter,
   /// The TLS handshake failed, with the alert that the transport error code carries.
