@@ -9,7 +9,7 @@ rimu fork). Background (colossus, not in the repo):
   Clones are in `h3win/rivals/` and `h3win/wtx-upstream/`.
 Every factual claim below about a rival or the client is cited `path:line` in those reports.
 
-Items marked **[Q1]**–**[Q4]** wait on the user; the text states the recommended default.
+Items marked **[Q1]**–**[Q4]** were decided by the user on 8 Nov (§10).
 
 ## 1. Intent
 
@@ -122,7 +122,7 @@ Goals
 - Production quality: the gate in §8.
 
 Non-goals (now)
-- 0-RTT and session resumption (h2load never uses them; **[Q1]**), HelloRetryRequest beyond what the TLS
+- 0-RTT and session resumption (h2load never uses them; out by **[Q1]**), HelloRetryRequest beyond what the TLS
   stack already lacks (h2load sends an X25519 key share), server push, QPACK dynamic table on the encoder
   side, ECN, connection migration initiated by the server, DATAGRAM and WebTransport, an HTTP/3 client.
 - Async handlers beyond the poll-once-then-park path of §5.10 (no h3 profile needs them).
@@ -337,7 +337,8 @@ window. Exact values are library defaults tuned by measurement.
 - **QPACK encoder (responses):** static table only, never the dynamic table. Response field sections are
   pre-encoded once per route and per (cached file, encoding) and copied; exact static entries are used where
   they exist (`:status 200`, `content-type` values, `content-encoding: br/gzip`, `vary: accept-encoding`).
-  Which headers go out is **[Q2]**.
+  Which headers go out is chosen by measurement (**[Q2]**, §10): `content-type` only, or `content-type` +
+  `date` + `server`; both are framework options and the pre-encoded block splices `date` once a second.
 - Request validation per RFC 9114 §4.3 (pseudo-headers, no connection-specific headers, lowercase names);
   malformed requests get stream errors, not connection kills (except where the RFC says connection error).
 
@@ -349,7 +350,7 @@ library defaults) so the h2 entry's routes run on h3 unchanged.
   receive turn with a no-op waker. If it completes (every h3 profile route does), the response is encoded
   into the connection's send queue in the same turn. If it is pending, the request is parked on a pooled
   per-request task slot and resumes later (bounded, counted). No task per stream or connection otherwise.
-- **Middleware** runs the same way (the h2 entry's `server` header middleware, if kept: **[Q2]**).
+- **Middleware** runs the same way (the h2 entry's `server` header middleware, if the Q2 measurement keeps it).
 - **Static files:** `StaticFiles` (today in `http2_server_framework/static_files.rs`, a per-thread cache
   that follows the disk, `.br`/`.gz` twins, `vary`) is lifted to a shared `http` module and used by both
   h2 and h3. h3 additionally keeps, per cached (file, encoding), a pre-encoded HEADERS block, and sends the
@@ -395,7 +396,7 @@ Configurable limits, each with a production default, each with a unit test:
 
 ## 6. HttpArena entry (local only, never pushed)
 
-**[Q3]** (recommended): h3 joins the existing `rimu-ws` entry (experimental, **standard** mode), on UDP 8443
+**[Q3]** (decided): h3 joins the existing `rimu-ws` entry (experimental, **standard** mode), on UDP 8443
 beside its h2 on TCP 8443, same certificate and static directory, subscribing `baseline-h3` and `static-h3`.
 In standard mode the entry uses the library defaults, so the defaults must be the fast ones (as decided for
 h2). Dockerfile `EXPOSE 8443/udp`. Readiness and validation as the arena runs them (h2load-h3 `-n 4`).
@@ -456,23 +457,22 @@ Plus the score goal in §3.
     a hostile-client soak (§5.12, §8), with the soak's attackers built on quinn plus a raw sender.
 11. Score exit criterion and tie rule copied from h2 (§3); the local result governs, EC2 confirms.
 
-## 10. Questions for the user
+## 10. User decisions (8 Nov)
 
-- **[Q1] Scope of QUIC v1.** Recommended: production core — every MUST of RFCs 9000/9001/9002/9114/9204,
-  full loss recovery and CC, key update, Retry (automatic under handshake load), stateless reset, path
-  validation for NAT rebinding, the abuse limits of §5.12; the full gate of §8 including the hostile soak;
-  0-RTT and session resumption left out (the scorer never uses them). Alternatives: also 0-RTT + resumption
-  now; or benchmark first, harden later.
-- **[Q2] Response headers on h3.** The client pays per header field (§2.1). Options: `content-type` only
-  (exact static entry, 1 byte; like the h3 leaders); `content-type` + `date` + `server` like the h2 entry
-  (RFC 9110 makes Date a MUST for an origin server with a clock; costs the client a literal and a malloc
-  per response); or measure first and decide with numbers.
-- **[Q3] Which entry.** Recommended: the existing standard `rimu-ws` entry beside h2 (defaults must be
-  fast). Alternative: a separate tuned entry, which may tune QUIC parameters, CC and UDP buffers outside
-  the defaults.
-- **[Q4] Phasing.** Recommended: one design, built in order — UDP I/O + QUIC core + TLS, then H3/QPACK +
-  baseline-h3, then static-h3, then the perf passes and the gate — with baseline-h3 measured against the
-  rivals as soon as it runs. Alternative: stop after baseline-h3 for review before static-h3.
+- **[Q1] Scope: production core.** Every MUST of RFCs 9000/9001/9002/9114/9204, full loss recovery and CC,
+  key update, Retry automatic under handshake load, stateless reset, path validation for NAT rebinding, the
+  abuse limits of §5.12, and the full gate of §8 including the hostile soak. 0-RTT and session resumption
+  are out.
+- **[Q2] Response headers: measure, then decide.** Both header sets are built as options of the framework:
+  (a) `content-type` only (one exact static entry), and (b) `content-type` + `date` + `server`, as the h2
+  entry sends. Once baseline-h3 runs, A/B both against the rivals with h2load-h3 (rps, server and generator
+  CPU per request) and bring the numbers to the user, who chooses. The run does not stop for this: work
+  continues on static-h3 while the answer is pending, and only the entry's final header set waits on it.
+- **[Q3] Entry: the existing `rimu-ws` entry, standard mode,** h3 on UDP 8443 beside h2 (§6). The entry uses
+  library defaults, so the defaults are the fast ones.
+- **[Q4] Phasing: one run, measured early.** UDP I/O + QUIC core + TLS, then H3/QPACK + baseline-h3
+  (measured against the rivals as soon as it runs), then static-h3, then the perf passes and the gate,
+  without stopping except for the Q2 numbers above and the EC2 go-ahead.
 
 ## 11. Left to the builder
 
