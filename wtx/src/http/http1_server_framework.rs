@@ -2221,6 +2221,9 @@ mod tests {
       round(&mut stream);
     }
     let before = ALLOCATIONS.load(Ordering::SeqCst);
+    // The server's start and warm-up allocate: 0 here would mean its thread is not counted, and
+    // the window below would pass on nothing.
+    assert!(before > 0, "no allocation counted on the server thread: it is not counted");
     for _ in 0..300 {
       round(&mut stream);
     }

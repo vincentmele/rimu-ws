@@ -5169,6 +5169,66 @@ mod tests {
     assert!(bytes <= super::SEND_POOL_IDLE_BYTES, "{bytes} bytes kept with no connection left");
   }
 
+  // A small first receive on a new connection, made while the send pool holds large buffers, does
+  // not take one of them as its receive buffer: it would keep it for the connection's life, outside
+  // every pool's bounds. (Found by the final review's probe.)
+  #[test]
+  fn a_small_receive_does_not_take_a_large_pooled_buffer() {
+    use crate::net::{StreamReader, StreamWriter};
+
+    const LEN: usize = 512 * 1024;
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let client = std::thread::spawn(move || {
+      let mut a = connect(&client_addr);
+      let mut got = alloc::vec![0u8; 4 * LEN];
+      std::io::Read::read_exact(&mut a, &mut got).unwrap();
+      let mut b = connect(&client_addr);
+      std::io::Write::write_all(&mut b, b"0123456789").unwrap();
+      let mut rest = Vec::new();
+      let _ = std::io::Read::read_to_end(&mut b, &mut rest);
+      drop(a);
+    });
+    let runtime = UringRuntime::new().unwrap();
+    let (pooled, rx_cap) = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let (mut a, _) = listener.accept(TcpParams::default()).await.unwrap();
+      for _ in 0..4 {
+        let mut owned = alloc::vec![9; LEN];
+        if !a.try_send_owned(&mut owned).unwrap() {
+          a.write_all(&alloc::vec![9; LEN]).await.unwrap();
+        }
+        for _ in 0..20 {
+          yield_once().await;
+        }
+      }
+      for _ in 0..200 {
+        yield_once().await;
+      }
+      let pooled = super::with_reactor(|reactor| {
+        Ok(reactor.send_pool.borrow().iter().map(Vec::capacity).collect::<Vec<_>>())
+      })
+      .unwrap();
+      let (mut b, _) = listener.accept(TcpParams::default()).await.unwrap();
+      let mut buf = [0u8; 16];
+      let mut got = 0;
+      while got < 10 {
+        got += b.read(buf.as_mut_slice().into()).await.unwrap().unwrap().get();
+      }
+      let rx_cap = super::with_reactor(|reactor| {
+        let conns = reactor.conns.borrow();
+        Ok(conns.iter().filter(|el| el.in_use).map(|el| el.rx.capacity()).max().unwrap_or(0))
+      })
+      .unwrap();
+      drop(b);
+      drop(a);
+      (pooled, rx_cap)
+    });
+    client.join().unwrap();
+    assert!(pooled.iter().any(|el| *el >= LEN), "the pool held no large buffer: {pooled:?}");
+    assert!(rx_cap < 64 * 1024, "a 10-byte receive holds a {rx_cap}-byte buffer");
+  }
+
   // After a burst of connections closes, at most `WARM_FREE_MIN` free slots keep buffers: the rest
   // give them back, so memory follows the connections open, not the most ever open.
   #[test]
