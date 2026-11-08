@@ -6,6 +6,7 @@ use crate::{
   quic::{
     MAX_CID_LEN, QuicError,
     varint::{VARINT_MAX, decode_varint},
+    writer::Writer,
   },
 };
 use core::hint::cold_path;
@@ -171,7 +172,7 @@ pub(crate) fn write_retry(
   if out.len() < prefix_len.wrapping_add(packet_len).max(packet_len.wrapping_add(AEAD_TAG_LEN)) {
     return Err(error(QuicError::BufferTooSmall));
   }
-  let mut writer = Writer { out, pos: 0 };
+  let mut writer = Writer::new(out);
   writer.put(&[odcid_len])?;
   writer.put(odcid)?;
   writer.put(&[RETRY_FIRST_BYTE])?;
@@ -181,16 +182,16 @@ pub(crate) fn write_retry(
   writer.put(&[scid_len])?;
   writer.put(scid)?;
   writer.put(token)?;
-  let pseudo_packet_len = writer.pos;
+  let pseudo_packet_len = writer.pos();
   let tag = Aes128GcmKeyGlobal::new(&RETRY_KEY)?.seal_in_place(
     RETRY_NONCE,
     out.get(..pseudo_packet_len).unwrap_or_default(),
     &mut [],
   )?;
   out.copy_within(prefix_len..pseudo_packet_len, 0);
-  let mut writer = Writer { out, pos: packet_len };
+  let mut writer = Writer::at(out, packet_len);
   writer.put(&tag)?;
-  Ok(writer.pos)
+  Ok(writer.pos())
 }
 
 #[inline(always)]
@@ -288,7 +289,7 @@ fn write_version_negotiation_inner(
   let (Ok(dcid_len), Ok(scid_len)) = (u8::try_from(dcid.len()), u8::try_from(scid.len())) else {
     return Err(error(QuicError::CidTooLong));
   };
-  let mut writer = Writer { out, pos: 0 };
+  let mut writer = Writer::new(out);
   writer.put(&[VERSION_NEGOTIATION_FIRST_BYTE])?;
   writer.put(&0u32.to_be_bytes())?;
   writer.put(&[dcid_len])?;
@@ -296,7 +297,7 @@ fn write_version_negotiation_inner(
   writer.put(&[scid_len])?;
   writer.put(scid)?;
   writer.put(&QUIC_V1.to_be_bytes())?;
-  Ok(writer.pos)
+  Ok(writer.pos())
 }
 
 /// Reads fields from the start of `rest`, which is placed `offset` bytes after the start of the
@@ -332,23 +333,6 @@ impl<'bytes> Cursor<'bytes> {
     };
     self.take(len)?;
     usize::try_from(value).map_err(|_| error(QuicError::Truncated))
-  }
-}
-
-struct Writer<'out> {
-  out: &'out mut [u8],
-  pos: usize,
-}
-
-impl Writer<'_> {
-  fn put(&mut self, bytes: &[u8]) -> crate::Result<()> {
-    let end = self.pos.wrapping_add(bytes.len());
-    let Some(dst) = self.out.get_mut(self.pos..end) else {
-      return Err(error(QuicError::BufferTooSmall));
-    };
-    dst.copy_from_slice(bytes);
-    self.pos = end;
-    Ok(())
   }
 }
 

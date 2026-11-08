@@ -13,6 +13,8 @@ const _: () = {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum QuicError {
+  /// An ACK range reaches below packet number zero.
+  AckRangeUnderflow,
   /// An output buffer is too small for what should be written to it.
   BufferTooSmall,
   /// A connection ID has more bytes than QUIC version 1 allows (20) or than the wire format can
@@ -20,16 +22,24 @@ pub enum QuicError {
   CidTooLong,
   /// The same transport parameter was sent more than once.
   DuplicateTransportParameter,
+  /// A frame type is not allowed in the type of the packet that carries it.
+  FrameNotAllowed,
   /// The fixed bit of a packet of version 1 is not set.
   InvalidFixedBit,
+  /// A field of a frame has a value that the frame cannot have.
+  InvalidFrame,
   /// The value or the length of a transport parameter is not valid.
   InvalidTransportParameter,
+  /// A frame type is encoded with more bytes than it needs.
+  NonMinimalFrameType,
   /// A packet is too short to hold the sample that header protection requires.
   PacketTooShort,
   /// A client sent a transport parameter that only servers can send.
   ServerOnlyTransportParameter,
   /// The input ended before a field or before the number of bytes announced by a length.
   Truncated,
+  /// A frame type that this implementation does not know.
+  UnknownFrameType,
   /// A value does not fit in a variable-length integer (at most 2^62 - 1).
   VarintOverflow,
 }

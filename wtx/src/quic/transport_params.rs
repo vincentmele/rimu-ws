@@ -2,7 +2,8 @@
 
 use crate::quic::{
   Cid, QuicError, TransportErrorCode,
-  varint::{VARINT_MAX, decode_varint, encode_varint, varint_len},
+  varint::{VARINT_MAX, decode_varint, varint_len},
+  writer::Writer,
 };
 use core::hint::cold_path;
 
@@ -172,54 +173,59 @@ impl TransportParams {
   ///
   /// Returns the number of written bytes.
   pub fn encode(&self, out: &mut [u8]) -> crate::Result<usize> {
-    let mut writer = Writer { out, pos: 0 };
+    let mut writer = Writer::new(out);
     if let Some(elem) = &self.original_destination_connection_id {
-      writer.bytes(ORIGINAL_DESTINATION_CONNECTION_ID, elem.as_slice())?;
+      param_bytes(&mut writer, ORIGINAL_DESTINATION_CONNECTION_ID, elem.as_slice())?;
     }
-    writer.varint_if(MAX_IDLE_TIMEOUT, self.max_idle_timeout_ms, 0)?;
+    param_varint_if(&mut writer, MAX_IDLE_TIMEOUT, self.max_idle_timeout_ms, 0)?;
     if let Some(elem) = &self.stateless_reset_token {
-      writer.bytes(STATELESS_RESET_TOKEN, elem)?;
+      param_bytes(&mut writer, STATELESS_RESET_TOKEN, elem)?;
     }
-    writer.varint_if(
+    param_varint_if(
+      &mut writer,
       MAX_UDP_PAYLOAD_SIZE,
       self.max_udp_payload_size,
       DEFAULT_MAX_UDP_PAYLOAD_SIZE,
     )?;
-    writer.varint_if(INITIAL_MAX_DATA, self.initial_max_data, 0)?;
-    writer.varint_if(
+    param_varint_if(&mut writer, INITIAL_MAX_DATA, self.initial_max_data, 0)?;
+    param_varint_if(
+      &mut writer,
       INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
       self.initial_max_stream_data_bidi_local,
       0,
     )?;
-    writer.varint_if(
+    param_varint_if(
+      &mut writer,
       INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
       self.initial_max_stream_data_bidi_remote,
       0,
     )?;
-    writer.varint_if(INITIAL_MAX_STREAM_DATA_UNI, self.initial_max_stream_data_uni, 0)?;
-    writer.varint_if(INITIAL_MAX_STREAMS_BIDI, self.initial_max_streams_bidi, 0)?;
-    writer.varint_if(INITIAL_MAX_STREAMS_UNI, self.initial_max_streams_uni, 0)?;
-    writer.varint_if(
+    param_varint_if(&mut writer, INITIAL_MAX_STREAM_DATA_UNI, self.initial_max_stream_data_uni, 0)?;
+    param_varint_if(&mut writer, INITIAL_MAX_STREAMS_BIDI, self.initial_max_streams_bidi, 0)?;
+    param_varint_if(&mut writer, INITIAL_MAX_STREAMS_UNI, self.initial_max_streams_uni, 0)?;
+    param_varint_if(
+      &mut writer,
       ACK_DELAY_EXPONENT,
       self.ack_delay_exponent.into(),
       DEFAULT_ACK_DELAY_EXPONENT.into(),
     )?;
-    writer.varint_if(MAX_ACK_DELAY, self.max_ack_delay_ms, DEFAULT_MAX_ACK_DELAY_MS)?;
+    param_varint_if(&mut writer, MAX_ACK_DELAY, self.max_ack_delay_ms, DEFAULT_MAX_ACK_DELAY_MS)?;
     if self.disable_active_migration {
-      writer.bytes(DISABLE_ACTIVE_MIGRATION, &[])?;
+      param_bytes(&mut writer, DISABLE_ACTIVE_MIGRATION, &[])?;
     }
-    writer.varint_if(
+    param_varint_if(
+      &mut writer,
       ACTIVE_CONNECTION_ID_LIMIT,
       self.active_connection_id_limit,
       DEFAULT_ACTIVE_CONNECTION_ID_LIMIT,
     )?;
     if let Some(elem) = &self.initial_source_connection_id {
-      writer.bytes(INITIAL_SOURCE_CONNECTION_ID, elem.as_slice())?;
+      param_bytes(&mut writer, INITIAL_SOURCE_CONNECTION_ID, elem.as_slice())?;
     }
     if let Some(elem) = &self.retry_source_connection_id {
-      writer.bytes(RETRY_SOURCE_CONNECTION_ID, elem.as_slice())?;
+      param_bytes(&mut writer, RETRY_SOURCE_CONNECTION_ID, elem.as_slice())?;
     }
-    Ok(writer.pos)
+    Ok(writer.pos())
   }
 }
 
@@ -282,53 +288,29 @@ fn varint_value(value: &[u8]) -> crate::Result<u64> {
   }
 }
 
-struct Writer<'out> {
-  out: &'out mut [u8],
-  pos: usize,
+// A parameter with arbitrary content
+fn param_bytes(writer: &mut Writer<'_>, id: u64, value: &[u8]) -> crate::Result<()> {
+  writer.varint(id)?;
+  writer.varint(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
+  writer.put(value)
 }
 
-impl Writer<'_> {
-  // A parameter with arbitrary content
-  fn bytes(&mut self, id: u64, value: &[u8]) -> crate::Result<()> {
-    self.varint(id)?;
-    self.varint(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
-    let end = self.pos.wrapping_add(value.len());
-    let Some(dst) = self.out.get_mut(self.pos..end) else {
-      return Err(buffer_too_small());
-    };
-    dst.copy_from_slice(value);
-    self.pos = end;
-    Ok(())
+// A parameter whose value is a variable-length integer, unless it is the default one
+fn param_varint_if(
+  writer: &mut Writer<'_>,
+  id: u64,
+  value: u64,
+  default: u64,
+) -> crate::Result<()> {
+  if value == default {
+    return Ok(());
   }
-
-  fn varint(&mut self, value: u64) -> crate::Result<()> {
-    if value > VARINT_MAX {
-      return Err(crate::Error::Quic(QuicError::VarintOverflow));
-    }
-    let Some(len) = self.out.get_mut(self.pos..).and_then(|dst| encode_varint(value, dst)) else {
-      return Err(buffer_too_small());
-    };
-    self.pos = self.pos.wrapping_add(len);
-    Ok(())
+  if value > VARINT_MAX {
+    return Err(crate::Error::Quic(QuicError::VarintOverflow));
   }
-
-  // A parameter whose value is a variable-length integer, unless it is the default one
-  fn varint_if(&mut self, id: u64, value: u64, default: u64) -> crate::Result<()> {
-    if value == default {
-      return Ok(());
-    }
-    if value > VARINT_MAX {
-      return Err(crate::Error::Quic(QuicError::VarintOverflow));
-    }
-    self.varint(id)?;
-    self.varint(u64::try_from(varint_len(value)).unwrap_or_default())?;
-    self.varint(value)
-  }
-}
-
-#[cold]
-fn buffer_too_small() -> crate::Error {
-  crate::Error::Quic(QuicError::BufferTooSmall)
+  writer.varint(id)?;
+  writer.varint(u64::try_from(varint_len(value)).unwrap_or_default())?;
+  writer.varint(value)
 }
 
 #[cfg(test)]

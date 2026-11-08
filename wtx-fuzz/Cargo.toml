@@ -27,6 +27,10 @@ name = "pem"
 path = "pem.rs"
 
 [[bin]]
+name = "quic_frame"
+path = "quic_frame.rs"
+
+[[bin]]
 name = "quic_packet"
 path = "quic_packet.rs"
 

@@ -4,6 +4,11 @@
 //! encoders write into buffers of the caller.
 
 mod cid;
+#[allow(dead_code, reason = "consumed by the connection of the later QUIC tasks")]
+mod frame;
+#[cfg(any(test, feature = "_fuzz"))]
+#[doc(hidden)]
+pub mod frame_check;
 #[allow(dead_code, reason = "consumed by the connection and the endpoint of the later QUIC tasks")]
 mod packet;
 #[cfg(any(test, feature = "_fuzz"))]
@@ -12,8 +17,11 @@ pub mod packet_check;
 mod quic_error;
 mod transport_params;
 mod varint;
+mod writer;
 
 pub use cid::{Cid, MAX_CID_LEN};
+#[allow(unused_imports, reason = "consumed by the connection of the later tasks")]
+pub(crate) use frame::{AckFrame, Frame, FrameReader, FrameWriter, Space};
 #[allow(unused_imports, reason = "consumed by the connection and endpoint of the later tasks")]
 pub(crate) use packet::{
   PacketHeader, PacketTy, QUIC_V1, decode_pn, parse_header, pn_len_for, write_retry,
