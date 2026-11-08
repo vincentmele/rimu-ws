@@ -42,6 +42,7 @@ impl BufStreamReader {
   }
 
   /// [`Self::new`] reading into `buffer`, emptied first.
+  #[cfg(feature = "tls")]
   #[inline]
   pub(crate) fn with_buffer(mut buffer: VectorUsize<u8>) -> Self {
     buffer.clear();
@@ -49,6 +50,7 @@ impl BufStreamReader {
   }
 
   /// Takes the internal buffer out, leaving an empty one and nothing to read.
+  #[cfg(feature = "tls")]
   #[inline]
   pub(crate) fn take_buffer(&mut self) -> VectorUsize<u8> {
     self.antecedent_end_idx = 0;

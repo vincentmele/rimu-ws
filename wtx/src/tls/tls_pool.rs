@@ -9,7 +9,6 @@
 use crate::{
   collections::VectorUsize,
   misc::zero_volatile,
-  net::BufStreamReader,
   tls::{KeySchedule, TlsBuffer},
 };
 use alloc::boxed::Box;
@@ -20,6 +19,7 @@ use core::{
 
 /// Key schedule boxes a thread keeps, and with no connection open.
 const KS_POOL_MAX: usize = 64;
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
 const KS_POOL_IDLE_KEEP: usize = 4;
 /// Buffer pairs a thread keeps, of at most `BUF_POOL_BYTES` in all; buffers larger than
 /// `BUF_MAX` are freed. With no connection open: the most recent `BUF_POOL_IDLE_KEEP` within
@@ -27,7 +27,9 @@ const KS_POOL_IDLE_KEEP: usize = 4;
 const BUF_POOL_MAX: usize = 64;
 const BUF_POOL_BYTES: usize = 8 << 20;
 const BUF_MAX: usize = 1 << 20;
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
 const BUF_POOL_IDLE_KEEP: usize = 4;
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
 const BUF_POOL_IDLE_BYTES: usize = 2 << 20;
 
 #[cfg(feature = "std")]
@@ -48,6 +50,7 @@ struct BufPool {
 
 /// Frees the oldest entries of this thread's pools until a few are left: called once the thread
 /// has no connection open.
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
 #[inline]
 pub(crate) fn trim_idle_pools() {
   #[cfg(feature = "std")]
@@ -195,7 +198,8 @@ impl TlsBuffer {
       .ok()
       .flatten()
     {
-      return Self { reader_buffer: BufStreamReader::with_buffer(reader), writer_buffer: writer };
+      let reader_buffer = crate::net::BufStreamReader::with_buffer(reader);
+      return Self { reader_buffer, writer_buffer: writer };
     }
     Self::new()
   }

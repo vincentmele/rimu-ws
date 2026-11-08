@@ -76,7 +76,9 @@ pub use tls_ctx::{
 };
 pub use tls_error::TlsError;
 pub use tls_mode::TlsMode;
-pub(crate) use tls_pool::{KsBox, trim_idle_pools};
+pub(crate) use tls_pool::KsBox;
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+pub(crate) use tls_pool::trim_idle_pools;
 pub use tls_stream::TlsStream;
 pub use tls_stream_bridge::{TlsStreamBridge, TlsStreamBridgeData};
 pub use tls_stream_reader::TlsStreamReader;

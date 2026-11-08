@@ -854,6 +854,7 @@ mod tests {
 
   /// GET, POST with a Content-Length and chunked, a pipelined `pair` and a closing GET, all
   /// answered, the output taken with `spare`.
+  #[cfg(not(miri))]
   fn serve_all(conn: &mut Http1Conn, pair: &[u8], spare: &mut Vec<u8>) -> usize {
     let mut answered = 0;
     for raw in [GET, POST_CL, POST_CHUNKED, pair, CLOSE] {
