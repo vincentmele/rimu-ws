@@ -48,6 +48,8 @@ pub mod net;
 #[cfg(feature = "odf")]
 pub mod odf;
 pub mod pool;
+#[cfg(feature = "quic")]
+pub mod quic;
 pub mod rng;
 #[cfg(feature = "secret")]
 pub mod secret;

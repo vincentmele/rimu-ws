@@ -185,6 +185,14 @@ impl From<DequeueError> for Error {
   }
 }
 
+#[cfg(feature = "quic")]
+impl From<crate::quic::QuicError> for Error {
+  #[inline]
+  fn from(from: crate::quic::QuicError) -> Self {
+    Self::Quic(from)
+  }
+}
+
 #[cfg(feature = "http")]
 impl From<crate::http::RouterError> for Error {
   #[inline]

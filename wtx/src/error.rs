@@ -337,6 +337,13 @@ pub enum Error {
   Postgres(crate::database::client::postgres::PostgresError),
   #[doc = associated_element_doc!()]
   Queue(DequeueError),
+  /// A QUIC element is invalid or could not be written. Packets are dropped and no connection is
+  /// closed because of it.
+  #[cfg(feature = "quic")]
+  Quic(crate::quic::QuicError),
+  /// A QUIC connection must be closed with the transport error code.
+  #[cfg(feature = "quic")]
+  QuicClose(crate::quic::TransportErrorCode, crate::quic::QuicError),
   #[cfg(feature = "http")]
   #[doc = associated_element_doc!()]
   Router(crate::http::RouterError),

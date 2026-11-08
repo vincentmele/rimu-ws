@@ -27,6 +27,10 @@ name = "pem"
 path = "pem.rs"
 
 [[bin]]
+name = "quic_packet"
+path = "quic_packet.rs"
+
+[[bin]]
 name = "tls"
 path = "tls.rs"
 
@@ -52,7 +56,7 @@ path = "x509.rs"
 
 [dependencies]
 libfuzzer-sys = { version = "0.4" }
-rimu-ws = { default-features = false, features = ["_fuzz", "arbitrary", "asn1", "crypto-ring", "http-cookie", "http2", "std", "web-socket", "x509"], path = "../wtx" }
+rimu-ws = { default-features = false, features = ["_fuzz", "arbitrary", "asn1", "crypto-ring", "http-cookie", "http2", "quic", "std", "web-socket", "x509"], path = "../wtx" }
 
 [package]
 edition = "2024"
