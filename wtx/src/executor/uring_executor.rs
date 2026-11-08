@@ -76,6 +76,11 @@ const SEND_POOL_MAX: usize = 64;
 const SEND_POOL_BUFFER_MAX: usize = 1 << 20;
 const SEND_POOL_IDLE_KEEP: usize = 4;
 const SEND_POOL_IDLE_BYTES: usize = 1 << 20;
+// A receive buffer a connection outgrew goes to the pool only from this capacity up; a growing
+// one takes a pooled buffer of up to this capacity however little it needs (half of what a free
+// slot keeps, see `Reactor::grow_rx`).
+const RX_RECYCLE_MIN: usize = 1024;
+const RX_TAKE_SMALL_MAX: usize = 32 * 1024;
 // A free slot keeps a buffer up to this capacity for the next connection, and gives a larger one
 // to the pool.
 const SLOT_BUFFER_KEEP: usize = 64 * 1024;
@@ -2904,20 +2909,28 @@ impl Reactor {
   }
 
   /// Moves the unread bytes of `conn.rx` into a pooled buffer with room for `additional` more, if
-  /// the pool has one, instead of growing it by doubling; the buffer it leaves goes to the pool.
+  /// the pool has one, instead of growing it by doubling: the largest of at most four times the
+  /// power of two the bytes need (what doubling would come to, and room for a few more), or of
+  /// `RX_TAKE_SMALL_MAX`, whichever is more. A larger one is left: a receive buffer is kept for as
+  /// long as its connection is open, so a small receive that took one would hold it outside every
+  /// pool's bounds. The largest fitting one, so that the small ones are left for the sends that need
+  /// them (a TLS handshake's flight is written into one). The buffer it leaves goes to the pool if
+  /// it is not too small to be worth a slot.
   #[cold]
   #[inline(never)]
   fn grow_rx(&self, conn: &mut Conn, additional: usize) {
     let unread = conn.rx.get(conn.rx_off as usize..).unwrap_or_default();
-    let Some(mut buffer) =
-      self.take_send_buffer(unread.len().saturating_add(additional), usize::MAX)
-    else {
+    let need = unread.len().saturating_add(additional);
+    let max = need.checked_next_power_of_two().unwrap_or(need).saturating_mul(4);
+    let Some(mut buffer) = self.take_largest_buffer(need, max.max(RX_TAKE_SMALL_MAX)) else {
       return;
     };
     buffer.extend_from_slice(unread);
     conn.rx_off = 0;
     let old = core::mem::replace(&mut conn.rx, buffer);
-    self.recycle_send_buffer(old);
+    if old.capacity() >= RX_RECYCLE_MIN {
+      self.recycle_send_buffer(old);
+    }
   }
 
   /// Stops receiving into a connection that holds `rx_high_water` unread bytes: the rest waits in
@@ -3186,6 +3199,19 @@ impl Reactor {
     self.push_sqe(&sqe);
     self.count_queued_send(len);
     Ok(true)
+  }
+
+  /// The largest pooled buffer with a capacity of `min` to `max` bytes, the most recent of those.
+  fn take_largest_buffer(&self, min: usize, max: usize) -> Option<Vec<u8>> {
+    let mut pool = self.send_pool.borrow_mut();
+    let mut found: Option<(usize, usize)> = None;
+    for (idx, elem) in pool.iter().enumerate() {
+      let capacity = elem.capacity();
+      if (min..=max).contains(&capacity) && found.is_none_or(|el| capacity >= el.1) {
+        found = Some((idx, capacity));
+      }
+    }
+    Some(pool.remove(found?.0))
   }
 
   /// The most recently pooled buffer with a capacity of `min` to `max` bytes, if any.
