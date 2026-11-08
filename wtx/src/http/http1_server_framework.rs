@@ -2052,7 +2052,10 @@ mod tests {
       let after = tls_stats(&uri).await;
       // The second stats connection's own: a handshake, a request, a close, give or take a cancel
       assert!(after[4] - before[4] <= 16, "{before:?} {after:?}");
-      assert!(before[0] <= 2 && after[0] <= 2, "{before:?} {after:?}");
+      // One timer for the delay; the stats connections' handshake and first-head timers may still
+      // await their removal (more so on a loaded machine). None per wake.
+      assert!(before[0] <= 3 && after[0] <= 3, "{before:?} {after:?}");
+      assert!(after[1] <= before[1] + 2, "timer slots added: {before:?} {after:?}");
       assert!(after[2] <= 2, "{after:?}");
       let got = tls_read_until(&mut stream, b"pong").await.unwrap();
       let got = String::from_utf8(got).unwrap();
