@@ -674,6 +674,7 @@ impl SendPart {
     mut bytes: &[u8],
     blocks: &mut FreeList<Box<TxBlock>>,
   ) -> crate::Result<()> {
+    let count = self.segs.len();
     if let Some(last) = self.segs.back_mut() {
       let (dst, room) = match &mut last.data {
         SegData::Inline(pos) if pos.wrapping_add(last.len) == self.inline_used => {
@@ -684,11 +685,18 @@ impl SendPart {
         SegData::Body(_) | SegData::Inline(_) => (None, 0),
       };
       let take = room.min(bytes.len());
-      if let Some(dst) = dst.and_then(|el| el.get_mut(..take))
+      if take > 0
+        && let Some(dst) = dst.and_then(|el| el.get_mut(..take))
         && let Some((head, tail)) = bytes.split_at_checked(take)
       {
         dst.copy_from_slice(head);
         bytes = tail;
+        // A segment that was all sent has bytes to send again: the cursor, which left it, comes
+        // back to them
+        if self.cursor >= count {
+          self.cursor = count.wrapping_sub(1);
+          self.cursor_pos = last.len;
+        }
         last.len = last.len.wrapping_add(take);
         if matches!(last.data, SegData::Inline(_)) {
           self.inline_used = self.inline_used.wrapping_add(take);
@@ -2876,6 +2884,44 @@ mod tests {
     let log = &link.client.app.streams[&id.0];
     assert_eq!((log.data.len(), log.fin), (8000, true));
     assert_eq!(link.server.conn.state(), ConnState::Confirmed);
+  }
+
+  // A stream written again once its bytes were sent, before they are acknowledged: the next frame
+  // carries the new bytes, inline or after those of a block, the frame of another stream that
+  // follows it in the packet keeps its own, and the acknowledgments let go of the block and of the
+  // body.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn write_after_send_before_ack_carries_the_new_bytes() {
+    for first_len in [5, 300] {
+      let mut link = settled(&LinkOpts::new(None));
+      let blocks = link.client.parts.pools.tx_blocks.len();
+      let body: Rc<[u8]> = vec![7; 50].into();
+      let first = vec![b'a'; first_len];
+      let id = open_bidi(&mut link).unwrap();
+      write(&mut link, id, &first, false);
+      // Sent, not acknowledged
+      let _ = link.client.flush(link.now_us);
+      let other = open_bidi(&mut link).unwrap();
+      write(&mut link, id, b" more", true);
+      let now_us = link.now_us;
+      let response = BodyRef::new(body.clone(), 0..50).unwrap();
+      link.client.with_ctx(now_us, |cx| cx.write_body(other, response, true)).unwrap();
+      let before = link.client.conn.stats().packets_out;
+      let _ = link.client.flush(link.now_us);
+      // Both frames in one packet, the body after the bytes
+      assert_eq!(link.client.conn.stats().packets_out - before, 1);
+      link.run();
+      assert_eq!(link.server.conn.state(), ConnState::Confirmed, "{first_len}");
+      let mut expected = first.clone();
+      expected.extend_from_slice(b" more");
+      let log = &link.server.app.streams[&id.0];
+      assert_eq!((log.data.as_slice(), log.fin), (expected.as_slice(), true));
+      let log = &link.server.app.streams[&other.0];
+      assert_eq!((log.data.as_slice(), log.fin), (&*body, true));
+      assert_eq!(Rc::strong_count(&body), 1);
+      assert_eq!(link.client.parts.pools.tx_blocks.len(), blocks + usize::from(first_len > 256));
+    }
   }
 
   // 100 streams that the client abandons, with RESET_STREAM or STOP_SENDING, are within the
