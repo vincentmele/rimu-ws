@@ -147,7 +147,7 @@ pub struct UringRuntime {
 }
 
 impl UringRuntime {
-  /// See [`UringStats`].
+  /// See [`UringStats`]. Walks every timer slot and connection slot (O(n) per call).
   #[inline]
   #[must_use]
   pub fn stats(&self) -> UringStats {
@@ -389,7 +389,8 @@ pub(crate) fn sqes_pushed() -> Option<u64> {
   unsafe { reactor.as_ref() }.map(|el| el.sqes_pushed.get())
 }
 
-/// The [`UringStats`] of the runtime running on this thread, if any.
+/// The [`UringStats`] of the runtime running on this thread, if any. Each call walks every timer
+/// slot and every connection slot (O(n)): for monitoring, not for a hot path.
 #[inline]
 #[must_use]
 pub fn uring_stats() -> Option<UringStats> {

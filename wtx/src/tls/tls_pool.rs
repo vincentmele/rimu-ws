@@ -2,7 +2,11 @@
 //! connection: the boxes of key schedules ([`KsBox`]) and the buffers of streams ([`TlsBuffer`]).
 //!
 //! Whatever comes back is zeroed first, all of it: a key schedule holds a connection's secrets, a
-//! buffer its handshake and decrypted data, and the next connection must find none of them. The
+//! buffer its handshake and decrypted data, and the next connection must find none of them. This
+//! covers key material and TLS record buffers only: the decrypted requests and responses the
+//! HTTP/1.1 driver keeps in its own pools (`CONN_POOL`, `RX_POOL`) are reused without being zeroed,
+//! and are only ever read through the lengths of what the next connection wrote (unreachable from
+//! safe code). The
 //! pools are bounded in count and bytes, and trimmed to a few entries once their thread has no
 //! connection open (see [`trim_idle_pools`]).
 
