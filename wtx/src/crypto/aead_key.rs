@@ -96,7 +96,7 @@ mod tests {
     tests::_count_allocations_in,
   };
   use alloc::vec::Vec;
-  use core::sync::atomic::Ordering;
+  use core::{mem::MaybeUninit, ptr, slice, sync::atomic::Ordering};
 
   // McGrew and Viega, "The Galois/Counter Mode of Operation", test cases 4 and 16
   const GCM_AAD: [u8; 20] = hexd!(b"feedfacedeadbeeffeedfacedeadbeefabaddad2");
@@ -229,11 +229,28 @@ mod tests {
     round(10);
     _count_allocations_in(counter);
     let before = counter.load(Ordering::SeqCst);
-    round(1000);
+    round(if cfg!(miri) { 20 } else { 1000 });
     counter.load(Ordering::SeqCst) - before
   }
 
   // `$allocations` is the `cfg` predicate of the allocation test
+  // The key is wiped when dropped, which is checked without reading freed memory: the key lives in
+  // a slot that the test owns.
+  fn wiped_on_drop<K>()
+  where
+    K: AeadKey,
+  {
+    let mut slot = MaybeUninit::<K>::uninit();
+    slot.write(K::new(&[7; 32][..K::KEY_LEN]).unwrap());
+    // SAFETY: the slot was initialized above and nothing reads it as a `K` after this
+    unsafe { ptr::drop_in_place(slot.as_mut_ptr()) };
+    // SAFETY: the drop overwrote every byte of the slot, padding included, so all of them are
+    // initialized
+    let bytes = unsafe { slice::from_raw_parts(slot.as_ptr().cast::<u8>(), size_of::<K>()) };
+    let left = bytes.iter().filter(|el| **el != 0).count();
+    assert_eq!(left, 0, "non-zero bytes left in the slot");
+  }
+
   macro_rules! suite {
     ($name:ident, $allocations:meta, $aes128:ty, $aes256:ty, $chacha:ty) => {
       mod $name {
@@ -295,6 +312,13 @@ mod tests {
           another_key_is_rejected::<$chacha>();
         }
 
+        #[test]
+        fn key_is_wiped_on_drop() {
+          wiped_on_drop::<$aes128>();
+          wiped_on_drop::<$aes256>();
+          wiped_on_drop::<$chacha>();
+        }
+
         #[cfg($allocations)]
         #[test]
         fn aead_key_new_once_then_seal_allocates_nothing() {
@@ -309,6 +333,7 @@ mod tests {
     };
   }
 
+  #[cfg(not(miri))]
   suite!(
     global,
     // Graviola allocates in debug builds, see below
@@ -317,7 +342,7 @@ mod tests {
     crate::crypto::Aes256GcmKeyGlobal,
     crate::crypto::Chacha20Poly1305KeyGlobal
   );
-  #[cfg(feature = "crypto-alr")]
+  #[cfg(all(feature = "crypto-alr", not(miri)))]
   suite!(
     alr,
     all(),
@@ -325,7 +350,7 @@ mod tests {
     crate::crypto::Aes256GcmKeyAlr,
     crate::crypto::Chacha20Poly1305KeyAlr
   );
-  #[cfg(feature = "crypto-graviola")]
+  #[cfg(all(feature = "crypto-graviola", not(miri)))]
   // In debug builds Graviola reads an environment variable, which allocates, every time it
   // checks a CPU feature (`low::x86_64::cpu::test_toggle`), so it is only allocation-free in
   // release builds.
@@ -336,7 +361,7 @@ mod tests {
     crate::crypto::Aes256GcmKeyGraviola,
     crate::crypto::Chacha20Poly1305KeyGraviola
   );
-  #[cfg(feature = "crypto-ring")]
+  #[cfg(all(feature = "crypto-ring", not(miri)))]
   suite!(
     ring,
     all(),

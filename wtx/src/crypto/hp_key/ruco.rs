@@ -16,7 +16,7 @@ impl HpKey for Aes128HpRuco {
       core::hint::cold_path();
       return Err(CryptoError::InvalidHeaderProtection.into());
     };
-    Ok(Self(elem))
+    Ok(Self::from_key(elem))
   }
 
   #[inline]
@@ -34,7 +34,7 @@ impl HpKey for Aes256HpRuco {
       core::hint::cold_path();
       return Err(CryptoError::InvalidHeaderProtection.into());
     };
-    Ok(Self(elem))
+    Ok(Self::from_key(elem))
   }
 
   #[inline]
@@ -52,7 +52,7 @@ impl HpKey for Chacha20HpRuco {
       core::hint::cold_path();
       return Err(CryptoError::InvalidHeaderProtection.into());
     };
-    Ok(Self(array))
+    Ok(Self::from_key(array))
   }
 
   // RFC 9001 section 5.4.4: the first four bytes of the sample are the little-endian block
@@ -68,7 +68,8 @@ impl HpKey for Chacha20HpRuco {
       return Err(CryptoError::InvalidHeaderProtection.into());
     };
     let nonce = <[u8; 12]>::try_from(nonce)?;
-    let mut core = ChaChaCore::<R20, Ietf>::new(&self.0.into(), &nonce.into());
+    let key: [u8; 32] = *self.0;
+    let mut core = ChaChaCore::<R20, Ietf>::new(&key.into(), &nonce.into());
     core.set_block_pos(u32::from_le_bytes(*counter));
     let mut block = Block::<ChaChaCore<R20, Ietf>>::default();
     core.write_keystream_block(&mut block);

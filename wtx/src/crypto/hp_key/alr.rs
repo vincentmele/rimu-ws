@@ -4,7 +4,7 @@ use aws_lc_rs::aead::quic::{AES_128, AES_256, Algorithm, CHACHA20, HeaderProtect
 impl HpKey for Aes128HpAlr {
   #[inline]
   fn new(key: &[u8]) -> crate::Result<Self> {
-    Ok(Self(local_new_hp(&AES_128, key)?))
+    Ok(Self::from_key(local_new_hp(&AES_128, key)?))
   }
 
   #[inline]
@@ -16,7 +16,7 @@ impl HpKey for Aes128HpAlr {
 impl HpKey for Aes256HpAlr {
   #[inline]
   fn new(key: &[u8]) -> crate::Result<Self> {
-    Ok(Self(local_new_hp(&AES_256, key)?))
+    Ok(Self::from_key(local_new_hp(&AES_256, key)?))
   }
 
   #[inline]
@@ -28,7 +28,7 @@ impl HpKey for Aes256HpAlr {
 impl HpKey for Chacha20HpAlr {
   #[inline]
   fn new(key: &[u8]) -> crate::Result<Self> {
-    Ok(Self(local_new_hp(&CHACHA20, key)?))
+    Ok(Self::from_key(local_new_hp(&CHACHA20, key)?))
   }
 
   #[inline]

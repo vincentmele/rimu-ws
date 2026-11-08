@@ -202,3 +202,43 @@ macro_rules! _create_wrappers {
     )*
   };
 }
+
+// Wrappers of the keys that QUIC keeps in pooled connection slots: whatever was expanded from the
+// key is dropped and then overwritten when the wrapper is dropped, so the next owner of the slot
+// cannot read it.
+macro_rules! _create_key_wrappers {
+  ($(
+    $(#[$meta:meta])*
+    $name:ident($ty:ty)
+  ),* $(,)?) => {
+    $(
+      /// A wrapper used to generalize third-party dependencies. The bytes of the key are
+      /// overwritten with zeros when it is dropped.
+      $(#[$meta])*
+      pub struct $name(pub(crate) core::mem::ManuallyDrop<$ty>);
+
+      impl $name {
+        /// Takes ownership of an already expanded key.
+        #[inline]
+        pub(crate) fn from_key(value: $ty) -> Self {
+          Self(core::mem::ManuallyDrop::new(value))
+        }
+      }
+
+      impl Drop for $name {
+        #[inline]
+        fn drop(&mut self) {
+          // SAFETY: the field is only dropped here, and `self` is not used after `drop`
+          unsafe { crate::crypto::drop_and_zero(&mut self.0) };
+        }
+      }
+
+      impl core::fmt::Debug for $name {
+        #[inline]
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+          f.write_str(stringify!($name))
+        }
+      }
+    )*
+  };
+}

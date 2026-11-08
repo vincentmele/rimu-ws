@@ -63,6 +63,7 @@ impl HpKey for HpKeyDummy {
 mod tests {
   use super::HpKeyDummy;
   use crate::crypto::{CryptoError, HpKey};
+  use core::{mem::MaybeUninit, ptr, slice};
 
   // RFC 9001 appendix A.2: client Initial
   const AES_128_KEY: [u8; 16] = hexd!(b"9f50449e04a0e810283a1e9933adedd2");
@@ -146,6 +147,23 @@ mod tests {
     assert!(HpKeyDummy(()).masks(&[[0; 16]], &mut [[0; 5]]).is_err());
   }
 
+  // The key is wiped when dropped, which is checked without reading freed memory: the key lives in
+  // a slot that the test owns.
+  fn wiped_on_drop<K>(key: &[u8])
+  where
+    K: HpKey,
+  {
+    let mut slot = MaybeUninit::<K>::uninit();
+    slot.write(K::new(key).unwrap());
+    // SAFETY: the slot was initialized above and nothing reads it as a `K` after this
+    unsafe { ptr::drop_in_place(slot.as_mut_ptr()) };
+    // SAFETY: the drop overwrote every byte of the slot, padding included, so all of them are
+    // initialized
+    let bytes = unsafe { slice::from_raw_parts(slot.as_ptr().cast::<u8>(), size_of::<K>()) };
+    let left = bytes.iter().filter(|el| **el != 0).count();
+    assert_eq!(left, 0, "non-zero bytes left in the slot");
+  }
+
   macro_rules! suite {
     ($name:ident, $aes128:ty, $aes256:ty, $chacha:ty) => {
       mod $name {
@@ -195,6 +213,13 @@ mod tests {
         }
 
         #[test]
+        fn key_is_wiped_on_drop() {
+          wiped_on_drop::<$aes128>(&AES_128_KEY);
+          wiped_on_drop::<$aes256>(&FIPS_256_KEY);
+          wiped_on_drop::<$chacha>(&CHACHA_KEY);
+        }
+
+        #[test]
         fn wrong_key_lengths() {
           wrong_key_length_is_rejected::<$aes128>(16);
           wrong_key_length_is_rejected::<$aes256>(32);
@@ -204,9 +229,13 @@ mod tests {
     };
   }
 
-  #[cfg(any(
-    feature = "crypto-ring",
-    all(not(feature = "crypto-graviola"), any(feature = "crypto-alr", feature = "crypto-ruco"))
+  // Under Miri only the Rust Crypto backend runs, the others call C or assembly
+  #[cfg(all(
+    not(miri),
+    any(
+      feature = "crypto-ring",
+      all(not(feature = "crypto-graviola"), any(feature = "crypto-alr", feature = "crypto-ruco"))
+    )
   ))]
   suite!(
     global,
@@ -214,9 +243,9 @@ mod tests {
     crate::crypto::Aes256HpGlobal,
     crate::crypto::Chacha20HpGlobal
   );
-  #[cfg(feature = "crypto-alr")]
+  #[cfg(all(feature = "crypto-alr", not(miri)))]
   suite!(alr, crate::crypto::Aes128HpAlr, crate::crypto::Aes256HpAlr, crate::crypto::Chacha20HpAlr);
-  #[cfg(feature = "crypto-ring")]
+  #[cfg(all(feature = "crypto-ring", not(miri)))]
   suite!(
     ring,
     crate::crypto::Aes128HpRing,

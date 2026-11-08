@@ -14,7 +14,7 @@ impl AeadKey for Aes128GcmKeyGraviola {
       core::hint::cold_path();
       return Err(CryptoError::InvalidAes128GcmData.into());
     }
-    Ok(Self(AesGcm::new(key)))
+    Ok(Self::from_key(AesGcm::new(key)))
   }
 
   #[inline]
@@ -52,7 +52,7 @@ impl AeadKey for Aes256GcmKeyGraviola {
       core::hint::cold_path();
       return Err(CryptoError::InvalidAes256GcmData.into());
     }
-    Ok(Self(AesGcm::new(key)))
+    Ok(Self::from_key(AesGcm::new(key)))
   }
 
   #[inline]
@@ -89,7 +89,7 @@ impl AeadKey for Chacha20Poly1305KeyGraviola {
       core::hint::cold_path();
       return Err(CryptoError::InvalidChacha20Poly1305Data.into());
     };
-    Ok(Self(ChaCha20Poly1305::new(array)))
+    Ok(Self::from_key(ChaCha20Poly1305::new(array)))
   }
 
   #[inline]

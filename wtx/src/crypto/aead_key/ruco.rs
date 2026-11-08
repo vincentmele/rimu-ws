@@ -15,7 +15,7 @@ impl AeadKey for Aes128GcmKeyRuco {
       core::hint::cold_path();
       return Err(CryptoError::InvalidAes128GcmData.into());
     };
-    Ok(Self(elem))
+    Ok(Self::from_key(elem))
   }
 
   #[inline]
@@ -50,7 +50,7 @@ impl AeadKey for Aes256GcmKeyRuco {
       core::hint::cold_path();
       return Err(CryptoError::InvalidAes256GcmData.into());
     };
-    Ok(Self(elem))
+    Ok(Self::from_key(elem))
   }
 
   #[inline]
@@ -85,7 +85,7 @@ impl AeadKey for Chacha20Poly1305KeyRuco {
       core::hint::cold_path();
       return Err(CryptoError::InvalidChacha20Poly1305Data.into());
     };
-    Ok(Self(elem))
+    Ok(Self::from_key(elem))
   }
 
   #[inline]

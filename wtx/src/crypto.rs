@@ -88,10 +88,6 @@ _create_wrappers!(
   Aes256GcmAlr<>(),
   #[derive(Default)]
   Chacha20Poly1305Alr<>(),
-  // Aead key
-  Aes128GcmKeyAlr<>(aws_lc_rs::aead::LessSafeKey),
-  Aes256GcmKeyAlr<>(aws_lc_rs::aead::LessSafeKey),
-  Chacha20Poly1305KeyAlr<>(aws_lc_rs::aead::LessSafeKey),
   // Agreement
   EcdhP256Alr<>(aws_lc_rs::agreement::EphemeralPrivateKey),
   EcdhP384Alr<>(aws_lc_rs::agreement::EphemeralPrivateKey),
@@ -111,10 +107,6 @@ _create_wrappers!(
   // Hmac
   HmacSha256Alr<>(aws_lc_rs::hmac::Context),
   HmacSha384Alr<>(aws_lc_rs::hmac::Context),
-  // Header protection
-  Aes128HpAlr<>(aws_lc_rs::aead::quic::HeaderProtectionKey),
-  Aes256HpAlr<>(aws_lc_rs::aead::quic::HeaderProtectionKey),
-  Chacha20HpAlr<>(aws_lc_rs::aead::quic::HeaderProtectionKey),
   // Signature
   #[derive(Default)]
   EcdsaP256Alr<>(),
@@ -132,6 +124,16 @@ _create_wrappers!(
   RsaPssSigningKeyAlr<>((HashTy, aws_lc_rs::signature::RsaKeyPair)),
 );
 
+#[cfg(feature = "crypto-alr")]
+_create_key_wrappers!(
+  Aes128GcmKeyAlr(aws_lc_rs::aead::LessSafeKey),
+  Aes256GcmKeyAlr(aws_lc_rs::aead::LessSafeKey),
+  Chacha20Poly1305KeyAlr(aws_lc_rs::aead::LessSafeKey),
+  Aes128HpAlr(aws_lc_rs::aead::quic::HeaderProtectionKey),
+  Aes256HpAlr(aws_lc_rs::aead::quic::HeaderProtectionKey),
+  Chacha20HpAlr(aws_lc_rs::aead::quic::HeaderProtectionKey),
+);
+
 #[cfg(feature = "crypto-graviola")]
 _create_wrappers!(
   // Aead
@@ -141,10 +143,6 @@ _create_wrappers!(
   Aes256GcmGraviola<>(),
   #[derive(Default)]
   Chacha20Poly1305Graviola<>(),
-  // Aead key
-  Aes128GcmKeyGraviola<>(graviola::aead::AesGcm),
-  Aes256GcmKeyGraviola<>(graviola::aead::AesGcm),
-  Chacha20Poly1305KeyGraviola<>(graviola::aead::ChaCha20Poly1305),
   // Agreement
   EcdhP256Graviola<>(graviola::key_agreement::p256::PrivateKey),
   EcdhP384Graviola<>(graviola::key_agreement::p384::PrivateKey),
@@ -179,6 +177,13 @@ _create_wrappers!(
   RsaPssSigningKeyGraviola<>((HashTy, graviola::signing::rsa::SigningKey)),
 );
 
+#[cfg(feature = "crypto-graviola")]
+_create_key_wrappers!(
+  Aes128GcmKeyGraviola(graviola::aead::AesGcm),
+  Aes256GcmKeyGraviola(graviola::aead::AesGcm),
+  Chacha20Poly1305KeyGraviola(graviola::aead::ChaCha20Poly1305),
+);
+
 #[cfg(feature = "crypto-ring")]
 _create_wrappers!(
   // Aead
@@ -188,10 +193,6 @@ _create_wrappers!(
   Aes256GcmRing<>(),
   #[derive(Default)]
   Chacha20Poly1305Ring<>(),
-  // Aead key
-  Aes128GcmKeyRing<>(ring::aead::LessSafeKey),
-  Aes256GcmKeyRing<>(ring::aead::LessSafeKey),
-  Chacha20Poly1305KeyRing<>(ring::aead::LessSafeKey),
   // Agreement
   EcdhP256Ring<>(ring::agreement::EphemeralPrivateKey),
   EcdhP384Ring<>(ring::agreement::EphemeralPrivateKey),
@@ -211,10 +212,6 @@ _create_wrappers!(
   // Hmac
   HmacSha256Ring<>(ring::hmac::Context),
   HmacSha384Ring<>(ring::hmac::Context),
-  // Header protection
-  Aes128HpRing<>(ring::aead::quic::HeaderProtectionKey),
-  Aes256HpRing<>(ring::aead::quic::HeaderProtectionKey),
-  Chacha20HpRing<>(ring::aead::quic::HeaderProtectionKey),
   // Signature
   #[derive(Default)]
   EcdsaP256Ring<>(),
@@ -232,6 +229,16 @@ _create_wrappers!(
   RsaPssSigningKeyRing<>((HashTy, ring::signature::RsaKeyPair)),
 );
 
+#[cfg(feature = "crypto-ring")]
+_create_key_wrappers!(
+  Aes128GcmKeyRing(ring::aead::LessSafeKey),
+  Aes256GcmKeyRing(ring::aead::LessSafeKey),
+  Chacha20Poly1305KeyRing(ring::aead::LessSafeKey),
+  Aes128HpRing(ring::aead::quic::HeaderProtectionKey),
+  Aes256HpRing(ring::aead::quic::HeaderProtectionKey),
+  Chacha20HpRing(ring::aead::quic::HeaderProtectionKey),
+);
+
 #[cfg(feature = "crypto-ruco")]
 _create_wrappers!(
   // Aead
@@ -241,10 +248,6 @@ _create_wrappers!(
   Aes256GcmRuco<>(),
   #[derive(Default)]
   Chacha20Poly1305Ruco<>(),
-  // Aead key
-  Aes128GcmKeyRuco<>(aes_gcm::Aes128Gcm),
-  Aes256GcmKeyRuco<>(aes_gcm::Aes256Gcm),
-  Chacha20Poly1305KeyRuco<>(chacha20poly1305::ChaCha20Poly1305),
   // Agreement
   EcdhP256Ruco<>(p256::ecdh::EphemeralSecret),
   EcdhP384Ruco<>(p384::ecdh::EphemeralSecret),
@@ -264,10 +267,6 @@ _create_wrappers!(
   // Hmac
   HmacSha256Ruco<>(::hmac::Hmac<sha2::Sha256>),
   HmacSha384Ruco<>(::hmac::Hmac<sha2::Sha384>),
-  // Header protection
-  Aes128HpRuco<>(::aes::Aes128),
-  Aes256HpRuco<>(::aes::Aes256),
-  Chacha20HpRuco<>([u8; 32]),
   // Signature
   #[derive(Default)]
   EcdsaP256Ruco<>(),
@@ -282,6 +281,42 @@ _create_wrappers!(
   EcdsaP384SigningKeyRuco<>(p384::ecdsa::SigningKey),
   Ed25519SigningKeyRuco<>(ed25519_dalek::SigningKey),
 );
+
+#[cfg(feature = "crypto-ruco")]
+_create_key_wrappers!(
+  Aes128GcmKeyRuco(aes_gcm::Aes128Gcm),
+  Aes256GcmKeyRuco(aes_gcm::Aes256Gcm),
+  Chacha20Poly1305KeyRuco(chacha20poly1305::ChaCha20Poly1305),
+  Aes128HpRuco(::aes::Aes128),
+  Aes256HpRuco(::aes::Aes256),
+  Chacha20HpRuco([u8; 32]),
+);
+
+/// Drops the value and then overwrites with zeros the bytes it occupied, with volatile writes that
+/// the compiler cannot remove, so that a key does not outlive its owner in a slot that is reused.
+///
+/// Only the bytes of the value itself are overwritten, memory that the value owns elsewhere is
+/// left to its own destructor.
+///
+/// # Safety
+///
+/// The value must not be used or dropped again.
+#[cfg(any(
+  feature = "crypto-alr",
+  feature = "crypto-graviola",
+  feature = "crypto-ring",
+  feature = "crypto-ruco"
+))]
+#[inline]
+pub(crate) unsafe fn drop_and_zero<T>(value: &mut core::mem::ManuallyDrop<T>) {
+  // SAFETY: up to the caller
+  unsafe { core::mem::ManuallyDrop::drop(value) };
+  // The pointer is taken after the drop so that it is not invalidated by it
+  let ptr = core::ptr::from_mut(value).cast::<u8>();
+  // SAFETY: `ptr` is the place of `value`, which is still allocated and `size_of::<T>()` long
+  // (`ManuallyDrop` has the layout of `T`), and nothing reads it as a `T` again
+  unsafe { crate::misc::zero_volatile(ptr, size_of::<T>()) };
+}
 
 /// AEAD nonce prefix
 #[inline]

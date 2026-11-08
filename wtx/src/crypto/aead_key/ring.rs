@@ -11,7 +11,7 @@ impl AeadKey for Aes128GcmKeyRing {
 
   #[inline]
   fn new(key: &[u8]) -> crate::Result<Self> {
-    Ok(Self(local_new_key(&AES_128_GCM, CryptoError::InvalidAes128GcmData, key)?))
+    Ok(Self::from_key(local_new_key(&AES_128_GCM, CryptoError::InvalidAes128GcmData, key)?))
   }
 
   #[inline]
@@ -40,7 +40,7 @@ impl AeadKey for Aes256GcmKeyRing {
 
   #[inline]
   fn new(key: &[u8]) -> crate::Result<Self> {
-    Ok(Self(local_new_key(&AES_256_GCM, CryptoError::InvalidAes256GcmData, key)?))
+    Ok(Self::from_key(local_new_key(&AES_256_GCM, CryptoError::InvalidAes256GcmData, key)?))
   }
 
   #[inline]
@@ -69,7 +69,11 @@ impl AeadKey for Chacha20Poly1305KeyRing {
 
   #[inline]
   fn new(key: &[u8]) -> crate::Result<Self> {
-    Ok(Self(local_new_key(&CHACHA20_POLY1305, CryptoError::InvalidChacha20Poly1305Data, key)?))
+    Ok(Self::from_key(local_new_key(
+      &CHACHA20_POLY1305,
+      CryptoError::InvalidChacha20Poly1305Data,
+      key,
+    )?))
   }
 
   #[inline]
