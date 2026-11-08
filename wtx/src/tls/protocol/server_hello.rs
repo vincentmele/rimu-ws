@@ -166,7 +166,7 @@ fn manage_extension<'de>(
     ExtensionTy::SupportedVersions => {
       *supported_versions_opt = Some(SupportedVersionsServer::decode(dw)?);
     }
-    ExtensionTy::Cookie | ExtensionTy::PreSharedKey => {}
+    ExtensionTy::Cookie | ExtensionTy::PreSharedKey | ExtensionTy::QuicTransportParameters => {}
     ExtensionTy::ApplicationLayerProtocolNegotiation
     | ExtensionTy::CertificateAuthorities
     | ExtensionTy::ClientCertificateType

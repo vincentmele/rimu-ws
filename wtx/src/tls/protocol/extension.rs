@@ -46,3 +46,18 @@ where
     })
   }
 }
+
+/// Writes the extension `extension_ty` with `data` as its data: the extension of the QUIC transport
+/// parameters (RFC 9001 section 8.2), whose data TLS carries without looking into it.
+#[inline]
+pub(crate) fn encode_opaque_extension(
+  data: &[u8],
+  extension_ty: ExtensionTy,
+  ew: &mut TlsEncodeWrapper<'_>,
+) -> crate::Result<()> {
+  extension_ty.encode(ew)?;
+  u16_write(CounterWriterBytesTy::IgnoresLen, None, ew, |local_ew| {
+    local_ew.buffer().extend_from_copyable_slice(data)?;
+    crate::Result::Ok(())
+  })
+}

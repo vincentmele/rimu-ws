@@ -33,6 +33,8 @@ pub(crate) enum ExtensionTy {
   PostHandshakeAuth = 49,
   SignatureAlgorithmsCert = 50,
   KeyShare = 51,
+  /// RFC 9001 section 8.2
+  QuicTransportParameters = 57,
 }
 
 impl From<ExtensionTy> for u16 {
@@ -61,6 +63,7 @@ impl From<ExtensionTy> for u16 {
       ExtensionTy::PostHandshakeAuth => 49,
       ExtensionTy::SignatureAlgorithmsCert => 50,
       ExtensionTy::KeyShare => 51,
+      ExtensionTy::QuicTransportParameters => 57,
     }
   }
 }
@@ -93,6 +96,7 @@ impl TryFrom<u16> for ExtensionTy {
       49 => Self::PostHandshakeAuth,
       50 => Self::SignatureAlgorithmsCert,
       51 => Self::KeyShare,
+      57 => Self::QuicTransportParameters,
       _ => {
         return Err(crate::Error::TlsErrorReply(
           TlsError::InvalidExtensionTy,

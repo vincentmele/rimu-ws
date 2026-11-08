@@ -243,6 +243,38 @@ impl Drop for TlsBuffer {
   }
 }
 
+/// Empties this thread's pools, so that what a test returns to them is the last entry.
+#[cfg(all(test, feature = "std"))]
+pub(crate) fn clear_thread_pools() {
+  KS_POOL.with(|el| el.borrow_mut().clear());
+  BUF_POOL.with(|el| {
+    let mut pool = el.borrow_mut();
+    pool.pairs.clear();
+    pool.bytes = 0;
+  });
+}
+
+/// Where the last key schedule box and the last buffer pair this thread pooled are, each with
+/// whether all of its bytes (the whole capacity, for buffers) are zero.
+#[cfg(all(test, feature = "std"))]
+pub(crate) fn last_pooled() -> (Option<(usize, bool)>, Option<[(usize, bool); 2]>) {
+  let zeroed = |ptr: *const u8, len| {
+    // SAFETY: the `len` bytes from `ptr` belong to one allocation (a pooled box or the capacity
+    // of a pooled buffer), every byte of which was written with a zero when it was pooled
+    unsafe { core::slice::from_raw_parts(ptr, len) }.iter().all(|el| *el == 0)
+  };
+  let ks = KS_POOL.with(|pool| {
+    let ptr = (&raw const **pool.borrow().last()?).cast::<u8>();
+    Some((ptr.addr(), zeroed(ptr, size_of::<KeySchedule>())))
+  });
+  let buffers = BUF_POOL.with(|pool| {
+    let pool = pool.borrow();
+    let (reader, writer) = pool.pairs.last()?;
+    Some([reader, writer].map(|el| (el.as_ptr().addr(), zeroed(el.as_ptr(), el.capacity()))))
+  });
+  (ks, buffers)
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
   use crate::tls::{
@@ -299,6 +331,23 @@ mod tests {
     drop(buffer);
     assert!(zeroed() - before >= capacity, "a buffer too large to pool was freed uncleared");
     assert!(BUF_POOL.with(|el| el.borrow().pairs.is_empty()));
+  }
+
+  // What the helper for the tests of other modules reports: the last entries, zeroed.
+  #[test]
+  fn last_pooled_reports_the_last_entries() {
+    use crate::tls::tls_pool::{clear_thread_pools, last_pooled};
+    clear_thread_pools();
+    assert_eq!(last_pooled(), (None, None));
+    let ks = KsBox::new(KeySchedule::unset());
+    let ks_addr = (&raw const *ks).addr();
+    let mut buffer = TlsBuffer::pooled();
+    buffer.writer_buffer.extend_from_copyable_slice(&[7; 100]).unwrap();
+    buffer.reader_buffer.buffer_mut().extend_from_copyable_slice(&[9; 10]).unwrap();
+    let addrs =
+      [buffer.reader_buffer.buffer_mut().as_ptr().addr(), buffer.writer_buffer.as_ptr().addr()];
+    drop((ks, buffer));
+    assert_eq!(last_pooled(), (Some((ks_addr, true)), Some(addrs.map(|el| (el, true)))));
   }
 
   // A stream's buffers come back zeroed in all of their capacity, and are the next one's.

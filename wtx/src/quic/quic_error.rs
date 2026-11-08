@@ -20,10 +20,16 @@ pub enum QuicError {
   /// A connection ID has more bytes than QUIC version 1 allows (20) or than the wire format can
   /// express (255).
   CidTooLong,
+  /// CRYPTO data arrived at an encryption level that TLS is not reading: an earlier one, whose
+  /// data was complete (with [`TransportErrorCode::ProtocolViolation`]), or a later one, or any
+  /// level once the handshake is over (with the `unexpected_message` alert).
+  CryptoDataAtWrongLevel,
   /// The same transport parameter was sent more than once.
   DuplicateTransportParameter,
   /// A frame type is not allowed in the type of the packet that carries it.
   FrameNotAllowed,
+  /// A TLS handshake message is longer than the 16 KiB that are buffered for one.
+  HandshakeMessageTooLong,
   /// The fixed bit of a packet of version 1 is not set.
   InvalidFixedBit,
   /// A field of a frame has a value that the frame cannot have.
@@ -36,6 +42,10 @@ pub enum QuicError {
   PacketTooShort,
   /// A client sent a transport parameter that only servers can send.
   ServerOnlyTransportParameter,
+  /// The TLS handshake failed, with the alert that the transport error code carries.
+  TlsAlert,
+  /// TLS moved past an encryption level whose traffic secrets were not taken yet.
+  TlsSecretsNotTaken,
   /// The input ended before a field or before the number of bytes announced by a length.
   Truncated,
   /// A frame type that this implementation does not know.

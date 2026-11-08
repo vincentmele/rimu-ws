@@ -110,7 +110,7 @@ const fn manage_extension(
   extension_ty: ExtensionTy,
 ) -> crate::Result<()> {
   match extension_ty {
-    ExtensionTy::EarlyData => Ok(()),
+    ExtensionTy::EarlyData | ExtensionTy::QuicTransportParameters => Ok(()),
     ExtensionTy::ApplicationLayerProtocolNegotiation
     | ExtensionTy::CertificateAuthorities
     | ExtensionTy::ClientCertificateType

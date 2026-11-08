@@ -13,13 +13,20 @@ use crate::{
     AlertDescription, CipherSuite, MaxFragmentLength, NamedGroup, PublicKeys, TlsConfig, TlsError,
     misc::{decode_extension_ty, u8_chunk, u16_chunk},
     protocol::{
-      alpn::Alpn, certificate_authorities::CertificateAuthorities, extension::Extension,
-      extension_ty::ExtensionTy, key_share_client_hello::KeyShareClientHello,
-      key_share_entry::KeyShareEntry, named_group::NamedGroupAgreement,
-      protocol_version::ProtocolVersion, protocol_versions::SupportedVersionsClient,
-      psk_key_exchange_modes::PskKeyExchangeModes, server_name_list::ServerNameList,
+      alpn::Alpn,
+      certificate_authorities::CertificateAuthorities,
+      extension::{Extension, encode_opaque_extension},
+      extension_ty::ExtensionTy,
+      key_share_client_hello::KeyShareClientHello,
+      key_share_entry::KeyShareEntry,
+      named_group::NamedGroupAgreement,
+      protocol_version::ProtocolVersion,
+      protocol_versions::SupportedVersionsClient,
+      psk_key_exchange_modes::PskKeyExchangeModes,
+      server_name_list::ServerNameList,
       signature_algorithms::SignatureAlgorithms,
-      signature_algorithms_cert::SignatureAlgorithmsCert, supported_groups::SupportedGroups,
+      signature_algorithms_cert::SignatureAlgorithmsCert,
+      supported_groups::SupportedGroups,
     },
     tls_cc::TlsCc,
     tls_cc_wrappers::{TlsDecodeWrapper, TlsEncodeWrapper},
@@ -29,15 +36,16 @@ use crate::{
 };
 
 #[derive(Debug)]
-pub(crate) struct ClientHello<G, TCG> {
+pub(crate) struct ClientHello<'qtp, G, TCG> {
   generic: G,
   legacy_session_id: ArrayVectorCopy<u8, 32>,
+  quic_transport_parameters: Option<&'qtp [u8]>,
   random: [u8; 32],
   supported_versions: SupportedVersionsClient,
   tls_config: TCG,
 }
 
-impl<G, TCG> ClientHello<G, TCG> {
+impl<'qtp, G, TCG> ClientHello<'qtp, G, TCG> {
   pub(crate) fn new<RNG>(generic: G, rng: &mut RNG, tls_config: TCG) -> Self
   where
     RNG: CryptoRng,
@@ -49,6 +57,7 @@ impl<G, TCG> ClientHello<G, TCG> {
         rng.fill_slice(&mut array);
         array
       }),
+      quic_transport_parameters: None,
       random: {
         let mut array = [0u8; 32];
         rng.fill_slice(&mut array);
@@ -69,6 +78,11 @@ impl<G, TCG> ClientHello<G, TCG> {
     &self.legacy_session_id
   }
 
+  /// The data of the `quic_transport_parameters` extension (RFC 9001 section 8.2), if present.
+  pub(crate) const fn quic_transport_parameters(&self) -> Option<&'qtp [u8]> {
+    self.quic_transport_parameters
+  }
+
   pub(crate) const fn supported_versions(&self) -> &SupportedVersionsClient {
     &self.supported_versions
   }
@@ -76,10 +90,20 @@ impl<G, TCG> ClientHello<G, TCG> {
   pub(crate) const fn tls_config(&self) -> &TCG {
     &self.tls_config
   }
+
+  /// The ClientHello of a QUIC client: with its transport parameters and without a
+  /// `legacy_session_id`, which is only there for the middlebox compatibility mode of TLS over
+  /// TCP (RFC 9001 section 8.4).
+  #[cfg(all(feature = "quic", test))]
+  pub(crate) fn into_quic(mut self, transport_parameters: &'qtp [u8]) -> Self {
+    self.legacy_session_id.clear();
+    self.quic_transport_parameters = Some(transport_parameters);
+    self
+  }
 }
 
 impl<'de> Decode<'de, TlsCc>
-  for ClientHello<KeyShareClientHello<&'de [u8]>, TlsConfigInner<&'de [u8], ()>>
+  for ClientHello<'de, KeyShareClientHello<&'de [u8]>, TlsConfigInner<&'de [u8], ()>>
 {
   #[inline]
   fn decode(dw: &mut TlsDecodeWrapper<'de>) -> crate::Result<Self> {
@@ -139,6 +163,7 @@ impl<'de> Decode<'de, TlsCc>
     Ok(Self {
       generic: key_shares,
       legacy_session_id,
+      quic_transport_parameters: extensions.quic_transport_parameters,
       random,
       supported_versions,
       tls_config: TlsConfigInner {
@@ -162,7 +187,7 @@ impl<'de> Decode<'de, TlsCc>
 }
 
 impl<TCG, TCX> Encode<TlsCc>
-  for ClientHello<&ArrayVectorU8<NamedGroupAgreement, { NamedGroup::len() }>, TCG>
+  for ClientHello<'_, &ArrayVectorU8<NamedGroupAgreement, { NamedGroup::len() }>, TCG>
 where
   TCG: Lease<TlsConfig<TCX>> + SingleTypeStorage<Item = TCX>,
 {
@@ -218,6 +243,9 @@ where
         .encode(local_ew)?;
       Extension::new(ExtensionTy::SupportedVersions, &self.supported_versions).encode(local_ew)?;
       Extension::new(ExtensionTy::PskKeyExchangeModes, PskKeyExchangeModes {}).encode(local_ew)?;
+      if let Some(elem) = self.quic_transport_parameters {
+        encode_opaque_extension(elem, ExtensionTy::QuicTransportParameters, local_ew)?;
+      }
       crate::Result::Ok(())
     })?;
     Ok(())
@@ -299,6 +327,10 @@ fn manage_extension<'de>(
       duplicated_error(extensions.psk_key_exchange_modes.is_some())?;
       extensions.psk_key_exchange_modes = Some(PskKeyExchangeModes {});
     }
+    ExtensionTy::QuicTransportParameters => {
+      duplicated_error(extensions.quic_transport_parameters.is_some())?;
+      extensions.quic_transport_parameters = Some(dw.bytes());
+    }
     ExtensionTy::KeyShare => {
       duplicated_error(extensions.key_shares.is_some())?;
       extensions.key_shares = Some(KeyShareClientHello::<&[u8]>::decode(dw)?);
@@ -372,6 +404,7 @@ struct Extensions<'de> {
   post_handshake_auth: bool,
   pre_shared_key: bool,
   psk_key_exchange_modes: Option<PskKeyExchangeModes>,
+  quic_transport_parameters: Option<&'de [u8]>,
   server_certificate_type: bool,
   server_name: Option<ServerNameList>,
   signature_algorithms_cert: Option<SignatureAlgorithmsCert>,

@@ -8,8 +8,11 @@ use crate::{
     AlertDescription, MaxFragmentLength, TlsError,
     misc::{decode_extension_ty, u16_chunk},
     protocol::{
-      alpn::Alpn, extension::Extension, extension_ty::ExtensionTy,
-      server_name_list::ServerNameList, supported_groups::SupportedGroups,
+      alpn::Alpn,
+      extension::{Extension, encode_opaque_extension},
+      extension_ty::ExtensionTy,
+      server_name_list::ServerNameList,
+      supported_groups::SupportedGroups,
     },
     tls_cc::TlsCc,
     tls_cc_wrappers::{TlsDecodeWrapper, TlsEncodeWrapper},
@@ -17,21 +20,23 @@ use crate::{
 };
 
 #[derive(Debug)]
-pub(crate) struct EncryptedExtensions {
+pub(crate) struct EncryptedExtensions<'qtp> {
   alpn: Option<Alpn>,
   max_fragment_length: Option<MaxFragmentLength>,
+  quic_transport_parameters: Option<&'qtp [u8]>,
   server_name: Option<ServerNameList>,
   supported_groups: Option<SupportedGroups>,
 }
 
-impl EncryptedExtensions {
+impl<'qtp> EncryptedExtensions<'qtp> {
   pub(crate) const fn new(
     alpn: Option<Alpn>,
     max_fragment_length: Option<MaxFragmentLength>,
+    quic_transport_parameters: Option<&'qtp [u8]>,
     server_name: Option<ServerNameList>,
     supported_groups: Option<SupportedGroups>,
   ) -> Self {
-    Self { alpn, max_fragment_length, server_name, supported_groups }
+    Self { alpn, max_fragment_length, quic_transport_parameters, server_name, supported_groups }
   }
 
   pub(crate) const fn alpn(&self) -> &Option<Alpn> {
@@ -42,12 +47,18 @@ impl EncryptedExtensions {
     self.max_fragment_length
   }
 
+  /// The data of the `quic_transport_parameters` extension (RFC 9001 section 8.2), if present.
+  #[cfg(all(feature = "quic", test))]
+  pub(crate) const fn quic_transport_parameters(&self) -> Option<&'qtp [u8]> {
+    self.quic_transport_parameters
+  }
+
   pub(crate) const fn server_name(&self) -> &Option<ServerNameList> {
     &self.server_name
   }
 }
 
-impl<'de> Decode<'de, TlsCc> for EncryptedExtensions {
+impl<'de> Decode<'de, TlsCc> for EncryptedExtensions<'de> {
   #[inline]
   fn decode(dw: &mut TlsDecodeWrapper<'de>) -> crate::Result<Self> {
     let err = TlsError::InvalidEncryptedExtensions;
@@ -56,6 +67,7 @@ impl<'de> Decode<'de, TlsCc> for EncryptedExtensions {
     }
     let mut alpn = None;
     let mut max_fragment_length = None;
+    let mut quic_transport_parameters = None;
     let mut server_name = None;
     let mut supported_groups = None;
     u16_chunk(dw, err, |local_dw| {
@@ -70,6 +82,7 @@ impl<'de> Decode<'de, TlsCc> for EncryptedExtensions {
             local_local_dw,
             extension_ty,
             &mut max_fragment_length,
+            &mut quic_transport_parameters,
             &mut server_name,
             &mut supported_groups,
           )
@@ -77,14 +90,20 @@ impl<'de> Decode<'de, TlsCc> for EncryptedExtensions {
       }
       Ok(())
     })?;
-    Ok(Self { alpn, max_fragment_length, server_name, supported_groups })
+    Ok(Self { alpn, max_fragment_length, quic_transport_parameters, server_name, supported_groups })
   }
 }
 
-impl Encode<TlsCc> for EncryptedExtensions {
+impl Encode<TlsCc> for EncryptedExtensions<'_> {
   #[inline]
   fn encode(&self, ew: &mut TlsEncodeWrapper<'_>) -> crate::Result<()> {
-    let Self { alpn, max_fragment_length, server_name, supported_groups } = self;
+    let Self {
+      alpn,
+      max_fragment_length,
+      quic_transport_parameters,
+      server_name,
+      supported_groups,
+    } = self;
     u16_write(CounterWriterBytesTy::IgnoresLen, None, ew, |local_ew| {
       if let Some(el) = alpn {
         Extension::new(ExtensionTy::ApplicationLayerProtocolNegotiation, el).encode(local_ew)?;
@@ -97,6 +116,9 @@ impl Encode<TlsCc> for EncryptedExtensions {
       }
       if let Some(el) = supported_groups {
         Extension::new(ExtensionTy::SupportedGroups, el).encode(local_ew)?;
+      }
+      if let Some(el) = quic_transport_parameters {
+        encode_opaque_extension(el, ExtensionTy::QuicTransportParameters, local_ew)?;
       }
       Ok(())
     })
@@ -112,11 +134,12 @@ fn duplicated_error(is_some: bool) -> crate::Result<()> {
 }
 
 #[inline]
-fn manage_extension(
+fn manage_extension<'de>(
   alpn: &mut Option<Alpn>,
-  dw: &mut TlsDecodeWrapper<'_>,
+  dw: &mut TlsDecodeWrapper<'de>,
   extension_ty: ExtensionTy,
   max_fragment_length: &mut Option<MaxFragmentLength>,
+  quic_transport_parameters: &mut Option<&'de [u8]>,
   server_name: &mut Option<ServerNameList>,
   supported_groups: &mut Option<SupportedGroups>,
 ) -> crate::Result<()> {
@@ -128,6 +151,10 @@ fn manage_extension(
     ExtensionTy::MaxFragmentLength => {
       duplicated_error(max_fragment_length.is_some())?;
       *max_fragment_length = Some(MaxFragmentLength::decode(dw)?);
+    }
+    ExtensionTy::QuicTransportParameters => {
+      duplicated_error(quic_transport_parameters.is_some())?;
+      *quic_transport_parameters = Some(dw.bytes());
     }
     ExtensionTy::ServerName => {
       duplicated_error(server_name.is_some())?;

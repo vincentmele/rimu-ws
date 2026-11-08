@@ -93,6 +93,7 @@ fn manage_extension(
     }
     ExtensionTy::CertificateAuthorities
     | ExtensionTy::OidFilters
+    | ExtensionTy::QuicTransportParameters
     | ExtensionTy::SignedCertificateTimestamp
     | ExtensionTy::SignatureAlgorithmsCert
     | ExtensionTy::StatusRequest => {}

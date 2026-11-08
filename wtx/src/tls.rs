@@ -15,6 +15,9 @@ mod ktls_stream;
 mod misc;
 mod protocol;
 mod public_keys;
+#[cfg(feature = "quic")]
+#[allow(dead_code, reason = "consumed by the QUIC connection of the later tasks")]
+mod quic_tls;
 mod read_record_info;
 mod record_content_ty;
 #[cfg(test)]
@@ -60,6 +63,9 @@ pub use protocol::{
   supported_groups::SupportedGroups,
 };
 pub use public_keys::{PublicKeyRef, PublicKeys, PublicKeysIter};
+#[cfg(feature = "quic")]
+#[allow(unused_imports, reason = "consumed by the QUIC connection of the later tasks")]
+pub(crate) use quic_tls::{MAX_HANDSHAKE_MESSAGE, QuicTls, QuicTlsSecrets};
 pub use read_record_info::ReadRecordInfo;
 pub use tls_acceptor::{TlsAcceptOutput, TlsAcceptor};
 pub use tls_buffer::TlsBuffer;

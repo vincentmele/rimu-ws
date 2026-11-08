@@ -151,10 +151,15 @@ pub enum TlsError {
   MismatchedNegotiatedAlpnClient,
   /// Invalid Negotiated ALPN
   MismatchedNegotiatedAlpnServer,
+  /// QUIC requires ALPN (RFC 9001 section 8.1): the client offered none, or the server chose none
+  MissingAlpn,
   /// Missing Digital Signature in Key Usage
   MissingDigitalSignatureInKeyUsage,
   /// Missing Key Shares
   MissingKeyShares,
+  /// A QUIC ClientHello or EncryptedExtensions without the transport parameters (RFC 9001
+  /// section 8.2)
+  MissingQuicTransportParameters,
   /// Missing signature algorithms
   MissingSignatureAlgorithms,
   /// Missing supported groups
