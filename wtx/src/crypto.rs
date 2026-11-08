@@ -7,6 +7,7 @@
 mod macros;
 
 mod aead;
+mod aead_key;
 mod agreement;
 mod crypto_error;
 mod dyn_signing_key;
@@ -14,6 +15,7 @@ mod dyn_signing_output;
 mod hash;
 mod hkdf;
 mod hmac;
+mod hp_key;
 mod signing_key;
 mod signing_output;
 
@@ -21,6 +23,10 @@ use crate::rng::CryptoRng;
 pub use aead::{
   Aead, AeadDummy,
   global::{Aes128GcmGlobal, Aes256GcmGlobal, Chacha20Poly1305Global},
+};
+pub use aead_key::{
+  AeadKey, AeadKeyDummy,
+  global::{Aes128GcmKeyGlobal, Aes256GcmKeyGlobal, Chacha20Poly1305KeyGlobal},
 };
 pub use agreement::{
   Agreement, AgreementDummy,
@@ -41,6 +47,10 @@ pub use hkdf::{
 pub use hmac::{
   Hmac, HmacDummy,
   global::{HmacSha256Global, HmacSha384Global},
+};
+pub use hp_key::{
+  HpKey, HpKeyDummy,
+  global::{Aes128HpGlobal, Aes256HpGlobal, Chacha20HpGlobal},
 };
 pub use signing_key::{
   SigningKey, SigningKeyDummy,
@@ -78,6 +88,10 @@ _create_wrappers!(
   Aes256GcmAlr<>(),
   #[derive(Default)]
   Chacha20Poly1305Alr<>(),
+  // Aead key
+  Aes128GcmKeyAlr<>(aws_lc_rs::aead::LessSafeKey),
+  Aes256GcmKeyAlr<>(aws_lc_rs::aead::LessSafeKey),
+  Chacha20Poly1305KeyAlr<>(aws_lc_rs::aead::LessSafeKey),
   // Agreement
   EcdhP256Alr<>(aws_lc_rs::agreement::EphemeralPrivateKey),
   EcdhP384Alr<>(aws_lc_rs::agreement::EphemeralPrivateKey),
@@ -97,6 +111,10 @@ _create_wrappers!(
   // Hmac
   HmacSha256Alr<>(aws_lc_rs::hmac::Context),
   HmacSha384Alr<>(aws_lc_rs::hmac::Context),
+  // Header protection
+  Aes128HpAlr<>(aws_lc_rs::aead::quic::HeaderProtectionKey),
+  Aes256HpAlr<>(aws_lc_rs::aead::quic::HeaderProtectionKey),
+  Chacha20HpAlr<>(aws_lc_rs::aead::quic::HeaderProtectionKey),
   // Signature
   #[derive(Default)]
   EcdsaP256Alr<>(),
@@ -123,6 +141,10 @@ _create_wrappers!(
   Aes256GcmGraviola<>(),
   #[derive(Default)]
   Chacha20Poly1305Graviola<>(),
+  // Aead key
+  Aes128GcmKeyGraviola<>(graviola::aead::AesGcm),
+  Aes256GcmKeyGraviola<>(graviola::aead::AesGcm),
+  Chacha20Poly1305KeyGraviola<>(graviola::aead::ChaCha20Poly1305),
   // Agreement
   EcdhP256Graviola<>(graviola::key_agreement::p256::PrivateKey),
   EcdhP384Graviola<>(graviola::key_agreement::p384::PrivateKey),
@@ -166,6 +188,10 @@ _create_wrappers!(
   Aes256GcmRing<>(),
   #[derive(Default)]
   Chacha20Poly1305Ring<>(),
+  // Aead key
+  Aes128GcmKeyRing<>(ring::aead::LessSafeKey),
+  Aes256GcmKeyRing<>(ring::aead::LessSafeKey),
+  Chacha20Poly1305KeyRing<>(ring::aead::LessSafeKey),
   // Agreement
   EcdhP256Ring<>(ring::agreement::EphemeralPrivateKey),
   EcdhP384Ring<>(ring::agreement::EphemeralPrivateKey),
@@ -185,6 +211,10 @@ _create_wrappers!(
   // Hmac
   HmacSha256Ring<>(ring::hmac::Context),
   HmacSha384Ring<>(ring::hmac::Context),
+  // Header protection
+  Aes128HpRing<>(ring::aead::quic::HeaderProtectionKey),
+  Aes256HpRing<>(ring::aead::quic::HeaderProtectionKey),
+  Chacha20HpRing<>(ring::aead::quic::HeaderProtectionKey),
   // Signature
   #[derive(Default)]
   EcdsaP256Ring<>(),
@@ -211,6 +241,10 @@ _create_wrappers!(
   Aes256GcmRuco<>(),
   #[derive(Default)]
   Chacha20Poly1305Ruco<>(),
+  // Aead key
+  Aes128GcmKeyRuco<>(aes_gcm::Aes128Gcm),
+  Aes256GcmKeyRuco<>(aes_gcm::Aes256Gcm),
+  Chacha20Poly1305KeyRuco<>(chacha20poly1305::ChaCha20Poly1305),
   // Agreement
   EcdhP256Ruco<>(p256::ecdh::EphemeralSecret),
   EcdhP384Ruco<>(p384::ecdh::EphemeralSecret),
@@ -230,6 +264,10 @@ _create_wrappers!(
   // Hmac
   HmacSha256Ruco<>(::hmac::Hmac<sha2::Sha256>),
   HmacSha384Ruco<>(::hmac::Hmac<sha2::Sha384>),
+  // Header protection
+  Aes128HpRuco<>(::aes::Aes128),
+  Aes256HpRuco<>(::aes::Aes256),
+  Chacha20HpRuco<>([u8; 32]),
   // Signature
   #[derive(Default)]
   EcdsaP256Ruco<>(),

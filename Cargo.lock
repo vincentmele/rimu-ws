@@ -1464,6 +1464,7 @@ name = "rimu-ws"
 version = "0.52.1"
 dependencies = [
  "aead",
+ "aes",
  "aes-gcm",
  "arbitrary",
  "argon2",

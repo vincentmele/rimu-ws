@@ -40,6 +40,81 @@ macro_rules! common_aead_functions {
 }
 
 #[cfg(any(feature = "crypto-alr", feature = "crypto-ring"))]
+macro_rules! common_aead_key_functions {
+  () => {
+    #[inline]
+    fn local_new_key(
+      algorithm: &'static Algorithm,
+      error: CryptoError,
+      key: &[u8],
+    ) -> crate::Result<LessSafeKey> {
+      match UnboundKey::new(algorithm, key) {
+        Ok(elem) => Ok(LessSafeKey::new(elem)),
+        Err(_err) => {
+          core::hint::cold_path();
+          Err(error.into())
+        }
+      }
+    }
+
+    #[inline]
+    fn local_open_key<'data>(
+      aad: &[u8],
+      data: &'data mut [u8],
+      error: CryptoError,
+      key: &LessSafeKey,
+      nonce: [u8; AEAD_NONCE_LEN],
+    ) -> crate::Result<&'data mut [u8]> {
+      key.open_in_place(Nonce::assume_unique_for_key(nonce), Aad::from(aad), data).map_err(|_err| {
+        core::hint::cold_path();
+        crate::Error::from(error)
+      })
+    }
+
+    #[inline]
+    fn local_seal_key(
+      aad: &[u8],
+      data: &mut [u8],
+      error: CryptoError,
+      key: &LessSafeKey,
+      nonce: [u8; AEAD_NONCE_LEN],
+    ) -> crate::Result<[u8; AEAD_TAG_LEN]> {
+      let tag = key
+        .seal_in_place_separate_tag(Nonce::assume_unique_for_key(nonce), Aad::from(aad), data)
+        .map_err(|_err| {
+          core::hint::cold_path();
+          crate::Error::from(error)
+        })?;
+      Ok(tag.as_ref().try_into()?)
+    }
+  };
+}
+
+#[cfg(any(feature = "crypto-alr", feature = "crypto-ring"))]
+macro_rules! common_hp_key_functions {
+  () => {
+    #[inline]
+    fn local_new_hp(
+      algorithm: &'static Algorithm,
+      key: &[u8],
+    ) -> crate::Result<HeaderProtectionKey> {
+      HeaderProtectionKey::new(algorithm, key).map_err(|_err| {
+        core::hint::cold_path();
+        crate::Error::from(CryptoError::InvalidHeaderProtection)
+      })
+    }
+
+    #[inline]
+    fn local_mask_hp(key: &HeaderProtectionKey, sample: &[u8; 16]) -> crate::Result<[u8; 5]> {
+      key.new_mask(sample).map_err(|_err| {
+        core::hint::cold_path();
+        crate::Error::from(CryptoError::InvalidHeaderProtection)
+      })
+    }
+  };
+}
+
+#[cfg(any(feature = "crypto-alr", feature = "crypto-ring"))]
 macro_rules! common_hkdf_functions {
   ($krate:ident) => {
     #[inline]

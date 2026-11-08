@@ -34,6 +34,7 @@ zmij = { default-features = false, optional = true, version = "1.0" }
 
 # Rust Crypto and its extravagant set of associated dependencies
 aead = { default-features = false, optional = true, version = "0.6" }
+aes = { default-features = false, optional = true, version = "0.9" }
 aes-gcm = { default-features = false, optional = true, version = "0.11" }
 argon2 = { default-features = false, optional = true, version = "0.6" }
 chacha20 = { default-features = false, optional = true, version = "0.10" }
@@ -75,6 +76,7 @@ crypto-alr = ["dep:aws-lc-rs", "crypto"]
 crypto-graviola = ["crypto", "dep:graviola", "std"]
 crypto-ruco = [
   "dep:aead",
+  "dep:aes",
   "dep:aes-gcm",
   "aes-gcm/aes",
   "dep:chacha20",
@@ -134,6 +136,8 @@ http1-server-framework = ["http", "io-uring", "tls"]
 http2 = ["foldhash", "hashbrown", "http", "tls"]
 http2-client-pool = ["http2", "std"]
 http2-server-framework = ["http2"]
+http3 = ["http", "quic"]
+http3-server-framework = ["http2-server-framework", "http3", "io-uring"]
 http-cookie = ["http"]
 http-cookie-secure = ["crypto", "http-cookie"]
 http-session = ["http-cookie-secure", "secret", "serde_json"]
@@ -152,6 +156,9 @@ portable-atomic = ["dep:portable-atomic", "portable-atomic?/fallback"]
 portable-atomic-util = ["portable-atomic", "dep:portable-atomic-util", "portable-atomic-util/alloc"]
 postgres = ["crypto", "database", "foldhash", "hashbrown", "tls"]
 postgres-pool = ["postgres", "secret"]
+# QUIC seals and opens every packet and protects its headers (RFC 9001 section 5.4), which only
+# `crypto-ring`, `crypto-alr` and `crypto-ruco` provide: `crypto-graviola` has no header protection.
+quic = ["tls", "foldhash", "hashbrown"]
 quick-protobuf = ["dep:quick-protobuf", "quick-protobuf?/std", "std"]
 rand_core = ["dep:rand_core"]
 rust_decimal = ["dep:rust_decimal", "rust_decimal?/maths"]

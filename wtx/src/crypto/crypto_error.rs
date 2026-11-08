@@ -21,6 +21,9 @@ pub enum CryptoError {
   InvalidChacha20Poly1305Data,
   /// Invalid Hash Length
   InvalidHashLength,
+  /// Opaque error originated from header protection operations, for example, a key with the
+  /// wrong length
+  InvalidHeaderProtection,
   /// Large HKDF Output
   LargeHkdfOutput,
   /// Public Key Agreement Error
@@ -29,6 +32,8 @@ pub enum CryptoError {
   SignatureError,
   /// Sig Key Error
   SigningKeyError,
+  /// The selected crypto backend does not implement header protection
+  UnsupportedHeaderProtection,
   /// Unsupported Signature Oid
   UnsupportedKeyOid,
   /// Unsupported Signature Oid

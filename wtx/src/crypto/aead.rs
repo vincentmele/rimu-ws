@@ -178,7 +178,7 @@ impl<S> Aead for AeadDummy<S> {
 }
 
 #[cfg(any(feature = "crypto-graviola", feature = "crypto-ruco"))]
-fn split_content_tag(
+pub(super) fn split_content_tag(
   data: &mut [u8],
   error: CryptoError,
 ) -> crate::Result<(&mut [u8], [u8; AEAD_TAG_LEN])> {
