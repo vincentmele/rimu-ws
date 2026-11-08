@@ -5,6 +5,8 @@
 
 mod cid;
 #[allow(dead_code, reason = "consumed by the connection of the later QUIC tasks")]
+mod crypto;
+#[allow(dead_code, reason = "consumed by the connection of the later QUIC tasks")]
 mod frame;
 #[cfg(any(test, feature = "_fuzz"))]
 #[doc(hidden)]
@@ -20,6 +22,11 @@ mod varint;
 mod writer;
 
 pub use cid::{Cid, MAX_CID_LEN};
+#[allow(unused_imports, reason = "consumed by the connection of the later tasks")]
+pub(crate) use crypto::{
+  DirectionalKeys, PacketKeys, QuicAead, QuicHp, initial_keys, keys_from_secret, open_payload,
+  protect, remove_header_protection,
+};
 #[allow(unused_imports, reason = "consumed by the connection of the later tasks")]
 pub(crate) use frame::{AckFrame, Frame, FrameReader, FrameWriter, Space};
 #[allow(unused_imports, reason = "consumed by the connection and endpoint of the later tasks")]

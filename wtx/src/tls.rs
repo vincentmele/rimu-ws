@@ -7,7 +7,7 @@ mod handshake_path;
 mod handshake_ty;
 #[cfg(all(feature = "libc", feature = "std", target_os = "linux"))]
 pub(crate) mod kernel_tls;
-mod key_schedule;
+pub(crate) mod key_schedule;
 #[cfg(all(feature = "std", target_os = "linux"))]
 mod ktls_bindings;
 #[cfg(all(feature = "std", target_os = "linux"))]
@@ -29,7 +29,7 @@ mod tls_connector_builder;
 mod tls_ctx;
 mod tls_error;
 mod tls_hash;
-mod tls_hkdf;
+pub(crate) mod tls_hkdf;
 mod tls_hmac;
 mod tls_mode;
 mod tls_pool;

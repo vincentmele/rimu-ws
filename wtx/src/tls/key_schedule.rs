@@ -434,7 +434,7 @@ fn hkdf_array(
 }
 
 #[inline]
-fn hkdf_expand_label<const LENGTH: usize>(
+pub(crate) fn hkdf_expand_label<const LENGTH: usize>(
   context: Option<&[u8]>,
   label: &[u8],
   output_len: u8,
