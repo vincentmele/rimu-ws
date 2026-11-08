@@ -2,13 +2,14 @@
 //! 5.4): grown on demand up to caps, reused without allocating once warm, and trimmed to a few
 //! entries when the worker is idle.
 //!
-//! A connection holds indices into [`FrameRefPool`], and owns what it took from the free lists
-//! until it gives it back, once closed or aborted.
+//! A connection holds indices into [`FrameRefPool`] and [`StreamSlots`], and owns what it took
+//! from the free lists until it gives it back, once closed or aborted.
 
 use crate::quic::{
   QuicError, TransportErrorCode,
   conn::HandshakeSpaces,
   sent::{FrameRef, FrameRefRange, SentPacket},
+  stream::{ConnCold, StreamSlots},
   wipe,
 };
 use alloc::{boxed::Box, vec::Vec};
@@ -19,6 +20,13 @@ use core::hint::cold_path;
 pub(crate) const CRYPTO_BUFFER_LEN: usize = 4096;
 /// The size of a receive block.
 pub(crate) const RX_BLOCK_LEN: usize = 4096;
+/// The size of a send block.
+pub(crate) const TX_BLOCK_LEN: usize = 4096;
+
+/// Received stream data that does not fit in its slot.
+pub(crate) type RxBlock = [u8; RX_BLOCK_LEN];
+/// Stream data written by the application that does not fit in its slot.
+pub(crate) type TxBlock = [u8; TX_BLOCK_LEN];
 
 // References per chunk of the frame reference pool
 const CHUNK_REFS: usize = 8;
@@ -29,11 +37,14 @@ const MAX_FREE: usize = 1024;
 // Entries kept by an idle pool
 const IDLE_KEEP: usize = 4;
 const IDLE_KEEP_CHUNKS: usize = 64;
+const IDLE_KEEP_SLOTS: usize = 64;
 const NO_CHUNK: u32 = u32::MAX;
 
 /// The pools of a worker. See the [module documentation](self).
 #[derive(Debug)]
 pub(crate) struct QuicPools {
+  /// The seldom used state of a connection.
+  pub(crate) conn_cold: FreeList<Box<ConnCold>>,
   /// Out-of-order CRYPTO data of a level.
   pub(crate) crypto_buffers: FreeList<Box<CryptoBuffer>>,
   /// The frames of sent packets.
@@ -41,33 +52,42 @@ pub(crate) struct QuicPools {
   /// The Initial and Handshake spaces of a handshake, keys included (wiped when they come back).
   pub(crate) handshake_spaces: FreeList<Box<HandshakeSpaces>>,
   /// Received stream data that does not fit in a stream slot.
-  #[allow(dead_code, reason = "taken by the streams")]
-  pub(crate) rx_blocks: FreeList<Box<[u8; RX_BLOCK_LEN]>>,
+  pub(crate) rx_blocks: FreeList<Box<RxBlock>>,
   /// The records of sent packets of a packet number space.
   pub(crate) sent_rings: FreeList<Vec<Option<SentPacket>>>,
+  /// The streams of every connection.
+  pub(crate) stream_slots: StreamSlots,
+  /// Stream data to send that does not fit in a stream slot.
+  pub(crate) tx_blocks: FreeList<Box<TxBlock>>,
 }
 
 impl QuicPools {
   /// Empty pools, which allocate nothing until used.
   pub(crate) const fn new() -> Self {
     Self {
+      conn_cold: FreeList::new(),
       crypto_buffers: FreeList::new(),
       frame_refs: FrameRefPool::new(MAX_CHUNKS),
       handshake_spaces: FreeList::new(),
       rx_blocks: FreeList::new(),
       sent_rings: FreeList::new(),
+      stream_slots: StreamSlots::new(),
+      tx_blocks: FreeList::new(),
     }
   }
 
   /// Frees all but a few entries of every pool, for a worker that has no connection: the frame
-  /// reference pool only if none of its references is in use.
+  /// reference pool and the stream slots only if none is in use.
   #[inline]
   pub(crate) fn trim_idle(&mut self) {
+    self.conn_cold.trim(IDLE_KEEP);
     self.crypto_buffers.trim(IDLE_KEEP);
     self.frame_refs.trim_idle(IDLE_KEEP_CHUNKS);
     self.handshake_spaces.trim(IDLE_KEEP);
     self.rx_blocks.trim(IDLE_KEEP);
     self.sent_rings.trim(IDLE_KEEP);
+    self.stream_slots.trim_idle(IDLE_KEEP_SLOTS);
+    self.tx_blocks.trim(IDLE_KEEP);
   }
 }
 
@@ -176,6 +196,12 @@ impl FrameRefPool {
     }
   }
 
+  /// A cursor over the references of `range`, which borrows the pool only while it moves.
+  #[inline]
+  pub(crate) const fn cursor(range: FrameRefRange) -> FrameRefCursor {
+    FrameRefCursor { idx: range.head, len: range.len(), nth: 0 }
+  }
+
   /// The references of `range`, in the order in which they were pushed.
   #[inline]
   pub(crate) fn iter(&self, range: FrameRefRange) -> impl Iterator<Item = FrameRef> + '_ {
@@ -263,6 +289,33 @@ impl FrameRefPool {
   }
 }
 
+/// The references of a [`FrameRefRange`], one at a time, for a caller that needs the pools in
+/// between.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FrameRefCursor {
+  idx: u32,
+  len: usize,
+  nth: usize,
+}
+
+impl FrameRefCursor {
+  /// The next reference, from `pool`.
+  #[inline]
+  pub(crate) fn next(&mut self, pool: &FrameRefPool) -> Option<FrameRef> {
+    if self.nth >= self.len {
+      return None;
+    }
+    let slot = self.nth % CHUNK_REFS;
+    let chunk = pool.chunks.get(usize::try_from(self.idx).ok()?)?;
+    let frame = chunk.refs.get(slot).copied()?;
+    self.nth = self.nth.wrapping_add(1);
+    if slot == CHUNK_REFS.wrapping_sub(1) {
+      self.idx = chunk.next;
+    }
+    Some(frame)
+  }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Chunk {
   next: u32,
@@ -317,6 +370,16 @@ mod tests {
     }
     assert_eq!(pool.chunks.len(), chunks);
     assert_eq!(refs(&pool, third), [FrameRef::HandshakeDone; 24]);
+    let mut cursor = FrameRefPool::cursor(third);
+    let mut count = 0;
+    while let Some(frame) = cursor.next(&pool) {
+      assert_eq!(frame, FrameRef::HandshakeDone);
+      count += 1;
+    }
+    assert_eq!(count, 24);
+    let mut cursor = FrameRefPool::cursor(second);
+    let walked: Vec<_> = core::iter::from_fn(|| cursor.next(&pool)).collect();
+    assert_eq!(walked, refs(&pool, second));
     pool.free(second);
     pool.free(third);
     assert_eq!(pool.live_chunks(), 0);

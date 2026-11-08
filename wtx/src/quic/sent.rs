@@ -27,9 +27,72 @@ pub(crate) enum FrameRef {
     /// The number of bytes.
     len: u32,
   },
+  /// DATA_BLOCKED
+  DataBlocked {
+    /// The connection credit of the peer that the frame reported.
+    max: u64,
+  },
   /// HANDSHAKE_DONE
   HandshakeDone,
+  /// MAX_DATA
+  MaxData {
+    /// The limit that the frame gave.
+    max: u64,
+  },
+  /// MAX_STREAM_DATA of the stream in slot `slot` of [`QuicPools::stream_slots`], if the slot
+  /// still has the generation `generation`.
+  MaxStreamData {
+    /// The slot of the stream.
+    slot: u32,
+    /// The generation of the slot when the frame was sent.
+    generation: u32,
+  },
+  /// MAX_STREAMS, of bidirectional or unidirectional streams.
+  MaxStreams {
+    /// If the frame was for bidirectional streams.
+    bidi: bool,
+    /// The limit that the frame gave.
+    max: u64,
+  },
+  /// RESET_STREAM of a stream (see [`Self::MaxStreamData`] for the fields).
+  ResetStream {
+    /// The slot of the stream.
+    slot: u32,
+    /// The generation of the slot when the frame was sent.
+    generation: u32,
+  },
+  /// STOP_SENDING of a stream (see [`Self::MaxStreamData`] for the fields).
+  StopSending {
+    /// The slot of the stream.
+    slot: u32,
+    /// The generation of the slot when the frame was sent.
+    generation: u32,
+  },
+  /// A STREAM frame, with what is needed to send it again. Its bytes stay with the stream until
+  /// every frame that carries them is acknowledged, or the stream is reset.
+  Stream {
+    /// The slot of the stream (see [`Self::MaxStreamData`]).
+    slot: u32,
+    /// The generation of the slot when the frame was sent.
+    generation: u32,
+    /// The offset of the data in the stream.
+    offset: u64,
+    /// The number of bytes.
+    len: u16,
+    /// If the frame had the FIN bit.
+    fin: bool,
+  },
+  /// STREAM_DATA_BLOCKED of a stream (see [`Self::MaxStreamData`] for the fields).
+  StreamDataBlocked {
+    /// The slot of the stream.
+    slot: u32,
+    /// The generation of the slot when the frame was sent.
+    generation: u32,
+  },
 }
+
+// A chunk of the frame reference pool holds eight of them
+const _: () = assert!(size_of::<FrameRef>() <= 24);
 
 /// The frames of a sent packet, in [`QuicPools::frame_refs`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

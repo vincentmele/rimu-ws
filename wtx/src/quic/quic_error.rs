@@ -17,6 +17,8 @@ pub enum QuicError {
   AckRangeUnderflow,
   /// An ACK frame acknowledges a packet number that was not sent.
   AckOfUnsentPacket,
+  /// The range of a body reference is not within its bytes.
+  BodyOutOfBounds,
   /// An output buffer is too small for what should be written to it.
   BufferTooSmall,
   /// A connection ID has more bytes than QUIC version 1 allows (20) or than the wire format can
@@ -39,6 +41,12 @@ pub enum QuicError {
   /// [`crate::quic::QuicLimits::excessive_load_app_code`], an application error (with
   /// [`TransportErrorCode::ApplicationError`] in Initial and Handshake packets).
   ExcessiveLoad,
+  /// The final size of a stream changed, data arrived past it, or it is below the data that
+  /// arrived (with [`TransportErrorCode::FinalSizeError`]).
+  FinalSizeChanged,
+  /// The peer sent more stream data than the credit that it was given allows (with
+  /// [`TransportErrorCode::FlowControlError`]).
+  FlowControlExceeded,
   /// A frame that only the other role sends, such as HANDSHAKE_DONE from a client.
   FrameFromWrongRole,
   /// A frame type is not allowed in the type of the packet that carries it.
@@ -53,15 +61,33 @@ pub enum QuicError {
   InvalidTransportParameter,
   /// A frame type is encoded with more bytes than it needs.
   NonMinimalFrameType,
+  /// Received stream data that waits for earlier data, or that the application retains, goes
+  /// past a limit of [`crate::quic::QuicLimits`] (with [`TransportErrorCode::ProtocolViolation`]).
+  OutOfOrderLimit,
   /// A packet is too short to hold the sample that header protection requires.
   PacketTooShort,
   /// A worker-wide pool is at its cap.
   PoolExhausted,
+  /// A set of ranges has no room for another separate range.
+  RangeSetFull,
   /// The reserved bits of a header are not zero once protection is removed (RFC 9000 section
   /// 17).
   ReservedBitsSet,
+  /// The application retained more of the data of a stream than fits in one block (4 KiB) and
+  /// the stream can not go on.
+  RetainTooLong,
   /// A client sent a transport parameter that only servers can send.
   ServerOnlyTransportParameter,
+  /// The stream is not open, or the part of it that the operation needs is finished or reset.
+  StreamClosed,
+  /// The peer opened a stream above the limit that it was given (with
+  /// [`TransportErrorCode::StreamLimitError`]).
+  StreamLimitExceeded,
+  /// A frame for a stream that is not in a state, or of a direction, that allows it (with
+  /// [`TransportErrorCode::StreamStateError`]).
+  StreamStateInvalid,
+  /// The peer allows no more streams of the type for now.
+  StreamsBlocked,
   /// The TLS handshake failed, with the alert that the transport error code carries.
   TlsAlert,
   /// TLS moved past an encryption level whose traffic secrets were not taken yet.

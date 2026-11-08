@@ -11,7 +11,8 @@
 //! A datagram holds, in this order, a packet of each space that has something to send: Initial,
 //! Handshake and 1-RTT, coalesced while the handshake lasts. A packet carries an ACK frame if an
 //! ack-eliciting packet arrived since the last one, then the control frames that are owed, then
-//! CRYPTO data. An ACK-only packet is never acknowledged on its own: only ack-eliciting packets
+//! CRYPTO data and, in 1-RTT packets, the credit and the data of the streams
+//! ([`crate::quic::stream`]). An ACK-only packet is never acknowledged on its own: only ack-eliciting packets
 //! make an ACK frame owed. Datagrams with an Initial packet of a client, or an ack-eliciting one
 //! of a server, are padded to 1200 bytes (RFC 9000 section 14.1), and until the address of the
 //! client is validated a server sends at most three times what it received (RFC 9000 section
@@ -26,15 +27,17 @@
 use crate::{
   crypto::AEAD_TAG_LEN,
   quic::{
-    AckFrame, Cid, DatagramMeta, Frame, FrameReader, FrameWriter, PacketKeys, PacketTy, QUIC_V1,
-    QuicError, Space, TransportErrorCode, TransportParams, TxArena, initial_keys, keys_from_secret,
-    limits::{QuicLimits, RateBudget},
+    AckFrame, Cid, ConnCtx, DatagramMeta, Frame, FrameReader, FrameWriter, PacketKeys, PacketTy,
+    QUIC_V1, QuicApp, QuicError, Space, TransportErrorCode, TransportParams, TxArena, initial_keys,
+    keys_from_secret,
+    limits::QuicLimits,
     open_payload, parse_header, pn_len_for,
-    pools::{CRYPTO_BUFFER_LEN, CryptoBuffer, QuicPools},
+    pools::{CRYPTO_BUFFER_LEN, CryptoBuffer, FrameRefPool, QuicPools},
     protect,
     recv_tracker::RecvTracker,
     remove_header_protection,
     sent::{FrameRef, FrameRefRange, SentPacket, SentRing},
+    stream::{BIDI_WINDOW, Streams, UNI_REMOTE_WINDOW},
     varint::varint_len,
     writer::Writer,
   },
@@ -69,19 +72,6 @@ const MIN_PN_AND_PAYLOAD_LEN: usize = 4;
 const SHORT_RESERVED_BITS: u8 = 0x18;
 const SPACES: [Space; 3] = [Space::Initial, Space::Handshake, Space::Data];
 
-/// What a connection tells the application. The stream callbacks come with the streams.
-pub(crate) trait QuicApp {
-  /// The state that the application keeps for each connection.
-  type ConnState: Default;
-
-  /// The handshake is complete: the connection can carry application data. An error closes the
-  /// connection.
-  fn on_established(&mut self, state: &mut Self::ConnState) -> crate::Result<()>;
-
-  /// The connection is over, whatever the reason: its state is not used anymore.
-  fn on_closed(&mut self, state: &mut Self::ConnState);
-}
-
 /// Where a connection is in its life.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConnState {
@@ -115,9 +105,9 @@ pub(crate) struct ConnParams {
   pub(crate) stream_window: u64,
   /// The receive window of the connection.
   pub(crate) conn_window: u64,
-  /// The bidirectional streams that the peer can open.
+  /// The bidirectional streams that the peer can open at once, at most 256.
   pub(crate) max_streams_bidi: u64,
-  /// The unidirectional streams that the peer can open.
+  /// The unidirectional streams that the peer can open at once, at most 16.
   pub(crate) max_streams_uni: u64,
   /// The idle timeout advertised, zero for none.
   pub(crate) max_idle_timeout_ms: u64,
@@ -156,8 +146,9 @@ impl ConnParams {
       initial_max_stream_data_bidi_local: self.stream_window,
       initial_max_stream_data_bidi_remote: self.stream_window,
       initial_max_stream_data_uni: self.stream_window,
-      initial_max_streams_bidi: self.max_streams_bidi,
-      initial_max_streams_uni: self.max_streams_uni,
+      // The windows of the index arrays of the streams
+      initial_max_streams_bidi: self.max_streams_bidi.min(BIDI_WINDOW as u64),
+      initial_max_streams_uni: self.max_streams_uni.min(UNI_REMOTE_WINDOW as u64),
       ack_delay_exponent: self.ack_delay_exponent,
       max_ack_delay_ms: self.max_ack_delay_ms,
       disable_active_migration: false,
@@ -240,26 +231,26 @@ where
   local: Option<IpAddr>,
   local_cid: Cid,
   max_datagram: usize,
-  original_dcid: Cid,
   params: ConnParams,
-  path_challenges: RateBudget,
   path_response: Option<[u8; 8]>,
   peer: SocketAddr,
   peer_cid: Cid,
   peer_cid_known: bool,
   peer_idle_timeout_ms: u64,
   peer_max_ack_delay_ms: u64,
-  pings: RateBudget,
   // The 1-RTT space
   data: PacketSpace,
   // The Initial and Handshake spaces, from the worker's pool until the handshake is confirmed
   handshake: Option<Box<HandshakeSpaces>>,
   state: ConnState,
   stats: ConnStats,
+  streams: Streams,
   tls: Option<QuicTls<IS_CLIENT, RNG, TCX>>,
-  // Raw frames for the next 1-RTT packet
+  // Raw frames for the next 1-RTT packet, boxed so that tests measure about the size of the
+  // connection that they do not have
+  #[allow(clippy::box_collection, reason = "the box keeps the connection of tests small")]
   #[cfg(test)]
-  test_frames: alloc::vec::Vec<u8>,
+  test_frames: Option<Box<alloc::vec::Vec<u8>>>,
 }
 
 impl<A, RNG, TCX> QuicConn<A, RNG, TCX, false>
@@ -285,16 +276,8 @@ where
     let original_dcid = Cid::new(client_dcid)?;
     let initial = initial_keys(client_dcid, true)?;
     // The CID of the client is in the header of its first Initial packet
-    Ok(Self::with_parts(
-      params,
-      local_cid,
-      original_dcid,
-      Cid::default(),
-      meta,
-      tls,
-      HandshakeSpaces::take(initial, pools),
-      now_us,
-    ))
+    let handshake = HandshakeSpaces::take(initial, original_dcid, pools);
+    Ok(Self::with_parts(params, local_cid, Cid::default(), meta, tls, handshake, now_us, pools))
   }
 }
 
@@ -319,16 +302,8 @@ where
   ) -> crate::Result<Self> {
     let initial = initial_keys(original_dcid.as_slice(), false)?;
     let meta = DatagramMeta { peer, local: None, segment_size: None };
-    Ok(Self::with_parts(
-      params,
-      local_cid,
-      original_dcid,
-      original_dcid,
-      meta,
-      tls,
-      HandshakeSpaces::take(initial, pools),
-      now_us,
-    ))
+    let handshake = HandshakeSpaces::take(initial, original_dcid, pools);
+    Ok(Self::with_parts(params, local_cid, original_dcid, meta, tls, handshake, now_us, pools))
   }
 }
 
@@ -351,7 +326,7 @@ where
   /// Closes the connection with an application error (CONNECTION_CLOSE of type 0x1d).
   #[inline]
   pub(crate) fn close_app(&mut self, now_us: u64, code: u64) {
-    self.enter_closing(now_us, CloseFrame { app: true, code });
+    self.enter_closing(now_us, CloseFrame { app: true, code, requested: false });
   }
 
   /// Writes the packets that are due into `tx`, as many datagrams as needed.
@@ -400,6 +375,22 @@ where
         }
       }
     }
+  }
+
+  /// Runs `f` with the context of the connection at `now_us`, for an application that writes
+  /// outside of the callbacks of [`QuicApp`], such as a handler that finished later. A close that
+  /// it asks for is applied when `f` returns.
+  #[inline]
+  pub(crate) fn with_ctx<R>(
+    &mut self,
+    now_us: u64,
+    pools: &mut QuicPools,
+    f: impl FnOnce(&mut ConnCtx<'_, A::ConnState>) -> R,
+  ) -> R {
+    let rslt =
+      f(&mut ConnCtx::new(&mut self.app_state, &mut self.streams, pools, &self.params, now_us));
+    let _closing = self.apply_app_close(now_us);
+    rslt
   }
 
   /// When [`Self::on_timeout`] is due, if ever.
@@ -529,7 +520,9 @@ where
   fn accepts_dcid(&self, dcid: &Cid) -> bool {
     // The first Initial packets of a client go to the CID that it chose
     *dcid == self.local_cid
-      || (!IS_CLIENT && self.state == ConnState::Handshake && *dcid == self.original_dcid)
+      || (!IS_CLIENT
+        && self.state == ConnState::Handshake
+        && self.handshake.as_ref().is_some_and(|el| el.original_dcid == *dcid))
   }
 
   // Records the processing of a packet of `space`.
@@ -545,13 +538,22 @@ where
       // 8.1), whose keys are not needed anymore (RFC 9001 section 4.9.1)
       self.address_validated = true;
       if let Some(elem) = &mut self.handshake {
-        elem.initial.clear(pools);
+        elem.discard_initial(pools);
       }
     }
     if !IS_CLIENT && self.handshake_complete && self.state == ConnState::Handshake {
       // A server confirms the handshake once it is complete (RFC 9001 section 4.1.2)
       self.confirm(pools);
     }
+  }
+
+  // The application asked for a close: an application CONNECTION_CLOSE. Returns whether the
+  // connection is closing.
+  fn apply_app_close(&mut self, now_us: u64) -> bool {
+    if let Some(code) = self.streams.take_close_request() {
+      self.enter_closing(now_us, CloseFrame { app: true, code, requested: true });
+    }
+    !matches!(self.state, ConnState::Handshake | ConnState::Confirmed)
   }
 
   fn amplification_budget(&self) -> usize {
@@ -564,9 +566,10 @@ where
 
   // Checks the CIDs of the transport parameters of the peer (RFC 9000 section 7.3).
   fn check_peer_params(&self, params: &TransportParams) -> crate::Result<()> {
+    let original_dcid = self.handshake.as_ref().map(|el| el.original_dcid);
     let mismatch = params.initial_source_connection_id != Some(self.peer_cid)
       || (IS_CLIENT
-        && (params.original_destination_connection_id != Some(self.original_dcid)
+        && (params.original_destination_connection_id != original_dcid
           || params.retry_source_connection_id.is_some()));
     if mismatch {
       return Err(crate::Error::QuicClose(
@@ -582,7 +585,7 @@ where
       crate::Error::QuicClose(code, _) => *code,
       _ => TransportErrorCode::InternalError,
     };
-    self.enter_closing(now_us, CloseFrame { app: false, code: code.code() });
+    self.enter_closing(now_us, CloseFrame { app: false, code: code.code(), requested: false });
   }
 
   fn confirm(&mut self, pools: &mut QuicPools) {
@@ -621,6 +624,7 @@ where
     self.state = ConnState::Closing;
     self.close = close;
     self.close_owed = true;
+    self.streams.on_closing();
     self.close_deadline_us = now_us.saturating_add(self.pto_us().saturating_mul(3));
     self.closing_datagrams = 0;
     self.closing_threshold = 1;
@@ -637,6 +641,7 @@ where
     }
     self.state = ConnState::Draining;
     self.close_owed = false;
+    self.streams.on_closing();
   }
 
   // A budget is spent: the application closes the connection with its excessive load code. The
@@ -644,8 +649,16 @@ where
   fn excessive_load(&mut self, now_us: u64) -> crate::Error {
     cold_path();
     let code = self.params.limits.excessive_load_app_code;
-    self.enter_closing(now_us, CloseFrame { app: true, code });
+    self.enter_closing(now_us, CloseFrame { app: true, code, requested: false });
     crate::Error::QuicClose(TransportErrorCode::ApplicationError, QuicError::ExcessiveLoad)
+  }
+
+  // A spent budget of the streams closes as the budgets of the connection do.
+  fn on_streams_rslt(&mut self, now_us: u64, rslt: crate::Result<()>) -> crate::Result<()> {
+    match rslt {
+      Err(crate::Error::QuicClose(_, QuicError::ExcessiveLoad)) => Err(self.excessive_load(now_us)),
+      _ => rslt,
+    }
   }
 
   // If the next datagram must have at least 1200 bytes: it has the Initial packet of a client, an
@@ -692,15 +705,20 @@ where
       sp.largest_acked = Some(ack.largest);
     }
     let mut our_ack = None;
+    // The frames of every acknowledged packet go back, even after an error
+    let mut rslt = Ok(());
     for range in ack.ranges().take(max_ranges) {
       let range = range?;
       for pn in sp.sent.window(*range.start(), *range.end()) {
         let Some(packet) = sp.sent.take(pn) else {
           continue;
         };
-        for frame in pools.frame_refs.iter(packet.frames) {
+        let mut cursor = FrameRefPool::cursor(packet.frames);
+        while let Some(frame) = cursor.next(&pools.frame_refs) {
           if let FrameRef::Ack { largest } = frame {
             our_ack = our_ack.max(Some(largest));
+          } else if rslt.is_ok() {
+            rslt = self.streams.on_frame_acked(frame, pools);
           }
         }
         pools.frame_refs.free(packet.frames);
@@ -709,12 +727,13 @@ where
     if let Some(elem) = our_ack {
       sp.recv.on_ack_of_our_ack(elem);
     }
-    Ok(())
+    rslt
   }
 
   // CRYPTO data, in order to TLS, what comes early buffered.
   fn on_crypto(
     &mut self,
+    now_us: u64,
     space: Space,
     offset: u64,
     data: &[u8],
@@ -733,17 +752,17 @@ where
     if space == Space::Data {
       // Nothing is read after the handshake: TLS closes the connection
       feed(tls, space, data, None, data_keys)?;
-      return self.on_tls_progress(app);
+      return self.on_tls_progress(now_us, app, pools);
     }
     let Some(hs) = self.handshake.as_deref_mut() else {
       return Ok(());
     };
-    let HandshakeSpaces { handshake, initial } = hs;
+    let HandshakeSpaces { handshake, handshake_rx, initial_rx, .. } = hs;
     // Initial data yields the keys of Handshake, Handshake data those of 1-RTT
     let (rx, mut handshake_keys) = if space == Space::Initial {
-      (&mut initial.crypto_rx, Some(&mut handshake.keys))
+      (initial_rx, Some(&mut handshake.keys))
     } else {
-      (&mut handshake.crypto_rx, None)
+      (handshake_rx, None)
     };
     let direct = rx.accept(offset, data, pools)?;
     feed(tls, space, direct, handshake_keys.as_deref_mut(), data_keys)?;
@@ -756,7 +775,7 @@ where
       feed(tls, space, buffered, handshake_keys.as_deref_mut(), data_keys)?;
       rx.consume(len, pools);
     }
-    self.on_tls_progress(app)
+    self.on_tls_progress(now_us, app, pools)
   }
 
   fn on_datagram_while_closing(&mut self) {
@@ -770,7 +789,12 @@ where
   }
 
   // What TLS learned: the transport parameters of the peer, the end of the handshake.
-  fn on_tls_progress(&mut self, app: &mut A) -> crate::Result<()> {
+  fn on_tls_progress(
+    &mut self,
+    now_us: u64,
+    app: &mut A,
+    pools: &mut QuicPools,
+  ) -> crate::Result<()> {
     let Some(tls) = &self.tls else {
       return Ok(());
     };
@@ -788,11 +812,14 @@ where
       self.has_peer_params = true;
       self.peer_idle_timeout_ms = elem.max_idle_timeout_ms;
       self.peer_max_ack_delay_ms = elem.max_ack_delay_ms;
+      self.streams.on_peer_params(&elem);
     }
     if is_complete && !self.handshake_complete {
       self.handshake_complete = true;
       self.handshake_done_owed = !IS_CLIENT;
-      app.on_established(&mut self.app_state)?;
+      let mut cx =
+        ConnCtx::new(&mut self.app_state, &mut self.streams, pools, &self.params, now_us);
+      app.on_established(&mut cx)?;
     }
     Ok(())
   }
@@ -829,7 +856,10 @@ where
         }
         Frame::Crypto { offset, data } => {
           ack_eliciting = true;
-          self.on_crypto(space, offset, data, app, pools)?;
+          self.on_crypto(now_us, space, offset, data, app, pools)?;
+          if self.apply_app_close(now_us) {
+            return Ok(ack_eliciting);
+          }
         }
         Frame::HandshakeDone => {
           ack_eliciting = true;
@@ -851,29 +881,87 @@ where
           // Answered, always (RFC 9000 section 8.2.2), and the latest one only
           ack_eliciting = true;
           self.path_response = Some(data);
-          if !self.path_challenges.take(self.params.limits.path_challenge_budget, now_us) {
+          let budget = self.params.limits.path_challenge_budget;
+          if !self.streams.take_path_challenge_budget(budget, now_us) {
             return Err(self.excessive_load(now_us));
           }
         }
         Frame::Ping => {
           ack_eliciting = true;
-          if !self.pings.take(self.params.limits.ping_budget, now_us) {
+          if !self.streams.take_ping_budget(self.params.limits.ping_budget, now_us) {
             return Err(self.excessive_load(now_us));
           }
         }
-        // Streams, flow control and connection IDs belong to the layers above
-        Frame::ResetStream { .. }
-        | Frame::StopSending { .. }
-        | Frame::Stream { .. }
-        | Frame::MaxData(_)
-        | Frame::MaxStreamData { .. }
-        | Frame::MaxStreams { .. }
-        | Frame::DataBlocked(_)
-        | Frame::StreamDataBlocked { .. }
-        | Frame::StreamsBlocked { .. }
-        | Frame::NewConnectionId { .. }
-        | Frame::RetireConnectionId(_)
-        | Frame::PathResponse(_) => ack_eliciting = true,
+        Frame::Stream { id, offset, data, fin } => {
+          ack_eliciting = true;
+          let (params, streams) = (&self.params, &mut self.streams);
+          let rslt = streams.on_stream(
+            app,
+            &mut self.app_state,
+            pools,
+            params,
+            now_us,
+            (id, offset, data, fin),
+          );
+          self.on_streams_rslt(now_us, rslt)?;
+          if self.apply_app_close(now_us) {
+            return Ok(ack_eliciting);
+          }
+        }
+        Frame::ResetStream { id, code, final_size } => {
+          ack_eliciting = true;
+          let (params, streams) = (&self.params, &mut self.streams);
+          let rslt = streams.on_reset_stream(
+            app,
+            &mut self.app_state,
+            pools,
+            params,
+            now_us,
+            (id, code, final_size),
+          );
+          self.on_streams_rslt(now_us, rslt)?;
+          if self.apply_app_close(now_us) {
+            return Ok(ack_eliciting);
+          }
+        }
+        Frame::StopSending { id, code } => {
+          ack_eliciting = true;
+          let (params, streams) = (&self.params, &mut self.streams);
+          let rslt =
+            streams.on_stop_sending(app, &mut self.app_state, pools, params, now_us, id, code);
+          self.on_streams_rslt(now_us, rslt)?;
+          if self.apply_app_close(now_us) {
+            return Ok(ack_eliciting);
+          }
+        }
+        Frame::MaxData(max) => {
+          ack_eliciting = true;
+          self.streams.on_max_data(max);
+        }
+        Frame::MaxStreamData { id, max } => {
+          ack_eliciting = true;
+          self.streams.on_max_stream_data(pools, &self.params, id, max)?;
+        }
+        Frame::MaxStreams { bidi, max } => {
+          ack_eliciting = true;
+          self.streams.on_max_streams(bidi, max);
+        }
+        Frame::DataBlocked(_) => {
+          ack_eliciting = true;
+          self.streams.on_data_blocked(&self.params);
+        }
+        Frame::StreamDataBlocked { id, .. } => {
+          ack_eliciting = true;
+          self.streams.on_stream_data_blocked(pools, &self.params, id)?;
+        }
+        Frame::StreamsBlocked { bidi, .. } => {
+          ack_eliciting = true;
+          self.streams.on_streams_blocked(bidi);
+        }
+        // Connection IDs belong to the endpoint
+        Frame::NewConnectionId { .. } | Frame::RetireConnectionId(_) | Frame::PathResponse(_) => {
+          ack_eliciting = true;
+        }
       }
     }
     if is_empty {
@@ -987,10 +1075,11 @@ where
     }
     let mut wants = sp.recv.ack_pending() || !self.crypto_unsent(space).is_empty();
     if space == Space::Data {
-      wants |= self.handshake_done_owed || self.path_response.is_some();
+      wants |=
+        self.handshake_done_owed || self.path_response.is_some() || self.streams.wants_send();
       #[cfg(test)]
       {
-        wants |= !self.test_frames.is_empty();
+        wants |= self.test_frames.as_ref().is_some_and(|el| !el.is_empty());
       }
     }
     wants
@@ -1000,6 +1089,7 @@ where
     self.state = ConnState::Closed;
     self.release_handshake(pools);
     self.data.clear(pools);
+    self.streams.release(pools);
     self.close_owed = false;
     self.handshake_done_owed = false;
     self.path_response = None;
@@ -1019,19 +1109,19 @@ where
   fn with_parts(
     params: &ConnParams,
     local_cid: Cid,
-    original_dcid: Cid,
     peer_cid: Cid,
     meta: DatagramMeta,
     tls: QuicTls<IS_CLIENT, RNG, TCX>,
     handshake: Box<HandshakeSpaces>,
     now_us: u64,
+    pools: &mut QuicPools,
   ) -> Self {
     Self {
       address_validated: false,
       app_state: A::ConnState::default(),
       bytes_received: 0,
       bytes_sent: 0,
-      close: CloseFrame { app: false, code: 0 },
+      close: CloseFrame { app: false, code: 0, requested: false },
       close_deadline_us: 0,
       close_owed: false,
       closing_datagrams: 0,
@@ -1044,23 +1134,21 @@ where
       local: meta.local,
       local_cid,
       max_datagram: INITIAL_MAX_DATAGRAM,
-      original_dcid,
       params: *params,
-      path_challenges: RateBudget::default(),
       path_response: None,
       peer: meta.peer,
       peer_cid,
       peer_cid_known: false,
       peer_idle_timeout_ms: 0,
       peer_max_ack_delay_ms: TransportParams::default().max_ack_delay_ms,
-      pings: RateBudget::default(),
       data: PacketSpace::new(),
       handshake: Some(handshake),
       state: ConnState::Handshake,
       stats: ConnStats::default(),
+      streams: Streams::new(params, IS_CLIENT, pools),
       tls: Some(tls),
       #[cfg(test)]
-      test_frames: alloc::vec::Vec::new(),
+      test_frames: None,
     }
   }
 
@@ -1135,7 +1223,7 @@ where
     if IS_CLIENT && sent_handshake {
       // RFC 9001 section 4.9.1
       if let Some(elem) = &mut self.handshake {
-        elem.initial.clear(pools);
+        elem.discard_initial(pools);
       }
     }
     Ok(pos)
@@ -1187,7 +1275,8 @@ where
       } else {
         (self.close.app, self.close.code)
       };
-      let _written = fw.write_connection_close(app, code, (!app).then_some(0), &[]);
+      let reason = if app && self.close.requested { self.streams.close_reason() } else { &[] };
+      let _written = fw.write_connection_close(app, code, (!app).then_some(0), reason);
     } else {
       if sp.recv.ack_pending()
         && let Some(largest) = sp.recv.largest()
@@ -1210,8 +1299,11 @@ where
           full_datagram = true;
         }
         #[cfg(test)]
-        if !self.test_frames.is_empty() && fw.write_bytes(&self.test_frames) {
-          self.test_frames.clear();
+        if let Some(elem) = self.test_frames.as_deref_mut()
+          && !elem.is_empty()
+          && fw.write_bytes(elem)
+        {
+          elem.clear();
           ack_eliciting = true;
         }
       }
@@ -1235,6 +1327,9 @@ where
           sp.crypto_tx = sp.crypto_tx.wrapping_add(u64::from(len));
           ack_eliciting = true;
         }
+      }
+      if space == Space::Data {
+        ack_eliciting |= self.streams.write_frames(&mut fw, &mut frames, pools, &self.params)?;
       }
     }
     let mut payload_len = fw.len();
@@ -1274,9 +1369,27 @@ impl<A, RNG, TCX, const IS_CLIENT: bool> QuicConn<A, RNG, TCX, IS_CLIENT>
 where
   A: QuicApp,
 {
+  /// The CONNECTION_CLOSE that the connection owes, if it is closing: (application, code).
+  pub(crate) const fn close_code(&self) -> Option<(bool, u64)> {
+    match self.state {
+      ConnState::Closing => Some((self.close.app, self.close.code)),
+      _ => None,
+    }
+  }
+
   /// Sends `frames`, raw, in the next 1-RTT packet.
   pub(crate) fn queue_test_frames(&mut self, frames: &[u8]) {
-    self.test_frames.extend_from_slice(frames);
+    self.test_frames.get_or_insert_default().extend_from_slice(frames);
+  }
+
+  /// The streams.
+  pub(crate) const fn streams(&self) -> &Streams {
+    &self.streams
+  }
+
+  /// The streams, to change.
+  pub(crate) const fn streams_mut(&mut self) -> &mut Streams {
+    &mut self.streams
   }
 }
 
@@ -1321,6 +1434,8 @@ where
 struct CloseFrame {
   app: bool,
   code: u64,
+  // The application asked for it, with the reason that the streams keep
+  requested: bool,
 }
 
 // CRYPTO data of a level that arrives before the data that TLS reads next, buffered in a ring
@@ -1415,6 +1530,12 @@ impl CryptoRx {
       CryptoBuffer::give(elem, pools);
     }
   }
+
+  // Gives the buffer back and starts over, for the next handshake.
+  fn reset(&mut self, pools: &mut QuicPools) {
+    self.release(pools);
+    self.offset = 0;
+  }
 }
 
 // A packet written into a datagram but not sealed yet: the last one of a datagram can still take
@@ -1449,7 +1570,6 @@ impl OpenPacket {
 // The state of one packet number space.
 #[derive(Debug)]
 struct PacketSpace {
-  crypto_rx: CryptoRx,
   // The bytes of the TLS output of the level that were sent
   crypto_tx: u64,
   keys: Option<PacketKeys>,
@@ -1462,7 +1582,6 @@ struct PacketSpace {
 impl PacketSpace {
   const fn new() -> Self {
     Self {
-      crypto_rx: CryptoRx::new(),
       crypto_tx: 0,
       keys: None,
       largest_acked: None,
@@ -1475,34 +1594,52 @@ impl PacketSpace {
   fn clear(&mut self, pools: &mut QuicPools) {
     self.keys = None;
     self.sent.release(pools);
-    self.crypto_rx.release(pools);
     *self = Self::new();
   }
 }
 
 /// The Initial and Handshake packet number spaces of a connection: keys, CRYPTO reassembly,
-/// acknowledgments and sent packets. A connection takes them from the worker's pool for its
-/// handshake and gives them back, wiped, once the handshake is confirmed (spec section 5.4).
+/// acknowledgments and sent packets, and the other state that only the handshake needs. A
+/// connection takes them from the worker's pool for its handshake and gives them back, wiped,
+/// once the handshake is confirmed (spec section 5.4).
 #[derive(Debug)]
 pub(crate) struct HandshakeSpaces {
   handshake: PacketSpace,
+  handshake_rx: CryptoRx,
   initial: PacketSpace,
+  initial_rx: CryptoRx,
+  // The destination CID of the first Initial packet of the client
+  original_dcid: Cid,
 }
 
 impl HandshakeSpaces {
   // Spaces from the pool, or new ones, with the keys of Initial.
-  fn take(initial: PacketKeys, pools: &mut QuicPools) -> Box<Self> {
+  fn take(initial: PacketKeys, original_dcid: Cid, pools: &mut QuicPools) -> Box<Self> {
     let mut this = pools.handshake_spaces.take().unwrap_or_else(|| {
-      Box::new(Self { handshake: PacketSpace::new(), initial: PacketSpace::new() })
+      Box::new(Self {
+        handshake: PacketSpace::new(),
+        handshake_rx: CryptoRx::new(),
+        initial: PacketSpace::new(),
+        initial_rx: CryptoRx::new(),
+        original_dcid: Cid::default(),
+      })
     });
     this.initial.keys = Some(initial);
+    this.original_dcid = original_dcid;
     this
+  }
+
+  // The Initial keys, wiped, and what was buffered at that level are not needed anymore.
+  fn discard_initial(&mut self, pools: &mut QuicPools) {
+    self.initial.clear(pools);
+    self.initial_rx.reset(pools);
   }
 
   // Wipes the keys where they are and gives the spaces back.
   fn give(mut this: Box<Self>, pools: &mut QuicPools) {
-    this.initial.clear(pools);
+    this.discard_initial(pools);
     this.handshake.clear(pools);
+    this.handshake_rx.reset(pools);
     pools.handshake_spaces.give(this);
   }
 }
@@ -1656,18 +1793,20 @@ fn write_header(
 mod tests {
   use crate::{
     quic::{
-      Cid, ConnState, FlushOutcome, PacketTy, QuicError, Space, TransportErrorCode,
+      BodyRef, Cid, ConnState, FlushOutcome, Frame, PacketTy, QuicError, Space, TransportErrorCode,
       conn::CryptoRx,
       parse_header,
-      pools::{CRYPTO_BUFFER_LEN, QuicPools},
+      pools::{CRYPTO_BUFFER_LEN, QuicPools, RX_BLOCK_LEN, TX_BLOCK_LEN},
       protect,
-      testing::{CLIENT_ADDR, Link, LinkOpts, Parts, SERVER_ADDR},
+      testing::{
+        Behavior, CLIENT_ADDR, Link, LinkOpts, Parts, SERVER_ADDR, TestApp, encode_frames,
+      },
     },
     sync::AtomicU64,
     tests::_count_allocations_in,
     tls::CipherSuite,
   };
-  use alloc::{vec, vec::Vec};
+  use alloc::{boxed::Box, rc::Rc, vec, vec::Vec};
   use core::sync::atomic::Ordering;
 
   const PING: [u8; 1] = [0x01];
@@ -1928,6 +2067,9 @@ mod tests {
     assert_eq!(link.server.conn.state(), ConnState::Confirmed);
     assert_eq!(link.server.conn.data.recv.largest(), Some(0));
     assert_eq!(link.server.app.established, 1);
+    // The request reached the application in that same call
+    let log = &link.server.app.streams[&0];
+    assert_eq!((log.data.as_slice(), log.fin), (b"hello".as_slice(), true));
     link.run();
     assert_eq!(link.client.conn.state(), ConnState::Confirmed);
   }
@@ -2133,6 +2275,46 @@ mod tests {
     // Aborting again changes nothing
     link.server.conn.abort(&mut link.server.app, &mut link.server.parts.pools);
     assert_eq!(link.server.app.closed, 1);
+    // In the middle of streams: a response that is not acknowledged, with a block of the send
+    // queue and a body by reference, and data that waits for earlier data in a receive block
+    const HEAD: [u8; 300] = [b'h'; 300];
+    let (client_parts, mut server_parts) = link.into_parts();
+    for _ in 0..4 {
+      server_parts.pools.rx_blocks.give(Box::new([0; RX_BLOCK_LEN]));
+      server_parts.pools.tx_blocks.give(Box::new([0; TX_BLOCK_LEN]));
+    }
+    let body: Rc<[u8]> = vec![1; 3000].into();
+    let mut opts = LinkOpts::new(None);
+    let response = BodyRef::new(body.clone(), 0..3000).unwrap();
+    opts.server_app = TestApp::new(Behavior::RespondBody(&HEAD, response));
+    let mut link = Link::with_parts(&opts, client_parts, server_parts);
+    drop(opts);
+    link.run();
+    let now_us = link.now_us;
+    let id = link
+      .client
+      .with_ctx(now_us, |cx| {
+        let id = cx.open_bidi()?;
+        cx.write(id, b"GET /", true)?;
+        Ok::<_, crate::Error>(id)
+      })
+      .unwrap();
+    let frame = Frame::Stream { id: id.0 + 4, offset: 5000, data: b"x", fin: false };
+    link.client.conn.queue_test_frames(&encode_frames(&[frame]));
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
+    let _ = link.server.flush(link.now_us);
+    let pools = &link.server.parts.pools;
+    assert_eq!(pools.stream_slots.live(), 2);
+    assert_eq!((pools.rx_blocks.len(), pools.tx_blocks.len()), (3, 3));
+    link.server.app.behavior = Behavior::Collect;
+    assert_eq!(Rc::strong_count(&body), 2);
+    link.server.abort();
+    let pools = &link.server.parts.pools;
+    assert_eq!(counts(&link.server.parts), warm);
+    assert_eq!(pools.stream_slots.live(), 0);
+    assert_eq!((pools.rx_blocks.len(), pools.tx_blocks.len()), (4, 4));
+    assert_eq!(Rc::strong_count(&body), 1);
   }
 
   // What a connection holds of the pools goes back only if it is closed or aborted, so dropping it

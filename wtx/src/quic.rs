@@ -1,13 +1,18 @@
-//! QUIC version 1 (RFC 9000): the wire codecs, packet protection and the connection core.
+//! QUIC version 1 (RFC 9000): the wire codecs, packet protection, the connection core and its
+//! streams, flow control and application interface.
 //!
 //! Everything here is sans-I/O: decoders return slices of their input, encoders write into
 //! buffers of the caller and connections are fed datagrams and drained into a [`TxArena`].
 
+#[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
+mod app;
 mod cid;
 #[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
 mod conn;
 #[allow(dead_code, reason = "consumed by the connection of the later QUIC tasks")]
 mod crypto;
+#[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
+mod flow;
 #[allow(dead_code, reason = "consumed by the connection of the later QUIC tasks")]
 mod frame;
 #[cfg(any(test, feature = "_fuzz"))]
@@ -26,6 +31,8 @@ mod quic_error;
 mod recv_tracker;
 #[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
 mod sent;
+#[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
+mod stream;
 #[cfg(test)]
 pub(crate) mod testing;
 mod transport_params;
@@ -33,9 +40,11 @@ mod tx_arena;
 mod varint;
 mod writer;
 
+#[allow(unused_imports, reason = "reached through the endpoint of the later QUIC tasks")]
+pub(crate) use app::{BodyRef, ConnCtx, QuicApp};
 pub use cid::{Cid, MAX_CID_LEN};
 #[allow(unused_imports, reason = "reached through the endpoint of the later QUIC tasks")]
-pub(crate) use conn::{ConnParams, ConnState, ConnStats, FlushOutcome, QuicApp, QuicConn};
+pub(crate) use conn::{ConnParams, ConnState, ConnStats, FlushOutcome, QuicConn};
 use core::net::{IpAddr, SocketAddr};
 #[allow(unused_imports, reason = "consumed by the connection of the later tasks")]
 pub(crate) use crypto::{
@@ -51,6 +60,8 @@ pub(crate) use packet::{
   write_version_negotiation,
 };
 pub use quic_error::{QuicError, TransportErrorCode};
+#[allow(unused_imports, reason = "reached through the endpoint of the later QUIC tasks")]
+pub(crate) use stream::StreamId;
 pub use transport_params::TransportParams;
 pub use tx_arena::{TrainId, TxArena, TxTrain};
 #[allow(unused_imports, reason = "consumed by the frame codec of the later tasks")]

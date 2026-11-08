@@ -7,15 +7,15 @@
 
 use crate::{
   quic::{
-    Cid, ConnParams, DatagramMeta, FlushOutcome, QuicApp, QuicConn, TransportParams, TxArena,
-    pools::QuicPools,
+    BodyRef, Cid, ConnCtx, ConnParams, DatagramMeta, FlushOutcome, Frame, FrameWriter, QuicApp,
+    QuicConn, QuicError, StreamId, TransportErrorCode, TransportParams, TxArena, pools::QuicPools,
   },
   rng::{ChaCha20, Rng as _},
   sync::{Arc, AtomicU64},
   tests::{_PUBLIC_KEY, _SECRET_KEY, _count_allocations_in},
   tls::{CipherSuite, QuicTls, SkCtx, TlsConfig, TlsCtxSk, UnverifiedCtx},
 };
-use alloc::vec::Vec;
+use alloc::{collections::BTreeMap, vec, vec::Vec};
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 /// The address of the client of a [`Link`].
@@ -35,20 +35,199 @@ pub(crate) type ClientConn = QuicConn<TestApp, ChaCha20, UnverifiedCtx, true>;
 /// The connection of the server of a [`Link`].
 pub(crate) type ServerConn = QuicConn<TestApp, ChaCha20, SkCtx, false>;
 
-/// An application that counts what the connection tells it.
-#[derive(Debug, Default)]
+/// What a [`TestApp`] does with the data that arrives on a stream.
+#[derive(Clone, Debug, Default)]
+pub(crate) enum Behavior {
+  /// Keeps everything in [`TestApp::streams`].
+  #[default]
+  Collect,
+  /// Writes back what arrives, with the FIN when it arrives.
+  Echo,
+  /// Answers each request, once its FIN arrived, with these bytes and the FIN.
+  Respond(&'static [u8]),
+  /// Answers each request, once its FIN arrived, with these bytes and then the body, by
+  /// reference, with the FIN.
+  RespondBody(&'static [u8], BodyRef),
+  /// By stream index modulo 3: `small` written by copy, the body by reference, `large` written by
+  /// copy, with the FIN.
+  Mixed {
+    /// For the streams of index 0 modulo 3.
+    small: &'static [u8],
+    /// For the streams of index 1 modulo 3.
+    body: BodyRef,
+    /// For the streams of index 2 modulo 3.
+    large: &'static [u8],
+  },
+  /// Keeps the lines (ended by `\n`, or by the FIN) in [`TestApp::lines`], and retains what is
+  /// left of a line until the rest of it arrives.
+  Lines,
+}
+
+/// How a [`TestApp`] fails on the first data that arrives.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Fail {
+  /// With an error that closes with this transport code.
+  Transport(TransportErrorCode),
+  /// With an error that is not a QUIC close.
+  Other,
+  /// By closing with this application code, without an error.
+  AppClose(u64),
+}
+
+/// What arrived on a stream, for [`Behavior::Collect`].
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StreamLog {
+  /// The bytes, in order.
+  pub(crate) data: Vec<u8>,
+  /// If the FIN arrived.
+  pub(crate) fin: bool,
+  /// The length and the FIN of every call.
+  pub(crate) calls: Vec<(usize, bool)>,
+}
+
+/// An application that does what its [`Behavior`] says and counts what the connection tells it.
+#[derive(Clone, Debug, Default)]
 pub(crate) struct TestApp {
+  /// What it does with the data that arrives.
+  pub(crate) behavior: Behavior,
   /// Calls of [`QuicApp::on_closed`].
   pub(crate) closed: u32,
   /// Calls of [`QuicApp::on_established`].
   pub(crate) established: u32,
+  /// How it fails, if it does.
+  pub(crate) fail: Option<Fail>,
+  /// FINs that arrived.
+  pub(crate) fins: u64,
+  /// If it is the application of the server of a [`Link`], which sets it: the server answers a
+  /// reset of the peer with a reset of its own sending part.
+  pub(crate) is_server: bool,
+  /// The lines of [`Behavior::Lines`].
+  pub(crate) lines: Vec<Vec<u8>>,
+  /// Calls of [`QuicApp::on_stream_reset`].
+  pub(crate) resets: Vec<(StreamId, u64)>,
+  /// Calls of [`QuicApp::on_stop_sending`].
+  pub(crate) stops: Vec<(StreamId, u64)>,
+  /// What arrived, by stream, for [`Behavior::Collect`].
+  pub(crate) streams: BTreeMap<u64, StreamLog>,
+  /// Opens a unidirectional stream once established and writes these bytes on it.
+  pub(crate) uni_on_established: Option<&'static [u8]>,
+  /// The stream of [`Self::uni_on_established`].
+  pub(crate) uni: Option<StreamId>,
+}
+
+impl TestApp {
+  /// An application with this behavior.
+  pub(crate) fn new(behavior: Behavior) -> Self {
+    Self { behavior, ..Self::default() }
+  }
 }
 
 impl QuicApp for TestApp {
   type ConnState = ();
 
-  fn on_established(&mut self, _state: &mut ()) -> crate::Result<()> {
+  fn on_established(&mut self, cx: &mut ConnCtx<'_, ()>) -> crate::Result<()> {
     self.established = self.established.wrapping_add(1);
+    if let Some(bytes) = self.uni_on_established {
+      let id = cx.open_uni()?;
+      cx.write(id, bytes, false)?;
+      self.uni = Some(id);
+    }
+    Ok(())
+  }
+
+  fn on_stream_data(
+    &mut self,
+    cx: &mut ConnCtx<'_, ()>,
+    id: StreamId,
+    data: &[u8],
+    fin: bool,
+  ) -> crate::Result<()> {
+    if let Some(fail) = self.fail {
+      return match fail {
+        Fail::Transport(code) => Err(crate::Error::QuicClose(code, QuicError::InvalidFrame)),
+        Fail::Other => Err(crate::Error::ProgrammingError),
+        Fail::AppClose(code) => {
+          cx.close(code, b"bye");
+          Ok(())
+        }
+      };
+    }
+    if fin {
+      self.fins = self.fins.wrapping_add(1);
+    }
+    match &self.behavior {
+      Behavior::Collect => {
+        let log = self.streams.entry(id.0).or_default();
+        log.data.extend_from_slice(data);
+        log.fin |= fin;
+        log.calls.push((data.len(), fin));
+      }
+      Behavior::Echo => match cx.write(id, data, fin) {
+        // The peer asked for no more (STOP_SENDING)
+        Err(crate::Error::Quic(QuicError::StreamClosed)) => {}
+        rslt => rslt?,
+      },
+      Behavior::Respond(bytes) => {
+        if fin {
+          cx.write(id, bytes, true)?;
+        }
+      }
+      Behavior::RespondBody(head, body) => {
+        if fin {
+          cx.write(id, head, false)?;
+          cx.write_body(id, body.clone(), true)?;
+        }
+      }
+      Behavior::Mixed { small, body, large } => {
+        if fin {
+          match id.index() % 3 {
+            0 => cx.write(id, small, true)?,
+            1 => cx.write_body(id, body.clone(), true)?,
+            _ => cx.write(id, large, true)?,
+          }
+        }
+      }
+      Behavior::Lines => {
+        let mut start = 0;
+        while let Some(pos) =
+          data.get(start..).and_then(|el| el.iter().position(|byte| *byte == b'\n'))
+        {
+          self.lines.push(data[start..start + pos].to_vec());
+          start += pos + 1;
+        }
+        if fin {
+          if start < data.len() {
+            self.lines.push(data[start..].to_vec());
+          }
+        } else {
+          cx.retain(data.len() - start)?;
+        }
+      }
+    }
+    Ok(())
+  }
+
+  fn on_stream_reset(
+    &mut self,
+    cx: &mut ConnCtx<'_, ()>,
+    id: StreamId,
+    code: u64,
+  ) -> crate::Result<()> {
+    self.resets.push((id, code));
+    if self.is_server {
+      // What would have answered the request is not wanted anymore
+      cx.reset(id, code);
+    }
+    Ok(())
+  }
+
+  fn on_stop_sending(
+    &mut self,
+    _cx: &mut ConnCtx<'_, ()>,
+    id: StreamId,
+    code: u64,
+  ) -> crate::Result<()> {
+    self.stops.push((id, code));
     Ok(())
   }
 
@@ -83,6 +262,8 @@ impl Parts {
 pub(crate) struct LinkOpts {
   /// The parameters of the client.
   pub(crate) client: ConnParams,
+  /// The application of the client.
+  pub(crate) client_app: TestApp,
   /// Changes the transport parameters that the client sends.
   pub(crate) client_tp: fn(&mut TransportParams),
   /// The allocation counters of the server and of everything else, if allocations are counted.
@@ -91,6 +272,8 @@ pub(crate) struct LinkOpts {
   pub(crate) seed: u8,
   /// The parameters of the server.
   pub(crate) server: ConnParams,
+  /// The application of the server.
+  pub(crate) server_app: TestApp,
   /// The TLS configuration of the server, made once and shared.
   pub(crate) server_config: Arc<TlsConfig<SkCtx>>,
   /// Changes the transport parameters that the server sends.
@@ -104,10 +287,12 @@ impl LinkOpts {
   pub(crate) fn new(suite: Option<CipherSuite>) -> Self {
     Self {
       client: ConnParams::default(),
+      client_app: TestApp::default(),
       client_tp: |_| {},
       counters: None,
       seed: 1,
       server: ConnParams::default(),
+      server_app: TestApp::default(),
       server_config: server_config(suite),
       server_tp: |_| {},
       server_tp_padding: 0,
@@ -163,6 +348,19 @@ where
     let _rslt =
       self.conn.recv_datagram(now_us, datagram, meta, &mut self.app, &mut self.parts.pools);
     self.leave();
+  }
+
+  /// Runs `f` with the context of the connection, as the application does outside of the
+  /// callbacks.
+  pub(crate) fn with_ctx<R>(
+    &mut self,
+    now_us: u64,
+    f: impl FnOnce(&mut ConnCtx<'_, ()>) -> R,
+  ) -> R {
+    self.enter();
+    let rslt = self.conn.with_ctx(now_us, &mut self.parts.pools, f);
+    self.leave();
+    rslt
   }
 
   /// The datagrams that the arena holds, taken out of it.
@@ -228,7 +426,7 @@ impl Link {
     let original_dcid = Cid::new(&original_dcid).unwrap();
     let mut client = Side {
       addr: CLIENT_ADDR,
-      app: TestApp::default(),
+      app: opts.client_app.clone(),
       conn: client_conn(
         &opts.client,
         client_cid,
@@ -258,8 +456,8 @@ impl Link {
     if let Some((_, others)) = counters {
       _count_allocations_in(others);
     }
-    let mut server =
-      Side { addr: SERVER_ADDR, app: TestApp::default(), conn, counters, parts: server_parts };
+    let app = TestApp { is_server: true, ..opts.server_app.clone() };
+    let mut server = Side { addr: SERVER_ADDR, app, conn, counters, parts: server_parts };
     server.recv(now_us, &mut first[0], CLIENT_ADDR);
     Self { client, now_us, scratch: Vec::with_capacity(1 << 16), server }
   }
@@ -292,7 +490,12 @@ impl Link {
 
   /// Flushes both sides and delivers what they sent, until nothing moves anymore.
   pub(crate) fn run(&mut self) {
-    for _ in 0..MAX_STEPS {
+    self.run_for(MAX_STEPS);
+  }
+
+  /// [`Self::run`] for at most `max_steps` steps.
+  pub(crate) fn run_for(&mut self, max_steps: usize) {
+    for _ in 0..max_steps {
       if !self.step() {
         return;
       }
@@ -424,4 +627,16 @@ where
     }
   }
   datagrams
+}
+
+/// The frames, one after the other, as a packet carries them.
+pub(crate) fn encode_frames(frames: &[Frame<'_>]) -> Vec<u8> {
+  let mut buffer = vec![0; 1 << 16];
+  let mut writer = FrameWriter::new(&mut buffer);
+  for frame in frames {
+    assert!(writer.write_frame(frame), "{frame:?}");
+  }
+  let len = writer.len();
+  buffer.truncate(len);
+  buffer
 }
