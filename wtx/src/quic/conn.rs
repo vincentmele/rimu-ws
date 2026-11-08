@@ -374,7 +374,14 @@ where
       let Some(buffer) = tx.begin(self.peer, self.local, max_len) else {
         return FlushOutcome::ArenaFull;
       };
+      // The arena can give less than asked for, the room left in the train that the datagram
+      // joins: what does not fit there waits for a flush with more room
+      if buffer.len() < max_len && buffer.len() < MIN_DATAGRAM_LEN && self.needs_full_datagram() {
+        return FlushOutcome::ArenaFull;
+      }
+      let short = buffer.len() < max_len;
       match self.write_datagram(now_us, buffer, pools) {
+        Ok(0) if short => return FlushOutcome::ArenaFull,
         Ok(0) => return FlushOutcome::Done,
         Ok(len) => {
           tx.commit(len);
@@ -632,12 +639,27 @@ where
     self.close_owed = false;
   }
 
-  // A budget is spent: the application closes the connection with its excessive load code.
+  // A budget is spent: the application closes the connection with its excessive load code. The
+  // error has the code that such a close takes before 1-RTT (RFC 9000 section 10.2.3).
   fn excessive_load(&mut self, now_us: u64) -> crate::Error {
     cold_path();
     let code = self.params.limits.excessive_load_app_code;
     self.enter_closing(now_us, CloseFrame { app: true, code });
-    crate::Error::Quic(QuicError::ExcessiveLoad)
+    crate::Error::QuicClose(TransportErrorCode::ApplicationError, QuicError::ExcessiveLoad)
+  }
+
+  // If the next datagram must have at least 1200 bytes: it has the Initial packet of a client, an
+  // ack-eliciting Initial packet of a server or a PATH_RESPONSE (RFC 9000 sections 8.2.2 and
+  // 14.1).
+  fn needs_full_datagram(&self) -> bool {
+    let has_keys =
+      |space| space_ref(&self.data, &self.handshake, space).is_some_and(|el| el.keys.is_some());
+    if self.state == ConnState::Closing {
+      return IS_CLIENT && has_keys(Space::Initial);
+    }
+    let initial = self.space_wants_send(Space::Initial)
+      && (IS_CLIENT || !self.crypto_unsent(Space::Initial).is_empty());
+    initial || (self.path_response.is_some() && has_keys(Space::Data))
   }
 
   fn idle_deadline(&self) -> Option<u64> {
@@ -888,12 +910,6 @@ where
     };
     if sp.recv.is_duplicate(pn) {
       self.stats.duplicates = self.stats.duplicates.wrapping_add(1);
-      return Ok(());
-    }
-    if sp.recv.would_forget_unreported(pn) {
-      // The ACK that reports the older packets goes out first, with the next flush: until then
-      // this one is dropped, and the peer sends what it carried again
-      self.drop_packet();
       return Ok(());
     }
     let header_len = pn_offset.wrapping_add(pn_len);
@@ -1640,7 +1656,7 @@ fn write_header(
 mod tests {
   use crate::{
     quic::{
-      Cid, ConnState, PacketTy, QuicError, Space, TransportErrorCode,
+      Cid, ConnState, FlushOutcome, PacketTy, QuicError, Space, TransportErrorCode,
       conn::CryptoRx,
       parse_header,
       pools::{CRYPTO_BUFFER_LEN, QuicPools},
@@ -2036,16 +2052,17 @@ mod tests {
     assert_eq!(link.server.take_datagrams().len(), 1);
   }
 
-  // 900 packets of the client in one turn of the server are all in its next ACK.
+  // 2,000 packets of the client in one turn of the server, twice what its window holds, are all
+  // processed and all in its next ACK.
   #[cfg_attr(miri, ignore)]
   #[test]
-  fn nine_hundred_packets_in_one_turn_are_all_reported() {
+  fn two_thousand_packets_in_one_turn_are_all_processed_and_reported() {
     let mut opts = LinkOpts::new(None);
-    opts.server.limits.ping_budget = 1000;
+    opts.server.limits.ping_budget = 3000;
     let mut link = settled(&opts);
     let first = link.client.conn.data.sent.next_pn();
     let mut datagrams = Vec::new();
-    for nth in 0..900 {
+    for nth in 0..2000 {
       if nth % 200 == 0 {
         // As if acknowledged: the client sends more than its ring holds in flight
         link.client.conn.data.sent.release(&mut link.client.parts.pools);
@@ -2054,14 +2071,18 @@ mod tests {
       let _ = link.client.flush(link.now_us);
       datagrams.extend(link.client.take_datagrams());
     }
-    assert_eq!(datagrams.len(), 900);
+    assert_eq!(datagrams.len(), 2000);
+    let before = *link.server.conn.stats();
     for datagram in &mut datagrams {
       link.server.recv(link.now_us, datagram, CLIENT_ADDR);
     }
-    // With the ACK-only packets of the client before them
+    let after = *link.server.conn.stats();
+    assert_eq!(after.packets_in, before.packets_in + 2000);
+    assert_eq!(after.packets_dropped, before.packets_dropped);
+    // With the ACK-only packets of the client before them, all in the first range
     let (start, end) = server_data_ranges(&link)[0];
-    assert!(start <= first && end == first + 899, "{start}..={end}");
-    let ack_only = link.server.conn.stats().ack_only_out;
+    assert!(start <= first && end == first + 1999, "{start}..={end}");
+    let ack_only = after.ack_only_out;
     let _ = link.server.flush(link.now_us);
     assert_eq!(link.server.conn.stats().ack_only_out, ack_only + 1);
     link.client.conn.data.sent.release(&mut link.client.parts.pools);
@@ -2125,6 +2146,86 @@ mod tests {
     let mut rng = crate::rng::ChaCha20::from_key([3; 32]);
     let params = super::ConnParams::default();
     drop(crate::quic::testing::client_conn(&params, cid, cid, &mut rng, 0, &mut pools, |_| {}));
+  }
+
+  // Takes every train descriptor of `tx`, the newest one for a train to the client of datagrams
+  // of `segment` bytes, which the server can still join.
+  fn fill_descriptors(tx: &mut crate::quic::TxArena, segment: usize) {
+    let other = core::net::IpAddr::V4(core::net::Ipv4Addr::new(10, 9, 9, 9));
+    let mut port = 1;
+    while let Some(buffer) = tx.begin(core::net::SocketAddr::new(other, port), None, segment) {
+      buffer.fill(0);
+      tx.commit(segment);
+      port += 1;
+    }
+    let oldest = tx.pending().next().unwrap().id;
+    tx.release(oldest);
+    tx.begin(CLIENT_ADDR, None, segment).unwrap().fill(0);
+    tx.commit(segment);
+  }
+
+  // A datagram that must have 1200 bytes, for a PATH_RESPONSE, does not go out in the short room
+  // of a train that it can join: the flush stops with ArenaFull, and the answer goes out padded
+  // once the arena has room. So does a packet that does not fit at all.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn a_short_arena_segment_holds_back_what_needs_more_room() {
+    let mut link = settled(&LinkOpts::new(None));
+    fill_descriptors(&mut link.server.parts.tx, 60);
+    link.client.conn.queue_test_frames(&[0x1a, 1, 2, 3, 4, 5, 6, 7, 8]);
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
+    assert_eq!(link.server.flush(link.now_us), FlushOutcome::ArenaFull);
+    assert_eq!(link.server.conn.path_response, Some([1, 2, 3, 4, 5, 6, 7, 8]));
+    // Only the 60-byte datagrams of the filler were there
+    let filler = link.server.take_datagrams();
+    assert!(filler.iter().all(|el| el.len() == 60), "{:?}", filler.last().map(Vec::len));
+    assert_eq!(link.server.flush(link.now_us), FlushOutcome::Done);
+    let answer = link.server.take_datagrams();
+    assert_eq!(answer.iter().map(Vec::len).collect::<Vec<_>>(), [1200]);
+    assert_eq!(link.server.conn.path_response, None);
+    // Room for no packet at all: the ACK that is owed waits
+    fill_descriptors(&mut link.server.parts.tx, 20);
+    link.client.conn.queue_test_frames(&PING);
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
+    assert_eq!(link.server.flush(link.now_us), FlushOutcome::ArenaFull);
+    assert!(link.server.conn.data.recv.ack_pending());
+    let _ = link.server.take_datagrams();
+    assert_eq!(link.server.flush(link.now_us), FlushOutcome::Done);
+    assert_eq!(link.server.take_datagrams().len(), 1);
+    assert!(!link.server.conn.data.recv.ack_pending());
+  }
+
+  // A spent budget closes the connection, so `recv_datagram` reports it as a connection error.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn excessive_load_is_a_connection_error() {
+    let mut opts = LinkOpts::new(None);
+    opts.server.limits.ping_budget = 1;
+    let mut link = settled(&opts);
+    let mut pings = Vec::new();
+    for _ in 0..2 {
+      link.client.conn.queue_test_frames(&PING);
+      let _ = link.client.flush(link.now_us);
+      pings.extend(link.client.take_datagrams());
+    }
+    let meta = crate::quic::DatagramMeta { peer: CLIENT_ADDR, local: None, segment_size: None };
+    let server = &mut link.server;
+    let (app, pools) = (&mut server.app, &mut server.parts.pools);
+    assert!(server.conn.recv_datagram(link.now_us, &mut pings[0], meta, app, pools).is_ok());
+    let rslt = server.conn.recv_datagram(link.now_us, &mut pings[1], meta, app, pools);
+    assert!(
+      matches!(
+        rslt,
+        Err(crate::Error::QuicClose(
+          TransportErrorCode::ApplicationError,
+          QuicError::ExcessiveLoad
+        ))
+      ),
+      "{rslt:?}"
+    );
+    assert_eq!((server.conn.state(), server.conn.close.app), (ConnState::Closing, true));
   }
 
   // RFC 9000 table 3 lets 1-RTT packets carry HANDSHAKE_DONE, but only servers send it.

@@ -18,10 +18,12 @@
 //! Besides the shared configuration and the random number generator, the whole state of a
 //! handshake (key schedule, transcript, buffers) lives in a box that this thread pools, and the two
 //! buffers come from this thread's TLS pools ([`TlsBuffer`]): both go back zeroed when this is
-//! dropped, which a connection does once the handshake is confirmed. The reader buffer holds the transport parameters that are kept (the local ones of a
-//! server until its EncryptedExtensions is written, then those of the peer), followed by the
-//! handshake message that is arriving, at most [`MAX_HANDSHAKE_MESSAGE`] bytes. The writer buffer
-//! holds what is sent: the bytes of Initial, then those of Handshake.
+//! dropped, which a connection does once the handshake is confirmed.
+//!
+//! The reader buffer holds the transport parameters that are kept (the local ones of a server
+//! until its EncryptedExtensions is written, then those of the peer), followed by the handshake
+//! message that is arriving, at most [`MAX_HANDSHAKE_MESSAGE`] bytes. The writer buffer holds what
+//! is sent: the bytes of Initial, then those of Handshake.
 
 use crate::{
   collections::ArrayVectorCopy,

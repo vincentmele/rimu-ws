@@ -36,7 +36,8 @@ pub enum QuicError {
   /// A packet has no frames (RFC 9000 section 12.4).
   EmptyPacket,
   /// A peer went past a budget of [`crate::quic::QuicLimits`]: the connection closes with
-  /// [`crate::quic::QuicLimits::excessive_load_app_code`].
+  /// [`crate::quic::QuicLimits::excessive_load_app_code`], an application error (with
+  /// [`TransportErrorCode::ApplicationError`] in Initial and Handshake packets).
   ExcessiveLoad,
   /// A frame that only the other role sends, such as HANDSHAKE_DONE from a client.
   FrameFromWrongRole,

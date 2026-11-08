@@ -3,9 +3,10 @@
 //!
 //! A sliding window of bitmaps holds the most recent 1024 packet numbers. Packet numbers below the
 //! window, or below the ranges that an acknowledged ACK of ours reported, are not accepted again:
-//! RFC 9000 section 13.2.3 allows forgetting a range only on that condition. The window never
-//! slides past ack-eliciting packets that no ACK of ours reported yet: the packet that would make
-//! it slide is refused until an ACK is sent, so the peer does not take them for lost.
+//! RFC 9000 section 13.2.3 allows forgetting a range only on that condition. Every packet is
+//! accepted whatever the window: when it slides past packets that no ACK of ours reported yet,
+//! their ranges are kept apart (at most 16, the oldest dropped first) and reported by the next
+//! ACK, so the peer does not take them for lost.
 
 use crate::quic::FrameWriter;
 use core::ops::RangeInclusive;
@@ -16,6 +17,8 @@ const WINDOW: u64 = 64 * WORDS as u64;
 // The most ranges of an ACK frame of ours. Older ranges are not reported, as if the window ended
 // before them.
 const MAX_WRITTEN_RANGES: usize = 32;
+// The most ranges kept for the next ACK of what slid off the window
+const MAX_SPILLED: usize = 16;
 
 /// See the [module documentation](self).
 #[derive(Clone, Copy, Debug)]
@@ -31,6 +34,10 @@ pub(crate) struct RecvTracker {
   largest: Option<u64>,
   // When `largest` arrived, for the ACK Delay field
   largest_time_us: u64,
+  // Ranges below the window that no ACK frame of ours reported, from the oldest to the newest,
+  // the first `spilled_len` of them
+  spilled: [(u64, u64); MAX_SPILLED],
+  spilled_len: u8,
   // The smallest ack-eliciting packet number since the last ACK frame of ours
   unreported_low: Option<u64>,
 }
@@ -45,6 +52,8 @@ impl RecvTracker {
       floor: 0,
       largest: None,
       largest_time_us: 0,
+      spilled: [(0, 0); MAX_SPILLED],
+      spilled_len: 0,
       unreported_low: None,
     }
   }
@@ -67,14 +76,6 @@ impl RecvTracker {
     self.bits.get(word).is_some_and(|elem| elem & mask != 0)
   }
 
-  /// If accepting `pn` would slide the window past ack-eliciting packet numbers that no ACK frame
-  /// of ours reported yet.
-  #[inline]
-  pub(crate) fn would_forget_unreported(&self, pn: u64) -> bool {
-    pn >= self.base.saturating_add(WINDOW)
-      && self.unreported_low.is_some_and(|elem| window_base(pn) > elem)
-  }
-
   /// The largest packet number received, if any.
   #[inline]
   pub(crate) const fn largest(&self) -> Option<u64> {
@@ -89,14 +90,28 @@ impl RecvTracker {
     if floor > self.floor {
       self.floor = floor;
     }
+    // The ranges kept apart are below the window: those up to the acknowledged ACK go too
+    let mut kept = 0usize;
+    for idx in 0..usize::from(self.spilled_len) {
+      let Some(&(start, end)) = self.spilled.get(idx) else {
+        break;
+      };
+      if end < floor {
+        continue;
+      }
+      if let Some(slot) = self.spilled.get_mut(kept) {
+        *slot = (start.max(floor), end);
+      }
+      kept = kept.wrapping_add(1);
+    }
+    self.spilled_len = u8::try_from(kept).unwrap_or(0);
   }
 
   /// Records `pn`, which arrived at `now_us` in a packet that has been processed. Returns `false`,
-  /// and changes nothing, if it is a duplicate (see [`Self::is_duplicate`]) or if it would forget
-  /// packets that are not reported yet (see [`Self::would_forget_unreported`]).
+  /// and changes nothing, if it is a duplicate (see [`Self::is_duplicate`]).
   #[inline]
   pub(crate) fn on_packet(&mut self, pn: u64, ack_eliciting: bool, now_us: u64) -> bool {
-    if self.is_duplicate(pn) || self.would_forget_unreported(pn) {
+    if self.is_duplicate(pn) {
       return false;
     }
     if pn >= self.base.saturating_add(WINDOW) {
@@ -125,6 +140,7 @@ impl RecvTracker {
   #[inline]
   pub(crate) const fn on_ack_sent(&mut self) {
     self.ack_pending = false;
+    self.spilled_len = 0;
     self.unreported_low = None;
   }
 
@@ -146,8 +162,27 @@ impl RecvTracker {
       || w.write_ack(largest, delay, self.ranges().take(1))
   }
 
-  /// The ranges that an ACK frame would report, from the largest packet numbers to the smallest.
+  /// The ranges that an ACK frame would report, from the largest packet numbers to the smallest:
+  /// those of the window, then those kept from below it, adjacent ones merged.
   pub(crate) fn ranges(&self) -> impl Iterator<Item = RangeInclusive<u64>> + '_ {
+    let spilled = self.spilled.get(..usize::from(self.spilled_len)).unwrap_or_default();
+    let mut inner =
+      self.window_ranges().chain(spilled.iter().rev().map(|&(start, end)| start..=end)).peekable();
+    core::iter::from_fn(move || {
+      let first = inner.next()?;
+      let (mut start, end) = (*first.start(), *first.end());
+      while let Some(next) = inner.peek()
+        && next.end().wrapping_add(1) == start
+      {
+        start = *next.start();
+        let _ = inner.next();
+      }
+      Some(start..=end)
+    })
+  }
+
+  // The ranges of the window, from the largest packet numbers to the smallest.
+  fn window_ranges(&self) -> impl Iterator<Item = RangeInclusive<u64>> + '_ {
     let mut next = self.largest.filter(|elem| *elem >= self.floor);
     core::iter::from_fn(move || {
       let end = self.highest(next?, true)?;
@@ -179,6 +214,46 @@ impl RecvTracker {
     }
   }
 
+  // The smallest packet number from `pn`, and below `to`, that was received (`set`) or that was
+  // not, in the window.
+  fn lowest(&self, pn: u64, to: u64, set: bool) -> Option<u64> {
+    let mut pn = pn;
+    while pn < to {
+      let (word, bit) = self.split(pn)?;
+      let raw = *self.bits.get(word)?;
+      let bits = (if set { raw } else { !raw }) >> bit;
+      if bits != 0 {
+        let found = pn.wrapping_add(u64::from(bits.trailing_zeros()));
+        return (found < to).then_some(found);
+      }
+      pn = pn.wrapping_add(64u64.wrapping_sub(u64::from(bit)));
+    }
+    None
+  }
+
+  // Keeps the range `start..=end`, which is above the ranges kept so far, for the next ACK: merged
+  // with the newest one if adjacent, in place of the oldest one if there is no room.
+  fn push_spilled(&mut self, start: u64, end: u64) {
+    let len = usize::from(self.spilled_len);
+    if let Some(last) = len.checked_sub(1).and_then(|idx| self.spilled.get_mut(idx))
+      && last.1.wrapping_add(1) == start
+    {
+      last.1 = end;
+      return;
+    }
+    if len >= MAX_SPILLED {
+      self.spilled.copy_within(1.., 0);
+      if let Some(last) = self.spilled.last_mut() {
+        *last = (start, end);
+      }
+      return;
+    }
+    if let Some(slot) = self.spilled.get_mut(len) {
+      *slot = (start, end);
+      self.spilled_len = self.spilled_len.wrapping_add(1);
+    }
+  }
+
   // The word and the mask of `pn`, which must be in the window.
   fn position(&self, pn: u64) -> Option<(usize, u64)> {
     let (word, bit) = self.split(pn)?;
@@ -188,6 +263,16 @@ impl RecvTracker {
   // Moves the window up so that its last word holds `pn`, dropping the oldest bits.
   fn slide_to(&mut self, pn: u64) {
     let new_base = window_base(pn);
+    // What falls off the window and was not reported yet is kept apart, range by range
+    if let Some(low) = self.unreported_low.filter(|elem| *elem < new_base) {
+      let to = new_base.min(self.base.saturating_add(WINDOW));
+      let mut from = low.max(self.floor);
+      while let Some(start) = self.lowest(from, to, true) {
+        let end = self.lowest(start, to, false).unwrap_or(to);
+        self.push_spilled(start, end.wrapping_sub(1));
+        from = end;
+      }
+    }
     let shift = usize::try_from(new_base.wrapping_sub(self.base) / 64).unwrap_or(usize::MAX);
     if shift >= WORDS {
       self.bits = [0; WORDS];
@@ -339,39 +424,89 @@ mod tests {
     assert!(tracker.is_duplicate(WINDOW + 70));
   }
 
-  // 900 packets between two flushes, all of them in the ACK of the next one.
-  #[test]
-  fn nine_hundred_packets_in_one_turn_are_all_reported() {
-    let mut tracker = RecvTracker::new();
-    for pn in 0..900 {
-      assert!(tracker.on_packet(pn, true, 0));
+  // The descending ranges of the packet numbers below `end` that `received` keeps.
+  fn reference(end: u64, received: impl Fn(u64) -> bool) -> Vec<(u64, u64)> {
+    let mut rslt: Vec<(u64, u64)> = Vec::new();
+    for pn in (0..end).filter(|el| received(*el)) {
+      match rslt.last_mut() {
+        Some(last) if last.1 + 1 == pn => last.1 = pn,
+        _ => rslt.push((pn, pn)),
+      }
     }
-    assert_eq!(ranges(&tracker), [(0, 899)]);
-    assert_eq!(written_ack(&tracker, 0).unwrap().2, [(0, 899)]);
+    rslt.reverse();
+    rslt
   }
 
-  // A packet that would slide the window past ack-eliciting packets that no ACK reported yet waits
-  // for that ACK: it is refused until then.
+  // 2,000 packets between two flushes, more than the window holds: every one is accepted and the
+  // next ACK reports them all.
   #[test]
-  fn a_slide_never_forgets_unreported_packets() {
+  fn two_thousand_packets_in_one_turn_are_all_reported() {
     let mut tracker = RecvTracker::new();
-    for pn in 0..WINDOW {
+    for pn in 0..2000 {
+      assert!(tracker.on_packet(pn, true, 0), "{pn}");
+    }
+    assert_eq!(ranges(&tracker), [(0, 1999)]);
+    assert_eq!(written_ack(&tracker, 0).unwrap().2, [(0, 1999)]);
+    // Once reported, what fell off the window is forgotten at the next slide
+    tracker.on_ack_sent();
+    assert!(tracker.on_packet(2100, true, 0));
+    assert_eq!(ranges(&tracker), [(2100, 2100), (1088, 1999)]);
+  }
+
+  // Packet numbers that a peer skips stay gaps across slides: the ranges are exact.
+  #[test]
+  fn a_gappy_peer_is_reported_exactly_across_a_slide() {
+    let received = |pn: u64| pn % 250 != 125;
+    let mut tracker = RecvTracker::new();
+    for pn in (0..2000).filter(|el| received(*el)) {
+      assert!(tracker.on_packet(pn, true, 0), "{pn}");
+    }
+    let expected = reference(2000, received);
+    assert_eq!(expected.len(), 9);
+    assert_eq!(ranges(&tracker), expected);
+    assert_eq!(written_ack(&tracker, 0).unwrap().2, expected);
+  }
+
+  // Beyond the ranges that are kept for what slid off the window, the oldest go first.
+  #[test]
+  fn spilled_ranges_beyond_the_cap_lose_the_oldest() {
+    let received = |pn: u64| pn >= 1000 || pn % 10 != 5;
+    let mut tracker = RecvTracker::new();
+    for pn in (0..3000).filter(|el| received(*el)) {
+      assert!(tracker.on_packet(pn, true, 0), "{pn}");
+    }
+    let expected = reference(3000, received);
+    let got = ranges(&tracker);
+    assert!(got.len() < expected.len());
+    // The newest ranges, exactly, and none of the oldest
+    assert_eq!(got, expected[..got.len()]);
+    assert_eq!(got[0], (996, 2999));
+    assert!(got.len() > 1 && got.last().unwrap().0 > 0);
+    assert_eq!(written_ack(&tracker, 0).unwrap().2, got);
+  }
+
+  // A packet number that slid off the window is a duplicate, whether it is in a range kept for the
+  // next ACK or not.
+  #[test]
+  fn a_duplicate_of_a_spilled_packet_is_detected() {
+    let mut tracker = RecvTracker::new();
+    for pn in 0..1500 {
       assert!(tracker.on_packet(pn, true, 0));
     }
-    assert!(tracker.would_forget_unreported(WINDOW));
-    assert!(!tracker.on_packet(WINDOW, true, 0));
-    assert_eq!(ranges(&tracker), [(0, WINDOW - 1)]);
+    assert!(tracker.is_duplicate(5) && tracker.is_duplicate(511));
+    assert!(!tracker.on_packet(5, true, 0));
+    assert_eq!(ranges(&tracker), [(0, 1499)]);
+    // The spilled ranges are reported once, in the ACK that is sent; then the window is left
     tracker.on_ack_sent();
-    assert!(!tracker.would_forget_unreported(WINDOW));
-    assert!(tracker.on_packet(WINDOW, true, 0));
-    assert_eq!(ranges(&tracker), [(64, WINDOW)]);
-    // Packets that are not ack-eliciting are not waited for
+    assert_eq!(ranges(&tracker), [(512, 1499)]);
+    assert!(!tracker.on_packet(5, true, 0));
+    // An acknowledged ACK of ours removes them too
     let mut tracker = RecvTracker::new();
-    for pn in 0..WINDOW {
-      assert!(tracker.on_packet(pn, false, 0));
+    for pn in 0..1500 {
+      assert!(tracker.on_packet(pn, true, 0));
     }
-    assert!(!tracker.would_forget_unreported(WINDOW + 500));
-    assert!(tracker.on_packet(WINDOW + 500, true, 0));
+    tracker.on_ack_of_our_ack(299);
+    assert_eq!(ranges(&tracker), [(300, 1499)]);
   }
 
   #[test]
