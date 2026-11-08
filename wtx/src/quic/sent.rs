@@ -129,29 +129,38 @@ impl SentRing {
       self.slots = pools.sent_rings.take().unwrap_or_else(|| Vec::with_capacity(SENT_RING_LEN));
       self.slots.resize(SENT_RING_LEN, None);
     }
-    if self.next_pn.wrapping_sub(self.base) < SENT_RING_LEN as u64 {
-      return true;
-    }
-    let base = self.base;
-    let Some(slot) = self.slot_mut(base) else {
-      return false;
-    };
-    match *slot {
-      Some(packet) if packet.in_flight => return false,
-      Some(packet) => {
-        *slot = None;
-        pools.frame_refs.free(packet.frames);
+    // Packet numbers used without a record (`skip`) can leave more than one slot to free
+    while self.next_pn.wrapping_sub(self.base) >= SENT_RING_LEN as u64 {
+      let base = self.base;
+      let Some(slot) = self.slot_mut(base) else {
+        return false;
+      };
+      match *slot {
+        Some(packet) if packet.in_flight => return false,
+        Some(packet) => {
+          *slot = None;
+          pools.frame_refs.free(packet.frames);
+        }
+        None => {}
       }
-      None => {}
+      self.base = base.wrapping_add(1);
+      self.advance_base();
     }
-    self.advance_base();
     true
+  }
+
+  /// Uses up the next packet number without a record: the packet needs none, as a
+  /// CONNECTION_CLOSE.
+  #[inline]
+  pub(crate) const fn skip(&mut self) {
+    self.next_pn = self.next_pn.wrapping_add(1);
   }
 
   /// Takes the record of `pn` out of the ring, if it is held.
   #[inline]
   pub(crate) fn take(&mut self, pn: u64) -> Option<SentPacket> {
-    if pn < self.base || pn >= self.next_pn {
+    // Records are only ever held for the `SENT_RING_LEN` packet numbers from the base
+    if pn < self.base || pn >= self.next_pn || pn.wrapping_sub(self.base) >= SENT_RING_LEN as u64 {
       return None;
     }
     let packet = self.slot_mut(pn)?.take();
@@ -241,6 +250,27 @@ mod tests {
     assert!(!ring.reserve(&mut pools));
     assert!(ring.take(0).is_some());
     assert!(ring.reserve(&mut pools));
+  }
+
+  // Packet numbers without a record leave the records that are held where they are
+  #[test]
+  fn skipped_packet_numbers_have_no_record() {
+    let mut pools = QuicPools::new();
+    let mut ring = SentRing::new();
+    assert!(ring.reserve(&mut pools));
+    ring.on_sent(packet(true, FrameRefRange::EMPTY));
+    for _ in 0..SENT_RING_LEN {
+      ring.skip();
+    }
+    assert_eq!(ring.next_pn(), 1 + SENT_RING_LEN as u64);
+    // Packet 256 shares the slot of packet 0, whose record it is not
+    assert!(ring.take(SENT_RING_LEN as u64).is_none());
+    // The record of 0, in flight, holds the ring back
+    assert!(!ring.reserve(&mut pools));
+    assert!(ring.take(0).is_some());
+    assert!(ring.reserve(&mut pools));
+    ring.on_sent(packet(false, FrameRefRange::EMPTY));
+    assert!(ring.take(SENT_RING_LEN as u64 + 1).is_some());
   }
 
   #[test]

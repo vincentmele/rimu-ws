@@ -7,7 +7,8 @@
 
 use crate::{
   quic::{
-    Cid, ConnParams, DatagramMeta, FlushOutcome, QuicApp, QuicConn, TxArena, pools::QuicPools,
+    Cid, ConnParams, DatagramMeta, FlushOutcome, QuicApp, QuicConn, TransportParams, TxArena,
+    pools::QuicPools,
   },
   rng::{ChaCha20, Rng as _},
   sync::{Arc, AtomicU64},
@@ -70,6 +71,11 @@ impl Parts {
   pub(crate) fn new() -> Self {
     Self { pools: QuicPools::new(), tx: TxArena::new(ARENA_BYTES).unwrap() }
   }
+
+  // What takes the place of parts that were moved out.
+  fn placeholder() -> Self {
+    Self { pools: QuicPools::new(), tx: TxArena::new(0).unwrap() }
+  }
 }
 
 /// How to build a [`Link`].
@@ -77,6 +83,8 @@ impl Parts {
 pub(crate) struct LinkOpts {
   /// The parameters of the client.
   pub(crate) client: ConnParams,
+  /// Changes the transport parameters that the client sends.
+  pub(crate) client_tp: fn(&mut TransportParams),
   /// The allocation counters of the server and of everything else, if allocations are counted.
   pub(crate) counters: Option<(&'static AtomicU64, &'static AtomicU64)>,
   /// Seeds the random numbers of the link.
@@ -85,6 +93,8 @@ pub(crate) struct LinkOpts {
   pub(crate) server: ConnParams,
   /// The TLS configuration of the server, made once and shared.
   pub(crate) server_config: Arc<TlsConfig<SkCtx>>,
+  /// Changes the transport parameters that the server sends.
+  pub(crate) server_tp: fn(&mut TransportParams),
   /// Bytes of an unknown transport parameter that the server sends, to make its flight longer.
   pub(crate) server_tp_padding: usize,
 }
@@ -94,10 +104,12 @@ impl LinkOpts {
   pub(crate) fn new(suite: Option<CipherSuite>) -> Self {
     Self {
       client: ConnParams::default(),
+      client_tp: |_| {},
       counters: None,
       seed: 1,
       server: ConnParams::default(),
       server_config: server_config(suite),
+      server_tp: |_| {},
       server_tp_padding: 0,
     }
   }
@@ -122,6 +134,13 @@ impl<TCX, const IS_CLIENT: bool> Side<TCX, IS_CLIENT>
 where
   TCX: TlsCtxSk,
 {
+  /// Aborts the connection if it is not closed.
+  pub(crate) fn abort(&mut self) {
+    self.enter();
+    self.conn.abort(&mut self.app, &mut self.parts.pools);
+    self.leave();
+  }
+
   /// Flushes the connection into its arena.
   pub(crate) fn flush(&mut self, now_us: u64) -> FlushOutcome {
     self.enter();
@@ -194,7 +213,11 @@ impl Link {
   }
 
   /// [`Self::new`] with pools and arenas that were used before.
-  pub(crate) fn with_parts(opts: &LinkOpts, client_parts: Parts, server_parts: Parts) -> Self {
+  pub(crate) fn with_parts(
+    opts: &LinkOpts,
+    mut client_parts: Parts,
+    mut server_parts: Parts,
+  ) -> Self {
     let now_us = 1_000_000;
     let mut rng = ChaCha20::from_key([opts.seed; 32]);
     let mut client_cid = [0; 8];
@@ -206,7 +229,15 @@ impl Link {
     let mut client = Side {
       addr: CLIENT_ADDR,
       app: TestApp::default(),
-      conn: client_conn(&opts.client, client_cid, original_dcid, &mut rng, now_us),
+      conn: client_conn(
+        &opts.client,
+        client_cid,
+        original_dcid,
+        &mut rng,
+        now_us,
+        &mut client_parts.pools,
+        opts.client_tp,
+      ),
       counters: None,
       parts: client_parts,
     };
@@ -222,7 +253,8 @@ impl Link {
     if let Some((own, _)) = counters {
       _count_allocations_in(own);
     }
-    let conn = server_conn(opts, server_cid, original_dcid, server_seed, now_us);
+    let conn =
+      server_conn(opts, server_cid, original_dcid, server_seed, now_us, &mut server_parts.pools);
     if let Some((_, others)) = counters {
       _count_allocations_in(others);
     }
@@ -239,9 +271,23 @@ impl Link {
     self.server.on_timeout(self.now_us);
   }
 
-  /// The pools and arenas, for the next link.
-  pub(crate) fn into_parts(self) -> (Parts, Parts) {
-    (self.client.parts, self.server.parts)
+  /// The pools and arenas, for the next link, once both connections are aborted (if they are not
+  /// closed) and the arenas emptied.
+  pub(crate) fn into_parts(mut self) -> (Parts, Parts) {
+    self.abort();
+    // What is still in the arenas is not for the next link
+    let _ = self.client.take_datagrams();
+    let _ = self.server.take_datagrams();
+    (
+      core::mem::replace(&mut self.client.parts, Parts::placeholder()),
+      core::mem::replace(&mut self.server.parts, Parts::placeholder()),
+    )
+  }
+
+  /// Aborts the connections that are not closed.
+  pub(crate) fn abort(&mut self) {
+    self.client.abort();
+    self.server.abort();
   }
 
   /// Flushes both sides and delivers what they sent, until nothing moves anymore.
@@ -275,6 +321,12 @@ impl Link {
   }
 }
 
+impl Drop for Link {
+  fn drop(&mut self) {
+    self.abort();
+  }
+}
+
 /// A client connection on the client mode of the TLS stack, which sends its first Initial packet
 /// to [`SERVER_ADDR`] with `original_dcid`.
 pub(crate) fn client_conn(
@@ -283,12 +335,16 @@ pub(crate) fn client_conn(
   original_dcid: Cid,
   rng: &mut ChaCha20,
   now_us: u64,
+  pools: &mut QuicPools,
+  change_tp: fn(&mut TransportParams),
 ) -> ClientConn {
   let mut tp = [0; 256];
-  let len = params.transport_params(local_cid, None).encode(&mut tp).unwrap();
+  let mut params_tp = params.transport_params(local_cid, None);
+  change_tp(&mut params_tp);
+  let len = params_tp.encode(&mut tp).unwrap();
   let tls =
     QuicTls::new_client("localhost", b"h3", &tp[..len], ChaCha20::from_key(seed(rng))).unwrap();
-  QuicConn::new_client(params, local_cid, original_dcid, SERVER_ADDR, tls, now_us).unwrap()
+  QuicConn::new_client(params, local_cid, original_dcid, SERVER_ADDR, tls, now_us, pools).unwrap()
 }
 
 /// The TLS configuration of the test certificate, offering only `suite` if given.
@@ -315,9 +371,12 @@ fn server_conn(
   original_dcid: Cid,
   seed: u32,
   now_us: u64,
+  pools: &mut QuicPools,
 ) -> ServerConn {
   let mut tp = [0; 256];
-  let len = opts.server.transport_params(local_cid, Some(original_dcid)).encode(&mut tp).unwrap();
+  let mut params_tp = opts.server.transport_params(local_cid, Some(original_dcid));
+  (opts.server_tp)(&mut params_tp);
+  let len = params_tp.encode(&mut tp).unwrap();
   let mut key = [0; 32];
   key[..4].copy_from_slice(&seed.to_le_bytes());
   let rng = ChaCha20::from_key(key);
@@ -332,7 +391,7 @@ fn server_conn(
     QuicTls::new(&opts.server_config, &padded, rng).unwrap()
   };
   let meta = DatagramMeta { peer: CLIENT_ADDR, local: None, segment_size: None };
-  QuicConn::new_server(&opts.server, local_cid, original_dcid.as_slice(), meta, tls, now_us)
+  QuicConn::new_server(&opts.server, local_cid, original_dcid.as_slice(), meta, tls, now_us, pools)
     .unwrap()
 }
 

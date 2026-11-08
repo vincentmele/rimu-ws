@@ -3,11 +3,11 @@
 //! entries when the worker is idle.
 //!
 //! A connection holds indices into [`FrameRefPool`], and owns what it took from the free lists
-//! until it gives it back: a connection that is dropped without being closed frees what it held
-//! instead, so the next ones allocate it again.
+//! until it gives it back, once closed or aborted.
 
 use crate::quic::{
   QuicError, TransportErrorCode,
+  conn::HandshakeSpaces,
   sent::{FrameRef, FrameRefRange, SentPacket},
   wipe,
 };
@@ -38,6 +38,8 @@ pub(crate) struct QuicPools {
   pub(crate) crypto_buffers: FreeList<Box<CryptoBuffer>>,
   /// The frames of sent packets.
   pub(crate) frame_refs: FrameRefPool,
+  /// The Initial and Handshake spaces of a handshake, keys included (wiped when they come back).
+  pub(crate) handshake_spaces: FreeList<Box<HandshakeSpaces>>,
   /// Received stream data that does not fit in a stream slot.
   #[allow(dead_code, reason = "taken by the streams")]
   pub(crate) rx_blocks: FreeList<Box<[u8; RX_BLOCK_LEN]>>,
@@ -51,6 +53,7 @@ impl QuicPools {
     Self {
       crypto_buffers: FreeList::new(),
       frame_refs: FrameRefPool::new(MAX_CHUNKS),
+      handshake_spaces: FreeList::new(),
       rx_blocks: FreeList::new(),
       sent_rings: FreeList::new(),
     }
@@ -62,6 +65,7 @@ impl QuicPools {
   pub(crate) fn trim_idle(&mut self) {
     self.crypto_buffers.trim(IDLE_KEEP);
     self.frame_refs.trim_idle(IDLE_KEEP_CHUNKS);
+    self.handshake_spaces.trim(IDLE_KEEP);
     self.rx_blocks.trim(IDLE_KEEP);
     self.sent_rings.trim(IDLE_KEEP);
   }

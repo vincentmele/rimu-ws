@@ -9,8 +9,10 @@
 use crate::collections::Vector;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-// The limits of the kernel for one UDP_SEGMENT send
-const MAX_TRAIN_BYTES: usize = 65_535;
+// The limits of the kernel for one UDP_SEGMENT send: 64 segments and 65,535 bytes of IP payload,
+// which leaves 65,535 - 20 - 8 bytes of UDP payload over IPv4 and 65,535 - 8 over IPv6
+const MAX_TRAIN_BYTES_V4: usize = 65_507;
+const MAX_TRAIN_BYTES_V6: usize = 65_527;
 const MAX_TRAIN_SEGMENTS: u16 = 64;
 // Bytes of the arena per train descriptor: datagrams to different peers that are shorter than
 // this on average run out of descriptors before the arena runs out of bytes.
@@ -74,6 +76,9 @@ impl TxArena {
   /// Room for a datagram of at most `max_len` bytes to `peer`, from `local`, or `None` if the
   /// arena is full. The datagram is written into the returned bytes and then given to
   /// [`Self::commit`]; another call to this method forgets it.
+  ///
+  /// Once every train descriptor is taken, only a datagram that joins the newest train has room,
+  /// and the returned bytes are then at most as many as the datagrams of that train.
   #[inline]
   pub(crate) fn begin(
     &mut self,
@@ -83,9 +88,12 @@ impl TxArena {
   ) -> Option<&mut [u8]> {
     self.begun = None;
     let capacity = self.buffer.len();
-    if max_len == 0 || max_len > capacity.min(MAX_TRAIN_BYTES) || self.count >= self.trains.len() {
+    if max_len == 0 || max_len > capacity.min(max_train_bytes(&peer)) {
       return None;
     }
+    let must_join = self.count >= self.trains.len();
+    let max_len =
+      if must_join { max_len.min(self.joinable_segment(peer, local)?) } else { max_len };
     let (start, after_newest) = if let (Some(oldest), Some(newest)) = (self.oldest(), self.newest())
     {
       let head = newest.start.wrapping_add(newest.len);
@@ -108,14 +116,18 @@ impl TxArena {
     } else {
       (0, false)
     };
+    if must_join && !after_newest {
+      return None;
+    }
     self.begun = Some(Begun { after_newest, local, max_len, peer, start });
     self.buffer.get_mut(start..start.wrapping_add(max_len))
   }
 
   /// Takes the first `len` bytes of the datagram that [`Self::begin`] handed out. They join the
   /// newest train if it goes to the same peer from the same address, has not been submitted, has
-  /// fewer than 64 datagrams and fewer than 65,535 bytes with this one, and if its datagrams have
-  /// `len` bytes. A shorter datagram is the last one of its train.
+  /// fewer than 64 datagrams, at most 65,507 bytes with this one to an IPv4 peer (v4-mapped IPv6
+  /// included) or 65,527 to an IPv6 peer, and if its datagrams have `len` bytes. A shorter
+  /// datagram is the last one of its train.
   #[inline]
   pub(crate) fn commit(&mut self, len: usize) {
     let Some(begun) = self.begun.take() else {
@@ -133,7 +145,7 @@ impl TxArena {
       && newest.peer == begun.peer
       && newest.local == begun.local
       && newest.segments < MAX_TRAIN_SEGMENTS
-      && newest.len.wrapping_add(len) <= MAX_TRAIN_BYTES
+      && newest.len.wrapping_add(len) <= max_train_bytes(&begun.peer)
       && len <= usize::from(newest.segment_size)
     {
       newest.len = newest.len.wrapping_add(len);
@@ -144,6 +156,10 @@ impl TxArena {
       return;
     }
     let capacity = self.trains.len();
+    if self.count >= capacity {
+      // `begin` only hands out such bytes to a datagram that joins the newest train
+      return;
+    }
     let idx = self.first.wrapping_add(self.count) % capacity;
     let Some(slot) = self.trains.get_mut(idx) else {
       return;
@@ -214,6 +230,20 @@ impl TxArena {
     }
   }
 
+  // The size of the datagrams of the newest train if one more of them to `peer` from `local` can
+  // join it.
+  fn joinable_segment(&self, peer: SocketAddr, local: Option<IpAddr>) -> Option<usize> {
+    let newest = self.newest()?;
+    let segment = usize::from(newest.segment_size);
+    let joinable = self.open
+      && newest.state == TrainState::Pending
+      && newest.peer == peer
+      && newest.local == local
+      && newest.segments < MAX_TRAIN_SEGMENTS
+      && newest.len.wrapping_add(segment) <= max_train_bytes(&peer);
+    joinable.then_some(segment)
+  }
+
   fn is_newest(&self, id: TrainId) -> bool {
     self.newest().is_some_and(|train| train.id == id.0)
   }
@@ -244,6 +274,14 @@ impl TxArena {
     }
     let capacity = self.trains.len();
     self.trains.get_mut(self.first.wrapping_add(offset) % capacity)
+  }
+}
+
+// The most UDP payload of one train to `peer`.
+fn max_train_bytes(peer: &SocketAddr) -> usize {
+  match peer.ip() {
+    IpAddr::V6(elem) if elem.to_ipv4_mapped().is_none() => MAX_TRAIN_BYTES_V6,
+    IpAddr::V4(_) | IpAddr::V6(_) => MAX_TRAIN_BYTES_V4,
   }
 }
 
@@ -336,7 +374,7 @@ mod tests {
   #[test]
   fn trains_respect_the_segment_and_byte_limits() {
     let mut arena = TxArena::new(TxArena::DEFAULT_BYTES).unwrap();
-    // 65,535 bytes at most: 44 datagrams of 1472
+    // 65,507 bytes at most to an IPv4 peer: 44 datagrams of 1472
     for _ in 0..45 {
       push(&mut arena, A, None, 1472, 0);
     }
@@ -360,6 +398,30 @@ mod tests {
     arena.mark_submitted(last);
     push(&mut arena, A, local, 1472, 0);
     assert_eq!(trains(&arena), [(1200, 1200, A), (1472, 1472, A), (1472, 1472, A)]);
+  }
+
+  // The kernel takes at most 65,535 bytes of IP payload in one UDP_SEGMENT send: 65,507 bytes of
+  // UDP payload over IPv4 (v4-mapped IPv6 peers included) and 65,527 over IPv6.
+  #[test]
+  fn trains_respect_the_gso_payload_limit_of_each_family() {
+    let mapped = SocketAddr::new(IpAddr::V6(Ipv4Addr::new(10, 0, 0, 1).to_ipv6_mapped()), 4433);
+    let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 4433);
+    for peer in [A, mapped] {
+      let mut arena = TxArena::new(TxArena::DEFAULT_BYTES).unwrap();
+      for _ in 0..48 {
+        push(&mut arena, peer, None, 1365, 0);
+      }
+      assert_eq!(trains(&arena), [(1365, 47 * 1365, peer), (1365, 1365, peer)], "{peer}");
+      assert!(arena.begin(peer, None, 65_508).is_none());
+      assert!(arena.begin(peer, None, 65_507).is_some());
+    }
+    let mut arena = TxArena::new(TxArena::DEFAULT_BYTES).unwrap();
+    for _ in 0..49 {
+      push(&mut arena, v6, None, 1365, 0);
+    }
+    assert_eq!(trains(&arena), [(1365, 48 * 1365, v6), (1365, 1365, v6)]);
+    assert!(arena.begin(v6, None, 65_528).is_none());
+    assert!(arena.begin(v6, None, 65_527).is_some());
   }
 
   #[test]
@@ -425,6 +487,29 @@ mod tests {
 
   fn ids_of(arena: &TxArena) -> TrainId {
     arena.pending().next().unwrap().id
+  }
+
+  // With every descriptor taken, a datagram can still join the newest train, at most as long as
+  // its datagrams.
+  #[test]
+  fn a_datagram_joins_the_newest_train_without_a_free_descriptor() {
+    let mut arena = TxArena::new(TxArena::DEFAULT_BYTES).unwrap();
+    let mut port = 1u16;
+    while let Some(buffer) = arena.begin(SocketAddr::new(A.ip(), port), None, 60) {
+      buffer.fill(0);
+      arena.commit(60);
+      port = port.wrapping_add(1);
+    }
+    let last = SocketAddr::new(A.ip(), port.wrapping_sub(1));
+    let buffer = arena.begin(last, None, 1500).unwrap();
+    assert_eq!(buffer.len(), 60);
+    buffer.fill(7);
+    arena.commit(60);
+    let newest = arena.pending().last().unwrap();
+    assert_eq!((newest.peer, newest.segment_size, newest.bytes.len()), (last, 60, 120));
+    assert!(newest.bytes.iter().skip(60).all(|el| *el == 7));
+    // Another peer still waits for a descriptor
+    assert!(arena.begin(A, None, 60).is_none());
   }
 
   #[test]

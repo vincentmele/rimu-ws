@@ -15,9 +15,10 @@
 //!
 //! # Memory
 //!
-//! The key schedule and the two buffers come from this thread's TLS pools ([`KsBox`],
-//! [`TlsBuffer`]), which take them back zeroed when this is dropped: drop it once the handshake is
-//! confirmed. The reader buffer holds the transport parameters that are kept (the local ones of a
+//! Besides the shared configuration and the random number generator, the whole state of a
+//! handshake (key schedule, transcript, buffers) lives in a box that this thread pools, and the two
+//! buffers come from this thread's TLS pools ([`TlsBuffer`]): both go back zeroed when this is
+//! dropped, which a connection does once the handshake is confirmed. The reader buffer holds the transport parameters that are kept (the local ones of a
 //! server until its EncryptedExtensions is written, then those of the peer), followed by the
 //! handshake message that is arriving, at most [`MAX_HANDSHAKE_MESSAGE`] bytes. The writer buffer
 //! holds what is sent: the bytes of Initial, then those of Handshake.
@@ -30,7 +31,7 @@ use crate::{
   rng::CryptoRng,
   sync::Arc,
   tls::{
-    AlertDescription, CipherSuite, DLFT_MAX_FRAGMENT_LENGTH, HandshakeTy, KsBox, NamedGroup,
+    AlertDescription, CipherSuite, DLFT_MAX_FRAGMENT_LENGTH, HandshakeTy, NamedGroup,
     SignatureScheme, TlsBuffer, TlsConfig, TlsCtxSk, TlsError,
     key_schedule::KeySchedule,
     protocol::handshake::Handshake,
@@ -41,10 +42,13 @@ use crate::{
     tls_hash::TlsHash,
   },
 };
+use alloc::boxed::Box;
 use core::{
   fmt::{Debug, Formatter},
   hint::cold_path,
-  ops::Range,
+  mem::{ManuallyDrop, MaybeUninit},
+  ops::{Deref, DerefMut, Range},
+  ptr,
 };
 
 /// The longest handshake message that is buffered: a longer one closes the connection with
@@ -55,6 +59,16 @@ const INITIAL_LEVEL: u8 = 0;
 const HANDSHAKE_LEVEL: u8 = 1;
 const DATA_LEVEL: u8 = 2;
 const SECRET_LEN: usize = MAX_HASH_LEN;
+// State boxes that a thread keeps
+#[cfg(feature = "std")]
+const STATE_POOL_MAX: usize = 64;
+
+#[cfg(feature = "std")]
+std::thread_local! {
+  #[allow(clippy::vec_box, reason = "the boxes are what is pooled")]
+  static STATE_POOL: core::cell::RefCell<alloc::vec::Vec<Box<MaybeUninit<QuicTlsState>>>> =
+    const { core::cell::RefCell::new(alloc::vec::Vec::new()) };
+}
 
 /// The traffic secrets of one encryption level, from which the connection derives its packet
 /// protection keys with [`crate::quic::keys_from_secret`].
@@ -100,18 +114,24 @@ impl Drop for QuicTlsSecrets {
 /// In QUIC the only application protocol is HTTP/3: whatever ALPN the configuration lists, the
 /// server negotiates `h3` and nothing else.
 pub(crate) struct QuicTls<const IS_CLIENT: bool, RNG, TCX> {
+  config: Arc<TlsConfig<TCX>>,
+  rng: RNG,
+  // Everything else, in a box that this thread pools
+  state: StateBox,
+}
+
+// The state of a handshake, which goes back to the thread's pool zeroed (see `StateBox`).
+struct QuicTlsState {
   alpn: ArrayVectorCopy<u8, 8>,
   buffer: TlsBuffer,
-  config: Arc<TlsConfig<TCX>>,
   has_peer_transport_params: bool,
-  key_schedule: KsBox,
+  key_schedule: KeySchedule,
   // Where the message that is arriving begins in the reader buffer
   msg_start: usize,
   named_group: NamedGroup,
   // What is sent in Initial and in Handshake: ranges of the writer buffer
   output_handshake: Range<usize>,
   output_initial: Range<usize>,
-  rng: RNG,
   // The levels whose secrets TLS has (Handshake, then Data), and how many of them were taken
   secrets_ready: u8,
   secrets_taken: u8,
@@ -137,10 +157,11 @@ where
     rng: RNG,
   ) -> crate::Result<Self> {
     let mut this = Self::with_parts(Arc::clone(config), rng, Stage::ClientHello);
-    this.signature_algorithms = filter_signature_algorithms(config);
-    this.buffer.reader_buffer.buffer_mut().extend_from_copyable_slice(local_transport_params)?;
-    this.stored_len = local_transport_params.len();
-    this.msg_start = this.stored_len;
+    let state = &mut *this.state;
+    state.signature_algorithms = filter_signature_algorithms(config);
+    state.buffer.reader_buffer.buffer_mut().extend_from_copyable_slice(local_transport_params)?;
+    state.stored_len = local_transport_params.len();
+    state.msg_start = state.stored_len;
     Ok(this)
   }
 }
@@ -180,10 +201,11 @@ where
     }
     let mut this = Self::with_parts(Arc::new(config), rng, Stage::Failed);
     let client_hello = ClientHello::new(&secrets, &mut this.rng, &*this.config);
+    let state = &mut *this.state;
     Handshake::new(HandshakeTy::ClientHello, client_hello.into_quic(local_transport_params))
-      .encode(&mut TlsEncodeWrapper::from_buffer(&mut this.buffer.writer_buffer))?;
-    this.output_initial = 0..this.buffer.writer_buffer.len();
-    this.stage = Stage::ServerHello(secrets);
+      .encode(&mut TlsEncodeWrapper::from_buffer(&mut state.buffer.writer_buffer))?;
+    state.output_initial = 0..state.buffer.writer_buffer.len();
+    state.stage = Stage::ServerHello(secrets);
     Ok(this)
   }
 }
@@ -197,7 +219,7 @@ where
   #[allow(dead_code, reason = "for the application layer")]
   #[inline]
   pub(crate) fn alpn(&self) -> &[u8] {
-    self.alpn.as_slice()
+    self.state.alpn.as_slice()
   }
 
   /// Marks the first `n` bytes of [`Self::output`] at `space` as sent.
@@ -205,8 +227,8 @@ where
   #[inline]
   pub(crate) fn consume_output(&mut self, space: Space, n: usize) {
     let range = match space {
-      Space::Initial => &mut self.output_initial,
-      Space::Handshake => &mut self.output_handshake,
+      Space::Initial => &mut self.state.output_initial,
+      Space::Handshake => &mut self.state.output_handshake,
       Space::Data => return,
     };
     range.start = range.start.saturating_add(n).min(range.end);
@@ -225,7 +247,7 @@ where
     }
     if let Err(err) = self.read_level(space, data) {
       cold_path();
-      self.stage = Stage::Failed;
+      self.state.stage = Stage::Failed;
       return Err(quic_close(err));
     }
     Ok(())
@@ -234,7 +256,7 @@ where
   /// If the handshake is over: for a server, once the Finished of the client is verified.
   #[inline]
   pub(crate) fn is_complete(&self) -> bool {
-    matches!(self.stage, Stage::Complete)
+    matches!(self.state.stage, Stage::Complete)
   }
 
   /// The handshake bytes to send in CRYPTO frames at `space`: a ServerHello (a ClientHello) in
@@ -242,21 +264,21 @@ where
   #[inline]
   pub(crate) fn output(&self, space: Space) -> &[u8] {
     let range = match space {
-      Space::Initial => self.output_initial.clone(),
-      Space::Handshake => self.output_handshake.clone(),
+      Space::Initial => self.state.output_initial.clone(),
+      Space::Handshake => self.state.output_handshake.clone(),
       Space::Data => return &[],
     };
-    self.buffer.writer_buffer.get(range).unwrap_or_default()
+    self.state.buffer.writer_buffer.get(range).unwrap_or_default()
   }
 
   /// The encoded transport parameters of the peer, once its ClientHello (its
   /// EncryptedExtensions) arrived. Their presence is checked, their content is not.
   #[inline]
   pub(crate) fn peer_transport_params(&self) -> Option<&[u8]> {
-    if !self.has_peer_transport_params {
+    if !self.state.has_peer_transport_params {
       return None;
     }
-    self.buffer.reader_buffer.filled().get(..self.stored_len)
+    self.state.buffer.reader_buffer.filled().get(..self.state.stored_len)
   }
 
   /// The traffic secrets of the next encryption level, once TLS has them: those of Handshake once
@@ -265,41 +287,45 @@ where
   /// [`Self::feed`]: TLS does not keep the secrets of a level that it moved past.
   #[inline]
   pub(crate) fn poll_secrets(&mut self) -> Option<QuicTlsSecrets> {
-    if self.secrets_taken >= self.secrets_ready || matches!(self.stage, Stage::Failed) {
+    if self.state.secrets_taken >= self.state.secrets_ready
+      || matches!(self.state.stage, Stage::Failed)
+    {
       return None;
     }
-    let space = if self.secrets_taken == 0 { Space::Handshake } else { Space::Data };
+    let space = if self.state.secrets_taken == 0 { Space::Handshake } else { Space::Data };
     let mut secrets = QuicTlsSecrets {
       space,
-      suite: self.key_schedule.cipher_suite(),
+      suite: self.state.key_schedule.cipher_suite(),
       rx: ArrayVectorCopy::new(),
       tx: ArrayVectorCopy::new(),
     };
-    let (read, write) = (self.key_schedule.read().state(), self.key_schedule.write().state());
+    let (read, write) =
+      (self.state.key_schedule.read().state(), self.state.key_schedule.write().state());
     secrets.rx.extend_from_copyable_slice(read.raw_traffic_secret()).ok()?;
     secrets.tx.extend_from_copyable_slice(write.raw_traffic_secret()).ok()?;
-    self.secrets_taken = self.secrets_taken.wrapping_add(1);
+    self.state.secrets_taken = self.state.secrets_taken.wrapping_add(1);
     Some(secrets)
   }
 
   // Derives the secrets of Data from the transcript up to the Finished of the server.
   fn enter_data_level(&mut self) -> crate::Result<()> {
-    if self.secrets_taken < HANDSHAKE_LEVEL {
+    if self.state.secrets_taken < HANDSHAKE_LEVEL {
       cold_path();
       return Err(crate::Error::QuicClose(
         TransportErrorCode::InternalError,
         QuicError::TlsSecretsNotTaken,
       ));
     }
-    self.key_schedule.master_secret::<IS_CLIENT>(&self.transcript_hash.clone().finalize())?;
-    self.secrets_ready = DATA_LEVEL;
-    self.stage = Stage::Complete;
+    let state = &mut *self.state;
+    state.key_schedule.master_secret::<IS_CLIENT>(&state.transcript_hash.clone().finalize())?;
+    state.secrets_ready = DATA_LEVEL;
+    state.stage = Stage::Complete;
     Ok(())
   }
 
   // Takes `data`, of the level of `space`, one handshake message at a time.
   fn read_level(&mut self, space: Space, mut data: &[u8]) -> crate::Result<()> {
-    let Some(reading) = self.stage.reading_level() else {
+    let Some(reading) = self.state.stage.reading_level() else {
       return Err(alert(AlertDescription::InternalError, QuicError::TlsAlert));
     };
     let level = level(space);
@@ -318,8 +344,9 @@ where
     }
     let header_len = Handshake::<()>::HEADER_LEN;
     loop {
-      let start = self.msg_start;
-      let input = self.buffer.reader_buffer.buffer_mut();
+      let state = &mut *self.state;
+      let start = state.msg_start;
+      let input = state.buffer.reader_buffer.buffer_mut();
       // The header, then the rest of the message, never more than the message
       let have = input.len().wrapping_sub(start);
       if have < header_len {
@@ -343,13 +370,14 @@ where
       if input.len().wrapping_sub(start) < msg_len {
         return Ok(());
       }
-      let keeps_messages = self.stage.keeps_messages();
+      let keeps_messages = state.stage.keeps_messages();
       self.read_message(start, !data.is_empty())?;
-      if keeps_messages && self.stage.keeps_messages() {
-        self.msg_start = self.buffer.reader_buffer.filled().len();
+      let state = &mut *self.state;
+      if keeps_messages && state.stage.keeps_messages() {
+        state.msg_start = state.buffer.reader_buffer.filled().len();
       } else {
-        self.buffer.reader_buffer.truncate(self.stored_len);
-        self.msg_start = self.stored_len;
+        state.buffer.reader_buffer.truncate(state.stored_len);
+        state.msg_start = state.stored_len;
       }
       if data.is_empty() {
         return Ok(());
@@ -359,7 +387,7 @@ where
 
   // The complete message at `start` of the reader buffer, which `excess` data follows.
   fn read_message(&mut self, start: usize, excess: bool) -> crate::Result<()> {
-    match self.stage {
+    match self.state.stage {
       Stage::ClientHello => self.server_client_hello(start, excess),
       Stage::ClientFinished => self.server_client_finished(start, excess),
       #[cfg(test)]
@@ -374,11 +402,12 @@ where
 
   // The ClientHello: in return, a ServerHello in Initial and the rest of the flight in Handshake.
   fn server_client_hello(&mut self, start: usize, excess: bool) -> crate::Result<()> {
+    let state = &mut *self.state;
     if excess {
       // The ClientHello is all that a client sends in Initial
       return Err(unexpected_message());
     }
-    let TlsBuffer { reader_buffer, writer_buffer } = &mut self.buffer;
+    let TlsBuffer { reader_buffer, writer_buffer } = &mut state.buffer;
     let (local_transport_params, client_hello) =
       reader_buffer.filled().split_at_checked(start).unwrap_or_default();
     if client_hello.first() != Some(&HandshakeTy::ClientHello.into()) {
@@ -391,43 +420,43 @@ where
     let negotiation = negotiate_client_hello::<_, _, true>(
       client_hello,
       &self.config,
-      &mut self.key_schedule,
+      &mut state.key_schedule,
       (&mut max_fragment_length, &mut max_fragment_length_send),
-      &mut self.named_group,
+      &mut state.named_group,
       writer_buffer,
       &mut self.rng,
-      &self.signature_algorithms,
-      &mut self.transcript_hash,
+      &state.signature_algorithms,
+      &mut state.transcript_hash,
     )?;
     let handshake_begin = writer_buffer.len();
     if let Some(elem) = negotiation.alpn.as_ref().and_then(|el| el.protocol_name_list.first()) {
-      self.alpn = *elem;
+      state.alpn = *elem;
     }
     let peer_transport_params = negotiation.quic_transport_parameters.start.wrapping_add(start)
       ..negotiation.quic_transport_parameters.end.wrapping_add(start);
     let _indices = write_server_flight(
       &self.config,
-      &mut self.key_schedule,
+      &mut state.key_schedule,
       negotiation,
       writer_buffer,
       Some(local_transport_params),
       &mut self.rng,
-      &mut self.transcript_hash,
+      &mut state.transcript_hash,
     )?;
-    self.output_initial = initial_begin..handshake_begin;
-    self.output_handshake = handshake_begin..writer_buffer.len();
+    state.output_initial = initial_begin..handshake_begin;
+    state.output_handshake = handshake_begin..writer_buffer.len();
     // The parameters of the client take the place of those of the server, which are sent
-    keep_transport_params(reader_buffer.buffer_mut(), peer_transport_params, &mut self.stored_len);
-    self.has_peer_transport_params = true;
-    self.secrets_ready = HANDSHAKE_LEVEL;
-    self.stage = Stage::ClientFinished;
+    keep_transport_params(reader_buffer.buffer_mut(), peer_transport_params, &mut state.stored_len);
+    state.has_peer_transport_params = true;
+    state.secrets_ready = HANDSHAKE_LEVEL;
+    state.stage = Stage::ClientFinished;
     Ok(())
   }
 
   // The Finished of the client, after which the secrets of Data can be taken.
   fn server_client_finished(&mut self, start: usize, excess: bool) -> crate::Result<()> {
-    let finished = self.buffer.reader_buffer.filled().get(start..).unwrap_or_default();
-    verify_client_finished(&self.key_schedule, finished, &self.transcript_hash)?;
+    let finished = self.state.buffer.reader_buffer.filled().get(start..).unwrap_or_default();
+    verify_client_finished(&self.state.key_schedule, finished, &self.state.transcript_hash)?;
     if excess {
       return Err(crate::Error::TlsErrorReply(
         TlsError::ExcessHandshakeData(crate::net::RoleTy::Server),
@@ -438,37 +467,36 @@ where
   }
 
   fn with_parts(config: Arc<TlsConfig<TCX>>, rng: RNG, stage: Stage) -> Self {
-    let key_schedule = KsBox::new(KeySchedule::default());
+    let key_schedule = KeySchedule::default();
     let transcript_hash = key_schedule.cipher_suite().hash_new();
     let named_group =
       config.supported_groups().named_group_list.first().copied().unwrap_or(NamedGroup::default());
-    Self {
+    let state = StateBox::new(QuicTlsState {
       alpn: ArrayVectorCopy::new(),
       buffer: TlsBuffer::pooled(),
-      config,
       has_peer_transport_params: false,
       key_schedule,
       msg_start: 0,
       named_group,
       output_handshake: 0..0,
       output_initial: 0..0,
-      rng,
       secrets_ready: 0,
       secrets_taken: 0,
       signature_algorithms: ArrayVectorCopy::new(),
       stage,
       stored_len: 0,
       transcript_hash,
-    }
+    });
+    Self { config, rng, state }
   }
 
-  /// Where the pooled key schedule and buffers are.
+  /// Where the pooled state and buffers are.
   #[cfg(test)]
   fn pooled_addrs(&mut self) -> [usize; 3] {
     [
-      (&raw const *self.key_schedule).addr(),
-      self.buffer.reader_buffer.buffer_mut().as_ptr().addr(),
-      self.buffer.writer_buffer.as_ptr().addr(),
+      (&raw const **self.state.0).addr(),
+      self.state.buffer.reader_buffer.buffer_mut().as_ptr().addr(),
+      self.state.buffer.writer_buffer.as_ptr().addr(),
     ]
   }
 }
@@ -485,14 +513,15 @@ where
       codec::Decode as _,
       tls::{tls_cc_wrappers::TlsDecodeWrapper, tls_connector::manage_server_hello},
     };
-    let Stage::ServerHello(secrets) = &mut self.stage else {
+    let state = &mut *self.state;
+    let Stage::ServerHello(secrets) = &mut state.stage else {
       return Err(unexpected_message());
     };
     if excess {
       // The ServerHello is all that a server sends in Initial
       return Err(unexpected_message());
     }
-    let server_hello = self.buffer.reader_buffer.filled().get(start..).unwrap_or_default();
+    let server_hello = state.buffer.reader_buffer.filled().get(start..).unwrap_or_default();
     let mut dw = TlsDecodeWrapper::from_bytes(server_hello);
     let handshake = Handshake::<&[u8]>::decode(&mut dw)?;
     if handshake.msg_type != HandshakeTy::ServerHello {
@@ -500,16 +529,16 @@ where
     }
     *dw.bytes_mut() = handshake.data;
     let mrsri = manage_server_hello(
-      self.buffer.writer_buffer.get(..self.output_initial.end).unwrap_or_default(),
+      state.buffer.writer_buffer.get(..state.output_initial.end).unwrap_or_default(),
       &mut dw,
-      &mut self.key_schedule,
-      &mut self.named_group,
+      &mut state.key_schedule,
+      &mut state.named_group,
       secrets,
       server_hello,
-      &mut self.transcript_hash,
+      &mut state.transcript_hash,
     )?;
-    self.secrets_ready = HANDSHAKE_LEVEL;
-    self.stage = Stage::ServerFlight(mrsri);
+    state.secrets_ready = HANDSHAKE_LEVEL;
+    state.stage = Stage::ServerFlight(mrsri);
     Ok(())
   }
 
@@ -525,17 +554,18 @@ where
         tls_connector::manage_server_flight_msg,
       },
     };
-    let Stage::ServerFlight(mrsri) = &mut self.stage else {
+    let state = &mut *self.state;
+    let Stage::ServerFlight(mrsri) = &mut state.stage else {
       return Err(unexpected_message());
     };
-    let TlsBuffer { reader_buffer, writer_buffer } = &mut self.buffer;
+    let TlsBuffer { reader_buffer, writer_buffer } = &mut state.buffer;
     let filled = reader_buffer.filled();
     let msg = filled.get(start..).unwrap_or_default();
     let mut dw = TlsDecodeWrapper::from_bytes(msg);
     let handshake = Handshake::<&[u8]>::decode(&mut dw)?;
     // The EncryptedExtensions comes first (RFC 9846 section 4.3.1), which also leaves the
     // transport parameters as the last message
-    if (handshake.msg_type == HandshakeTy::EncryptedExtensions) == self.has_peer_transport_params {
+    if (handshake.msg_type == HandshakeTy::EncryptedExtensions) == state.has_peer_transport_params {
       return Err(unexpected_message());
     }
     *dw.bytes_mut() = handshake.data;
@@ -556,12 +586,12 @@ where
       filled,
       false,
       hostname,
-      &mut self.key_schedule,
+      &mut state.key_schedule,
       (&mut max_fragment_length, &mut max_fragment_length_send),
       mrsri,
       msg,
       handshake.msg_type,
-      &mut self.transcript_hash,
+      &mut state.transcript_hash,
     )?;
     let client_cert_requested = mrsri.client_cert_requested();
     if let Some(elem) = encrypted_extensions {
@@ -574,11 +604,11 @@ where
           AlertDescription::NoApplicationProtocol,
         ));
       };
-      self.alpn = *alpn;
+      state.alpn = *alpn;
       let begin = peer_transport_params.as_ptr().addr().wrapping_sub(filled.as_ptr().addr());
       let range = begin..begin.wrapping_add(peer_transport_params.len());
-      keep_transport_params(reader_buffer.buffer_mut(), range, &mut self.stored_len);
-      self.has_peer_transport_params = true;
+      keep_transport_params(reader_buffer.buffer_mut(), range, &mut state.stored_len);
+      state.has_peer_transport_params = true;
     }
     if !is_finished {
       return Ok(());
@@ -586,15 +616,15 @@ where
     if client_cert_requested {
       return Err(TlsError::UnsupportedMtls.into());
     }
-    let verify_data = self
+    let verify_data = state
       .key_schedule
       .write()
       .state()
-      .create_finished_verify_data(self.transcript_hash.clone().finalize().lease())?;
+      .create_finished_verify_data(state.transcript_hash.clone().finalize().lease())?;
     let begin = writer_buffer.len();
     Handshake::new(HandshakeTy::Finished, Finished::new(&verify_data))
       .encode(&mut TlsEncodeWrapper::from_buffer(writer_buffer))?;
-    self.output_handshake = begin..writer_buffer.len();
+    state.output_handshake = begin..writer_buffer.len();
     self.enter_data_level()
   }
 }
@@ -604,10 +634,70 @@ impl<const IS_CLIENT: bool, RNG, TCX> Debug for QuicTls<IS_CLIENT, RNG, TCX> {
   fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
     f.debug_struct("QuicTls")
       .field("is_client", &IS_CLIENT)
-      .field("secrets_ready", &self.secrets_ready)
-      .field("secrets_taken", &self.secrets_taken)
-      .field("stage", &self.stage.reading_level())
+      .field("secrets_ready", &self.state.secrets_ready)
+      .field("secrets_taken", &self.state.secrets_taken)
+      .field("stage", &self.state.stage.reading_level())
       .finish_non_exhaustive()
+  }
+}
+
+/// A boxed [`QuicTlsState`] whose box comes from, and goes back to, this thread's pool, every byte
+/// of it zeroed, as [`crate::tls::KsBox`] does for the key schedules of the record path.
+struct StateBox(ManuallyDrop<Box<QuicTlsState>>);
+
+impl StateBox {
+  // `state` in a pooled box, or a new one.
+  fn new(state: QuicTlsState) -> Self {
+    #[cfg(feature = "std")]
+    if let Some(elem) = STATE_POOL.try_with(|pool| pool.try_borrow_mut().ok()?.pop()).ok().flatten()
+    {
+      return Self(ManuallyDrop::new(Box::write(elem, state)));
+    }
+    Self(ManuallyDrop::new(Box::new(state)))
+  }
+}
+
+impl Deref for StateBox {
+  type Target = QuicTlsState;
+
+  fn deref(&self) -> &QuicTlsState {
+    &self.0
+  }
+}
+
+impl DerefMut for StateBox {
+  fn deref_mut(&mut self) -> &mut QuicTlsState {
+    &mut self.0
+  }
+}
+
+impl Drop for StateBox {
+  fn drop(&mut self) {
+    // SAFETY: `self.0` is never used again
+    let raw = Box::into_raw(unsafe { ManuallyDrop::take(&mut self.0) });
+    // SAFETY: a valid state, dropped once, here: its buffers go back to their own pool
+    unsafe { ptr::drop_in_place(raw) };
+    // SAFETY: the allocation has room for a state, written here as plain bytes, with stores the
+    // compiler may not drop: the box is pooled or freed right after
+    unsafe { zero_volatile(raw.cast::<u8>(), size_of::<QuicTlsState>()) };
+    // SAFETY: `MaybeUninit<QuicTlsState>` has the layout of `QuicTlsState`, which `raw` was boxed
+    // with, and its value was dropped
+    let elem = unsafe { Box::from_raw(raw.cast::<MaybeUninit<QuicTlsState>>()) };
+    #[cfg(feature = "std")]
+    {
+      let mut elem = Some(elem);
+      let _rslt = STATE_POOL.try_with(|pool| {
+        if let Ok(mut pool) = pool.try_borrow_mut()
+          && pool.len() < STATE_POOL_MAX
+          && let Some(value) = elem.take()
+        {
+          pool.push(value);
+        }
+      });
+      drop(elem);
+    }
+    #[cfg(not(feature = "std"))]
+    drop(elem);
   }
 }
 
@@ -737,8 +827,8 @@ mod tests {
     sync::Arc,
     tests::{_PUBLIC_KEY, _SECRET_KEY},
     tls::{
-      CipherSuite, SkCtx, TlsConfig, UnverifiedCtx,
-      quic_tls::{QuicTls, QuicTlsSecrets},
+      CipherSuite, KeySchedule, NamedGroup, SkCtx, TlsBuffer, TlsConfig, UnverifiedCtx,
+      quic_tls::{QuicTls, QuicTlsSecrets, QuicTlsState, STATE_POOL, Stage, StateBox},
       tls_pool,
     },
   };
@@ -1109,6 +1199,7 @@ mod tests {
   #[test]
   fn handshake_state_zeroed_on_pool_return() {
     tls_pool::clear_thread_pools();
+    STATE_POOL.with(|el| el.borrow_mut().clear());
     let (mut client, mut server) = (client(b"h3"), server());
     server.feed(Space::Initial, &client_out(&mut client, Space::Initial)).unwrap();
     let _secrets = finish_handshake(&mut client, &mut server);
@@ -1116,11 +1207,60 @@ mod tests {
     let addrs = server.pooled_addrs();
     drop(client);
     drop(server);
-    let (ks, buffers) = tls_pool::last_pooled();
-    assert_eq!(ks, Some((addrs[0], true)), "the key schedule box");
+    let (_, buffers) = tls_pool::last_pooled();
+    assert_eq!(last_pooled_state(), Some((addrs[0], true)), "the state box");
     assert_eq!(buffers, Some([(addrs[1], true), (addrs[2], true)]), "the buffers");
     // The next handshake takes them again
     let mut again = self::server();
     assert_eq!(again.pooled_addrs(), addrs);
+  }
+
+  // The last state box that this thread pooled, with whether every byte of it is zero.
+  fn last_pooled_state() -> Option<(usize, bool)> {
+    STATE_POOL.with(|pool| {
+      let ptr = (&raw const **pool.borrow().last()?).cast::<u8>();
+      // SAFETY: the bytes belong to the pooled box, every one of which was written with a zero
+      // when it was pooled
+      let bytes = unsafe { slice::from_raw_parts(ptr, size_of::<QuicTlsState>()) };
+      Some((ptr.addr(), bytes.iter().all(|el| *el == 0)))
+    })
+  }
+
+  // A state that is not zero anywhere it has a value, without a crypto backend.
+  fn state_with_data() -> QuicTlsState {
+    let key_schedule = KeySchedule::unset();
+    let transcript_hash = key_schedule.cipher_suite().hash_new();
+    QuicTlsState {
+      alpn: ArrayVectorCopy::from_array(*b"h3"),
+      buffer: TlsBuffer::new(),
+      has_peer_transport_params: true,
+      key_schedule,
+      msg_start: 3,
+      named_group: NamedGroup::default(),
+      output_handshake: 5..9,
+      output_initial: 1..5,
+      secrets_ready: 2,
+      secrets_taken: 1,
+      signature_algorithms: ArrayVectorCopy::new(),
+      stage: Stage::Complete,
+      stored_len: 7,
+      transcript_hash,
+    }
+  }
+
+  // A state box comes back zeroed, and is the next one's. No crypto backend is involved: Miri runs
+  // this.
+  #[test]
+  fn state_box_comes_back_zeroed() {
+    STATE_POOL.with(|el| el.borrow_mut().clear());
+    let state = StateBox::new(state_with_data());
+    let addr = (&raw const **state.0).addr();
+    assert_eq!(state.stored_len, 7);
+    drop(state);
+    assert_eq!(last_pooled_state(), Some((addr, true)));
+    let again = StateBox::new(state_with_data());
+    assert_eq!((&raw const **again.0).addr(), addr);
+    assert_eq!(again.output_initial, 1..5);
+    assert!(STATE_POOL.with(|el| el.borrow().is_empty()));
   }
 }

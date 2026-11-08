@@ -9,18 +9,23 @@ const BUDGET_WINDOW_US: u64 = 1_000_000;
 /// Every limit has a production default ([`QuicLimits::default`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QuicLimits {
+  /// The application error code of the CONNECTION_CLOSE that ends a connection whose peer went
+  /// past a budget.
+  ///
+  /// Defaults to 0x0107, H3_EXCESSIVE_LOAD (RFC 9114 section 8.1): set it for other applications.
+  pub excessive_load_app_code: u64,
   /// The most ranges of a received ACK frame that are processed. The ranges after them, which
   /// acknowledge the oldest packets, are ignored as if the frame did not have them.
   ///
   /// Defaults to 256.
   pub max_ack_ranges: usize,
-  /// The most PING frames per second that make their packet ack-eliciting. A PING past the budget
-  /// is ignored: its packet is still acknowledged, along with the next ack-eliciting one.
+  /// The most PING frames per second. Each one is acknowledged; one more closes the connection
+  /// with [`Self::excessive_load_app_code`].
   ///
   /// Defaults to 64.
   pub ping_budget: u32,
-  /// The most PATH_CHALLENGE frames per second that are answered. A challenge past the budget is
-  /// ignored.
+  /// The most PATH_CHALLENGE frames per second. Each one is answered; one more closes the
+  /// connection with [`Self::excessive_load_app_code`].
   ///
   /// Defaults to 16.
   pub path_challenge_budget: u32,
@@ -29,7 +34,12 @@ pub struct QuicLimits {
 impl Default for QuicLimits {
   #[inline]
   fn default() -> Self {
-    Self { max_ack_ranges: 256, ping_budget: 64, path_challenge_budget: 16 }
+    Self {
+      excessive_load_app_code: 0x0107,
+      max_ack_ranges: 256,
+      ping_budget: 64,
+      path_challenge_budget: 16,
+    }
   }
 }
 
@@ -66,6 +76,7 @@ mod tests {
   #[test]
   fn defaults_are_the_documented_ones() {
     let limits = QuicLimits::default();
+    assert_eq!(limits.excessive_load_app_code, 0x0107);
     assert_eq!(limits.max_ack_ranges, 256);
     assert_eq!(limits.ping_budget, 64);
     assert_eq!(limits.path_challenge_budget, 16);

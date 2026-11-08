@@ -39,7 +39,7 @@ use crate::{
     writer::Writer,
   },
   rng::CryptoRng,
-  tls::{AlertDescription, QuicTls, QuicTlsSecrets, TlsCtxSk},
+  tls::{AlertDescription, QuicTls, TlsCtxSk},
 };
 use alloc::boxed::Box;
 use core::{
@@ -214,7 +214,8 @@ pub(crate) struct ConnStats {
 /// A QUIC connection of a server or, in tests, of a client (`IS_CLIENT`). See the
 /// [module documentation](self).
 ///
-/// Its resources go back to the pools when it reaches [`ConnState::Closed`]: drop it after that.
+/// Its resources go back to the pools when it reaches [`ConnState::Closed`], or when it is
+/// aborted ([`QuicConn::abort`]): drop it after that.
 pub(crate) struct QuicConn<A, RNG, TCX, const IS_CLIENT: bool = false>
 where
   A: QuicApp,
@@ -249,7 +250,10 @@ where
   peer_idle_timeout_ms: u64,
   peer_max_ack_delay_ms: u64,
   pings: RateBudget,
-  spaces: [PacketSpace; 3],
+  // The 1-RTT space
+  data: PacketSpace,
+  // The Initial and Handshake spaces, from the worker's pool until the handshake is confirmed
+  handshake: Option<Box<HandshakeSpaces>>,
   state: ConnState,
   stats: ConnStats,
   tls: Option<QuicTls<IS_CLIENT, RNG, TCX>>,
@@ -266,8 +270,8 @@ where
 {
   /// The connection that the first Initial packet of a client opens, which `meta` came with and
   /// whose destination CID is `client_dcid`. `tls` sends the transport parameters of
-  /// [`ConnParams::transport_params`] with `local_cid` and `client_dcid`. The datagram is then
-  /// given to [`Self::recv_datagram`].
+  /// [`ConnParams::transport_params`] with `local_cid` and `client_dcid`. The state of the
+  /// handshake comes from `pools`. The datagram is then given to [`Self::recv_datagram`].
   #[inline]
   pub(crate) fn new_server(
     params: &ConnParams,
@@ -276,6 +280,7 @@ where
     meta: DatagramMeta,
     tls: QuicTls<false, RNG, TCX>,
     now_us: u64,
+    pools: &mut QuicPools,
   ) -> crate::Result<Self> {
     let original_dcid = Cid::new(client_dcid)?;
     let initial = initial_keys(client_dcid, true)?;
@@ -287,7 +292,7 @@ where
       Cid::default(),
       meta,
       tls,
-      initial,
+      HandshakeSpaces::take(initial, pools),
       now_us,
     ))
   }
@@ -310,6 +315,7 @@ where
     peer: SocketAddr,
     tls: QuicTls<true, RNG, TCX>,
     now_us: u64,
+    pools: &mut QuicPools,
   ) -> crate::Result<Self> {
     let initial = initial_keys(original_dcid.as_slice(), false)?;
     let meta = DatagramMeta { peer, local: None, segment_size: None };
@@ -320,7 +326,7 @@ where
       original_dcid,
       meta,
       tls,
-      initial,
+      HandshakeSpaces::take(initial, pools),
       now_us,
     ))
   }
@@ -332,6 +338,16 @@ where
   RNG: CryptoRng,
   TCX: TlsCtxSk,
 {
+  /// Ends the connection at once, without a CONNECTION_CLOSE, and gives back to `pools` all that
+  /// it took: for an endpoint that evicts a connection or shuts down. A closed connection is left
+  /// as it is.
+  #[inline]
+  pub(crate) fn abort(&mut self, app: &mut A, pools: &mut QuicPools) {
+    if self.state != ConnState::Closed {
+      self.enter_closed(app, pools);
+    }
+  }
+
   /// Closes the connection with an application error (CONNECTION_CLOSE of type 0x1d).
   #[inline]
   pub(crate) fn close_app(&mut self, now_us: u64, code: u64) {
@@ -429,6 +445,8 @@ where
     match self.state {
       ConnState::Handshake | ConnState::Confirmed => {}
       ConnState::Closing => {
+        // What the amplification limit lets the CONNECTION_CLOSE in reply be
+        self.bytes_received = self.bytes_received.saturating_add(len);
         self.on_datagram_while_closing();
         return Ok(());
       }
@@ -519,7 +537,9 @@ where
       // A Handshake packet proves that the client got the Initial packets (RFC 9000 section
       // 8.1), whose keys are not needed anymore (RFC 9001 section 4.9.1)
       self.address_validated = true;
-      discard(&mut self.spaces, Space::Initial, pools);
+      if let Some(elem) = &mut self.handshake {
+        elem.initial.clear(pools);
+      }
     }
     if !IS_CLIENT && self.handshake_complete && self.state == ConnState::Handshake {
       // A server confirms the handshake once it is complete (RFC 9001 section 4.1.2)
@@ -560,8 +580,14 @@ where
 
   fn confirm(&mut self, pools: &mut QuicPools) {
     self.state = ConnState::Confirmed;
-    discard(&mut self.spaces, Space::Initial, pools);
-    discard(&mut self.spaces, Space::Handshake, pools);
+    self.release_handshake(pools);
+  }
+
+  // The Initial and Handshake spaces, wiped, and the TLS state go back to their pools.
+  fn release_handshake(&mut self, pools: &mut QuicPools) {
+    if let Some(elem) = self.handshake.take() {
+      HandshakeSpaces::give(elem, pools);
+    }
     // Back to the thread's pools, zeroed
     self.tls = None;
   }
@@ -570,7 +596,10 @@ where
     let Some(tls) = &self.tls else {
       return &[];
     };
-    let sent = usize::try_from(space_ref(&self.spaces, space).crypto_tx).unwrap_or(usize::MAX);
+    let Some(sp) = space_ref(&self.data, &self.handshake, space) else {
+      return &[];
+    };
+    let sent = usize::try_from(sp.crypto_tx).unwrap_or(usize::MAX);
     tls.output(space).get(sent..).unwrap_or_default()
   }
 
@@ -603,6 +632,14 @@ where
     self.close_owed = false;
   }
 
+  // A budget is spent: the application closes the connection with its excessive load code.
+  fn excessive_load(&mut self, now_us: u64) -> crate::Error {
+    cold_path();
+    let code = self.params.limits.excessive_load_app_code;
+    self.enter_closing(now_us, CloseFrame { app: true, code });
+    crate::Error::Quic(QuicError::ExcessiveLoad)
+  }
+
   fn idle_deadline(&self) -> Option<u64> {
     let local = self.params.max_idle_timeout_ms;
     let peer = if self.has_peer_params { self.peer_idle_timeout_ms } else { 0 };
@@ -616,14 +653,6 @@ where
     Some(self.last_activity_us.saturating_add(timeout))
   }
 
-  // Installs the keys of the secrets that TLS yielded, which are then dropped, and so wiped.
-  fn install(&mut self, secrets: QuicTlsSecrets) -> crate::Result<()> {
-    let local = keys_from_secret(secrets.suite, secrets.tx.as_slice())?;
-    let remote = keys_from_secret(secrets.suite, secrets.rx.as_slice())?;
-    space_mut(&mut self.spaces, secrets.space).keys = Some(PacketKeys { local, remote });
-    Ok(())
-  }
-
   fn on_ack(
     &mut self,
     space: Space,
@@ -631,7 +660,9 @@ where
     pools: &mut QuicPools,
   ) -> crate::Result<()> {
     let max_ranges = self.params.limits.max_ack_ranges;
-    let sp = space_mut(&mut self.spaces, space);
+    let Some(sp) = space_mut(&mut self.data, &mut self.handshake, space) else {
+      return Ok(());
+    };
     if ack.largest >= sp.sent.next_pn() {
       return Err(violation(QuicError::AckOfUnsentPacket));
     }
@@ -676,21 +707,32 @@ where
         QuicError::CryptoDataAtWrongLevel,
       ));
     };
-    let rx = &mut space_mut(&mut self.spaces, space).crypto_rx;
-    let mut secrets = [None, None];
+    let data_keys = &mut self.data.keys;
+    if space == Space::Data {
+      // Nothing is read after the handshake: TLS closes the connection
+      feed(tls, space, data, None, data_keys)?;
+      return self.on_tls_progress(app);
+    }
+    let Some(hs) = self.handshake.as_deref_mut() else {
+      return Ok(());
+    };
+    let HandshakeSpaces { handshake, initial } = hs;
+    // Initial data yields the keys of Handshake, Handshake data those of 1-RTT
+    let (rx, mut handshake_keys) = if space == Space::Initial {
+      (&mut initial.crypto_rx, Some(&mut handshake.keys))
+    } else {
+      (&mut handshake.crypto_rx, None)
+    };
     let direct = rx.accept(offset, data, pools)?;
-    feed(tls, space, direct, &mut secrets)?;
+    feed(tls, space, direct, handshake_keys.as_deref_mut(), data_keys)?;
     loop {
       let buffered = rx.buffered();
       if buffered.is_empty() {
         break;
       }
       let len = buffered.len();
-      feed(tls, space, buffered, &mut secrets)?;
+      feed(tls, space, buffered, handshake_keys.as_deref_mut(), data_keys)?;
       rx.consume(len, pools);
-    }
-    for elem in secrets.into_iter().flatten() {
-      self.install(elem)?;
     }
     self.on_tls_progress(app)
   }
@@ -784,14 +826,17 @@ where
           }
         }
         Frame::PathChallenge(data) => {
+          // Answered, always (RFC 9000 section 8.2.2), and the latest one only
           ack_eliciting = true;
-          if self.path_challenges.take(self.params.limits.path_challenge_budget, now_us) {
-            self.path_response = Some(data);
+          self.path_response = Some(data);
+          if !self.path_challenges.take(self.params.limits.path_challenge_budget, now_us) {
+            return Err(self.excessive_load(now_us));
           }
         }
         Frame::Ping => {
-          if self.pings.take(self.params.limits.ping_budget, now_us) {
-            ack_eliciting = true;
+          ack_eliciting = true;
+          if !self.pings.take(self.params.limits.ping_budget, now_us) {
+            return Err(self.excessive_load(now_us));
           }
         }
         // Streams, flow control and connection IDs belong to the layers above
@@ -827,7 +872,10 @@ where
     app: &mut A,
     pools: &mut QuicPools,
   ) -> crate::Result<()> {
-    let sp = space_mut(&mut self.spaces, space);
+    let Some(sp) = space_mut(&mut self.data, &mut self.handshake, space) else {
+      self.drop_packet();
+      return Ok(());
+    };
     let Some(keys) = &sp.keys else {
       self.drop_packet();
       return Ok(());
@@ -840,6 +888,12 @@ where
     };
     if sp.recv.is_duplicate(pn) {
       self.stats.duplicates = self.stats.duplicates.wrapping_add(1);
+      return Ok(());
+    }
+    if sp.recv.would_forget_unreported(pn) {
+      // The ACK that reports the older packets goes out first, with the next flush: until then
+      // this one is dropped, and the peer sends what it carried again
+      self.drop_packet();
       return Ok(());
     }
     let header_len = pn_offset.wrapping_add(pn_len);
@@ -863,14 +917,18 @@ where
       self.peer_cid_known = true;
     }
     let ack_eliciting = self.recv_frames(now_us, space, payload, app, pools)?;
-    let _is_new = space_mut(&mut self.spaces, space).recv.on_packet(pn, ack_eliciting, now_us);
+    if let Some(sp) = space_mut(&mut self.data, &mut self.handshake, space) {
+      let _is_new = sp.recv.on_packet(pn, ack_eliciting, now_us);
+    }
     self.after_packet(now_us, space, pools);
     Ok(())
   }
 
   // Seals `packet`, which is in `buffer`, and records it.
   fn seal(&mut self, now_us: u64, buffer: &mut [u8], packet: &OpenPacket) -> crate::Result<usize> {
-    let sp = space_mut(&mut self.spaces, packet.space);
+    let Some(sp) = space_mut(&mut self.data, &mut self.handshake, packet.space) else {
+      return Err(crate::Error::ProgrammingError);
+    };
     let Some(keys) = &sp.keys else {
       return Err(crate::Error::ProgrammingError);
     };
@@ -886,13 +944,17 @@ where
     }
     let len =
       protect(&keys.local, bytes, packet.pn_offset, packet.pn, packet.pn_len, packet.payload_len)?;
-    sp.sent.on_sent(SentPacket {
-      time_us: now_us,
-      size: u16::try_from(len).unwrap_or(u16::MAX),
-      ack_eliciting: packet.ack_eliciting,
-      in_flight: packet.ack_eliciting || packet.padded,
-      frames: packet.frames,
-    });
+    if self.state == ConnState::Closing {
+      sp.sent.skip();
+    } else {
+      sp.sent.on_sent(SentPacket {
+        time_us: now_us,
+        size: u16::try_from(len).unwrap_or(u16::MAX),
+        ack_eliciting: packet.ack_eliciting,
+        in_flight: packet.ack_eliciting || packet.padded,
+        frames: packet.frames,
+      });
+    }
     self.stats.packets_out = self.stats.packets_out.wrapping_add(1);
     if !packet.ack_eliciting && self.state != ConnState::Closing {
       self.stats.ack_only_out = self.stats.ack_only_out.wrapping_add(1);
@@ -901,7 +963,9 @@ where
   }
 
   fn space_wants_send(&self, space: Space) -> bool {
-    let sp = space_ref(&self.spaces, space);
+    let Some(sp) = space_ref(&self.data, &self.handshake, space) else {
+      return false;
+    };
     if sp.keys.is_none() {
       return false;
     }
@@ -918,10 +982,8 @@ where
 
   fn enter_closed(&mut self, app: &mut A, pools: &mut QuicPools) {
     self.state = ConnState::Closed;
-    for space in SPACES {
-      discard(&mut self.spaces, space, pools);
-    }
-    self.tls = None;
+    self.release_handshake(pools);
+    self.data.clear(pools);
     self.close_owed = false;
     self.handshake_done_owed = false;
     self.path_response = None;
@@ -945,11 +1007,9 @@ where
     peer_cid: Cid,
     meta: DatagramMeta,
     tls: QuicTls<IS_CLIENT, RNG, TCX>,
-    initial: PacketKeys,
+    handshake: Box<HandshakeSpaces>,
     now_us: u64,
   ) -> Self {
-    let mut spaces = [PacketSpace::new(), PacketSpace::new(), PacketSpace::new()];
-    space_mut(&mut spaces, Space::Initial).keys = Some(initial);
     Self {
       address_validated: false,
       app_state: A::ConnState::default(),
@@ -978,7 +1038,8 @@ where
       peer_idle_timeout_ms: 0,
       peer_max_ack_delay_ms: TransportParams::default().max_ack_delay_ms,
       pings: RateBudget::default(),
-      spaces,
+      data: PacketSpace::new(),
+      handshake: Some(handshake),
       state: ConnState::Handshake,
       stats: ConnStats::default(),
       tls: Some(tls),
@@ -1000,7 +1061,7 @@ where
     let mut pos = 0usize;
     for (space, slot) in SPACES.into_iter().zip(&mut packets) {
       let wanted = if closing {
-        space_ref(&self.spaces, space).keys.is_some()
+        space_ref(&self.data, &self.handshake, space).is_some_and(|el| el.keys.is_some())
       } else {
         self.space_wants_send(space)
       };
@@ -1057,7 +1118,9 @@ where
     }
     if IS_CLIENT && sent_handshake {
       // RFC 9001 section 4.9.1
-      discard(&mut self.spaces, Space::Initial, pools);
+      if let Some(elem) = &mut self.handshake {
+        elem.initial.clear(pools);
+      }
     }
     Ok(pos)
   }
@@ -1072,8 +1135,12 @@ where
     pools: &mut QuicPools,
   ) -> crate::Result<Option<OpenPacket>> {
     let (dcid, scid) = (self.peer_cid, self.local_cid);
-    let sp = space_mut(&mut self.spaces, space);
-    if sp.keys.is_none() || !sp.sent.reserve(pools) {
+    let Some(sp) = space_mut(&mut self.data, &mut self.handshake, space) else {
+      return Ok(None);
+    };
+    // A CONNECTION_CLOSE needs a packet number, not a record: it is neither ack-eliciting nor in
+    // flight
+    if sp.keys.is_none() || (!closing && !sp.sent.reserve(pools)) {
       return Ok(None);
     }
     let pn = sp.sent.next_pn();
@@ -1194,6 +1261,26 @@ where
   /// Sends `frames`, raw, in the next 1-RTT packet.
   pub(crate) fn queue_test_frames(&mut self, frames: &[u8]) {
     self.test_frames.extend_from_slice(frames);
+  }
+}
+
+impl<A, RNG, TCX, const IS_CLIENT: bool> Drop for QuicConn<A, RNG, TCX, IS_CLIENT>
+where
+  A: QuicApp,
+{
+  #[inline]
+  fn drop(&mut self) {
+    // What it holds of the pools of the worker goes back only once it is closed or aborted
+    #[cfg(feature = "std")]
+    debug_assert!(
+      self.state == ConnState::Closed || std::thread::panicking(),
+      "a QUIC connection was dropped before it was closed or aborted"
+    );
+    #[cfg(not(feature = "std"))]
+    debug_assert!(
+      self.state == ConnState::Closed,
+      "a QUIC connection was dropped before it was closed or aborted"
+    );
   }
 }
 
@@ -1367,36 +1454,72 @@ impl PacketSpace {
       sent: SentRing::new(),
     }
   }
+
+  // Drops the keys in their slot, which wipes them, gives the resources back and starts over.
+  fn clear(&mut self, pools: &mut QuicPools) {
+    self.keys = None;
+    self.sent.release(pools);
+    self.crypto_rx.release(pools);
+    *self = Self::new();
+  }
 }
 
-// Drops the keys of `space`, in their slot, and gives its resources back.
-fn discard(spaces: &mut [PacketSpace; 3], space: Space, pools: &mut QuicPools) {
-  let sp = space_mut(spaces, space);
-  sp.keys = None;
-  sp.sent.release(pools);
-  sp.crypto_rx.release(pools);
+/// The Initial and Handshake packet number spaces of a connection: keys, CRYPTO reassembly,
+/// acknowledgments and sent packets. A connection takes them from the worker's pool for its
+/// handshake and gives them back, wiped, once the handshake is confirmed (spec section 5.4).
+#[derive(Debug)]
+pub(crate) struct HandshakeSpaces {
+  handshake: PacketSpace,
+  initial: PacketSpace,
 }
 
-// Feeds TLS and takes the secrets that it yields, as TLS requires after every feed.
+impl HandshakeSpaces {
+  // Spaces from the pool, or new ones, with the keys of Initial.
+  fn take(initial: PacketKeys, pools: &mut QuicPools) -> Box<Self> {
+    let mut this = pools.handshake_spaces.take().unwrap_or_else(|| {
+      Box::new(Self { handshake: PacketSpace::new(), initial: PacketSpace::new() })
+    });
+    this.initial.keys = Some(initial);
+    this
+  }
+
+  // Wipes the keys where they are and gives the spaces back.
+  fn give(mut this: Box<Self>, pools: &mut QuicPools) {
+    this.initial.clear(pools);
+    this.handshake.clear(pools);
+    pools.handshake_spaces.give(this);
+  }
+}
+
+// Feeds TLS and installs the keys of every secret that it yields, in the slot of the level, which
+// TLS requires after every feed. The secrets are dropped, and so wiped, once their keys are made.
 fn feed<const IS_CLIENT: bool, RNG, TCX>(
   tls: &mut QuicTls<IS_CLIENT, RNG, TCX>,
   space: Space,
   data: &[u8],
-  secrets: &mut [Option<QuicTlsSecrets>; 2],
+  mut handshake_keys: Option<&mut Option<PacketKeys>>,
+  data_keys: &mut Option<PacketKeys>,
 ) -> crate::Result<()>
 where
   RNG: CryptoRng,
   TCX: TlsCtxSk,
 {
   tls.feed(space, data)?;
-  while let Some(elem) = tls.poll_secrets() {
-    let Some(slot) = secrets.iter_mut().find(|el| el.is_none()) else {
+  while let Some(secrets) = tls.poll_secrets() {
+    let slot = match secrets.space {
+      Space::Handshake => handshake_keys.as_deref_mut(),
+      Space::Data => Some(&mut *data_keys),
+      Space::Initial => None,
+    };
+    let Some(slot) = slot else {
       return Err(crate::Error::QuicClose(
         TransportErrorCode::InternalError,
         QuicError::TlsSecretsNotTaken,
       ));
     };
-    *slot = Some(elem);
+    let local = keys_from_secret(secrets.suite, secrets.tx.as_slice())?;
+    let remote = keys_from_secret(secrets.suite, secrets.rx.as_slice())?;
+    *slot = Some(PacketKeys { local, remote });
   }
   Ok(())
 }
@@ -1443,21 +1566,28 @@ fn set_bits(have: &mut [u64], start: usize, len: usize, value: bool) {
   }
 }
 
-const fn space_mut(spaces: &mut [PacketSpace; 3], space: Space) -> &mut PacketSpace {
-  let [initial, handshake, data] = spaces;
+// The state of `space`, if it is not gone.
+fn space_mut<'conn>(
+  data: &'conn mut PacketSpace,
+  handshake: &'conn mut Option<Box<HandshakeSpaces>>,
+  space: Space,
+) -> Option<&'conn mut PacketSpace> {
   match space {
-    Space::Initial => initial,
-    Space::Handshake => handshake,
-    Space::Data => data,
+    Space::Initial => handshake.as_deref_mut().map(|el| &mut el.initial),
+    Space::Handshake => handshake.as_deref_mut().map(|el| &mut el.handshake),
+    Space::Data => Some(data),
   }
 }
 
-const fn space_ref(spaces: &[PacketSpace; 3], space: Space) -> &PacketSpace {
-  let [initial, handshake, data] = spaces;
+fn space_ref<'conn>(
+  data: &'conn PacketSpace,
+  handshake: &'conn Option<Box<HandshakeSpaces>>,
+  space: Space,
+) -> Option<&'conn PacketSpace> {
   match space {
-    Space::Initial => initial,
-    Space::Handshake => handshake,
-    Space::Data => data,
+    Space::Initial => handshake.as_deref().map(|el| &el.initial),
+    Space::Handshake => handshake.as_deref().map(|el| &el.handshake),
+    Space::Data => Some(data),
   }
 }
 
@@ -1510,17 +1640,18 @@ fn write_header(
 mod tests {
   use crate::{
     quic::{
-      ConnState, PacketTy, QuicError, Space, TransportErrorCode,
-      conn::{CryptoRx, space_ref},
+      Cid, ConnState, PacketTy, QuicError, Space, TransportErrorCode,
+      conn::CryptoRx,
       parse_header,
       pools::{CRYPTO_BUFFER_LEN, QuicPools},
+      protect,
       testing::{CLIENT_ADDR, Link, LinkOpts, Parts, SERVER_ADDR},
     },
     sync::AtomicU64,
     tests::_count_allocations_in,
     tls::CipherSuite,
   };
-  use alloc::vec::Vec;
+  use alloc::{vec, vec::Vec};
   use core::sync::atomic::Ordering;
 
   const PING: [u8; 1] = [0x01];
@@ -1546,8 +1677,51 @@ mod tests {
     rslt
   }
 
+  // A packet of the client with the keys of `space`: a header to `dcid` (the CID that the client
+  // sends to if `None`) with the reserved bits `reserved`, a 4-byte packet number that the client
+  // then skips, and `payload`, which can be anything.
+  fn client_packet(
+    link: &mut Link,
+    space: Space,
+    dcid: Option<Cid>,
+    reserved: u8,
+    payload: &[u8],
+  ) -> Vec<u8> {
+    let conn = &mut link.client.conn;
+    let (dcid, scid) = (dcid.unwrap_or(conn.peer_cid), conn.local_cid);
+    let sp = super::space_mut(&mut conn.data, &mut conn.handshake, space).unwrap();
+    let pn = sp.sent.next_pn();
+    sp.sent.skip();
+    let mut out = vec![0; 2048];
+    let (header_len, pn_offset, length_at) =
+      super::write_header(&mut out, space, &dcid, &scid, pn, 4).unwrap();
+    out[0] |= reserved;
+    out[header_len..header_len + payload.len()].copy_from_slice(payload);
+    if let Some(at) = length_at {
+      let length = u16::try_from(4 + payload.len() + 16).unwrap() | 0x4000;
+      out[at..at + 2].copy_from_slice(&length.to_be_bytes());
+    }
+    let keys = sp.keys.as_ref().unwrap();
+    let len = protect(&keys.local, &mut out, pn_offset, pn, 4, payload.len()).unwrap();
+    out.truncate(len);
+    out
+  }
+
+  // The error code of the CONNECTION_CLOSE that the server owes, which must be a transport one.
+  fn server_close_code(link: &Link) -> Option<u64> {
+    let conn = &link.server.conn;
+    (conn.state() == ConnState::Closing && !conn.close.app).then_some(conn.close.code)
+  }
+
+  // A PING padded to `len` bytes: the payload of an Initial packet.
+  fn initial_ping(len: usize) -> Vec<u8> {
+    let mut payload = vec![0; len];
+    payload[0] = 0x01;
+    payload
+  }
+
   fn server_data_ranges(link: &Link) -> Vec<(u64, u64)> {
-    let recv = &space_ref(&link.server.conn.spaces, Space::Data).recv;
+    let recv = &link.server.conn.data.recv;
     recv.ranges().map(|el| (*el.start(), *el.end())).collect()
   }
 
@@ -1565,14 +1739,12 @@ mod tests {
       assert_eq!((link.client.app.established, link.server.app.established), (1, 1));
       // A client is confirmed by HANDSHAKE_DONE only, and the server sent it once
       assert!(!link.server.conn.handshake_done_owed && link.client.conn.handshake_complete);
-      for (spaces, tls_gone) in [
-        (&link.client.conn.spaces, link.client.conn.tls.is_none()),
-        (&link.server.conn.spaces, link.server.conn.tls.is_none()),
-      ] {
-        assert!(tls_gone, "{suite:?}");
-        assert!(space_ref(spaces, Space::Initial).keys.is_none());
-        assert!(space_ref(spaces, Space::Handshake).keys.is_none());
-        let keys = space_ref(spaces, Space::Data).keys.as_ref().unwrap();
+      for conn in [&link.client.conn.handshake, &link.server.conn.handshake] {
+        assert!(conn.is_none(), "{suite:?}");
+      }
+      assert!(link.client.conn.tls.is_none() && link.server.conn.tls.is_none());
+      for data in [&link.client.conn.data, &link.server.conn.data] {
+        let keys = data.keys.as_ref().unwrap();
         assert_eq!((keys.local.suite(), keys.remote.suite()), (suite, suite));
       }
       // The server validated the address of the client with its Handshake packet
@@ -1670,7 +1842,7 @@ mod tests {
     // Everything up to the Largest Acknowledged of that ACK is forgotten, and refused: only the
     // ACK-only packet of the client, which came after, is left
     assert_eq!(server_data_ranges(&link), [(largest + 2, largest + 2)]);
-    let recv = &space_ref(&link.server.conn.spaces, Space::Data).recv;
+    let recv = &link.server.conn.data.recv;
     assert!(recv.is_duplicate(ranges[0].0) && recv.is_duplicate(largest + 1));
   }
 
@@ -1729,14 +1901,16 @@ mod tests {
       })
       .unwrap();
     for (nth, datagram) in datagrams.iter_mut().enumerate() {
-      assert_eq!(space_ref(&link.server.conn.spaces, Space::Data).recv.largest(), None);
+      // The Finished is in the datagram with the request, not before it
+      assert_eq!(link.server.conn.state(), ConnState::Handshake);
+      assert_eq!(link.server.conn.data.recv.largest(), None);
       link.server.recv(link.now_us, datagram, CLIENT_ADDR);
       if nth == idx {
         break;
       }
     }
     assert_eq!(link.server.conn.state(), ConnState::Confirmed);
-    assert_eq!(space_ref(&link.server.conn.spaces, Space::Data).recv.largest(), Some(0));
+    assert_eq!(link.server.conn.data.recv.largest(), Some(0));
     assert_eq!(link.server.app.established, 1);
     link.run();
     assert_eq!(link.client.conn.state(), ConnState::Confirmed);
@@ -1769,7 +1943,7 @@ mod tests {
       assert!(!link.step());
       // Everything went back to the pools
       assert_eq!(link.server.parts.pools.frame_refs.live_chunks(), 0);
-      assert!(link.server.conn.spaces.iter().all(|el| el.keys.is_none()));
+      assert!(link.server.conn.handshake.is_none() && link.server.conn.data.keys.is_none());
     }
   }
 
@@ -1817,6 +1991,142 @@ mod tests {
     assert_eq!((link.client.app.closed, link.server.app.closed), (1, 1));
   }
 
+  // A CONNECTION_CLOSE needs a packet number, not a record: it goes out even when every record of
+  // the sent ring is a packet in flight.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn close_goes_out_with_a_full_sent_ring() {
+    let mut link = settled(&LinkOpts::new(None));
+    let mut sent = 0;
+    loop {
+      link.server.conn.queue_test_frames(&PING);
+      let _ = link.server.flush(link.now_us);
+      if link.server.take_datagrams().is_empty() {
+        break;
+      }
+      sent += 1;
+    }
+    assert_eq!(sent, crate::quic::sent::SENT_RING_LEN);
+    link.server.conn.close_app(link.now_us, 0);
+    let _ = link.server.flush(link.now_us);
+    assert_eq!(link.server.take_datagrams().len(), 1);
+  }
+
+  // Datagrams that arrive in the closing state count towards the amplification limit: a server
+  // that closes before validating the client answers once the client sends more.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn close_reply_counts_what_arrives_while_closing() {
+    let mut opts = LinkOpts::new(None);
+    opts.server_tp_padding = 6000;
+    let mut link = Link::new(&opts);
+    let _ = link.server.flush(link.now_us);
+    let flight = link.server.take_datagrams();
+    assert_eq!(flight.iter().map(Vec::len).sum::<usize>(), 3 * 1200);
+    link.server.conn.close_app(link.now_us, 0);
+    let _ = link.server.flush(link.now_us);
+    assert!(link.server.take_datagrams().is_empty(), "nothing left of the 3x limit");
+    for mut datagram in flight {
+      link.client.recv(link.now_us, &mut datagram, SERVER_ADDR);
+    }
+    let _ = link.client.flush(link.now_us);
+    assert!(link.deliver_to_server() > 0);
+    assert!(!link.server.conn.address_validated);
+    let _ = link.server.flush(link.now_us);
+    assert_eq!(link.server.take_datagrams().len(), 1);
+  }
+
+  // 900 packets of the client in one turn of the server are all in its next ACK.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn nine_hundred_packets_in_one_turn_are_all_reported() {
+    let mut opts = LinkOpts::new(None);
+    opts.server.limits.ping_budget = 1000;
+    let mut link = settled(&opts);
+    let first = link.client.conn.data.sent.next_pn();
+    let mut datagrams = Vec::new();
+    for nth in 0..900 {
+      if nth % 200 == 0 {
+        // As if acknowledged: the client sends more than its ring holds in flight
+        link.client.conn.data.sent.release(&mut link.client.parts.pools);
+      }
+      link.client.conn.queue_test_frames(&PING);
+      let _ = link.client.flush(link.now_us);
+      datagrams.extend(link.client.take_datagrams());
+    }
+    assert_eq!(datagrams.len(), 900);
+    for datagram in &mut datagrams {
+      link.server.recv(link.now_us, datagram, CLIENT_ADDR);
+    }
+    // With the ACK-only packets of the client before them
+    let (start, end) = server_data_ranges(&link)[0];
+    assert!(start <= first && end == first + 899, "{start}..={end}");
+    let ack_only = link.server.conn.stats().ack_only_out;
+    let _ = link.server.flush(link.now_us);
+    assert_eq!(link.server.conn.stats().ack_only_out, ack_only + 1);
+    link.client.conn.data.sent.release(&mut link.client.parts.pools);
+  }
+
+  // An aborted connection, in the middle of its handshake or of a transfer, gives back at once all
+  // that it took from the pools.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn abort_returns_everything_to_the_pools() {
+    fn counts(parts: &Parts) -> (usize, usize, usize, usize) {
+      let pools = &parts.pools;
+      (
+        pools.frame_refs.live_chunks(),
+        pools.handshake_spaces.len(),
+        pools.sent_rings.len(),
+        pools.crypto_buffers.len(),
+      )
+    }
+    let opts = LinkOpts::new(None);
+    // Warm counts, after a connection that closed normally
+    let mut link = settled(&opts);
+    link.client.conn.close_app(link.now_us, 0);
+    link.run();
+    link.advance(3 * PTO_US);
+    let (client_parts, server_parts) = link.into_parts();
+    let warm = counts(&server_parts);
+    assert_eq!(warm.0, 0);
+    // In the middle of the handshake: the flight of the server is not acknowledged
+    let mut link = Link::with_parts(&opts, client_parts, server_parts);
+    let _ = link.server.flush(link.now_us);
+    assert!(link.server.parts.pools.frame_refs.live_chunks() > 0);
+    link.server.conn.abort(&mut link.server.app, &mut link.server.parts.pools);
+    assert_eq!(link.server.conn.state(), ConnState::Closed);
+    assert_eq!(link.server.app.closed, 1);
+    assert_eq!(counts(&link.server.parts), warm);
+    let (client_parts, server_parts) = link.into_parts();
+    // In the middle of a transfer: an ACK of the server is not acknowledged
+    let mut link = Link::with_parts(&opts, client_parts, server_parts);
+    link.run();
+    link.client.conn.queue_test_frames(&PING);
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
+    let _ = link.server.flush(link.now_us);
+    assert!(link.server.parts.pools.frame_refs.live_chunks() > 0);
+    link.server.conn.abort(&mut link.server.app, &mut link.server.parts.pools);
+    assert_eq!(counts(&link.server.parts), warm);
+    // Aborting again changes nothing
+    link.server.conn.abort(&mut link.server.app, &mut link.server.parts.pools);
+    assert_eq!(link.server.app.closed, 1);
+  }
+
+  // What a connection holds of the pools goes back only if it is closed or aborted, so dropping it
+  // before is a bug that debug builds catch.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  #[should_panic(expected = "dropped before it was closed or aborted")]
+  fn dropping_an_open_connection_is_a_bug() {
+    let mut pools = QuicPools::new();
+    let cid = crate::quic::Cid::new(&[1; 8]).unwrap();
+    let mut rng = crate::rng::ChaCha20::from_key([3; 32]);
+    let params = super::ConnParams::default();
+    drop(crate::quic::testing::client_conn(&params, cid, cid, &mut rng, 0, &mut pools, |_| {}));
+  }
+
   // RFC 9000 table 3 lets 1-RTT packets carry HANDSHAKE_DONE, but only servers send it.
   #[cfg_attr(miri, ignore)]
   #[test]
@@ -1830,6 +2140,223 @@ mod tests {
     let _ = link.server.flush(link.now_us);
     assert_eq!(link.deliver_to_client(), 1);
     assert_eq!(link.client.conn.state(), ConnState::Draining);
+  }
+
+  // Every PING within the budget is acknowledged; one more in the same second closes the
+  // connection with the excessive load code of the application.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn ping_flood_over_budget_closes_with_excessive_load() {
+    let mut opts = LinkOpts::new(None);
+    opts.server.limits.ping_budget = 4;
+    let mut link = settled(&opts);
+    for _ in 0..4 {
+      link.client.conn.queue_test_frames(&PING);
+      let _ = link.client.flush(link.now_us);
+      assert_eq!(link.deliver_to_server(), 1);
+      assert!(link.server.conn.data.recv.ack_pending());
+      let _ = link.server.flush(link.now_us);
+      assert_eq!(link.server.take_datagrams().len(), 1);
+    }
+    link.client.conn.queue_test_frames(&PING);
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
+    assert_eq!(link.server.conn.state(), ConnState::Closing);
+    assert!(link.server.conn.close.app);
+    assert_eq!(link.server.conn.close.code, 0x0107);
+    let _ = link.server.flush(link.now_us);
+    assert_eq!(link.deliver_to_client(), 1);
+    assert_eq!(link.client.conn.state(), ConnState::Draining);
+  }
+
+  // A PATH_CHALLENGE is answered in a datagram of 1200 bytes; past the budget the connection
+  // closes.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn path_challenges_are_answered_until_the_budget_closes() {
+    let mut opts = LinkOpts::new(None);
+    opts.server.limits.path_challenge_budget = 2;
+    let mut link = settled(&opts);
+    for _ in 0..2 {
+      link.client.conn.queue_test_frames(&[0x1a, 1, 2, 3, 4, 5, 6, 7, 8]);
+      let _ = link.client.flush(link.now_us);
+      assert_eq!(link.deliver_to_server(), 1);
+      assert_eq!(link.server.conn.path_response, Some([1, 2, 3, 4, 5, 6, 7, 8]));
+      let _ = link.server.flush(link.now_us);
+      let datagrams = link.server.take_datagrams();
+      assert_eq!(datagrams.iter().map(Vec::len).collect::<Vec<_>>(), [1200]);
+    }
+    link.client.conn.queue_test_frames(&[0x1a, 1, 2, 3, 4, 5, 6, 7, 8]);
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
+    assert_eq!(link.server.conn.state(), ConnState::Closing);
+    assert_eq!((link.server.conn.close.app, link.server.conn.close.code), (true, 0x0107));
+  }
+
+  // Rule: a packet without frames is a PROTOCOL_VIOLATION (RFC 9000 section 12.4).
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn empty_packet_is_protocol_violation() {
+    let mut link = settled(&LinkOpts::new(None));
+    let mut packet = client_packet(&mut link, Space::Data, None, 0, &[]);
+    link.server.recv(link.now_us, &mut packet, CLIENT_ADDR);
+    assert_eq!(server_close_code(&link), Some(TransportErrorCode::ProtocolViolation.code()));
+  }
+
+  // Rule: the reserved bits of a header must be zero once protection is removed (RFC 9000
+  // section 17.3.1).
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn reserved_bits_set_is_protocol_violation() {
+    let mut link = settled(&LinkOpts::new(None));
+    let mut packet = client_packet(&mut link, Space::Data, None, 0x18, &PING);
+    link.server.recv(link.now_us, &mut packet, CLIENT_ADDR);
+    assert_eq!(server_close_code(&link), Some(TransportErrorCode::ProtocolViolation.code()));
+  }
+
+  // Rule: 0-RTT packets are dropped before any frame is read, even one that the keys of the
+  // connection would open.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn zero_rtt_packet_is_dropped() {
+    let mut link = settled(&LinkOpts::new(None));
+    let conn = &mut link.client.conn;
+    let (dcid, scid) = (conn.peer_cid, conn.local_cid);
+    let pn = conn.data.sent.next_pn();
+    conn.data.sent.skip();
+    // Long header of type 1 with a 4-byte packet number, a Length for it, a PING and the tag
+    let mut datagram = vec![0xd3, 0, 0, 0, 1, 8];
+    datagram.extend_from_slice(dcid.as_slice());
+    datagram.push(8);
+    datagram.extend_from_slice(scid.as_slice());
+    datagram.extend_from_slice(&(0x4000u16 | (4 + 1 + 16)).to_be_bytes());
+    let pn_offset = datagram.len();
+    datagram.extend_from_slice(&u32::try_from(pn).unwrap().to_be_bytes());
+    datagram.push(0x01);
+    datagram.resize(datagram.len() + 16, 0);
+    let keys = conn.data.keys.as_ref().unwrap();
+    let len = protect(&keys.local, &mut datagram, pn_offset, pn, 4, 1).unwrap();
+    assert_eq!(len, datagram.len());
+    let before = *link.server.conn.stats();
+    link.server.recv(link.now_us, &mut datagram, CLIENT_ADDR);
+    assert_eq!(link.server.conn.stats().packets_dropped, before.packets_dropped + 1);
+    assert_eq!(link.server.conn.stats().packets_in, before.packets_in);
+    assert_eq!(link.server.conn.state(), ConnState::Confirmed);
+    let _ = link.server.flush(link.now_us);
+    assert!(link.server.take_datagrams().is_empty());
+  }
+
+  // Rule: only a server sends NEW_TOKEN (RFC 9000 section 19.7).
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn new_token_from_a_client_is_protocol_violation() {
+    let mut link = settled(&LinkOpts::new(None));
+    link.client.conn.queue_test_frames(&[0x07, 0x01, 0xaa]);
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
+    assert_eq!(server_close_code(&link), Some(TransportErrorCode::ProtocolViolation.code()));
+  }
+
+  // An ACK of a packet number that was never sent is a PROTOCOL_VIOLATION (RFC 9000 section 13.1).
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn ack_of_an_unsent_packet_is_protocol_violation() {
+    let mut link = settled(&LinkOpts::new(None));
+    // An ACK of packet 1000, which the server is far from
+    link.client.conn.queue_test_frames(&[0x02, 0x43, 0xe8, 0x00, 0x00, 0x00]);
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
+    assert_eq!(server_close_code(&link), Some(TransportErrorCode::ProtocolViolation.code()));
+  }
+
+  // Rule: the CIDs of the transport parameters are those of the packets (RFC 9000 section 7.3),
+  // on both sides.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn transport_parameter_cid_mismatch_is_transport_parameter_error() {
+    let code = Some(TransportErrorCode::TransportParameterError.code());
+    let client_cases: [fn(&mut crate::quic::TransportParams); 2] = [
+      |el| el.initial_source_connection_id = Some(Cid::new(&[9; 8]).unwrap()),
+      |el| el.initial_source_connection_id = None,
+    ];
+    for change in client_cases {
+      let mut opts = LinkOpts::new(None);
+      opts.client_tp = change;
+      let link = Link::new(&opts);
+      assert_eq!(server_close_code(&link), code);
+    }
+    let server_cases: [fn(&mut crate::quic::TransportParams); 3] = [
+      |el| el.original_destination_connection_id = Some(Cid::new(&[9; 8]).unwrap()),
+      |el| el.initial_source_connection_id = None,
+      |el| el.retry_source_connection_id = Some(Cid::new(&[9; 8]).unwrap()),
+    ];
+    for change in server_cases {
+      let mut opts = LinkOpts::new(None);
+      opts.server_tp = change;
+      let mut link = Link::new(&opts);
+      let _ = link.server.flush(link.now_us);
+      assert_eq!(link.deliver_to_client(), 1);
+      let client = &link.client.conn;
+      assert_eq!(client.state(), ConnState::Closing);
+      assert_eq!((client.close.app, Some(client.close.code)), (false, code));
+    }
+  }
+
+  // RFC 9000 section 14.1: a server pads a datagram with an ack-eliciting Initial packet to 1200
+  // bytes, and not one with an ACK-only Initial packet.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn server_pads_only_ack_eliciting_initial_datagrams() {
+    let mut link = Link::new(&LinkOpts::new(None));
+    let _ = link.server.flush(link.now_us);
+    let flight = link.server.take_datagrams();
+    assert_eq!(flight.len(), 1);
+    assert_eq!(flight[0].len(), 1200);
+    assert_eq!(packet_types(&flight[0])[0], PacketTy::Initial);
+    let mut ping = client_packet(&mut link, Space::Initial, None, 0, &initial_ping(1200));
+    link.server.recv(link.now_us, &mut ping, CLIENT_ADDR);
+    let _ = link.server.flush(link.now_us);
+    let ack = link.server.take_datagrams();
+    assert_eq!(ack.len(), 1);
+    assert_eq!(packet_types(&ack[0]), [PacketTy::Initial]);
+    assert!(ack[0].len() < 100, "{}", ack[0].len());
+  }
+
+  // Rule: a server drops an Initial packet of a datagram below 1200 bytes (RFC 9000 section 14.1).
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn client_initial_in_a_short_datagram_is_dropped() {
+    let mut link = Link::new(&LinkOpts::new(None));
+    let _ = link.server.flush(link.now_us);
+    let _ = link.server.take_datagrams();
+    let mut ping = client_packet(&mut link, Space::Initial, None, 0, &initial_ping(600));
+    assert!(ping.len() < 1200);
+    let before = *link.server.conn.stats();
+    link.server.recv(link.now_us, &mut ping, CLIENT_ADDR);
+    assert_eq!(link.server.conn.stats().packets_dropped, before.packets_dropped + 1);
+    assert_eq!(link.server.conn.stats().packets_in, before.packets_in);
+    let _ = link.server.flush(link.now_us);
+    assert!(link.server.take_datagrams().is_empty());
+  }
+
+  // Rule: a packet coalesced after one with another destination CID is dropped (RFC 9000 section
+  // 12.2); the first one is processed.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn coalesced_packet_with_another_dcid_is_dropped() {
+    let mut link = Link::new(&LinkOpts::new(None));
+    let _ = link.server.flush(link.now_us);
+    let _ = link.server.take_datagrams();
+    // The first packet goes to the CID that the client chose, the second one to the server's: the
+    // server takes either alone, not both in one datagram
+    let mut datagram = client_packet(&mut link, Space::Initial, None, 0, &initial_ping(700));
+    let other = link.server.conn.local_cid;
+    assert_ne!(other, link.client.conn.peer_cid);
+    datagram.extend(client_packet(&mut link, Space::Initial, Some(other), 0, &initial_ping(700)));
+    let before = *link.server.conn.stats();
+    link.server.recv(link.now_us, &mut datagram, CLIENT_ADDR);
+    assert_eq!(link.server.conn.stats().packets_in, before.packets_in + 1);
+    assert_eq!(link.server.conn.stats().packets_dropped, before.packets_dropped + 1);
   }
 
   // A corrupted packet is dropped without a word, and the connection goes on.
@@ -1894,6 +2421,14 @@ mod tests {
     assert!(allocations <= 9 * HANDSHAKES);
     assert_eq!(allocations, 0, "{allocations} allocations in {HANDSHAKES} handshakes");
     assert_eq!(parts.1.pools.frame_refs.live_chunks(), 0);
+  }
+
+  // Spec section 5.4: a connection is at most 4 KiB, the state of the handshake comes from pools
+  #[test]
+  fn quic_conn_fits_in_4_kib() {
+    use crate::quic::testing::{ClientConn, ServerConn};
+    assert!(size_of::<ServerConn>() <= 4096, "{}", size_of::<ServerConn>());
+    assert!(size_of::<ClientConn>() <= 4096, "{}", size_of::<ClientConn>());
   }
 
   // CRYPTO data in pieces, out of order and overlapping, reaches TLS in order and once.

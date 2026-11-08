@@ -63,7 +63,7 @@ pub use protocol::{
 };
 pub use public_keys::{PublicKeyRef, PublicKeys, PublicKeysIter};
 #[cfg(feature = "quic")]
-pub(crate) use quic_tls::{QuicTls, QuicTlsSecrets};
+pub(crate) use quic_tls::QuicTls;
 pub use read_record_info::ReadRecordInfo;
 pub use tls_acceptor::{TlsAcceptOutput, TlsAcceptor};
 pub use tls_buffer::TlsBuffer;

@@ -35,6 +35,9 @@ pub enum QuicError {
   DuplicateTransportParameter,
   /// A packet has no frames (RFC 9000 section 12.4).
   EmptyPacket,
+  /// A peer went past a budget of [`crate::quic::QuicLimits`]: the connection closes with
+  /// [`crate::quic::QuicLimits::excessive_load_app_code`].
+  ExcessiveLoad,
   /// A frame that only the other role sends, such as HANDSHAKE_DONE from a client.
   FrameFromWrongRole,
   /// A frame type is not allowed in the type of the packet that carries it.

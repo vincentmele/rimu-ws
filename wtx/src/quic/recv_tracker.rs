@@ -1,15 +1,17 @@
 //! The packet numbers received in one packet number space, and the ACK frames that report them
 //! (RFC 9000 sections 12.3 and 13.2).
 //!
-//! A sliding window of bitmaps holds the most recent packet numbers. Packet numbers below the
+//! A sliding window of bitmaps holds the most recent 1024 packet numbers. Packet numbers below the
 //! window, or below the ranges that an acknowledged ACK of ours reported, are not accepted again:
-//! RFC 9000 section 13.2.3 allows forgetting a range only on that condition.
+//! RFC 9000 section 13.2.3 allows forgetting a range only on that condition. The window never
+//! slides past ack-eliciting packets that no ACK of ours reported yet: the packet that would make
+//! it slide is refused until an ACK is sent, so the peer does not take them for lost.
 
 use crate::quic::FrameWriter;
 use core::ops::RangeInclusive;
 
-// The window: 256 packet numbers
-const WORDS: usize = 4;
+// The window: 1024 packet numbers, more than a peer sends between two flushes
+const WORDS: usize = 16;
 const WINDOW: u64 = 64 * WORDS as u64;
 // The most ranges of an ACK frame of ours. Older ranges are not reported, as if the window ended
 // before them.
@@ -29,6 +31,8 @@ pub(crate) struct RecvTracker {
   largest: Option<u64>,
   // When `largest` arrived, for the ACK Delay field
   largest_time_us: u64,
+  // The smallest ack-eliciting packet number since the last ACK frame of ours
+  unreported_low: Option<u64>,
 }
 
 impl RecvTracker {
@@ -41,6 +45,7 @@ impl RecvTracker {
       floor: 0,
       largest: None,
       largest_time_us: 0,
+      unreported_low: None,
     }
   }
 
@@ -62,6 +67,14 @@ impl RecvTracker {
     self.bits.get(word).is_some_and(|elem| elem & mask != 0)
   }
 
+  /// If accepting `pn` would slide the window past ack-eliciting packet numbers that no ACK frame
+  /// of ours reported yet.
+  #[inline]
+  pub(crate) fn would_forget_unreported(&self, pn: u64) -> bool {
+    pn >= self.base.saturating_add(WINDOW)
+      && self.unreported_low.is_some_and(|elem| window_base(pn) > elem)
+  }
+
   /// The largest packet number received, if any.
   #[inline]
   pub(crate) const fn largest(&self) -> Option<u64> {
@@ -79,10 +92,11 @@ impl RecvTracker {
   }
 
   /// Records `pn`, which arrived at `now_us` in a packet that has been processed. Returns `false`,
-  /// and changes nothing, if it is a duplicate (see [`Self::is_duplicate`]).
+  /// and changes nothing, if it is a duplicate (see [`Self::is_duplicate`]) or if it would forget
+  /// packets that are not reported yet (see [`Self::would_forget_unreported`]).
   #[inline]
   pub(crate) fn on_packet(&mut self, pn: u64, ack_eliciting: bool, now_us: u64) -> bool {
-    if self.is_duplicate(pn) {
+    if self.is_duplicate(pn) || self.would_forget_unreported(pn) {
       return false;
     }
     if pn >= self.base.saturating_add(WINDOW) {
@@ -100,6 +114,9 @@ impl RecvTracker {
     }
     if ack_eliciting {
       self.ack_pending = true;
+      if self.unreported_low.is_none_or(|elem| pn < elem) {
+        self.unreported_low = Some(pn);
+      }
     }
     true
   }
@@ -108,6 +125,7 @@ impl RecvTracker {
   #[inline]
   pub(crate) const fn on_ack_sent(&mut self) {
     self.ack_pending = false;
+    self.unreported_low = None;
   }
 
   /// Writes an ACK frame of what was received, the delay since the largest packet number arrived
@@ -169,7 +187,7 @@ impl RecvTracker {
 
   // Moves the window up so that its last word holds `pn`, dropping the oldest bits.
   fn slide_to(&mut self, pn: u64) {
-    let new_base = (pn & !63).saturating_sub(WINDOW - 64);
+    let new_base = window_base(pn);
     let shift = usize::try_from(new_base.wrapping_sub(self.base) / 64).unwrap_or(usize::MAX);
     if shift >= WORDS {
       self.bits = [0; WORDS];
@@ -190,6 +208,11 @@ impl RecvTracker {
     let offset = pn.checked_sub(self.base).filter(|elem| *elem < WINDOW)?;
     Some((usize::try_from(offset / 64).ok()?, u32::try_from(offset % 64).ok()?))
   }
+}
+
+// The base of a window whose last word holds `pn`.
+const fn window_base(pn: u64) -> u64 {
+  (pn & !63).saturating_sub(WINDOW - 64)
 }
 
 #[cfg(test)]
@@ -301,16 +324,54 @@ mod tests {
     let mut tracker = RecvTracker::new();
     tracker.on_packet(0, true, 0);
     tracker.on_packet(10, true, 0);
-    tracker.on_packet(WINDOW + 70, true, 0);
+    // Reported, so they can be forgotten
+    tracker.on_ack_sent();
+    assert!(tracker.on_packet(WINDOW + 70, true, 0));
     // The window covers WINDOW numbers up to the word of the largest
     assert_eq!(ranges(&tracker), [(WINDOW + 70, WINDOW + 70)]);
     assert!(tracker.is_duplicate(10) && tracker.is_duplicate(127));
     assert!(tracker.on_packet(128, true, 0));
     assert_eq!(ranges(&tracker), [(WINDOW + 70, WINDOW + 70), (128, 128)]);
-    // A jump far ahead drops everything
-    tracker.on_packet(1_000_000, true, 0);
+    // A jump far ahead drops everything, once reported
+    tracker.on_ack_sent();
+    assert!(tracker.on_packet(1_000_000, true, 0));
     assert_eq!(ranges(&tracker), [(1_000_000, 1_000_000)]);
     assert!(tracker.is_duplicate(WINDOW + 70));
+  }
+
+  // 900 packets between two flushes, all of them in the ACK of the next one.
+  #[test]
+  fn nine_hundred_packets_in_one_turn_are_all_reported() {
+    let mut tracker = RecvTracker::new();
+    for pn in 0..900 {
+      assert!(tracker.on_packet(pn, true, 0));
+    }
+    assert_eq!(ranges(&tracker), [(0, 899)]);
+    assert_eq!(written_ack(&tracker, 0).unwrap().2, [(0, 899)]);
+  }
+
+  // A packet that would slide the window past ack-eliciting packets that no ACK reported yet waits
+  // for that ACK: it is refused until then.
+  #[test]
+  fn a_slide_never_forgets_unreported_packets() {
+    let mut tracker = RecvTracker::new();
+    for pn in 0..WINDOW {
+      assert!(tracker.on_packet(pn, true, 0));
+    }
+    assert!(tracker.would_forget_unreported(WINDOW));
+    assert!(!tracker.on_packet(WINDOW, true, 0));
+    assert_eq!(ranges(&tracker), [(0, WINDOW - 1)]);
+    tracker.on_ack_sent();
+    assert!(!tracker.would_forget_unreported(WINDOW));
+    assert!(tracker.on_packet(WINDOW, true, 0));
+    assert_eq!(ranges(&tracker), [(64, WINDOW)]);
+    // Packets that are not ack-eliciting are not waited for
+    let mut tracker = RecvTracker::new();
+    for pn in 0..WINDOW {
+      assert!(tracker.on_packet(pn, false, 0));
+    }
+    assert!(!tracker.would_forget_unreported(WINDOW + 500));
+    assert!(tracker.on_packet(WINDOW + 500, true, 0));
   }
 
   #[test]
