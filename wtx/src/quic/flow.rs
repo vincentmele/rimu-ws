@@ -188,7 +188,7 @@ mod tests {
         link.run();
       }
     }
-    assert!(link.server.app.streams.get(&id.0).is_none());
+    assert!(!link.server.app.streams.contains_key(&id.0));
     let frame = Frame::Stream { id: id.0, offset: 0, data: &data[..PIECE], fin: false };
     client_sends(&mut link, &[frame]);
     let log = &link.server.app.streams[&id.0];

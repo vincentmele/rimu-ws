@@ -1837,8 +1837,12 @@ impl Streams {
           break;
         }
         if rx.keep_block.is_none() {
-          let buffer = inline.get_or_insert_with(|| [0; INLINE_LEN]);
-          if let Some((dst, src)) = buffer.get_mut(..rx.keep).zip(rx.inline.get(..rx.keep)) {
+          if inline.is_none() {
+            inline = Some([0; INLINE_LEN]);
+          }
+          if let Some((dst, src)) =
+            inline.as_mut().and_then(|el| el.get_mut(..rx.keep)).zip(rx.inline.get(..rx.keep))
+          {
             dst.copy_from_slice(src);
           }
         }
