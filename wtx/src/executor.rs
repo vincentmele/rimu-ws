@@ -39,6 +39,8 @@ pub use uring_executor::{
   UringExecutor, UringJoinHandle, UringParams, UringReadHalf, UringRuntime, UringStats,
   UringTcpListener, UringTcpStream, UringWriteHalf, uring_stats,
 };
+#[cfg(all(feature = "io-uring", feature = "quic", target_os = "linux"))]
+pub use uring_executor::{UdpInbox, UdpParams, UdpStats, UringUdpSocket};
 #[cfg(feature = "std")]
 use {crate::net::ToSocketAddrs, core::net::SocketAddr};
 #[cfg(feature = "std")]

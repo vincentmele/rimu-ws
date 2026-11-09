@@ -179,6 +179,13 @@ impl TxArena {
     self.open = true;
   }
 
+  /// The most trains that the arena holds at once, pending, submitted or not yet released: a
+  /// driver that keeps the kernel's view of each submitted train needs that many.
+  #[inline]
+  pub(crate) fn max_trains(&self) -> usize {
+    self.trains.len()
+  }
+
   /// Marks the train as handed to the kernel: no datagram joins it anymore.
   #[inline]
   pub fn mark_submitted(&mut self, id: TrainId) {

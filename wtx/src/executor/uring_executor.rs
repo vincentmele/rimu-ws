@@ -36,8 +36,17 @@ use core::{
 };
 use io_uring::{IoUring, cqueue, opcode, opcode::AcceptMulti, squeue, types};
 use std::os::fd::{IntoRawFd, RawFd};
+#[cfg(feature = "quic")]
+pub use udp::{UdpInbox, UdpParams, UdpStats, UringUdpSocket};
+
+#[cfg(feature = "quic")]
+mod udp;
 
 const BUF_GROUP: u16 = 0;
+// The provided buffers of the UDP socket in slot 0; each UDP socket has a group of its own, this
+// plus its slot (see `udp`)
+#[cfg(feature = "quic")]
+const BUF_GROUP_UDP: u16 = 1;
 
 const KIND_RECV: u64 = 1;
 const KIND_SEND: u64 = 2;
@@ -48,6 +57,13 @@ const KIND_ACCEPT_RETRY: u64 = 6;
 const KIND_DOORBELL: u64 = 7;
 const KIND_SLEEP: u64 = 8;
 const KIND_CONNECT: u64 = 9;
+// A UDP socket's multishot receive, one of its sends, and a push into its inbox from another ring
+#[cfg(feature = "quic")]
+const KIND_UDP_RECV: u64 = 10;
+#[cfg(feature = "quic")]
+const KIND_UDP_SEND: u64 = 11;
+#[cfg(feature = "quic")]
+const KIND_MSG_RING: u64 = 12;
 // One-shot accepts kept armed per listener with direct descriptors close to running out
 const ACCEPT_DEPTH: u32 = 16;
 // The `generation` of a one-shot accept's `user_data`; a multishot accept's is 0.
@@ -154,7 +170,7 @@ impl UringRuntime {
     self.reactor.stats()
   }
 
-  #[cfg(test)]
+  #[cfg(all(test, feature = "web-socket", feature = "crypto-ring"))]
   fn open_conns(&self) -> usize {
     self.reactor.conns.borrow().iter().filter(|conn| conn.in_use).count()
   }
@@ -382,7 +398,7 @@ pub struct UringStats {
 }
 
 /// Submissions the runtime running on this thread has queued, if any.
-#[cfg(test)]
+#[cfg(all(test, feature = "http1-server-framework"))]
 pub(crate) fn sqes_pushed() -> Option<u64> {
   let reactor = CURRENT.with(Cell::get);
   // SAFETY: set by `block_on`, which outlives everything it polls
@@ -1477,6 +1493,8 @@ fn waker_drop(_: *const ()) {}
 enum Message {
   DropConn(u32, u32),
   DropListener(usize),
+  #[cfg(feature = "quic")]
+  DropUdp(u32, u32),
   Wake(usize),
 }
 
@@ -1789,6 +1807,26 @@ struct BufRing {
 }
 
 impl BufRing {
+  /// `count` buffers of `len` bytes, and the ring of their entries, all zeroed and none pushed.
+  /// `count` is a power of two, at least one.
+  fn new(count: u16, len: usize) -> crate::Result<Self> {
+    let layout = Layout::from_size_align(usize::from(count) * 16, 4096)
+      .map_err(|_err| io_err(libc::EINVAL))?;
+    // SAFETY: `layout` has a non-zero size
+    let entries = unsafe { alloc::alloc::alloc_zeroed(layout) };
+    if entries.is_null() {
+      return Err(io_err(libc::ENOMEM));
+    }
+    Ok(BufRing {
+      count,
+      entries,
+      layout,
+      len,
+      mem: alloc::vec![0; usize::from(count) * len],
+      tail: 0,
+    })
+  }
+
   fn push(&mut self, bid: u16) {
     let idx = usize::from(self.tail & (self.count - 1));
     let addr = self.mem.as_ptr() as u64 + u64::from(bid) * self.len as u64;
@@ -1828,7 +1866,7 @@ struct Reactor {
   #[cfg(test)]
   accept_arms: Cell<usize>,
   // Submissions queued, for tests that pin a path as submitting nothing
-  #[cfg(test)]
+  #[cfg(all(test, feature = "http1-server-framework"))]
   sqes_pushed: Cell<u64>,
   // Accepted sockets closed because setting them up failed
   #[cfg(test)]
@@ -1873,6 +1911,9 @@ struct Reactor {
   reaping: Cell<bool>,
   tasks: RefCell<Vec<TaskSlot>>,
   timers: RefCell<Timers>,
+  // After `ring`: what the kernel may still use of the UDP sockets goes after the ring is closed
+  #[cfg(feature = "quic")]
+  udp: udp::UdpTable,
 }
 
 impl Drop for Reactor {
@@ -1890,6 +1931,8 @@ impl Drop for Reactor {
       // SAFETY: closed once, here; the ring that could still use it is dropped right after
       let _rslt = unsafe { libc::close(slot.fd) };
     }
+    #[cfg(feature = "quic")]
+    self.udp.close_all();
     let direct = self.params.direct_files > 0;
     for listener in self.listeners.get_mut().iter_mut().filter(|el| !el.closed) {
       listener.closed = true;
@@ -1923,24 +1966,10 @@ impl Reactor {
     // overflows a `u16`.
     let count = params.recv_buffers.clamp(1, 32768).next_power_of_two();
     let len = (params.recv_buffer_len.max(1) as usize).min(MAX_RECV_RING / usize::from(count));
-    let layout = Layout::from_size_align(usize::from(count) * 16, 4096)
-      .map_err(|_err| io_err(libc::EINVAL))?;
-    // SAFETY: `layout` has a non-zero size
-    let entries = unsafe { alloc::alloc::alloc_zeroed(layout) };
-    if entries.is_null() {
-      return Err(io_err(libc::ENOMEM));
-    }
-    let mut bufs = BufRing {
-      count,
-      entries,
-      layout,
-      len,
-      mem: alloc::vec![0; usize::from(count) * len],
-      tail: 0,
-    };
+    let mut bufs = BufRing::new(count, len)?;
     // SAFETY: `entries` stays allocated, and registered, for as long as the ring
     unsafe {
-      ring.submitter().register_buf_ring_with_flags(entries as u64, count, BUF_GROUP, 0)?;
+      ring.submitter().register_buf_ring_with_flags(bufs.entries as u64, count, BUF_GROUP, 0)?;
     }
     for bid in 0..count {
       bufs.push(bid);
@@ -1978,7 +2007,7 @@ impl Reactor {
       doorbell: core::cell::UnsafeCell::new(0),
       #[cfg(test)]
       accept_arms: Cell::new(0),
-      #[cfg(test)]
+      #[cfg(all(test, feature = "http1-server-framework"))]
       sqes_pushed: Cell::new(0),
       #[cfg(test)]
       accept_setup_failures: Cell::new(0),
@@ -2009,6 +2038,8 @@ impl Reactor {
       ready: RefCell::new(VecDeque::new()),
       tasks: RefCell::new(Vec::new()),
       timers: RefCell::new(timers),
+      #[cfg(feature = "quic")]
+      udp: udp::UdpTable::default(),
     })
   }
 
@@ -2271,6 +2302,8 @@ impl Reactor {
       match message {
         Message::DropConn(idx, generation) => self.drop_conn_ref(idx, generation),
         Message::DropListener(idx) => self.drop_listener(idx),
+        #[cfg(feature = "quic")]
+        Message::DropUdp(idx, generation) => self.drop_udp(idx, generation),
         Message::Wake(data) => self.schedule(data),
       }
     }
@@ -2396,7 +2429,7 @@ impl Reactor {
   // submit and a retry, is handled out of line.
   #[inline(always)]
   fn push_sqe(&self, sqe: &squeue::Entry) {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "http1-server-framework"))]
     self.sqes_pushed.set(self.sqes_pushed.get().wrapping_add(1));
     let mut ring = self.ring.borrow_mut();
     // SAFETY: every buffer an entry points to lives in a `Conn` or `BufRing` until its completion
@@ -2416,13 +2449,13 @@ impl Reactor {
     let mut tries: u32 = 0;
     // SAFETY: as in `push_sqe`
     while unsafe { ring.submission().push(sqe) }.is_err() {
-      #[cfg(test)]
+      #[cfg(all(test, feature = "web-socket", feature = "crypto-ring"))]
       let rslt = if tests::FAIL_SUBMIT.with(core::cell::Cell::get) {
         Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
       } else {
         ring.submit()
       };
-      #[cfg(not(test))]
+      #[cfg(not(all(test, feature = "web-socket", feature = "crypto-ring")))]
       let rslt = ring.submit();
       // A submit that succeeds empties the queue, so a second try means refusals.
       let Err(err) = rslt else {
@@ -2524,6 +2557,12 @@ impl Reactor {
         KIND_DOORBELL => self.on_doorbell(res),
         KIND_SLEEP => self.on_sleep(idx, generation),
         KIND_CONNECT => self.on_connect(idx, generation, res),
+        #[cfg(feature = "quic")]
+        KIND_UDP_RECV => self.on_udp_recv(idx, generation, res, flags),
+        #[cfg(feature = "quic")]
+        KIND_UDP_SEND => self.on_udp_send(idx, generation, res),
+        #[cfg(feature = "quic")]
+        KIND_MSG_RING => self.on_msg_ring(idx, generation),
         _ => {}
       }
     }
@@ -2886,7 +2925,7 @@ impl Reactor {
       conn.rx_eof = true;
     } else if res == -libc::ENOBUFS {
       bump(&self.counters.recv_buffers_exhausted);
-      #[cfg(test)]
+      #[cfg(all(test, feature = "web-socket", feature = "crypto-ring"))]
       let _ = tests::ENOBUFS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     } else if res != -libc::ECANCELED {
       conn.rx_err = errno(res);
