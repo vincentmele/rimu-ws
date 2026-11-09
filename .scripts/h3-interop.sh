@@ -43,10 +43,9 @@
 #              `cargo build --release -p rimu-ws-internal --features arena-h2,udp-impair`
 #   IMPAIR_BIN the udp-impair binary (default $CARGO_TARGET_DIR/release/udp-impair)
 #   SEED       seed of the proxy (default 1)
-#   PING_BUDGET  ARENA_H3_PING_BUDGET of the server (unset: the library's 64 PING frames a second).
-#              The ngtcp2 example client sends more than that during a fast transfer under loss and
-#              is closed with H3_EXCESSIVE_LOAD (ruling T7-c's known cost); PING_BUDGET=100000 shows
-#              that nothing else fails there
+#   PING_BUDGET  ARENA_H3_PING_BUDGET of the server (unset: the library's base of 64 PING frames a
+#              second, plus 2 per smoothed RTT, ruling T21-g). Before T21-g the ngtcp2 example client
+#              was closed with H3_EXCESSIVE_LOAD under loss5 at the flat 64
 #   SEQ, PAR   sequential requests (1000) and parallel connections (64)
 #   CELL_LIMIT seconds a cell may take before it is stopped and failed (default 240)
 

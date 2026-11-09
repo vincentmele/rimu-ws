@@ -95,6 +95,9 @@ const MIN_DATAGRAM_LEN: usize = 1200;
 // protection sample, which starts four bytes after the packet number, is within the packet
 const MIN_PN_AND_PAYLOAD_LEN: usize = 4;
 // The PING frame
+/// The most PING frames a second that a connection takes with the allowance scaled by its RTT
+/// (ruling T21-g), unless the base budget is larger.
+const PING_ALLOWANCE_CAP: u32 = 16_384;
 const PING_FRAME: [u8; 1] = [0x01];
 // Probes sent after a probe timeout (RFC 9002 section 6.2.4)
 const PTO_PROBES: u8 = 2;
@@ -1556,6 +1559,19 @@ where
     self.streams.on_closing();
   }
 
+  // The PING frames a window of one second takes (ruling T21-g): the base budget plus two per
+  // smoothed RTT, because a conformant peer in a run of ACK-only packets pings once per RTT (RFC
+  // 9000 section 13.2.4) and PTO and path MTU probes add to that. At most `PING_ALLOWANCE_CAP`,
+  // or the base if that is larger. Before the first RTT sample the initial RTT is the smoothed one.
+  // One division, and only for a PING frame.
+  fn ping_allowance(&self) -> u32 {
+    let base = self.params.limits.ping_budget;
+    let per_rtt = 1_000_000u64 / self.recovery.rtt.smoothed_us.max(1);
+    let scaled = u64::from(base).saturating_add(per_rtt.saturating_mul(2));
+    let cap = u64::from(base.max(PING_ALLOWANCE_CAP));
+    u32::try_from(scaled.min(cap)).unwrap_or(u32::MAX)
+  }
+
   // A budget is spent: the application closes the connection with its excessive load code. The
   // error has the code that such a close takes before 1-RTT (RFC 9000 section 10.2.3).
   fn excessive_load(&mut self, now_us: u64) -> crate::Error {
@@ -1914,7 +1930,7 @@ where
         }
         Frame::Ping => {
           ack_eliciting = true;
-          let budget = self.params.limits.ping_budget;
+          let budget = self.ping_allowance();
           if !self.cold.as_deref_mut().is_none_or(|el| el.pings.take(budget, now_us)) {
             return Err(self.excessive_load(now_us));
           }
@@ -4159,6 +4175,9 @@ mod tests {
     // No path MTU probe from the client, whose PING the budget would count
     opts.server.max_udp_payload_size = 1200;
     let mut link = settled(&opts);
+    // Ruling T21-g: the allowance is the base plus 2 per RTT, which is thousands on this link;
+    // an RTT over one second adds none, so the base is the allowance
+    link.server.conn.recovery.rtt.smoothed_us = 10_000_000;
     let mut pings = Vec::new();
     for _ in 0..2 {
       link.client.conn.queue_test_frames(&PING);
@@ -4208,6 +4227,8 @@ mod tests {
     // No path MTU probe from the client, whose PING the budget would count
     opts.server.max_udp_payload_size = 1200;
     let mut link = settled(&opts);
+    // Ruling T21-g: as in `excessive_load_is_a_connection_error`, an RTT of 10 s leaves the base
+    link.server.conn.recovery.rtt.smoothed_us = 10_000_000;
     for _ in 0..4 {
       link.client.conn.queue_test_frames(&PING);
       let _ = link.client.flush(link.now_us);
@@ -4231,10 +4252,9 @@ mod tests {
   // ACK-only packets adds a PING once per smoothed RTT, which is more than the default budget of 64
   // a second whenever that RTT is under 15 ms (the example client was closed with H3_EXCESSIVE_LOAD
   // in a 1 MiB transfer on loopback under 5% loss). A peer that pings once per millisecond for a
-  // tenth of a second, 100 PINGs, is legal and must not be closed. Ignored: the limit is ruling
-  // T7-c's, and widening it, or scaling it with the RTT, is the controller's decision (task-21-report.md).
+  // tenth of a second, 100 PINGs, is legal and must not be closed (ruling T21-g: the allowance
+  // scales with the RTT).
   #[cfg_attr(miri, ignore)]
-  #[ignore = "T21: waits for the decision on the PING budget"]
   #[test]
   fn a_peer_that_pings_once_per_rtt_is_not_closed() {
     let mut opts = LinkOpts::new(None);
@@ -4250,6 +4270,67 @@ mod tests {
       let _ = link.server.take_datagrams();
       link.now_us = link.now_us.wrapping_add(1_000);
     }
+  }
+
+  // Ruling T21-g: the PINGs a second are 64 plus 2 per smoothed RTT. Sends PINGs at one instant
+  // until the connection closes; the number taken before that.
+  fn pings_until_closed(smoothed_rtt_us: u64, base: u32) -> (u32, ConnState) {
+    let mut opts = LinkOpts::new(None);
+    opts.server.limits.ping_budget = base;
+    // No path MTU probe from the client, whose PING the budget would count
+    opts.server.max_udp_payload_size = 1200;
+    let mut link = settled(&opts);
+    link.server.conn.recovery.rtt.smoothed_us = smoothed_rtt_us;
+    let mut taken = 0;
+    for _ in 0..20_000 {
+      link.client.conn.queue_test_frames(&PING);
+      let _ = link.client.flush(link.now_us);
+      assert_eq!(link.deliver_to_server(), 1, "after {taken} PINGs");
+      if link.server.conn.state() != ConnState::Confirmed {
+        break;
+      }
+      taken += 1;
+      let _ = link.server.flush(link.now_us);
+      let _ = link.deliver_to_client();
+    }
+    let closing = (link.server.conn.close.app, link.server.conn.close.code);
+    assert_eq!(closing, (true, 0x0107));
+    (taken, link.server.conn.state())
+  }
+
+  // Ruling T21-g, a flooder past the scaled allowance is closed: with a long RTT (1 s, one PING
+  // per RTT) the allowance is the base 64 plus 2, and the 67th PING closes the connection.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn ping_flood_with_a_long_rtt_gets_the_base_allowance() {
+    assert_eq!(pings_until_closed(1_000_000, 64), (66, ConnState::Closing));
+    // The base is the one that is configured
+    assert_eq!(pings_until_closed(1_000_000, 10), (12, ConnState::Closing));
+    // Before the first sample the initial RTT (333 ms) applies: 64 + 2 * 3
+    assert_eq!(pings_until_closed(333_000, 64), (70, ConnState::Closing));
+  }
+
+  // Ruling T21-g, with a tiny RTT the allowance would be 64 + 2,000,000: the cap of 16,384 a
+  // second applies, and the 16,385th PING closes the connection.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn ping_flood_with_a_tiny_rtt_is_capped() {
+    assert_eq!(pings_until_closed(1, 64), (16_384, ConnState::Closing));
+  }
+
+  // Ruling T21-g: the allowance follows the RTT between the two ends, and a base above the cap
+  // stays the base.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn ping_allowance_follows_the_rtt() {
+    let mut link = settled(&LinkOpts::new(None));
+    let conn = &mut link.server.conn;
+    for (srtt, want) in [(1_000_000, 66), (100_000, 84), (15_625, 192), (1_000, 2_064), (10, 16_384), (0, 16_384)] {
+      conn.recovery.rtt.smoothed_us = srtt;
+      assert_eq!(conn.ping_allowance(), want, "srtt {srtt} us");
+    }
+    conn.params.limits.ping_budget = 100_000;
+    assert_eq!(conn.ping_allowance(), 100_000);
   }
 
   // A PATH_CHALLENGE is answered in a datagram of 1200 bytes; past the budget the connection

@@ -70,8 +70,14 @@ pub struct QuicLimits {
   /// Defaults to 16: a client sends one for each connection ID that it gives, and the server
   /// stores at most two.
   pub new_connection_id_budget: u32,
-  /// The most PING frames per second. Each one is acknowledged; one more closes the connection
-  /// with [`Self::excessive_load_app_code`].
+  /// The base of the PING frames per second that a connection may send. Each one is acknowledged;
+  /// one more than the allowance closes the connection with [`Self::excessive_load_app_code`].
+  ///
+  /// The allowance is this base plus 2 per smoothed RTT of the connection, `base + 2 * (1 s /
+  /// smoothed RTT)`, at most 16,384 a second (or the base, if that is larger), because a peer in
+  /// a run of ACK-only packets pings once per RTT (RFC 9000 section 13.2.4) and PTO and path MTU
+  /// probes add to it: 70 before the first RTT sample, 84 at 100 ms, 192 at 15.6 ms, 2,064 at 1 ms.
+  /// The initial RTT applies until the first sample (ruling T21-g).
   ///
   /// Defaults to 64.
   pub ping_budget: u32,

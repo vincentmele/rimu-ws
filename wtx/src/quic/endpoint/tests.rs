@@ -398,20 +398,25 @@ fn frame_flood_budgets_close_connection() {
       reset_token: &token,
     }]));
   }
-  let floods: [(&str, Vec<u8>); 3] = [
-    ("PING", encode_frames(&[Frame::Ping; 65])),
-    ("PATH_CHALLENGE", encode_frames(&[Frame::PathChallenge([1; 8]); 17])),
-    ("NEW_CONNECTION_ID", new_cids),
+  let floods: [(&str, Vec<Vec<u8>>); 3] = [
+    // Ruling T21-g: the PINGs a second are 64 plus 2 per smoothed RTT, at most 16,384, and the
+    // RTT of this network is tiny: 17,000 PINGs, 1,000 to a packet, close the connection
+    // whatever the RTT is
+    ("PING", vec![encode_frames(&vec![Frame::Ping; 1000]); 17]),
+    ("PATH_CHALLENGE", vec![encode_frames(&[Frame::PathChallenge([1; 8]); 17])]),
+    ("NEW_CONNECTION_ID", vec![new_cids]),
   ];
   for (name, flood) in floods {
     let mut net = net(1, QuicParams::default());
     let client = net.add_client();
     net.run();
     let cid = server_cid(&net, client);
-    net.clients[client].conn.queue_test_frames(&flood);
-    let mut datagrams = net.client_datagrams(client);
-    for datagram in &mut datagrams {
-      let _ = net.deliver_to_server(client, datagram);
+    for packet in &flood {
+      net.clients[client].conn.queue_test_frames(packet);
+      let mut datagrams = net.client_datagrams(client);
+      for datagram in &mut datagrams {
+        let _ = net.deliver_to_server(client, datagram);
+      }
     }
     let conn = net.servers[0].endpoint.conn(&cid).unwrap();
     assert_eq!(conn.close_code(), Some((true, excessive)), "{name}");
