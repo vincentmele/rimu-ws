@@ -314,6 +314,12 @@ mod tests {
     use crate::{misc::ZEROED, tls::tls_pool::KS_POOL_MAX};
     let zeroed = || ZEROED.with(core::cell::Cell::get);
     KS_POOL.with(|el| el.borrow_mut().clear());
+    // What the drop of a key schedule wipes by itself, its states' secrets (ruling T18-e), before
+    // its box is cleared
+    let before = zeroed();
+    drop(KeySchedule::unset());
+    let own = zeroed() - before;
+    assert!(own > 0, "a key schedule did not wipe its secrets");
     let boxes: alloc::vec::Vec<_> =
       (0..=KS_POOL_MAX).map(|_| KsBox::new(KeySchedule::unset())).collect();
     let before = zeroed();
@@ -322,7 +328,7 @@ mod tests {
     assert_eq!(KS_POOL.with(|el| el.borrow().len()), KS_POOL_MAX);
     assert_eq!(
       cleared,
-      (KS_POOL_MAX + 1) * size_of::<KeySchedule>(),
+      (KS_POOL_MAX + 1) * (own + size_of::<KeySchedule>()),
       "a key schedule box left uncleared"
     );
     BUF_POOL.with(|el| el.borrow_mut().pairs.clear());
