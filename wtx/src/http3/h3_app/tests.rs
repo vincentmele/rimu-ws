@@ -482,6 +482,40 @@ fn h3_steady_state_allocates_nothing_after_warmup() {
   assert_eq!(net.servers[0].app.handler.count, (2 * CLIENTS * REQUESTS) as u64);
 }
 
+// Carried from task 13 (ruling T16-a): a response copied whole that is larger than the response
+// buffer keeps (16 KiB) leaves its body with a write of its own instead of through that buffer,
+// which would be made and freed again for each response; the client gets the same bytes.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn large_copied_responses_allocate_nothing_after_warmup() {
+  static OTHERS: AtomicU64 = AtomicU64::new(0);
+  static SERVER: AtomicU64 = AtomicU64::new(0);
+  static BODY: [u8; 40_000] = [b'x'; 40_000];
+  let handler = TestHandler { record: false, ..TestHandler::new(&BODY) };
+  let mut net = h3_net(QuicParams::default(), H3Params::default(), &handler);
+  net.count((&SERVER, &OTHERS));
+  let client = net.add_client();
+  net.run();
+  let _ = open_uni(&mut net, client, &control_stream(client_settings()));
+  let request = headers_frame(&GET);
+  let get = |net: &mut H3Net| {
+    let id = send(net, client, &request, true);
+    net.run();
+    let rsp = response(net, client, id).unwrap();
+    assert!(rsp.fin && rsp.body.iter().all(|el| *el == b'x'));
+    assert_eq!((rsp.body.len(), rsp.frames.as_slice()), (BODY.len(), &[0x01, 0x00][..]));
+  };
+  for _ in 0..4 {
+    get(&mut net);
+  }
+  let before = SERVER.load(Ordering::Relaxed);
+  for _ in 0..4 {
+    get(&mut net);
+  }
+  let allocations = SERVER.load(Ordering::Relaxed) - before;
+  assert_eq!(allocations, 0, "{allocations} allocations for 4 responses of 40 KB");
+}
+
 // Ruling T13-a: the inline state fits in 160 bytes and a connection with it in 4 KiB; a box that
 // comes back from the pool has a new decoder table and an empty memo, so another connection's
 // fields never replay.

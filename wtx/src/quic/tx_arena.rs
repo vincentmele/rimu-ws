@@ -51,6 +51,8 @@ pub struct TxArena {
   next_id: u32,
   // If the newest train can take more datagrams
   open: bool,
+  // The datagrams of a train at most
+  segments: u16,
   trains: Vector<usize, Train>,
 }
 
@@ -61,6 +63,12 @@ impl TxArena {
   /// An arena of `bytes` bytes, all of them allocated now.
   #[inline]
   pub fn new(bytes: usize) -> crate::Result<Self> {
+    Self::with_train_segments(bytes, MAX_TRAIN_SEGMENTS)
+  }
+
+  /// [`Self::new`] whose trains take at most `segments` datagrams, from 1 to the 64 of the kernel.
+  #[inline]
+  pub fn with_train_segments(bytes: usize, segments: u16) -> crate::Result<Self> {
     let trains = (bytes / BYTES_PER_TRAIN).max(MIN_TRAINS);
     Ok(Self {
       begun: None,
@@ -69,6 +77,7 @@ impl TxArena {
       first: 0,
       next_id: 0,
       open: false,
+      segments: segments.clamp(1, MAX_TRAIN_SEGMENTS),
       trains: Vector::from_cloneable_elem(trains, Train::EMPTY)?,
     })
   }
@@ -137,14 +146,14 @@ impl TxArena {
       return;
     }
     let len = len.min(begun.max_len);
-    let open = self.open;
+    let (open, segments) = (self.open, self.segments);
     if let Some(newest) = self.newest_mut()
       && open
       && begun.after_newest
       && newest.state == TrainState::Pending
       && newest.peer == begun.peer
       && newest.local == begun.local
-      && newest.segments < MAX_TRAIN_SEGMENTS
+      && newest.segments < segments
       && newest.len.wrapping_add(len) <= max_train_bytes(&begun.peer)
       && len <= usize::from(newest.segment_size)
     {
@@ -246,7 +255,7 @@ impl TxArena {
       && newest.state == TrainState::Pending
       && newest.peer == peer
       && newest.local == local
-      && newest.segments < MAX_TRAIN_SEGMENTS
+      && newest.segments < self.segments
       && newest.len.wrapping_add(segment) <= max_train_bytes(&peer);
     joinable.then_some(segment)
   }
@@ -405,6 +414,20 @@ mod tests {
     arena.mark_submitted(last);
     push(&mut arena, A, local, 1472, 0);
     assert_eq!(trains(&arena), [(1200, 1200, A), (1472, 1472, A), (1472, 1472, A)]);
+  }
+
+  // Ruling T16-b (task 19's measurement): a train takes at most the datagrams that the arena was
+  // made for, 64 (the kernel's limit) by default, from 1.
+  #[test]
+  fn trains_take_at_most_the_segments_asked_for() {
+    for (asked, taken) in [(32u16, 32usize), (1, 1), (0, 1), (64, 64), (100, 64)] {
+      let mut arena = TxArena::with_train_segments(TxArena::DEFAULT_BYTES, asked).unwrap();
+      for _ in 0..=taken {
+        push(&mut arena, A, None, 1000, 0);
+      }
+      let expected = [(1000, 1000 * taken, A), (1000, 1000, A)];
+      assert_eq!(trains(&arena), expected, "{asked}");
+    }
   }
 
   // The kernel takes at most 65,535 bytes of IP payload in one UDP_SEGMENT send: 65,507 bytes of

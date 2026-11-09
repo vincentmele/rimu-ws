@@ -776,7 +776,7 @@ impl Streams {
       && self.write_stream_control(fw, frames, pools, params, &mut wrote)?
       && self.write_lost(fw, frames, pools, &mut wrote)?
     {
-      self.write_stream_data(fw, frames, pools, &mut wrote)?;
+      self.write_stream_data(fw, frames, pools, params.bodies_round_robin, &mut wrote)?;
     }
     Ok(wrote)
   }
@@ -987,6 +987,9 @@ impl Streams {
     tx.copy_unsent(data_len, fw);
     tx.sent = tx.sent.wrapping_add(len);
     tx.fin_sent |= fin;
+    if fin && let Some(cold) = self.cold.as_deref_mut() {
+      cold.fins_out = cold.fins_out.wrapping_add(1);
+    }
     let more = tx.sent < tx.end;
     self.flow.tx_sent = self.flow.tx_sent.wrapping_add(len);
     self.unsent = self.unsent.saturating_sub(len);
@@ -1155,6 +1158,7 @@ impl Streams {
     fw: &mut FrameWriter<'_>,
     frames: &mut FrameRefRange,
     pools: &mut QuicPools,
+    bodies_round_robin: bool,
     wrote: &mut bool,
   ) -> crate::Result<()> {
     // Bytes written by copy: a frame for each stream in turn, those that are sent from go to the
@@ -1178,6 +1182,9 @@ impl Streams {
       }
       slot = next;
     }
+    if bodies_round_robin {
+      return self.write_bodies_in_turn(fw, frames, pools, wrote);
+    }
     // Bodies: one stream at a time, to its end
     loop {
       let slot = self.large.head;
@@ -1190,6 +1197,42 @@ impl Streams {
           *wrote = true;
           self.schedule(pools, slot);
         }
+      }
+    }
+  }
+
+  // Bodies in turn: a frame for each stream of the list, which then goes to its end, until the
+  // packet is full or a round writes nothing (every stream waits for credit)
+  fn write_bodies_in_turn(
+    &mut self,
+    fw: &mut FrameWriter<'_>,
+    frames: &mut FrameRefRange,
+    pools: &mut QuicPools,
+    wrote: &mut bool,
+  ) -> crate::Result<()> {
+    loop {
+      let last = self.large.tail;
+      let mut slot = self.large.head;
+      let mut any = false;
+      while slot != NO_LINK {
+        let next = pools.stream_slots.get(slot).map_or(NO_LINK, |el| el.ready.next);
+        match self.write_stream_frame(fw, frames, pools, slot)? {
+          Wrote::Full => return Ok(()),
+          Wrote::Blocked => {}
+          Wrote::Frame => {
+            *wrote = true;
+            any = true;
+            self.unlink_ready(&mut pools.stream_slots, slot);
+            self.schedule(pools, slot);
+          }
+        }
+        if slot == last {
+          break;
+        }
+        slot = next;
+      }
+      if !any {
+        return Ok(());
       }
     }
   }

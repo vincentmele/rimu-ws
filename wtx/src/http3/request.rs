@@ -23,6 +23,18 @@ const SCHEME: usize = 1;
 const AUTHORITY: usize = 2;
 /// The index of `:path`.
 const PATH: usize = 3;
+// The classes of a byte, bits of `CLASSES` (ruling T16-a: one load per byte for every check)
+/// `tchar` (RFC 9110 section 5.6.2).
+const TCHAR: u8 = 1;
+/// `tchar` that is not an uppercase letter: what a field name is made of (RFC 9114 section 4.2).
+const LOWER_TCHAR: u8 = 2;
+/// Neither a space nor a control: what `:authority` and `:path` are made of.
+const VISIBLE: u8 = 4;
+/// HTAB, SP, visible ASCII and obs-text: what a field value is made of (RFC 9110 section 5.5).
+const FIELD: u8 = 8;
+/// What a scheme is made of after its first letter (RFC 3986 section 3.1).
+const SCHEME_CHAR: u8 = 16;
+static CLASSES: [u8; 256] = classes();
 
 /// A complete request: its head, checked (RFC 9114 section 4.3), and its body, the payloads of its
 /// DATA frames. Pseudo-header fields that the request does not have are empty (`:scheme` and
@@ -38,11 +50,31 @@ pub(crate) struct H3Request<'a> {
   /// `:path`.
   pub path: &'a [u8],
   /// The fields that are not pseudo-header fields, in their order.
-  pub fields: &'a [(&'a [u8], &'a [u8])],
+  pub fields: Fields<'a>,
+  /// The value of `host`, empty if the request has none.
+  pub host: &'a [u8],
   /// The body.
   pub body: &'a [u8],
   /// The stream of the request.
   pub stream: StreamId,
+}
+
+/// The fields of a request that are not pseudo-header fields, read where they were decoded.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Fields<'a> {
+  head: &'a RequestHead,
+}
+
+impl<'a> Fields<'a> {
+  /// The fields of `head`.
+  pub(crate) const fn new(head: &'a RequestHead) -> Self {
+    Self { head }
+  }
+
+  /// The fields, in their order.
+  pub(crate) fn iter(&self) -> impl Iterator<Item = (&'a [u8], &'a [u8])> + use<'a> {
+    self.head.fields()
+  }
 }
 
 /// The decoded head of a request: the bytes of its names and values, where they are, and what
@@ -129,22 +161,22 @@ impl RequestHead {
   }
 
   /// The fields that are not pseudo-header fields, in their order.
-  pub(crate) fn fields(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+  pub(crate) fn fields(&self) -> impl Iterator<Item = (&[u8], &[u8])> + use<'_> {
     self.fields.iter().map(|&(start, name_len, value_len)| {
       let name_end = start.wrapping_add(name_len);
       (self.slice((start, name_len)), self.slice((name_end, value_len)))
     })
   }
 
-  /// The number of fields that are not pseudo-header fields.
-  pub(crate) fn fields_len(&self) -> usize {
-    self.fields.len()
-  }
-
   /// Frees each buffer whose capacity is more than `keep` bytes, out of `budget`.
   pub(crate) fn trim(&mut self, budget: &mut Budget, keep: usize) {
     budget.trim(&mut self.bytes, keep);
     budget.trim(&mut self.fields, keep);
+  }
+
+  /// The value of `host`, empty if absent.
+  pub(crate) fn host(&self) -> &[u8] {
+    self.host.map(|el| self.slice(el)).unwrap_or_default()
   }
 
   /// `:method`.
@@ -259,7 +291,7 @@ pub(crate) fn check_trailer(
 // a value of the `field-content` of RFC 9110 section 5.5 (section 10.3) and no field that is
 // specific to a connection (section 4.2).
 fn check_field(name: &[u8], value: &[u8]) -> crate::Result<()> {
-  if name.is_empty() || !name.iter().all(|el| is_tchar(*el) && !el.is_ascii_uppercase()) {
+  if name.is_empty() || !all_in(name, LOWER_TCHAR) {
     return Err(malformed());
   }
   if !is_field_content(value) {
@@ -285,49 +317,82 @@ fn count_field(size: &mut u64, name: &[u8], value: &[u8], max_size: u64) -> crat
   Ok(())
 }
 
+// If every byte of `bytes` is of the class `bit`.
+fn all_in(bytes: &[u8], bit: u8) -> bool {
+  bytes.iter().all(|el| class(*el) & bit != 0)
+}
+
+// The classes of `byte`.
+fn class(byte: u8) -> u8 {
+  CLASSES.get(usize::from(byte)).copied().unwrap_or(0)
+}
+
+const fn classes() -> [u8; 256] {
+  let mut rslt = [0; 256];
+  let mut idx = 0;
+  while idx < 256 {
+    #[expect(clippy::cast_possible_truncation, reason = "below 256")]
+    let byte = idx as u8;
+    let alnum = byte.is_ascii_alphanumeric();
+    let tchar = alnum
+      || matches!(
+        byte,
+        b'!'
+          | b'#'
+          | b'$'
+          | b'%'
+          | b'&'
+          | b'\''
+          | b'*'
+          | b'+'
+          | b'-'
+          | b'.'
+          | b'^'
+          | b'_'
+          | b'`'
+          | b'|'
+          | b'~'
+      );
+    let mut bits = 0;
+    if tchar {
+      bits |= TCHAR;
+      if !byte.is_ascii_uppercase() {
+        bits |= LOWER_TCHAR;
+      }
+    }
+    if byte > 0x20 && byte != 0x7f {
+      bits |= VISIBLE;
+    }
+    if byte == b'\t' || (byte >= 0x20 && byte != 0x7f) {
+      bits |= FIELD;
+    }
+    if alnum || matches!(byte, b'+' | b'-' | b'.') {
+      bits |= SCHEME_CHAR;
+    }
+    rslt[idx] = bits;
+    idx += 1;
+  }
+  rslt
+}
+
 // SP and HTAB are allowed inside, not at the ends; other controls and DEL are not
 fn is_field_content(value: &[u8]) -> bool {
   let ends = |el: Option<&u8>| !matches!(el, Some(b' ' | b'\t'));
-  ends(value.first())
-    && ends(value.last())
-    && value.iter().all(|el| *el == b'\t' || (*el >= 0x20 && *el != 0x7f))
+  ends(value.first()) && ends(value.last()) && all_in(value, FIELD)
 }
 
 // `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )` (RFC 3986 section 3.1)
 fn is_scheme(value: &[u8]) -> bool {
-  value.first().is_some_and(u8::is_ascii_alphabetic)
-    && value.iter().all(|el| el.is_ascii_alphanumeric() || matches!(el, b'+' | b'-' | b'.'))
-}
-
-fn is_tchar(byte: u8) -> bool {
-  byte.is_ascii_alphanumeric()
-    || matches!(
-      byte,
-      b'!'
-        | b'#'
-        | b'$'
-        | b'%'
-        | b'&'
-        | b'\''
-        | b'*'
-        | b'+'
-        | b'-'
-        | b'.'
-        | b'^'
-        | b'_'
-        | b'`'
-        | b'|'
-        | b'~'
-    )
+  value.first().is_some_and(u8::is_ascii_alphabetic) && all_in(value, SCHEME_CHAR)
 }
 
 fn is_token(value: &[u8]) -> bool {
-  !value.is_empty() && value.iter().all(|el| is_tchar(*el))
+  !value.is_empty() && all_in(value, TCHAR)
 }
 
 // No space and no control: `:authority` and `:path` are parts of a URI
 fn is_visible(value: &[u8]) -> bool {
-  value.iter().all(|el| *el > 0x20 && *el != 0x7f)
+  all_in(value, VISIBLE)
 }
 
 fn len_u32(bytes: &[u8]) -> crate::Result<u32> {
@@ -361,4 +426,32 @@ fn parse_content_length(value: &[u8]) -> crate::Result<u64> {
     length = length.wrapping_mul(10).wrapping_add(u64::from(byte.wrapping_sub(b'0')));
   }
   Ok(length)
+}
+
+#[cfg(test)]
+mod tests {
+  use crate::http3::request::{FIELD, LOWER_TCHAR, SCHEME_CHAR, TCHAR, VISIBLE, class};
+
+  // The checks as RFC 9110 and RFC 3986 word them, byte by byte, which the classes must match.
+  fn tchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+  }
+
+  // Ruling T16-a: the field checks read one table of byte classes; every byte is in the classes
+  // that the rules give it, and in no other.
+  #[test]
+  fn byte_classes_match_the_rules() {
+    for byte in 0..=255u8 {
+      let expected = [
+        (TCHAR, tchar(byte)),
+        (LOWER_TCHAR, tchar(byte) && !byte.is_ascii_uppercase()),
+        (VISIBLE, byte > 0x20 && byte != 0x7f),
+        (FIELD, byte == b'\t' || (byte >= 0x20 && byte != 0x7f)),
+        (SCHEME_CHAR, byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')),
+      ];
+      for (bit, is) in expected {
+        assert_eq!(class(byte) & bit != 0, is, "byte {byte:#04x}, class {bit:#04x}");
+      }
+    }
+  }
 }

@@ -119,6 +119,24 @@ pub(crate) struct EndpointStats {
   pub(crate) packets_out: u64,
   /// Packets sent that were not ack-eliciting, other than CONNECTION_CLOSE.
   pub(crate) ack_only_out: u64,
+  /// STREAM frames sent with the FIN of their stream, the first time: responses finished.
+  pub(crate) fins_out: u64,
+  /// Flushes of a connection that sent a FIN.
+  pub(crate) fin_flushes: u64,
+  /// Of [`Self::fin_flushes`], those that carried an ACK frame of the 1-RTT space.
+  pub(crate) fin_flushes_acked: u64,
+  /// DATA_BLOCKED frames received.
+  pub(crate) data_blocked_in: u64,
+  /// STREAM_DATA_BLOCKED frames received.
+  pub(crate) stream_data_blocked_in: u64,
+  /// STREAMS_BLOCKED frames received.
+  pub(crate) streams_blocked_in: u64,
+  /// Packets declared lost.
+  pub(crate) packets_lost: u64,
+  /// Probe timeouts that fired.
+  pub(crate) pto_probes: u64,
+  /// STREAM frames sent again.
+  pub(crate) frames_resent: u64,
   /// Retry packets sent.
   pub(crate) retries: u64,
   /// Datagrams handed to another worker.
@@ -359,6 +377,9 @@ where
       }
       self.stateless.pop();
     }
+    if self.params.flush_in_slot_order() {
+      self.dirty.as_slice_mut().sort_unstable();
+    }
     let mut done = 0usize;
     while let Some(idx) = self.dirty.get(done).copied() {
       let Self { pools, slots, stats, .. } = self;
@@ -367,12 +388,9 @@ where
       {
         let rslt = conn.flush(now_us, tx, app, pools);
         // What it sent counts once it is closed too (carried rule 4)
-        let counters = conn.stats();
-        let sent = (counters.datagrams_out, counters.packets_out, counters.ack_only_out);
-        stats.datagrams_out = stats.datagrams_out.wrapping_add(sent.0.wrapping_sub(slot.sent.0));
-        stats.packets_out = stats.packets_out.wrapping_add(sent.1.wrapping_sub(slot.sent.1));
-        stats.ack_only_out = stats.ack_only_out.wrapping_add(sent.2.wrapping_sub(slot.sent.2));
-        slot.sent = sent;
+        let tally = Tally::of(conn);
+        tally.add_since(&slot.sent, stats);
+        slot.sent = tally;
         if rslt == FlushOutcome::ArenaFull {
           // This one and the ones after it stay dirty
           let len = self.dirty.len();
@@ -473,6 +491,19 @@ where
       && let Some(loads) = &self.loads
     {
       loads.closed(worker);
+    }
+  }
+
+  /// The caller hands `segment`, a segment after the first of a coalesced datagram that
+  /// [`Self::recv`] returned [`RecvOutcome::Forward`] for, to `worker` apart: if it is a first
+  /// Initial packet, it takes a place on that worker as the first one did, which that worker gives
+  /// back if it opens nothing (and [`Self::forward_dropped`] if it can not be handed over).
+  #[inline]
+  pub(crate) fn forward_segment(&mut self, segment: &[u8], worker: u8) {
+    if carries_placement(segment)
+      && let Some(loads) = &self.loads
+    {
+      loads.placed(worker);
     }
   }
 
@@ -752,7 +783,7 @@ where
       local_cid: local,
       next_free: NO_SLOT,
       original_dcid: None,
-      sent: (0, 0, 0),
+      sent: Tally::ZERO,
     };
     self.half_open = self.half_open.wrapping_add(1);
     self.live = self.live.wrapping_add(1);
@@ -1091,8 +1122,8 @@ where
   next_free: u32,
   // The destination CID of the first Initial packet of the client, while it maps to the slot
   original_dcid: Option<Cid>,
-  // What the counters of the connection had sent at the last flush
-  sent: (u64, u64, u64),
+  // What the counters of the connection had at the last flush
+  sent: Tally,
 }
 
 impl<A, RNG, TCX> Slot<A, RNG, TCX>
@@ -1107,8 +1138,63 @@ where
     local_cid: [0; CID_LEN],
     next_free: NO_SLOT,
     original_dcid: None,
-    sent: (0, 0, 0),
+    sent: Tally::ZERO,
   };
+}
+
+/// The counters of a connection that the endpoint sums: read at each flush of the connection, and
+/// what grew since the last one added to [`EndpointStats`]. What a connection counts after its
+/// last flush (a frame received just before it closes) is not summed.
+#[derive(Clone, Copy, Debug)]
+struct Tally([u64; 12]);
+
+impl Tally {
+  const ZERO: Self = Self([0; 12]);
+
+  fn of<A, RNG, TCX>(conn: &QuicConn<A, RNG, TCX>) -> Self
+  where
+    A: QuicApp,
+    RNG: CryptoRng + CryptoSeedableRng,
+    TCX: TlsCtxSk,
+  {
+    let el = conn.stats();
+    let (fins_out, frames_resent) = conn.stream_tally();
+    Self([
+      el.datagrams_out,
+      el.packets_out,
+      el.ack_only_out,
+      fins_out,
+      el.fin_flushes,
+      el.fin_flushes_acked,
+      el.data_blocked_in,
+      el.stream_data_blocked_in,
+      el.streams_blocked_in,
+      el.packets_lost,
+      el.pto_probes,
+      frames_resent,
+    ])
+  }
+
+  // Adds to `stats` what grew since `before`.
+  fn add_since(&self, before: &Self, stats: &mut EndpointStats) {
+    let fields = [
+      &mut stats.datagrams_out,
+      &mut stats.packets_out,
+      &mut stats.ack_only_out,
+      &mut stats.fins_out,
+      &mut stats.fin_flushes,
+      &mut stats.fin_flushes_acked,
+      &mut stats.data_blocked_in,
+      &mut stats.stream_data_blocked_in,
+      &mut stats.streams_blocked_in,
+      &mut stats.packets_lost,
+      &mut stats.pto_probes,
+      &mut stats.frames_resent,
+    ];
+    for ((field, now), then) in fields.into_iter().zip(self.0).zip(before.0) {
+      *field = field.wrapping_add(now.wrapping_sub(then));
+    }
+  }
 }
 
 #[derive(Clone, Copy, Debug)]

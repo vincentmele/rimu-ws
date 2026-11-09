@@ -197,8 +197,10 @@ impl From<QuicLimits> for ConnLimits {
 pub struct QuicParams {
   ack_delay_exponent: u8,
   balance: bool,
+  bodies_round_robin: bool,
   cid_steering: bool,
   conn_window: u64,
+  flush_in_slot_order: bool,
   handshake_timeout_ms: u64,
   limits: QuicLimits,
   max_ack_delay_ms: u64,
@@ -209,6 +211,7 @@ pub struct QuicParams {
   max_streams_uni: u64,
   max_udp_payload_size: u64,
   pacing: bool,
+  pmtu_probe_after_rtt: bool,
   stream_window: u64,
 }
 
@@ -231,6 +234,16 @@ impl QuicParams {
     self.balance
   }
 
+  /// If the streams whose next bytes are a body sent by reference take turns, one STREAM frame
+  /// each, instead of going one at a time to the end of their body in the order in which they
+  /// were written (the bytes written by copy take turns either way).
+  ///
+  /// Defaults to `false`, one body to its end at a time (task 19 measures it).
+  #[inline]
+  pub const fn bodies_round_robin(&self) -> bool {
+    self.bodies_round_robin
+  }
+
   /// If the sockets of the workers steer packets by the first byte of their destination
   /// connection ID, which names the worker. While it is on, a connection has exactly one
   /// connection ID of the server and no NEW_CONNECTION_ID is sent, since connection IDs that name
@@ -250,6 +263,15 @@ impl QuicParams {
   #[inline]
   pub const fn conn_window(&self) -> u64 {
     self.conn_window
+  }
+
+  /// If a flush writes the connections that have something to send in the order of their slots,
+  /// instead of the order in which they came to have something to send.
+  ///
+  /// Defaults to `false`, the order of arrival (task 16 measures it).
+  #[inline]
+  pub const fn flush_in_slot_order(&self) -> bool {
+    self.flush_in_slot_order
   }
 
   /// The time that a client has to complete its handshake, from its first Initial packet.
@@ -331,6 +353,15 @@ impl QuicParams {
     self.pacing
   }
 
+  /// If the first probe of path MTU discovery waits one smoothed RTT after the handshake is
+  /// confirmed, instead of going with the first flush after it.
+  ///
+  /// Defaults to `false`, at once (task 19 measures it).
+  #[inline]
+  pub const fn pmtu_probe_after_rtt(&self) -> bool {
+    self.pmtu_probe_after_rtt
+  }
+
   /// The receive window of a stream, in bytes.
   ///
   /// Defaults to 1 MiB.
@@ -356,6 +387,14 @@ impl QuicParams {
     self
   }
 
+  /// Mutable version of [`Self::bodies_round_robin`].
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub const fn set_bodies_round_robin(mut self, value: bool) -> Self {
+    self.bodies_round_robin = value;
+    self
+  }
+
   /// Mutable version of [`Self::cid_steering`].
   #[inline]
   #[must_use = must_use_itself_doc!()]
@@ -369,6 +408,14 @@ impl QuicParams {
   #[must_use = must_use_itself_doc!()]
   pub const fn set_conn_window(mut self, value: u64) -> Self {
     self.conn_window = value;
+    self
+  }
+
+  /// Mutable version of [`Self::flush_in_slot_order`].
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub const fn set_flush_in_slot_order(mut self, value: bool) -> Self {
+    self.flush_in_slot_order = value;
     self
   }
 
@@ -453,6 +500,14 @@ impl QuicParams {
     self
   }
 
+  /// Mutable version of [`Self::pmtu_probe_after_rtt`].
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub const fn set_pmtu_probe_after_rtt(mut self, value: bool) -> Self {
+    self.pmtu_probe_after_rtt = value;
+    self
+  }
+
   /// Mutable version of [`Self::stream_window`].
   #[inline]
   #[must_use = must_use_itself_doc!()]
@@ -475,6 +530,8 @@ impl QuicParams {
       max_udp_payload_size: self.max_udp_payload_size,
       pacing: self.pacing,
       max_in_flight: self.max_in_flight,
+      bodies_round_robin: self.bodies_round_robin,
+      pmtu_probe_after_rtt: self.pmtu_probe_after_rtt,
       limits: self.limits.into(),
       ..ConnParams::default()
     }
@@ -488,8 +545,10 @@ impl Default for QuicParams {
     Self {
       ack_delay_exponent: 3,
       balance: true,
+      bodies_round_robin: false,
       cid_steering: true,
       conn_window: 16 << 20,
+      flush_in_slot_order: false,
       handshake_timeout_ms: 10_000,
       limits: QuicLimits::default(),
       max_ack_delay_ms: 25,
@@ -500,6 +559,7 @@ impl Default for QuicParams {
       max_streams_uni: MAX_STREAMS_UNI,
       max_udp_payload_size: 1472,
       pacing: true,
+      pmtu_probe_after_rtt: false,
       stream_window: 1 << 20,
     }
   }
@@ -581,6 +641,9 @@ mod tests {
     assert_eq!(params.max_in_flight(), 256 << 10);
     assert!(params.cid_steering());
     assert!(params.balance());
+    assert!(!params.flush_in_slot_order());
+    assert!(!params.bodies_round_robin());
+    assert!(!params.pmtu_probe_after_rtt());
     assert_eq!(params.limits(), &QuicLimits::default());
     assert_eq!(ConnLimits::default(), QuicLimits::default().into());
     // The connections of the defaults have the defaults of a connection
@@ -602,6 +665,14 @@ mod tests {
       (conn.max_udp_payload_size, conn.pacing, conn.max_in_flight, conn.limits),
       (default.max_udp_payload_size, default.pacing, default.max_in_flight, default.limits)
     );
+    assert_eq!(
+      (conn.bodies_round_robin, conn.pmtu_probe_after_rtt),
+      (default.bodies_round_robin, default.pmtu_probe_after_rtt)
+    );
+    // The switches of the measurements of tasks 16 and 19 reach the connections
+    let on = params.set_bodies_round_robin(true).set_pmtu_probe_after_rtt(true).conn_params();
+    assert!(on.bodies_round_robin && on.pmtu_probe_after_rtt);
+    assert!(params.set_flush_in_slot_order(true).flush_in_slot_order());
   }
 
   #[test]

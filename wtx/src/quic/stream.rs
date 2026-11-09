@@ -495,6 +495,8 @@ pub(crate) struct StreamsCold {
   close_reason: [u8; CLOSE_REASON_LEN],
   close_reason_len: u8,
   close_request: Option<u64>,
+  // STREAM frames sent with the FIN of their stream, the first time
+  fins_out: u64,
   held: Held,
   // The credit of a stream that the peer gives: client-initiated bidirectional ones and our
   // unidirectional ones
@@ -525,6 +527,7 @@ impl StreamsCold {
       close_reason: [0; CLOSE_REASON_LEN],
       close_reason_len: 0,
       close_request: None,
+      fins_out: 0,
       held: Held { blocks: 0, streams: 0 },
       peer_bidi_credit: 0,
       peer_uni_credit: 0,
@@ -634,6 +637,19 @@ impl Streams {
     if let Some(cold) = self.cold.as_deref_mut() {
       cold.send_blocked_frames = false;
     }
+  }
+
+  /// STREAM frames sent with the FIN of their stream, retransmissions not counted: the responses
+  /// that a server finished sending.
+  #[inline]
+  pub(crate) fn fins_out(&self) -> u64 {
+    self.cold.as_ref().map_or(0, |el| el.fins_out)
+  }
+
+  /// STREAM frames sent again.
+  #[inline]
+  pub(crate) fn frames_resent(&self) -> u64 {
+    self.cold.as_ref().map_or(0, |el| el.retransmitted)
   }
 
   /// STREAM frames sent again, and ranges sent again although they were acknowledged.
@@ -1111,6 +1127,81 @@ mod tests {
     // Nothing is held anymore
     assert_eq!(link.server.conn.streams().held_blocks(), 0);
     assert!(link.server.parts.pools.rx_blocks.len() > 0);
+  }
+
+  // Ruling T16-c: the 64 responses of one packet count 64 FINs, in one flush that carries the
+  // acknowledgment of the requests; BLOCKED frames received are counted by kind.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn fins_acked_flushes_and_blocked_frames_are_counted() {
+    let mut opts = LinkOpts::new(None);
+    opts.server_app = TestApp::new(Behavior::Respond(RESPONSE));
+    let mut link = settled(&opts);
+    let before = *link.server.conn.stats();
+    let fins = link.server.conn.stream_tally().0;
+    for _ in 0..64 {
+      let id = open_bidi(&mut link).unwrap();
+      write(&mut link, id, b"GET /", true);
+    }
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
+    let _ = link.server.flush(link.now_us);
+    let after = *link.server.conn.stats();
+    assert_eq!(link.server.conn.stream_tally().0 - fins, 64);
+    assert_eq!(after.fin_flushes - before.fin_flushes, 1);
+    assert_eq!(after.fin_flushes_acked - before.fin_flushes_acked, 1);
+    assert_eq!(link.deliver_to_client(), 1);
+    // A flush with nothing finished is not one
+    link.server.conn.queue_test_frames(&[0x01]);
+    let _ = link.server.flush(link.now_us);
+    assert_eq!(link.server.conn.stats().fin_flushes, after.fin_flushes);
+    let _ = link.server.take_datagrams();
+    let id = open_bidi(&mut link).unwrap();
+    write(&mut link, id, b"GET", false);
+    client_sends(
+      &mut link,
+      &[
+        Frame::DataBlocked(10),
+        Frame::StreamDataBlocked { id: id.0, max: 3 },
+        Frame::StreamsBlocked { bidi: true, max: 300 },
+      ],
+    );
+    let stats = link.server.conn.stats();
+    let blocked = (stats.data_blocked_in, stats.stream_data_blocked_in, stats.streams_blocked_in);
+    assert_eq!(blocked, (1, 1, 1));
+  }
+
+  // Ruling T16-b (task 19's measurement): bodies go one at a time to their end, or, with
+  // `bodies_round_robin`, take turns a STREAM frame each.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn bodies_go_to_completion_or_round_robin() {
+    let body = crate::misc::SharedBytes::from_slice(&[9; 6000]);
+    for round_robin in [false, true] {
+      let mut opts = LinkOpts::new(None);
+      opts.server.bodies_round_robin = round_robin;
+      let response = BodyRef::new(body.clone(), 0..6000).unwrap();
+      opts.server_app = TestApp::new(Behavior::RespondBody(b"", response));
+      let mut link = settled(&opts);
+      let ids = [open_bidi(&mut link).unwrap(), open_bidi(&mut link).unwrap()];
+      for id in ids {
+        write(&mut link, id, b"GET /", true);
+      }
+      let _ = link.client.flush(link.now_us);
+      assert_eq!(link.deliver_to_server(), 1);
+      let _ = link.server.flush(link.now_us);
+      let mut datagrams = link.server.take_datagrams();
+      assert!(datagrams.len() >= 4, "{}", datagrams.len());
+      for datagram in datagrams.iter_mut().take(2) {
+        link.client.recv(link.now_us, datagram, crate::quic::testing::SERVER_ADDR);
+      }
+      let got = ids.map(|id| link.client.app.streams.get(&id.0).map_or(0, |el| el.data.len()));
+      if round_robin {
+        assert!(got[0] > 0 && got[1] > 0, "{got:?}");
+      } else {
+        assert!(got[0] > 0 && got[1] == 0, "{got:?}");
+      }
+    }
   }
 
   // 64 responses of 14 bytes go out in a single packet, a STREAM frame each with its FIN.

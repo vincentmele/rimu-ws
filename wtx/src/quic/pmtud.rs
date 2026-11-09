@@ -3,6 +3,9 @@
 //! can take, and its acknowledgment makes that the size of every datagram. A lost probe is tried
 //! again smaller, at 1400 and then 1280 bytes, after which the size stays where it is.
 //!
+//! With [`crate::quic::QuicParams::pmtu_probe_after_rtt`] the first probe is held for one smoothed
+//! RTT after the confirmation ([`Pmtud::hold_until`]), a deadline of the connection.
+//!
 //! A probe is a 1-RTT packet of a PING and PADDING, sent apart, with the don't-fragment bit of the
 //! socket of the endpoint. It is ack-eliciting but does not count towards the bytes in flight, and
 //! its loss is no congestion signal (ruling T9-e).
@@ -23,6 +26,8 @@ const FALLBACKS: [usize; 2] = [1400, 1280];
 /// See the [module documentation](self).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Pmtud {
+  // No probe goes before this time
+  hold_until_us: Option<u64>,
   state: State,
 }
 
@@ -42,7 +47,28 @@ impl Pmtud {
   /// Before the handshake is confirmed.
   #[inline]
   pub(crate) const fn new() -> Self {
-    Self { state: State::Idle }
+    Self { hold_until_us: None, state: State::Idle }
+  }
+
+  /// No probe goes before `us`: a deadline of the connection ([`Self::hold_deadline`]) until
+  /// [`Self::on_timeout`] passes it.
+  #[inline]
+  pub(crate) const fn hold_until(&mut self, us: u64) {
+    self.hold_until_us = Some(us);
+  }
+
+  /// When the probes that are held may go, if they are held.
+  #[inline]
+  pub(crate) const fn hold_deadline(&self) -> Option<u64> {
+    self.hold_until_us
+  }
+
+  /// The time is `now_us`: a hold that it passed ends.
+  #[inline]
+  pub(crate) fn on_timeout(&mut self, now_us: u64) {
+    if self.hold_until_us.is_some_and(|el| now_us >= el) {
+      self.hold_until_us = None;
+    }
   }
 
   /// The handshake is confirmed: probes start at the smaller of `peer_max_udp_payload_size` and
@@ -61,9 +87,12 @@ impl Pmtud {
     self.state = due(peer_max.min(path_ceiling(peer)), current);
   }
 
-  /// The size of the probe that is due, if one is.
+  /// The size of the probe that is due, if one is and it is not held.
   #[inline]
   pub(crate) const fn probe_due(&self) -> Option<usize> {
+    if self.hold_until_us.is_some() {
+      return None;
+    }
     match self.state {
       State::Due(size) => Some(size as usize),
       State::Done | State::Idle | State::Sent { .. } => None,
@@ -177,6 +206,44 @@ mod tests {
     assert_eq!(pmtud.on_probe_acked(3), Some(1472));
     assert_eq!(pmtud.probe_due(), None);
     assert_eq!(pmtud.on_probe_acked(3), None);
+  }
+
+  // Ruling T16-b (task 19's measurement): the first probe goes with the first flush after the
+  // confirmation of the handshake, or, with `pmtu_probe_after_rtt`, once a smoothed RTT passed:
+  // a deadline of the connection, so that it goes even if nothing else does.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn first_probe_goes_at_once_or_after_one_rtt() {
+    for after_rtt in [false, true] {
+      let mut opts = LinkOpts::new(None);
+      opts.server.pmtu_probe_after_rtt = after_rtt;
+      let mut link = Link::new(&opts);
+      link.impair(Impairment::delay(5_000));
+      while link.server.conn.state() != ConnState::Confirmed {
+        if !link.step_impaired() {
+          assert!(link.advance_to_next_event());
+        }
+      }
+      let (confirmed_at, srtt) = (link.now_us, link.server.conn.smoothed_rtt_us());
+      let _ = link.server.flush(link.now_us);
+      if !after_rtt {
+        assert_eq!(link.server.conn.stats().mtu_probes, 1);
+        continue;
+      }
+      assert_eq!(link.server.conn.stats().mtu_probes, 0);
+      let deadline = link.server.conn.next_deadline().unwrap();
+      assert!(deadline <= confirmed_at + srtt, "{deadline} {confirmed_at} {srtt}");
+      // Nothing else to send: the deadline of the probe brings it
+      let _ = link.server.take_datagrams();
+      while link.server.conn.stats().mtu_probes == 0 {
+        let next = link.server.conn.next_deadline().unwrap();
+        assert!(next < confirmed_at + 1_000_000);
+        link.now_us = next;
+        link.server.on_timeout(next);
+        let _ = link.server.flush(next);
+      }
+      assert!(link.now_us >= confirmed_at + srtt, "{} {confirmed_at} {srtt}", link.now_us);
+    }
   }
 
   // The largest datagram that went from the server to the client

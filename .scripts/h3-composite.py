@@ -12,9 +12,12 @@ exceed 1000 on a profile; they do not move the reference. Ranks are per profile,
 in the file. A number marked ! comes from lines with errors. Lines without an rps (a failed start)
 are skipped.
 
-A line of rimu that carries "headers" (the A/B of the response headers, ARENA_H3_HEADERS) counts as
-the server "rimu-min" or "rimu-full"; in the composite those are rimu variants (the field has the
-best of them).
+A line of rimu that carries "headers" (the A/B of the response headers, ARENA_H3_HEADERS; h3-bench.sh
+writes it on every rimu line since task 16, `min` when unset) counts as the server "rimu-min" or
+"rimu-full"; in the composite those are rimu variants (the field has the best of them). A rimu line
+without it comes from an older h3-bench.sh, when unset meant `full` before decision Q2 and `min` after
+it: it counts as "rimu-unlabelled", never mixed with the others. A line that carries "variant" (the
+aws-h3 kit's variant phase) counts as "rimu@<variant>".
 
 --cpu prints, instead, a markdown table per server and profile: the median rps of the starts (and
 each start's), the medians over the starts of the server's and the generator's CPU microseconds per
@@ -32,9 +35,13 @@ FIELD = ("plod", "fib", "aegon", "rimu")
 
 
 def name_of(row):
-    """The name a line is listed under: rimu with its headers variant, if it has one."""
+    """The name a line is listed under: rimu with its variant or its headers."""
+    if row.get("variant"):
+        return f"{row['server']}@{row['variant']}"
     if row.get("headers"):
         return f"{row['server']}-{row['headers']}"
+    if row["server"] == "rimu":
+        return "rimu-unlabelled"
     return row["server"]
 
 

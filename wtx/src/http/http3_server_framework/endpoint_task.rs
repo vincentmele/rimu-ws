@@ -84,6 +84,7 @@ pub(crate) struct WorkerParams<DA, EC, EN, ER, M, RNG, TCX> {
   /// The clock of the process, which every worker reads its time from.
   pub(crate) epoch: Instant,
   pub(crate) error_cb: EC,
+  pub(crate) fresh_data: bool,
   pub(crate) h3_params: H3Params,
   pub(crate) keys: Arc<EndpointKeys>,
   pub(crate) loads: Arc<WorkerLoads>,
@@ -240,6 +241,7 @@ where
     date,
     epoch,
     error_cb,
+    fresh_data,
     h3_params,
     keys,
     loads,
@@ -303,8 +305,12 @@ where
     Some(loads),
     keys,
   )?;
-  let handler =
-    RouterHandler::new(data, (content_length, date), FwRouter::new(router), error_cb.clone())?;
+  let handler = RouterHandler::new(
+    (data, fresh_data),
+    (content_length, date),
+    FwRouter::new(router),
+    error_cb.clone(),
+  )?;
   let app = H3App::new(handler, h3_params);
   #[cfg(test)]
   let idle_trim_after = test.idle_trim_after.unwrap_or(IDLE_TRIM_AFTER);
@@ -377,9 +383,11 @@ fn bind_in_order(
   Ok(socket)
 }
 
-/// Hands `datagram`, which the endpoint returned for `worker`, to the inbox of that worker. If the
-/// inbox does not take it (full, its socket gone) or the worker is not there, the endpoint gives
-/// back the place that the datagram took on it (ruling T14-e). Returns `false` then.
+/// Hands `datagram`, which the endpoint returned for `worker`, to the inbox of that worker: a
+/// datagram that the kernel coalesced (generic receive offload) segment by segment, so that each
+/// fits an entry of the inbox (ruling T16-b). A segment that the inbox does not take (full, its
+/// socket gone), or that has no worker, is dropped, and the endpoint gives back the place that it
+/// took on that worker (ruling T14-e). Returns `false` if a segment was dropped.
 pub(crate) fn forward<A, RNG, TCX>(
   endpoint: &mut Endpoint<A, RNG, TCX>,
   inboxes: &[UdpInbox],
@@ -392,12 +400,29 @@ where
   RNG: CryptoRng + CryptoSeedableRng,
   TCX: TlsCtxSk,
 {
-  if inboxes.get(usize::from(worker)).is_some_and(|el| el.push(datagram, meta)) {
-    return true;
+  let inbox = inboxes.get(usize::from(worker));
+  let segment = meta.segment_size.map_or(datagram.len(), usize::from).max(1);
+  if datagram.len() <= segment {
+    if inbox.is_some_and(|el| el.push(datagram, meta)) {
+      return true;
+    }
+    cold_path();
+    endpoint.forward_dropped(datagram, worker);
+    return false;
   }
-  cold_path();
-  endpoint.forward_dropped(datagram, worker);
-  false
+  let meta = DatagramMeta { segment_size: None, ..meta };
+  let mut all = true;
+  for (nth, chunk) in datagram.chunks(segment).enumerate() {
+    if nth > 0 {
+      endpoint.forward_segment(chunk, worker);
+    }
+    if !inbox.is_some_and(|el| el.push(chunk, meta)) {
+      cold_path();
+      endpoint.forward_dropped(chunk, worker);
+      all = false;
+    }
+  }
+  all
 }
 
 type App<DA, EC, EN, ER, M> = H3App<RouterHandler<FwRouter<DA, EN, ER, M>, EC>>;
@@ -647,18 +672,27 @@ where
       ack_only_out: endpoint.ack_only_out,
       cid_steering: self.steering,
       conns: endpoint.conns.into(),
+      data_blocked_in: endpoint.data_blocked_in,
       datagrams_in: endpoint.datagrams_in,
       datagrams_out: endpoint.datagrams_out,
+      fin_flushes: endpoint.fin_flushes,
+      fin_flushes_acked: endpoint.fin_flushes_acked,
+      fins_out: endpoint.fins_out,
       forwarded: endpoint.forwarded,
       forward_dropped: self.forward_dropped,
+      frames_resent: endpoint.frames_resent,
       handler_panics: handler.panics,
       idle_trims: self.idle_trims,
+      packets_lost: endpoint.packets_lost,
       packets_out: endpoint.packets_out,
       parked: u64::try_from(self.app.handler.parked()).unwrap_or(u64::MAX),
       park_refused: handler.park_refused,
+      pto_probes: endpoint.pto_probes,
       requests: handler.requests,
       retries: endpoint.retries,
       stateless_resets: endpoint.resets,
+      stream_data_blocked_in: endpoint.stream_data_blocked_in,
+      streams_blocked_in: endpoint.streams_blocked_in,
       udp_send_errors: self.socket.stats().send_errors,
     });
   }

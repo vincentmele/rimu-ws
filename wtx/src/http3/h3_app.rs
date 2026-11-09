@@ -52,7 +52,7 @@
 //! worker (review V4).
 
 use crate::{
-  collections::{VectorError, VectorUsize},
+  collections::VectorUsize,
   http::prefix_int::decode_prefix_int,
   http3::{
     DecodeOutcome, H3ErrorCode, H3FrameTy, H3Settings, Http3Error, decode_frame_header,
@@ -65,7 +65,7 @@ use crate::{
     varint_len,
   },
 };
-use alloc::{boxed::Box, vec::Vec};
+use alloc::boxed::Box;
 use core::{hint::cold_path, net::IpAddr};
 
 /// The bytes that the connection retains for a stream at most (see `ConnCtx::retain`): what is
@@ -270,8 +270,6 @@ impl H3ReqCtx<'_, '_> {
 pub(crate) struct H3App<H> {
   /// What answers the requests.
   pub handler: H,
-  // The fields of the request that the handler is given; empty between calls
-  field_refs: Vec<(&'static [u8], &'static [u8])>,
   fields: VectorUsize<u8>,
   frame: VectorUsize<u8>,
   params: H3Params,
@@ -310,7 +308,6 @@ where
   pub(crate) const fn new(handler: H, params: H3Params) -> Self {
     Self {
       handler,
-      field_refs: Vec::new(),
       fields: VectorUsize::new(),
       frame: VectorUsize::new(),
       params,
@@ -353,7 +350,6 @@ where
       };
       self.pool_bytes = self.pool_bytes.saturating_sub(conn.heap_bytes());
     }
-    self.field_refs = Vec::new();
     self.fields = VectorUsize::new();
     self.frame = VectorUsize::new();
   }
@@ -396,19 +392,11 @@ where
     if req.head.content_length().is_some_and(|el| el != body_len) {
       return stream_error(conn, cx, idx, H3ErrorCode::MessageError);
     }
-    let Self { field_refs, fields, frame, handler, .. } = self;
-    let mut refs = recycle(core::mem::take(field_refs));
-    if refs.try_reserve(req.head.fields_len()).is_err() {
-      cold_path();
-      *field_refs = recycle(refs);
-      return Err(crate::Error::Vector(VectorError::CapacityOverflow));
-    }
-    refs.extend(req.head.fields());
-    let request = req.request(&refs);
+    let Self { fields, frame, handler, .. } = self;
+    let request = req.request();
     let mut rcx = H3ReqCtx { cx, fields, frame, responded: false, stream: req.id };
     let outcome = handler.on_request(&mut rcx, &request);
     let responded = rcx.responded;
-    *field_refs = recycle(refs);
     after_handler(conn, cx, idx, outcome, responded)
   }
 
@@ -1330,12 +1318,6 @@ fn push_frame_header(out: &mut VectorUsize<u8>, ty: H3FrameTy, len: usize) -> cr
   Ok(())
 }
 
-// The same storage for a list of fields of another lifetime: empty, it is collected in place.
-fn recycle<'to>(mut list: Vec<(&[u8], &[u8])>) -> Vec<(&'to [u8], &'to [u8])> {
-  list.clear();
-  list.into_iter().map(|_| (&[][..], &[][..])).collect()
-}
-
 // Refuses stream `id`, which has no request: after a GOAWAY.
 fn reject(
   conn: &mut H3Conn,
@@ -1439,10 +1421,17 @@ fn write_response(
   frame.clear();
   push_frame_header(frame, H3FrameTy::Headers, encoded_headers.len())?;
   frame.extend_from_copyable_slice(encoded_headers)?;
-  if !body.is_empty() {
-    push_frame_header(frame, H3FrameTy::Data, body.len())?;
-    frame.extend_from_copyable_slice(body)?;
+  if body.is_empty() {
+    return cx.write(stream, frame, true);
   }
+  push_frame_header(frame, H3FrameTy::Data, body.len())?;
+  // A body that would make the buffer grow past what it keeps goes with a write of its own: the
+  // stream copies it either way (carried from task 13)
+  if frame.len().saturating_add(body.len()) > KEEP_SCRATCH {
+    cx.write(stream, frame, false)?;
+    return cx.write(stream, body, true);
+  }
+  frame.extend_from_copyable_slice(body)?;
   cx.write(stream, frame, true)
 }
 

@@ -23,7 +23,7 @@ use crate::{
   collections::VectorUsize,
   http3::{
     DecodeMemo, H3Params, H3Settings, QpackDecoder,
-    request::{H3Request, RequestHead},
+    request::{Fields, H3Request, RequestHead},
   },
   quic::{ConnHandle, QuicConn, StreamId},
 };
@@ -217,16 +217,14 @@ impl Req {
   }
 
   /// The request for the handler, whose fields are `fields`.
-  pub(crate) fn request<'any>(
-    &'any self,
-    fields: &'any [(&'any [u8], &'any [u8])],
-  ) -> H3Request<'any> {
+  pub(crate) fn request(&self) -> H3Request<'_> {
     H3Request {
       method: self.head.method(),
       scheme: self.head.scheme(),
       authority: self.head.authority(),
       path: self.head.path(),
-      fields,
+      fields: Fields::new(&self.head),
+      host: self.head.host(),
       body: self.body.as_slice(),
       stream: self.id,
     }
@@ -529,7 +527,7 @@ impl H3Conn {
         el.phase == Phase::Free
           && el.body.is_empty()
           && el.stash.is_empty()
-          && el.head.fields_len() == 0
+          && el.head.fields().next().is_none()
           && el.head.method().is_empty()
       })
   }

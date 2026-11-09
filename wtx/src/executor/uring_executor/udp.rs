@@ -108,6 +108,9 @@ pub struct UdpParams {
   pub reuseport: bool,
   /// Bytes of the socket's [`TxArena`]. Defaults to [`TxArena::DEFAULT_BYTES`], 512 × 1500.
   pub tx_arena_bytes: usize,
+  /// The datagrams of one send at most (one `UDP_SEGMENT` train), from 1 to 64, the kernel's
+  /// limit. Defaults to 64 (task 19 measures it).
+  pub max_train_segments: u16,
 }
 
 impl UdpParams {
@@ -122,6 +125,7 @@ impl UdpParams {
       sndbuf: 4 << 20,
       reuseport: true,
       tx_arena_bytes: TxArena::DEFAULT_BYTES,
+      max_train_segments: 64,
     }
   }
 }
@@ -986,7 +990,7 @@ impl Reactor {
     let mut bufs = BufRing::new(count, len)?;
     let mut completed = VecDeque::new();
     completed.try_reserve_exact(usize::from(count)).map_err(|_err| io_err(libc::ENOMEM))?;
-    let tx = TxArena::new(params.tx_arena_bytes)?;
+    let tx = TxArena::with_train_segments(params.tx_arena_bytes, params.max_train_segments)?;
     let sends = SendSlots::new(tx.max_trains())?;
     let ring_fd = std::os::fd::AsRawFd::as_raw_fd(&*self.ring.borrow());
     let inbox_user_data = user_data(KIND_MSG_RING, generation, idx);

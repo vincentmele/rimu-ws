@@ -658,6 +658,28 @@ fn static_file_br_twin_served_by_reference() {
   assert_eq!(status(&client.get("/static/missing.css", &[])), b"404");
 }
 
+// Decision Q2 (fix in passing of task 16): with the default fields the `.br` twin of a file still
+// carries `content-encoding: br` and `vary: accept-encoding` (and `content-type`), and neither
+// `content-length` nor `date`.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn static_file_br_twin_in_default_mode() {
+  let opts = Opts::new("brtwin-default");
+  std::fs::write(opts.root.join("a.css"), vec![b'c'; 6_000]).unwrap();
+  std::fs::write(opts.root.join("a.css.br"), vec![b'b'; 2_500]).unwrap();
+  let served = serve(opts);
+  let mut client = Client::connect(served.addr);
+  let accept = [(&b"accept-encoding"[..], &b"br;q=1, gzip;q=0.8"[..])];
+  let rsp = client.get("/static/a.css", &accept);
+  assert_eq!(status(&rsp), b"200");
+  assert_eq!(rsp.field(b"content-encoding"), Some(&b"br"[..]));
+  assert_eq!(rsp.field(b"vary"), Some(&b"accept-encoding"[..]));
+  assert_eq!(rsp.field(b"content-type"), Some(&b"text/css"[..]));
+  assert_eq!((rsp.field(b"content-length"), rsp.field(b"date")), (None, None));
+  assert_eq!(rsp.body, vec![b'b'; 2_500]);
+  assert!(served.errors().is_empty(), "{:?}", served.errors());
+}
+
 // Brief step 1 and review focus 4: a POST of 2 MiB, past the stream window of 1 MiB, from a client
 // that never says it is blocked, reaches the handler whole.
 #[cfg_attr(miri, ignore)]
@@ -924,6 +946,59 @@ fn forward_dropped_gives_back_the_place() {
   }
 }
 
+// Ruling T16-b (carried from task 14): a datagram that the kernel coalesced (GRO) and that goes to
+// another worker is handed over segment by segment, each within an inbox entry; the place that the
+// first Initial packet took on that worker is counted once (each later segment that carries a
+// place takes one more, which the other worker gives back when it opens nothing).
+#[cfg_attr(miri, ignore)]
+#[test]
+fn coalesced_datagram_is_forwarded_segment_by_segment() {
+  let mut net = Net::new(2, QuicParams::default(), &TestApp::default());
+  net.loads.placed(0);
+  let client = net.add_split_client(1500);
+  let datagrams = net.client_datagrams(client);
+  assert_eq!(datagrams.len(), 2);
+  let segment = datagrams[0].len();
+  assert!(datagrams[1].len() <= segment);
+  let coalesced: Vec<u8> = datagrams.concat();
+  assert!(coalesced.len() > UdpInbox::DATAGRAM_LEN);
+  let peer = net.clients[client].addr;
+  let meta =
+    DatagramMeta { peer, local: None, segment_size: Some(u16::try_from(segment).unwrap()) };
+  let now_us = net.now_us;
+  let server = &mut net.servers[0];
+  let outcome = server.endpoint.recv(now_us, &mut coalesced.clone(), meta, &mut server.app);
+  assert_eq!(outcome, RecvOutcome::Forward { worker: 1 });
+  assert_eq!(net.loads.load(1), 1);
+  let received = UringRuntime::new().unwrap().block_on(async {
+    let params = UdpParams { reuseport: false, ..UdpParams::new() };
+    let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    let socket = UringUdpSocket::bind(local, &params).unwrap();
+    let inboxes = vec![socket.inbox(), socket.inbox()];
+    assert!(forward(&mut net.servers[0].endpoint, &inboxes, &coalesced, meta, 1));
+    let mut got = Vec::new();
+    core::future::poll_fn(|cx| {
+      let _count = socket.poll_inbox(cx, &mut |datagram, meta| got.push((datagram.to_vec(), meta)));
+      Poll::Ready(())
+    })
+    .await;
+    got
+  });
+  assert_eq!(received.len(), 2);
+  for ((datagram, got_meta), sent) in received.iter().zip(&datagrams) {
+    assert_eq!(datagram, sent);
+    assert_eq!(*got_meta, DatagramMeta { segment_size: None, ..meta });
+  }
+  // The other worker opens one connection from them, and its place is counted once
+  assert_eq!(net.loads.load(1), 2);
+  for (mut datagram, meta) in received {
+    let server = &mut net.servers[1];
+    server.endpoint.recv_forwarded(now_us, &mut datagram, meta, &mut server.app);
+  }
+  assert_eq!(net.servers[1].endpoint.stats().conns, 1);
+  assert_eq!(net.loads.load(1), 1);
+}
+
 // Ruling T14-e: a worker that has had no connection for a while trims its pools, once per idle
 // period: the free QUIC connection states, the TLS handshake states of the thread and the boxes of
 // the HTTP/3 connections that eight connections at once left go down to a few.
@@ -965,18 +1040,25 @@ fn idle_worker_trims_its_pools() {
 }
 
 // Brief step 1 (zero allocations after warm-up): once warm, a round of requests (inline routes,
-// static files by reference and parked handlers) allocates nothing on the thread of the worker.
+// static files by reference and parked handlers) allocates nothing on the thread of the worker,
+// with the default fields (what the HttpArena entry serves) and with the RFC 9110 ones (the most
+// the framework does per response: `date` and `content-length` encoded too). Fix in passing of
+// task 16: the default mode too.
 #[cfg_attr(miri, ignore)]
 #[test]
 fn framework_steady_state_allocates_nothing_after_warmup() {
-  static WORKER: AtomicU64 = AtomicU64::new(0);
-  let mut opts = Opts::new("alloc");
-  // The most the framework does per response: the RFC 9110 fields (`date`, `content-length`) are
-  // encoded too
-  opts.rfc9110 = Some(true);
+  static DEFAULT: AtomicU64 = AtomicU64::new(0);
+  static RFC9110: AtomicU64 = AtomicU64::new(0);
+  steady_state_allocates_nothing(None, &DEFAULT);
+  steady_state_allocates_nothing(Some(true), &RFC9110);
+}
+
+fn steady_state_allocates_nothing(rfc9110: Option<bool>, worker: &'static AtomicU64) {
+  let mut opts = Opts::new(if rfc9110.is_some() { "alloc-rfc9110" } else { "alloc-default" });
+  opts.rfc9110 = rfc9110;
   std::fs::write(opts.root.join("a.css"), vec![b'c'; 5_000]).unwrap();
   std::fs::write(opts.root.join("a.css.br"), vec![b'b'; 3_000]).unwrap();
-  opts.count = Some(&WORKER);
+  opts.count = Some(worker);
   let served = serve(opts);
   let mut client = Client::connect(served.addr);
   let accept = [(&b"accept-encoding"[..], &b"br;q=1, gzip;q=0.8"[..])];
@@ -1025,12 +1107,12 @@ fn framework_steady_state_allocates_nothing_after_warmup() {
   // measured round
   std::thread::sleep(Duration::from_millis(1100));
   round(&mut client, 100);
-  let before = WORKER.load(Ordering::Relaxed);
+  let before = worker.load(Ordering::Relaxed);
   let begin = Instant::now();
   round(&mut client, 400);
-  let allocations = WORKER.load(Ordering::Relaxed) - before;
+  let allocations = worker.load(Ordering::Relaxed) - before;
   assert!(begin.elapsed() < Duration::from_millis(900), "{:?}", begin.elapsed());
-  assert_eq!(allocations, 0);
+  assert_eq!(allocations, 0, "rfc9110 {rfc9110:?}");
   assert!(served.errors().is_empty(), "{:?}", served.errors());
 }
 
@@ -1288,4 +1370,101 @@ fn manual_routes_and_middlewares_on_h3() {
   let rsp = client.get("/blocked", &[]);
   assert_eq!((status(&rsp), rsp.field(b"server")), (&b"403"[..], Some(&b"rimu-ws"[..])));
   assert!(rsp.body.is_empty());
+}
+
+// Data whose clones are counted.
+#[derive(Debug)]
+struct Counted(&'static AtomicU64);
+
+impl Clone for Counted {
+  fn clone(&self) -> Self {
+    let _ = self.0.fetch_add(1, Ordering::Relaxed);
+    Self(self.0)
+  }
+}
+
+async fn counted(state: State<'_, Counted>) -> crate::Result<VerbatimParams> {
+  state.req.msg_data.clear();
+  state.req.msg_data.body.extend_from_copyable_slice(b"counted")?;
+  Ok(VerbatimParams(StatusCode::Ok))
+}
+
+// Ruling T16-a (EC2 profile: the clone and drop of the data of each request, an `Arc` shared by
+// every worker, took 7 % of the cycles of baseline-h3): a worker keeps the clones of its data that
+// its requests used and gives them to its next requests, so that a request clones nothing in the
+// steady state; with `set_fresh_data(true)` each request clones the data, as HTTP/2 does.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn requests_reuse_the_clones_of_the_data_unless_fresh() {
+  static REUSED: AtomicU64 = AtomicU64::new(0);
+  static FRESH: AtomicU64 = AtomicU64::new(0);
+  for (fresh, clones) in [(false, &REUSED), (true, &FRESH)] {
+    let signal = ShutdownSignal::new();
+    let (bound_tx, bound_rx) = mpsc::channel();
+    let mut fw = Http3ServerFramework::<(), fn(crate::Error), UringExecutor, _, _, _>::new(
+      UringExecutor::default(),
+      ChaCha20::from_std_random().unwrap(),
+      server_tls_config(),
+    )
+    .unwrap()
+    .set_data(Counted(clones))
+    .set_fresh_data(fresh)
+    .set_local_runtimes(NonZeroUsize::new(1))
+    .set_pin_workers(false)
+    .set_shutdown(signal.clone(), Duration::from_millis(100))
+    .set_udp_params(UdpParams { reuseport: false, ..UdpParams::new() });
+    fw.test = TestHooks { bound: Some(bound_tx), ..TestHooks::default() };
+    let run = std::thread::spawn(move || {
+      let router = HttpRouter::paths(crate::paths!(("/counted", get(counted))))?;
+      fw.run_in_threads("127.0.0.1:0", router)
+    });
+    let addr = bound_rx.recv_timeout(TIMEOUT).expect("the server did not bind");
+    let mut client = Client::connect(addr);
+    assert_eq!(client.get("/counted", &[]).body, b"counted");
+    let before = clones.load(Ordering::Relaxed);
+    for _ in 0..16 {
+      assert_eq!(client.get("/counted", &[]).body, b"counted");
+    }
+    let made = clones.load(Ordering::Relaxed) - before;
+    assert_eq!(made, if fresh { 16 } else { 0 }, "fresh {fresh}");
+    drop(client);
+    signal.trigger();
+    run.join().unwrap().unwrap();
+  }
+}
+
+// Ruling T16-c: every counter of a worker, the ones of the measurement of spec section 2.1
+// included, comes back from the cell that the worker stores it in as it was stored.
+#[test]
+fn worker_stats_round_trip_through_their_cell() {
+  let stats = Http3WorkerStats {
+    ack_only_out: 1,
+    cid_steering: true,
+    conns: 2,
+    data_blocked_in: 3,
+    datagrams_in: 4,
+    datagrams_out: 5,
+    fin_flushes: 6,
+    fin_flushes_acked: 7,
+    fins_out: 8,
+    forward_dropped: 9,
+    forwarded: 10,
+    frames_resent: 11,
+    handler_panics: 12,
+    idle_trims: 13,
+    packets_lost: 14,
+    packets_out: 15,
+    park_refused: 16,
+    parked: 17,
+    pto_probes: 18,
+    requests: 19,
+    retries: 20,
+    stateless_resets: 21,
+    stream_data_blocked_in: 22,
+    streams_blocked_in: 23,
+    udp_send_errors: 24,
+  };
+  let cell = crate::http::http3_server_framework::StatsCell::default();
+  cell.store(&stats);
+  assert_eq!(cell.load(), stats);
 }

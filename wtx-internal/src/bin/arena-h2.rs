@@ -6,12 +6,35 @@
 //! Environment: `CERT_DIR` (default `/certs`, with `server.crt` and `server.key`; without them
 //! only h2c is served), `DATASET_PATH` (default `/data/dataset.json`), `STATIC_DIR` (default
 //! `/data/static`), `ARENA_PARAMS` (`permissive` for `HttpRecvParams::with_permissive_params`, as
-//! upstream's wtx-http2 entry does; otherwise the library defaults), `ARENA_H3_HEADERS` (`min`, the
-//! default: h3 responses carry `content-type` only, no `date`, no `content-length`, no middleware,
-//! like the HttpArena h3 leaders cnetmod and zix and not RFC 9110-compliant; or `full`:
-//! `set_rfc9110_headers(true)` and the `server` middleware, as on h2; the user's decision Q2). The
-//! h3 limits are the defaults of `H3Params`, as in the HttpArena entry; `ARENA_PARAMS` is for h1
-//! and h2 only.
+//! upstream's wtx-http2 entry does; otherwise the library defaults) and the `ARENA_H3_*` switches
+//! of the table below. The h3 limits are the defaults of `H3Params`, as in the HttpArena entry;
+//! `ARENA_PARAMS` is for h1 and h2 only.
+//!
+//! # The h3 switches (ruling T16-b)
+//!
+//! Each selects, at start, one setting of the h3 server, so that one build measures the A/Bs of
+//! tasks 16, 17 and 19 (the EC2 variant phase of `/mnt/nvme1tb/claude-tmp/aws-h3`). Unset, each is
+//! the library default. A value outside the table stops the program; the server prints the
+//! settings it runs with on one line starting with `arena-h2: h3 knobs`.
+//!
+//! | variable | values | default | maps to |
+//! |---|---|---|---|
+//! | `ARENA_H3_HEADERS` | `min`, `full` | `min` | `min`: `content-type` only, no middleware (like cnetmod and zix, not RFC 9110-compliant; decision Q2); `full`: `Http3ServerFramework::set_rfc9110_headers(true)` and the `server` middleware, as on h2 |
+//! | `ARENA_H3_DATA` | `reuse`, `fresh` | `reuse` | `Http3ServerFramework::set_fresh_data` (`fresh`: a clone of the data per request) |
+//! | `ARENA_H3_GRO` | `0`, `1` | `0` | `UdpParams::gro` (on: receive buffers of 64 KiB) |
+//! | `ARENA_H3_RECV_BUFFERS` | 1 to 32768 | 256 | `UdpParams::recv_buffers` |
+//! | `ARENA_H3_TX_ARENA` | bytes, 65536 or more | 768000 | `UdpParams::tx_arena_bytes` |
+//! | `ARENA_H3_RCVBUF` | bytes | 4194304 | `UdpParams::rcvbuf` (capped by `net.core.rmem_max`) |
+//! | `ARENA_H3_SNDBUF` | bytes | 4194304 | `UdpParams::sndbuf` (capped by `net.core.wmem_max`) |
+//! | `ARENA_H3_TRAIN` | 1 to 64 | 64 | `UdpParams::max_train_segments` (datagrams of one GSO send) |
+//! | `ARENA_H3_FLUSH_ORDER` | `arrival`, `slot` | `arrival` | `QuicParams::set_flush_in_slot_order` |
+//! | `ARENA_H3_STEERING` | `cid`, `kernel` | `cid` | `QuicParams::set_cid_steering` (`kernel`: the kernel's hash, balance off) |
+//! | `ARENA_H3_BALANCE` | `0`, `1` | `1` | `QuicParams::set_balance` (with `cid` steering only) |
+//! | `ARENA_H3_PIN` | `0`, `1` | `1` | `Http3ServerFramework::set_pin_workers` |
+//! | `ARENA_H3_MAX_IN_FLIGHT` | bytes, 16384 or more | 262144 | `QuicParams::set_max_in_flight` |
+//! | `ARENA_H3_PACING` | `0`, `1` | `1` | `QuicParams::set_pacing` |
+//! | `ARENA_H3_PMTU_PROBE` | `now`, `rtt` | `now` | `QuicParams::set_pmtu_probe_after_rtt` (`rtt`: the first probe one smoothed RTT after the handshake) |
+//! | `ARENA_H3_BODIES` | `complete`, `round-robin` | `complete` | `QuicParams::set_bodies_round_robin` (bodies by reference: one to its end, or a frame each in turn) |
 //!
 //! With TLS on, SIGUSR1 prints the sums of the counters of the h3 workers on one line starting with
 //! `h3-stats` (what `h3-bench.sh` reads), and SIGINT or SIGTERM prints them with one line per
@@ -117,14 +140,10 @@ fn spawn_h3(
   key: Vec<u8>,
   data: ConnAux,
 ) -> rimu_ws::Result<(Http3Stats, std::thread::JoinHandle<rimu_ws::Result<()>>)> {
-  let min_headers = match std::env::var("ARENA_H3_HEADERS").as_deref() {
-    Ok("min") | Err(_) => true,
-    Ok("full") => false,
-    Ok(other) => {
-      let msg = format!("ARENA_H3_HEADERS must be `min` or `full`, not `{other}`");
-      return Err(std::io::Error::other(msg).into());
-    }
-  };
+  let knobs = knobs::H3Knobs::from_vars(|name| std::env::var(name).ok())
+    .map_err(|err| rimu_ws::Error::from(std::io::Error::other(err)))?;
+  eprintln!("arena-h2: h3 knobs {}", knobs.line());
+  let min_headers = knobs.headers == knobs::Headers::Min;
   let framework = Http3ServerFramework::<(), fn(rimu_ws::Error), UringExecutor, _, _, _>::new(
     UringExecutor::default(),
     ChaCha20::from_std_random()?,
@@ -132,7 +151,11 @@ fn spawn_h3(
   )?
   .set_data(data)
   .set_error_cb(error_cb)
-  .set_local_runtime_cb(runtime);
+  .set_fresh_data(knobs.data == knobs::Data::Fresh)
+  .set_local_runtime_cb(runtime)
+  .set_pin_workers(knobs.pin_workers)
+  .set_quic_params(knobs.quic)
+  .set_udp_params(knobs.udp);
   let stats = framework.stats();
   let handle = std::thread::spawn(move || -> rimu_ws::Result<()> {
     let rslt = if min_headers {
@@ -164,6 +187,159 @@ fn recv_params() -> HttpRecvParams {
 
 fn runtime() -> rimu_ws::Result<UringRuntime> {
   UringRuntime::with_params(UringParams::default())
+}
+
+/// The `ARENA_H3_*` switches: see the table of the program's documentation.
+mod knobs {
+  use rimu_ws::{executor::UdpParams, quic::QuicParams};
+
+  /// The response fields of h3.
+  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+  pub(super) enum Headers {
+    /// `content-type` only.
+    Min,
+    /// The RFC 9110 fields and the `server` middleware.
+    Full,
+  }
+
+  /// The data of the requests.
+  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+  pub(super) enum Data {
+    /// The clones that requests used go to the next ones.
+    Reuse,
+    /// A clone per request.
+    Fresh,
+  }
+
+  /// What the switches select.
+  #[derive(Clone, Copy, Debug)]
+  pub(super) struct H3Knobs {
+    pub(super) data: Data,
+    pub(super) headers: Headers,
+    pub(super) pin_workers: bool,
+    pub(super) quic: QuicParams,
+    pub(super) udp: UdpParams,
+  }
+
+  impl H3Knobs {
+    /// The switches, read with `var`.
+    pub(super) fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+      let (mut quic, mut udp) = (QuicParams::default(), UdpParams::new());
+      let headers = [("min", Headers::Min), ("full", Headers::Full)];
+      let headers = one_of(&var, "ARENA_H3_HEADERS", &headers)?.unwrap_or(Headers::Min);
+      let data = [("reuse", Data::Reuse), ("fresh", Data::Fresh)];
+      let data = one_of(&var, "ARENA_H3_DATA", &data)?.unwrap_or(Data::Reuse);
+      if let Some(elem) = flag(&var, "ARENA_H3_GRO")? {
+        udp.gro = elem;
+      }
+      if let Some(elem) = number(&var, "ARENA_H3_RECV_BUFFERS", 1, 32_768)? {
+        udp.recv_buffers = u16::try_from(elem).map_err(|err| err.to_string())?;
+      }
+      if let Some(elem) = number(&var, "ARENA_H3_TX_ARENA", 65_536, 1 << 30)? {
+        udp.tx_arena_bytes = usize::try_from(elem).map_err(|err| err.to_string())?;
+      }
+      if let Some(elem) = number(&var, "ARENA_H3_RCVBUF", 4096, 1 << 30)? {
+        udp.rcvbuf = usize::try_from(elem).map_err(|err| err.to_string())?;
+      }
+      if let Some(elem) = number(&var, "ARENA_H3_SNDBUF", 4096, 1 << 30)? {
+        udp.sndbuf = usize::try_from(elem).map_err(|err| err.to_string())?;
+      }
+      if let Some(elem) = number(&var, "ARENA_H3_TRAIN", 1, 64)? {
+        udp.max_train_segments = u16::try_from(elem).map_err(|err| err.to_string())?;
+      }
+      let order = [("arrival", false), ("slot", true)];
+      if let Some(elem) = one_of(&var, "ARENA_H3_FLUSH_ORDER", &order)? {
+        quic = quic.set_flush_in_slot_order(elem);
+      }
+      if let Some(elem) = flag(&var, "ARENA_H3_BALANCE")? {
+        quic = quic.set_balance(elem);
+      }
+      if let Some(elem) = one_of(&var, "ARENA_H3_STEERING", &[("cid", true), ("kernel", false)])? {
+        quic = quic.set_cid_steering(elem);
+        if !elem {
+          quic = quic.set_balance(false);
+        }
+      }
+      let pin_workers = flag(&var, "ARENA_H3_PIN")?.unwrap_or(true);
+      if let Some(elem) = number(&var, "ARENA_H3_MAX_IN_FLIGHT", 16_384, 1 << 30)? {
+        quic = quic.set_max_in_flight(usize::try_from(elem).map_err(|err| err.to_string())?);
+      }
+      if let Some(elem) = flag(&var, "ARENA_H3_PACING")? {
+        quic = quic.set_pacing(elem);
+      }
+      if let Some(elem) = one_of(&var, "ARENA_H3_PMTU_PROBE", &[("now", false), ("rtt", true)])? {
+        quic = quic.set_pmtu_probe_after_rtt(elem);
+      }
+      let bodies = [("complete", false), ("round-robin", true)];
+      if let Some(elem) = one_of(&var, "ARENA_H3_BODIES", &bodies)? {
+        quic = quic.set_bodies_round_robin(elem);
+      }
+      Ok(Self { data, headers, pin_workers, quic, udp })
+    }
+
+    /// The settings, `name=value` each, for the log of the server.
+    pub(super) fn line(&self) -> String {
+      let (quic, udp) = (&self.quic, &self.udp);
+      let pick = |cond: bool, yes: &'static str, no: &'static str| if cond { yes } else { no };
+      format!(
+        "headers={} data={} gro={} recv_buffers={} tx_arena={} rcvbuf={} sndbuf={} train={} \
+         flush_order={} steering={} balance={} pin={} max_in_flight={} pacing={} pmtu_probe={} \
+         bodies={}",
+        pick(self.headers == Headers::Min, "min", "full"),
+        pick(self.data == Data::Reuse, "reuse", "fresh"),
+        u8::from(udp.gro),
+        udp.recv_buffers,
+        udp.tx_arena_bytes,
+        udp.rcvbuf,
+        udp.sndbuf,
+        udp.max_train_segments,
+        pick(quic.flush_in_slot_order(), "slot", "arrival"),
+        pick(quic.cid_steering(), "cid", "kernel"),
+        u8::from(quic.balance()),
+        u8::from(self.pin_workers),
+        quic.max_in_flight(),
+        u8::from(quic.pacing()),
+        pick(quic.pmtu_probe_after_rtt(), "rtt", "now"),
+        pick(quic.bodies_round_robin(), "round-robin", "complete"),
+      )
+    }
+  }
+
+  fn one_of<T: Copy>(
+    var: &impl Fn(&str) -> Option<String>,
+    name: &str,
+    values: &[(&str, T)],
+  ) -> Result<Option<T>, String> {
+    let Some(value) = var(name) else {
+      return Ok(None);
+    };
+    match values.iter().find(|el| el.0 == value) {
+      Some(elem) => Ok(Some(elem.1)),
+      None => {
+        let names: Vec<&str> = values.iter().map(|el| el.0).collect();
+        Err(format!("{name} must be one of {names:?}, not `{value}`"))
+      }
+    }
+  }
+
+  fn flag(var: &impl Fn(&str) -> Option<String>, name: &str) -> Result<Option<bool>, String> {
+    one_of(var, name, &[("0", false), ("1", true)])
+  }
+
+  fn number(
+    var: &impl Fn(&str) -> Option<String>,
+    name: &str,
+    min: u64,
+    max: u64,
+  ) -> Result<Option<u64>, String> {
+    let Some(value) = var(name) else {
+      return Ok(None);
+    };
+    match value.parse::<u64>() {
+      Ok(elem) if (min..=max).contains(&elem) => Ok(Some(elem)),
+      _ => Err(format!("{name} must be a number from {min} to {max}, not `{value}`")),
+    }
+  }
 }
 
 /// SIGUSR1 prints the counters of the h3 workers; SIGINT and SIGTERM print them and exit.
@@ -225,10 +401,11 @@ mod stats_signals {
   }
 
   #[derive(Default)]
-  struct Counters([u64; 12]);
+  struct Counters([u64; 21]);
 
   impl Counters {
-    const NAMES: [&'static str; 12] = [
+    // The first twelve as before task 16, then the counters of spec section 2.1 (ruling T16-c)
+    const NAMES: [&'static str; 21] = [
       "conns",
       "requests",
       "datagrams_in",
@@ -241,6 +418,15 @@ mod stats_signals {
       "stateless_resets",
       "udp_send_errors",
       "handler_panics",
+      "fins_out",
+      "fin_flushes",
+      "fin_flushes_acked",
+      "streams_blocked_in",
+      "data_blocked_in",
+      "stream_data_blocked_in",
+      "packets_lost",
+      "pto_probes",
+      "frames_resent",
     ];
 
     fn of(worker: &Http3WorkerStats) -> Self {
@@ -257,6 +443,15 @@ mod stats_signals {
         worker.stateless_resets,
         worker.udp_send_errors,
         worker.handler_panics,
+        worker.fins_out,
+        worker.fin_flushes,
+        worker.fin_flushes_acked,
+        worker.streams_blocked_in,
+        worker.data_blocked_in,
+        worker.stream_data_blocked_in,
+        worker.packets_lost,
+        worker.pto_probes,
+        worker.frames_resent,
       ])
     }
 
@@ -418,6 +613,97 @@ struct DatasetItem {
 struct Rating {
   score: i64,
   count: i64,
+}
+
+#[cfg(test)]
+mod knob_tests {
+  use super::knobs::{Data, H3Knobs, Headers};
+  use rimu_ws::{executor::UdpParams, quic::QuicParams};
+
+  fn parse(vars: &[(&str, &str)]) -> Result<H3Knobs, String> {
+    H3Knobs::from_vars(|name| vars.iter().find(|el| el.0 == name).map(|el| el.1.to_string()))
+  }
+
+  // Ruling T16-b: without variables every knob is the library default.
+  #[test]
+  fn no_variables_give_the_library_defaults() {
+    let knobs = parse(&[]).unwrap();
+    let (quic, udp) = (QuicParams::default(), UdpParams::new());
+    assert_eq!(knobs.quic, quic);
+    assert_eq!(
+      (knobs.udp.gro, knobs.udp.recv_buffers, knobs.udp.recv_buffer_len, knobs.udp.tx_arena_bytes),
+      (udp.gro, udp.recv_buffers, udp.recv_buffer_len, udp.tx_arena_bytes)
+    );
+    assert_eq!(
+      (knobs.udp.rcvbuf, knobs.udp.sndbuf, knobs.udp.max_train_segments, knobs.udp.reuseport),
+      (udp.rcvbuf, udp.sndbuf, udp.max_train_segments, udp.reuseport)
+    );
+    assert!(knobs.pin_workers);
+    assert_eq!((knobs.data, knobs.headers), (Data::Reuse, Headers::Min));
+  }
+
+  // Ruling T16-b: each variable sets the field of the table in the program's documentation.
+  #[test]
+  fn each_variable_sets_its_field() {
+    let knobs = parse(&[
+      ("ARENA_H3_BALANCE", "0"),
+      ("ARENA_H3_BODIES", "round-robin"),
+      ("ARENA_H3_DATA", "fresh"),
+      ("ARENA_H3_FLUSH_ORDER", "slot"),
+      ("ARENA_H3_GRO", "1"),
+      ("ARENA_H3_HEADERS", "full"),
+      ("ARENA_H3_MAX_IN_FLIGHT", "131072"),
+      ("ARENA_H3_PACING", "0"),
+      ("ARENA_H3_PIN", "0"),
+      ("ARENA_H3_PMTU_PROBE", "rtt"),
+      ("ARENA_H3_RCVBUF", "1048576"),
+      ("ARENA_H3_RECV_BUFFERS", "512"),
+      ("ARENA_H3_SNDBUF", "2097152"),
+      ("ARENA_H3_STEERING", "kernel"),
+      ("ARENA_H3_TRAIN", "32"),
+      ("ARENA_H3_TX_ARENA", "1536000"),
+    ])
+    .unwrap();
+    let quic = knobs.quic;
+    assert!(!quic.balance() && quic.bodies_round_robin() && quic.flush_in_slot_order());
+    assert!(!quic.pacing() && quic.pmtu_probe_after_rtt() && !quic.cid_steering());
+    assert_eq!(quic.max_in_flight(), 131_072);
+    let udp = knobs.udp;
+    assert!(udp.gro);
+    assert_eq!(
+      (udp.recv_buffers, udp.tx_arena_bytes, udp.max_train_segments),
+      (512, 1_536_000, 32)
+    );
+    assert_eq!((udp.rcvbuf, udp.sndbuf), (1 << 20, 2 << 20));
+    assert!(!knobs.pin_workers);
+    assert_eq!((knobs.data, knobs.headers), (Data::Fresh, Headers::Full));
+    // The steering of the kernel has no balance, whatever is asked
+    let kernel = parse(&[("ARENA_H3_STEERING", "kernel"), ("ARENA_H3_BALANCE", "1")]).unwrap();
+    assert!(!kernel.quic.cid_steering() && !kernel.quic.balance());
+    // The line that the server prints names every knob
+    let line = knobs.line();
+    for name in ["gro=1", "recv_buffers=512", "train=32", "steering=kernel", "data=fresh"] {
+      assert!(line.contains(name), "{line}");
+    }
+  }
+
+  // A value that is not one of the table is an error that names the variable.
+  #[test]
+  fn bad_values_are_refused() {
+    for (name, value) in [
+      ("ARENA_H3_GRO", "yes"),
+      ("ARENA_H3_HEADERS", "some"),
+      ("ARENA_H3_TRAIN", "65"),
+      ("ARENA_H3_TRAIN", "0"),
+      ("ARENA_H3_RECV_BUFFERS", "0"),
+      ("ARENA_H3_MAX_IN_FLIGHT", "-1"),
+      ("ARENA_H3_STEERING", "hash"),
+      ("ARENA_H3_FLUSH_ORDER", "random"),
+    ] {
+      let err = parse(&[(name, value)]).unwrap_err();
+      assert!(err.contains(name), "{err}");
+    }
+  }
 }
 
 #[cfg(test)]

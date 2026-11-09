@@ -337,8 +337,11 @@ window. Exact values are library defaults tuned by measurement.
 - **QPACK encoder (responses):** static table only, never the dynamic table. Response field sections are
   pre-encoded once per route and per (cached file, encoding) and copied; exact static entries are used where
   they exist (`:status 200`, `content-type` values, `content-encoding: br/gzip`, `vary: accept-encoding`).
-  Which headers go out is chosen by measurement (**[Q2]**, §10): `content-type` only, or `content-type` +
-  `date` + `server`; both are framework options and the pre-encoded block splices `date` once a second.
+  Which headers go out was chosen by measurement (**[Q2]**, §10), and decided by the user on 9 Nov 2026:
+  the default (library, benchmark and HttpArena entry) is `content-type` only, like cnetmod and zix, which
+  is not RFC 9110-compliant; `set_rfc9110_headers(true)` turns on full RFC 9110 compliance (`date`, spliced
+  once a second, and `content-length`); the `server` header is the entry's middleware, off by default. The
+  measurement (EC2, the RFC 9110 set costs 17 % on baseline-h3) is in `docs/benchmarks/2026-11-09-h3-ec2/`.
 - Request validation per RFC 9114 §4.3 (pseudo-headers, no connection-specific headers, lowercase names);
   malformed requests get stream errors, not connection kills (except where the RFC says connection error).
 

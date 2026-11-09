@@ -57,10 +57,25 @@ pub struct Http3WorkerStats {
   pub forwarded: u64,
   /// Datagrams for another worker that its inbox could not take, dropped.
   pub forward_dropped: u64,
+  /// DATA_BLOCKED frames received: a client held back by the credit of its connection (spec
+  /// section 2.1: none expected).
+  pub data_blocked_in: u64,
+  /// Flushes of a connection that finished at least one response (sent the FIN of a stream).
+  pub fin_flushes: u64,
+  /// Of [`Self::fin_flushes`], those whose packets carried an ACK frame: the responses that leave
+  /// with the acknowledgment of the requests they answer (spec section 2.1: all of them).
+  pub fin_flushes_acked: u64,
+  /// STREAM frames sent with the FIN of their stream, the first time: responses finished.
+  /// Responses per packet are this over [`Self::packets_out`] (spec section 2.1).
+  pub fins_out: u64,
+  /// STREAM frames sent again after a loss.
+  pub frames_resent: u64,
   /// Panics of handlers, each answered with 500 on its stream.
   pub handler_panics: u64,
   /// Times the pools of the worker were trimmed after it had no connection for a while.
   pub idle_trims: u64,
+  /// Packets declared lost.
+  pub packets_lost: u64,
   /// Packets sent, each packet of a coalesced datagram counted.
   pub packets_out: u64,
   /// Requests parked now: their handlers wait.
@@ -68,12 +83,19 @@ pub struct Http3WorkerStats {
   /// Requests whose handler would have waited past the parked requests a worker keeps, answered
   /// with 503.
   pub park_refused: u64,
+  /// Probe timeouts that fired.
+  pub pto_probes: u64,
   /// Requests given to handlers.
   pub requests: u64,
   /// Retry packets sent.
   pub retries: u64,
   /// Stateless resets sent.
   pub stateless_resets: u64,
+  /// STREAM_DATA_BLOCKED frames received: a client held back by the credit of a stream.
+  pub stream_data_blocked_in: u64,
+  /// STREAMS_BLOCKED frames received: a client at the limit of its streams (spec section 2.1: none
+  /// expected).
+  pub streams_blocked_in: u64,
   /// Sends of datagrams that failed (their packets count as lost).
   pub udp_send_errors: u64,
 }
@@ -120,57 +142,106 @@ struct WorkersStats {
 #[derive(Debug)]
 pub(crate) struct StatsCell {
   cid_steering: AtomicBool,
-  values: [AtomicU64; 15],
+  values: [AtomicU64; StatsCell::LEN],
 }
 
 impl Default for StatsCell {
   #[inline]
   fn default() -> Self {
-    Self { cid_steering: AtomicBool::new(false), values: [const { AtomicU64::new(0) }; 15] }
+    Self { cid_steering: AtomicBool::new(false), values: [const { AtomicU64::new(0) }; Self::LEN] }
   }
 }
 
 impl StatsCell {
+  const LEN: usize = 24;
+
   fn load(&self) -> Http3WorkerStats {
-    let value = |idx: usize| self.values.get(idx).map_or(0, |el| el.load(Ordering::Relaxed));
+    let mut values = [0u64; Self::LEN];
+    for (to, from) in values.iter_mut().zip(&self.values) {
+      *to = from.load(Ordering::Relaxed);
+    }
+    let [
+      ack_only_out,
+      conns,
+      data_blocked_in,
+      datagrams_in,
+      datagrams_out,
+      fin_flushes,
+      fin_flushes_acked,
+      fins_out,
+      forward_dropped,
+      forwarded,
+      frames_resent,
+      handler_panics,
+      idle_trims,
+      packets_lost,
+      packets_out,
+      park_refused,
+      parked,
+      pto_probes,
+      requests,
+      retries,
+      stateless_resets,
+      stream_data_blocked_in,
+      streams_blocked_in,
+      udp_send_errors,
+    ] = values;
     Http3WorkerStats {
-      ack_only_out: value(13),
+      ack_only_out,
       cid_steering: self.cid_steering.load(Ordering::Relaxed),
-      conns: value(0),
-      datagrams_in: value(1),
-      datagrams_out: value(2),
-      forwarded: value(3),
-      forward_dropped: value(4),
-      handler_panics: value(5),
-      idle_trims: value(6),
-      packets_out: value(14),
-      parked: value(7),
-      park_refused: value(8),
-      requests: value(9),
-      retries: value(10),
-      stateless_resets: value(11),
-      udp_send_errors: value(12),
+      conns,
+      data_blocked_in,
+      datagrams_in,
+      datagrams_out,
+      fin_flushes,
+      fin_flushes_acked,
+      fins_out,
+      forward_dropped,
+      forwarded,
+      frames_resent,
+      handler_panics,
+      idle_trims,
+      packets_lost,
+      packets_out,
+      park_refused,
+      parked,
+      pto_probes,
+      requests,
+      retries,
+      stateless_resets,
+      stream_data_blocked_in,
+      streams_blocked_in,
+      udp_send_errors,
     }
   }
 
   pub(crate) fn store(&self, stats: &Http3WorkerStats) {
     self.cid_steering.store(stats.cid_steering, Ordering::Relaxed);
-    let values = [
+    let values: [u64; Self::LEN] = [
+      stats.ack_only_out,
       stats.conns,
+      stats.data_blocked_in,
       stats.datagrams_in,
       stats.datagrams_out,
-      stats.forwarded,
+      stats.fin_flushes,
+      stats.fin_flushes_acked,
+      stats.fins_out,
       stats.forward_dropped,
+      stats.forwarded,
+      stats.frames_resent,
       stats.handler_panics,
       stats.idle_trims,
-      stats.parked,
+      stats.packets_lost,
+      stats.packets_out,
       stats.park_refused,
+      stats.parked,
+      stats.pto_probes,
       stats.requests,
       stats.retries,
       stats.stateless_resets,
+      stats.stream_data_blocked_in,
+      stats.streams_blocked_in,
       stats.udp_send_errors,
-      stats.ack_only_out,
-      stats.packets_out,
     ];
     for (cell, value) in self.values.iter().zip(values) {
       cell.store(value, Ordering::Relaxed);
@@ -191,6 +262,7 @@ pub struct Http3ServerFramework<DA, EC, EX, RC, RNG, TCX> {
   date: bool,
   error_cb: EC,
   executor: EX,
+  fresh_data: bool,
   h3_params: H3Params,
   local_runtime_cb: RC,
   local_runtimes: Option<NonZeroUsize>,
@@ -230,6 +302,7 @@ where
       date: false,
       error_cb,
       executor,
+      fresh_data: false,
       h3_params: H3Params::default(),
       local_runtime_cb,
       local_runtimes: None,
@@ -254,7 +327,8 @@ impl<DA, EC, EX, RC, RNG, TCX> Http3ServerFramework<DA, EC, EX, RC, RNG, TCX> {
     &mut self.rng
   }
 
-  /// Shared data that is cloned for each request.
+  /// Shared data that each request gets a clone of: by default one that an earlier request of the
+  /// same worker used, see [`Self::set_fresh_data`].
   #[inline]
   pub fn set_data<_DA>(self, value: _DA) -> Http3ServerFramework<_DA, EC, EX, RC, RNG, TCX> {
     Http3ServerFramework {
@@ -263,6 +337,7 @@ impl<DA, EC, EX, RC, RNG, TCX> Http3ServerFramework<DA, EC, EX, RC, RNG, TCX> {
       date: self.date,
       error_cb: self.error_cb,
       executor: self.executor,
+      fresh_data: self.fresh_data,
       h3_params: self.h3_params,
       local_runtime_cb: self.local_runtime_cb,
       local_runtimes: self.local_runtimes,
@@ -309,6 +384,7 @@ impl<DA, EC, EX, RC, RNG, TCX> Http3ServerFramework<DA, EC, EX, RC, RNG, TCX> {
       date: self.date,
       error_cb: value,
       executor: self.executor,
+      fresh_data: self.fresh_data,
       h3_params: self.h3_params,
       local_runtime_cb: self.local_runtime_cb,
       local_runtimes: self.local_runtimes,
@@ -322,6 +398,20 @@ impl<DA, EC, EX, RC, RNG, TCX> Http3ServerFramework<DA, EC, EX, RC, RNG, TCX> {
       tls_config: self.tls_config,
       udp_params: self.udp_params,
     }
+  }
+
+  /// If each request clones the data of [`Self::set_data`], as HTTP/2 does. By default a worker
+  /// keeps the clones that its requests used and hands them to its next requests: a request then
+  /// clones nothing in the steady state (with data that holds an `Arc`, a clone and a drop per
+  /// request are two atomic operations on a counter that every worker shares). A clone that is
+  /// handed on keeps what an earlier request of the worker changed in it (`State::data` is
+  /// `&mut`): turn this on for data whose handlers change it and must each start from the
+  /// original. Defaults to `false`.
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub const fn set_fresh_data(mut self, value: bool) -> Self {
+    self.fresh_data = value;
+    self
   }
 
   /// See [`H3Params`].
@@ -358,6 +448,7 @@ impl<DA, EC, EX, RC, RNG, TCX> Http3ServerFramework<DA, EC, EX, RC, RNG, TCX> {
       date: self.date,
       error_cb: self.error_cb,
       executor: self.executor,
+      fresh_data: self.fresh_data,
       h3_params: self.h3_params,
       local_runtime_cb: value,
       local_runtimes: self.local_runtimes,
@@ -519,6 +610,7 @@ mod uring {
           cpu: cpus.get(usize::from(worker) % cpus.len().max(1)).copied(),
           data: self.data.clone(),
           content_length: self.content_length,
+          fresh_data: self.fresh_data,
           date: self.date,
           epoch,
           error_cb: self.error_cb.clone(),
@@ -586,6 +678,7 @@ mod uring {
       let params = WorkerParams {
         addr: endpoint_task::resolve(addr)?,
         content_length: self.content_length,
+        fresh_data: self.fresh_data,
         cpu: None,
         data: self.data,
         date: self.date,

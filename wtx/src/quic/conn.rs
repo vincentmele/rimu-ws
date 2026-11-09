@@ -154,6 +154,12 @@ pub(crate) struct ConnParams {
   pub(crate) pacing: bool,
   /// The most bytes in flight, whatever the congestion window.
   pub(crate) max_in_flight: usize,
+  /// If the streams whose next bytes are a body take turns, a STREAM frame each, instead of going
+  /// one at a time to the end of their body ([`crate::quic::QuicParams::bodies_round_robin`]).
+  pub(crate) bodies_round_robin: bool,
+  /// If the first probe of path MTU discovery waits a smoothed RTT after the confirmation of the
+  /// handshake ([`crate::quic::QuicParams::pmtu_probe_after_rtt`]).
+  pub(crate) pmtu_probe_after_rtt: bool,
   /// The packets sealed with one key of 1-RTT packets after which a key update starts, if it is
   /// below the threshold of the cipher suite.
   pub(crate) key_update_threshold: u64,
@@ -251,6 +257,8 @@ impl Default for ConnParams {
       max_udp_payload_size: 1472,
       pacing: true,
       max_in_flight: 256 << 10,
+      bodies_round_robin: false,
+      pmtu_probe_after_rtt: false,
       key_update_threshold: u64::MAX,
       #[cfg(test)]
       test_confidentiality_limit: u32::MAX,
@@ -296,6 +304,17 @@ pub(crate) struct ConnStats {
   pub(crate) persistent_congestions: u64,
   /// Probe timeouts that fired.
   pub(crate) pto_probes: u64,
+  /// Flushes that sent the FIN of a stream (that finished a response, on a server).
+  pub(crate) fin_flushes: u64,
+  /// Of [`Self::fin_flushes`], those whose packets carried an ACK frame of the 1-RTT space: the
+  /// answers that leave with the acknowledgment of what they answer.
+  pub(crate) fin_flushes_acked: u64,
+  /// DATA_BLOCKED frames received.
+  pub(crate) data_blocked_in: u64,
+  /// STREAM_DATA_BLOCKED frames received.
+  pub(crate) stream_data_blocked_in: u64,
+  /// STREAMS_BLOCKED frames received.
+  pub(crate) streams_blocked_in: u64,
 }
 
 impl ConnStats {
@@ -316,6 +335,11 @@ impl ConnStats {
     packets_lost: 0,
     persistent_congestions: 0,
     pto_probes: 0,
+    fin_flushes: 0,
+    fin_flushes_acked: 0,
+    data_blocked_in: 0,
+    stream_data_blocked_in: 0,
+    streams_blocked_in: 0,
   };
 }
 
@@ -342,6 +366,8 @@ where
   // the next one, which doubles each time
   closing_datagrams: u32,
   closing_threshold: u32,
+  // An ACK frame of the 1-RTT space went out in the flush under way
+  flush_acked: bool,
   // A client got an acknowledgment of a Handshake packet: the server validated its address
   handshake_acked: bool,
   handshake_complete: bool,
@@ -535,7 +561,16 @@ where
       ));
       let _closing = self.apply_app_close(now_us);
     }
+    let fins = self.streams.fins_out();
+    self.flush_acked = false;
     let rslt = self.flush_datagrams(now_us, tx, pools);
+    if self.streams.fins_out() != fins {
+      let acked = self.flush_acked;
+      self.count(|el| {
+        el.fin_flushes = el.fin_flushes.wrapping_add(1);
+        el.fin_flushes_acked = el.fin_flushes_acked.wrapping_add(u64::from(acked));
+      });
+    }
     if self.recovery.timer_stale {
       self.set_loss_timer(now_us);
     }
@@ -631,10 +666,16 @@ where
     match self.state {
       ConnState::Handshake | ConnState::Confirmed => {
         let paced = self.recovery.pacer_release_us.filter(|_| self.wants_send());
-        [self.idle_deadline(), self.recovery.loss_timer_us, paced, self.key.discard_deadline()]
-          .into_iter()
-          .flatten()
-          .min()
+        [
+          self.idle_deadline(),
+          self.recovery.loss_timer_us,
+          paced,
+          self.key.discard_deadline(),
+          self.pmtud.hold_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
       }
       ConnState::Closing | ConnState::Draining => Some(self.close_deadline_us),
       ConnState::Closed => None,
@@ -663,6 +704,7 @@ where
     if self.recovery.pacer_release_us.is_some_and(|elem| now_us >= elem) {
       self.recovery.pacer_release_us = None;
     }
+    self.pmtud.on_timeout(now_us);
     let mut rslt = Ok(());
     if self.key.discard_deadline().is_some_and(|elem| now_us >= elem) {
       rslt = self.key.discard_previous(self.data.keys.as_mut(), pools);
@@ -815,6 +857,13 @@ where
   #[inline]
   pub(crate) fn stats(&self) -> &ConnStats {
     self.cold.as_deref().map_or(&ConnStats::EMPTY, |el| &el.stats)
+  }
+
+  /// STREAM frames sent with the FIN of their stream the first time, and STREAM frames sent
+  /// again.
+  #[inline]
+  pub(crate) fn stream_tally(&self) -> (u64, u64) {
+    (self.streams.fins_out(), self.streams.frames_resent())
   }
 
   // Counts something, while the connection is open
@@ -1291,7 +1340,7 @@ where
     }
     if !IS_CLIENT && self.handshake_complete && self.state == ConnState::Handshake {
       // A server confirms the handshake once it is complete (RFC 9001 section 4.1.2)
-      self.confirm(pools)?;
+      self.confirm(now_us, pools)?;
     }
     Ok(())
   }
@@ -1344,8 +1393,11 @@ where
   // The handshake is confirmed: what only it needed goes back, and the keys of the next key phase
   // that open packets are made now, never while a packet is processed (RFC 9001 section 9.5,
   // review J12).
-  fn confirm(&mut self, pools: &mut QuicPools) -> crate::Result<()> {
+  fn confirm(&mut self, now_us: u64, pools: &mut QuicPools) -> crate::Result<()> {
     self.state = ConnState::Confirmed;
+    if self.params.pmtu_probe_after_rtt {
+      self.pmtud.hold_until(now_us.saturating_add(self.recovery.rtt.smoothed_us));
+    }
     self.release_handshake(pools);
     match self.data.keys.as_mut() {
       Some(keys) => self.key.prepare_next(keys, pools),
@@ -1736,7 +1788,7 @@ where
           }
           // A client confirms the handshake when the server says so (RFC 9001 section 4.1.2)
           if self.state == ConnState::Handshake {
-            self.confirm(pools)?;
+            self.confirm(now_us, pools)?;
           }
         }
         Frame::NewToken(_) => {
@@ -1817,14 +1869,17 @@ where
         }
         Frame::DataBlocked(_) => {
           ack_eliciting = true;
+          self.count(|el| el.data_blocked_in = el.data_blocked_in.wrapping_add(1));
           self.streams.on_data_blocked(&self.params);
         }
         Frame::StreamDataBlocked { id, .. } => {
           ack_eliciting = true;
+          self.count(|el| el.stream_data_blocked_in = el.stream_data_blocked_in.wrapping_add(1));
           self.streams.on_stream_data_blocked(pools, &self.params, id)?;
         }
         Frame::StreamsBlocked { bidi, .. } => {
           ack_eliciting = true;
+          self.count(|el| el.streams_blocked_in = el.streams_blocked_in.wrapping_add(1));
           self.streams.on_streams_blocked(bidi);
         }
         Frame::NewConnectionId { seq, retire_prior_to, cid, reset_token } => {
@@ -2051,6 +2106,7 @@ where
       close_owed: false,
       closing_datagrams: 0,
       closing_threshold: 1,
+      flush_acked: false,
       handshake_acked: false,
       handshake_complete: false,
       handshake_done_owed: false,
@@ -2268,6 +2324,7 @@ where
         && let Some(written) = sp.recv.write_ack(&mut fw, self.params.ack_delay_exponent, now_us)
       {
         pools.frame_refs.push(&mut frames, FrameRef::Ack { largest })?;
+        self.flush_acked |= space == Space::Data;
         // A frame with its first range only leaves the others owed (carried rule 4)
         if written == AckWritten::All {
           sp.recv.on_ack_sent(pools);
@@ -2396,6 +2453,11 @@ impl<A, RNG, TCX, const IS_CLIENT: bool> QuicConn<A, RNG, TCX, IS_CLIENT>
 where
   A: QuicApp,
 {
+  /// The smoothed RTT.
+  pub(crate) const fn smoothed_rtt_us(&self) -> u64 {
+    self.recovery.rtt.smoothed_us
+  }
+
   /// The CONNECTION_CLOSE that the connection owes, if it is closing: (application, code).
   pub(crate) const fn close_code(&self) -> Option<(bool, u64)> {
     match self.state {

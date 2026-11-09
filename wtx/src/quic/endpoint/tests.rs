@@ -1043,3 +1043,55 @@ fn with_conn_reaches_the_connection_of_a_handle_and_ignores_a_stale_one() {
   assert!(server.endpoint.with_conn(now_us, handle, &mut server.app, |_, _| ran = true).is_none());
   assert!(!ran);
 }
+
+// Ruling T16-c (spec section 2.1): the endpoint sums the counters of its connections that the
+// measurement asserts by: responses finished (STREAM FINs), the flushes that finished one and
+// those of them that carried the acknowledgment of the requests, the BLOCKED frames received,
+// losses, probe timeouts and STREAM frames sent again.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn endpoint_sums_the_counters_of_the_measurement() {
+  let mut net = net(1, QuicParams::default());
+  for _ in 0..4 {
+    let _ = net.add_client();
+  }
+  net.run();
+  let before = net.servers[0].endpoint.stats();
+  assert_eq!(net.run_requests(64, 64, b"GET /"), 4 * 64);
+  let stats = net.servers[0].endpoint.stats();
+  assert_eq!(stats.fins_out - before.fins_out, 4 * 64);
+  let flushes = stats.fin_flushes - before.fin_flushes;
+  assert!(flushes > 0 && flushes <= 4 * 64, "{stats:?}");
+  // Each answer leaves with the acknowledgment of the packets of its requests
+  assert_eq!(stats.fin_flushes_acked - before.fin_flushes_acked, flushes, "{stats:?}");
+  let blocked = (stats.data_blocked_in, stats.stream_data_blocked_in, stats.streams_blocked_in);
+  assert_eq!(blocked, (0, 0, 0));
+  assert_eq!((stats.packets_lost, stats.pto_probes, stats.frames_resent), (0, 0, 0));
+}
+
+// Ruling T16-b: a flush writes the connections in the order in which they came to have something
+// to send, or, with `flush_in_slot_order`, in the order of their slots.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn flush_order_is_arrival_or_slot() {
+  for slot_order in [false, true] {
+    let mut net = net(1, QuicParams::default().set_flush_in_slot_order(slot_order));
+    let (first, second) = (net.add_client(), net.add_client());
+    net.run();
+    assert!(confirmed(&net, first) && confirmed(&net, second));
+    // The second client's request arrives first
+    for client in [second, first] {
+      net.client_ctx(client, net.now_us, |cx| {
+        let id = cx.open_bidi().unwrap();
+        cx.write(id, b"GET /", true).unwrap();
+      });
+      for mut datagram in net.client_datagrams(client) {
+        let _ = net.deliver_to_server(client, &mut datagram);
+      }
+    }
+    let peers: Vec<u16> = net.server_datagrams(0).iter().map(|el| el.0.port()).collect();
+    let ports = [50_000 + first as u16, 50_000 + second as u16];
+    let expected = if slot_order { ports.to_vec() } else { vec![ports[1], ports[0]] };
+    assert_eq!(peers, expected, "slot order {slot_order}");
+  }
+}

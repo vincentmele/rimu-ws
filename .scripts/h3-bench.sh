@@ -18,8 +18,12 @@
 #
 # Prints one JSON line:
 #   {"server","profile","rps","server_cpu_us_per_req","gen_cpu_us_per_req","errors","runs":[rps..],"load1",
-#    "dgrams_in_per_req","dgrams_out_per_req","pkts_out_per_req","ack_only_share"}
-# (and "headers", for rimu, if ARENA_H3_HEADERS is set).
+#    "dgrams_in_per_req","dgrams_out_per_req","pkts_out_per_req","ack_only_share",
+#    "resp_per_pkt","fin_ack_share","streams_blocked","data_blocked","stream_data_blocked",
+#    "packets_lost","pto_probes","frames_resent"}
+# and, for rimu, "headers" (ARENA_H3_HEADERS, `min` when unset: arena-h2's default since decision
+# Q2, so that runs before and after it are never mixed unlabelled) and "knobs" (the line of h3
+# settings that arena-h2 prints at start, if it prints one).
 # rps and the per-request figures are those of the best run. A CPU figure is the CPU time (user +
 # system) the server, or the generator, used during the run, divided by the 2xx responses of that
 # run. The run is the span of h2load itself: the generator container waits for the script's go
@@ -46,7 +50,7 @@
 #                 builds with -C target-cpu=native, so the default target dir is the one built so)
 #   ARENA_H3_HEADERS  min (arena-h2's default: content-type only, like cnetmod and zix) or full
 #                 (RFC 9110 fields and the server middleware), passed on to arena-h2; recorded in
-#                 the output line when set
+#                 every rimu output line, `min` when unset
 #   RUNS          runs per server start (default 3)
 #   DURATION      h2load -D (default 5s)
 #   GEN_LOCALHOST v4 (default: the generator resolves localhost to 127.0.0.1 only) or auto (the
@@ -288,6 +292,9 @@ dgrams_in=()
 dgrams_out=()
 pkts_out=()
 ack_share=()
+# The counters of spec section 2.1 (ruling T16-c), one JSON fragment per run
+sec21=()
+sec21_null=',"resp_per_pkt":null,"fin_ack_share":null,"streams_blocked":null,"data_blocked":null,"stream_data_blocked":null,"packets_lost":null,"pto_probes":null,"frames_resent":null'
 total_errors=0
 for run in $(seq 1 "$runs"); do
 	name=$gen_name
@@ -366,11 +373,24 @@ exit $rc' \
 		dgrams_out+=("$(awk -v a="$dout" -v n="$ok" 'BEGIN { printf "%.3f", a / n }')")
 		pkts_out+=("$(awk -v a="$pout" -v n="$ok" 'BEGIN { printf "%.3f", a / n }')")
 		ack_share+=("$(awk -v a="$aout" -v p="$pout" 'BEGIN { if (p > 0) printf "%.4f", a / p; else print "null" }')")
+		if [[ $stats_after == *" fins_out="* ]]; then
+			fins=$(d fins_out)
+			ff=$(d fin_flushes)
+			ffa=$(d fin_flushes_acked)
+			sec21+=("$(printf ',"resp_per_pkt":%s,"fin_ack_share":%s,"streams_blocked":%s,"data_blocked":%s,"stream_data_blocked":%s,"packets_lost":%s,"pto_probes":%s,"frames_resent":%s' \
+				"$(awk -v a="$fins" -v p="$pout" 'BEGIN { if (p > 0) printf "%.2f", a / p; else print "null" }')" \
+				"$(awk -v a="$ffa" -v f="$ff" 'BEGIN { if (f > 0) printf "%.4f", a / f; else print "null" }')" \
+				"$(d streams_blocked_in)" "$(d data_blocked_in)" "$(d stream_data_blocked_in)" "$(d packets_lost)" \
+				"$(d pto_probes)" "$(d frames_resent)")")
+		else
+			sec21+=("$sec21_null")
+		fi
 	else
 		dgrams_in+=(null)
 		dgrams_out+=(null)
 		pkts_out+=(null)
 		ack_share+=(null)
+		sec21+=("$sec21_null")
 	fi
 	sleep 2
 done
@@ -388,9 +408,11 @@ join() {
 	echo "$*"
 }
 headers=""
-if [ -n "${ARENA_H3_HEADERS:-}" ] && [ "$server" = rimu ]; then
-	headers=$(printf ',"headers":"%s"' "$ARENA_H3_HEADERS")
+if [ "$server" = rimu ]; then
+	headers=$(printf ',"headers":"%s"' "${ARENA_H3_HEADERS:-min}")
+	knobs=$(grep -m1 '^arena-h2: h3 knobs ' "$log" | sed 's/^arena-h2: h3 knobs //' | tr -cd 'a-z0-9_=. -' || true)
+	[ -n "$knobs" ] && headers="$headers$(printf ',"knobs":"%s"' "$knobs")"
 fi
-printf '{"server":"%s","profile":"%s"%s,"rps":%s,"server_cpu_us_per_req":%s,"gen_cpu_us_per_req":%s,"errors":%s,"runs":[%s],"load1":%s,"dgrams_in_per_req":%s,"dgrams_out_per_req":%s,"pkts_out_per_req":%s,"ack_only_share":%s}\n' \
+printf '{"server":"%s","profile":"%s"%s,"rps":%s,"server_cpu_us_per_req":%s,"gen_cpu_us_per_req":%s,"errors":%s,"runs":[%s],"load1":%s,"dgrams_in_per_req":%s,"dgrams_out_per_req":%s,"pkts_out_per_req":%s,"ack_only_share":%s%s}\n' \
 	"$server" "$profile" "$headers" "$best" "${srv_cpu[$best_idx]}" "${gen_cpu[$best_idx]}" "$total_errors" "$(join "${rps[@]}")" "$load1" \
-	"${dgrams_in[$best_idx]}" "${dgrams_out[$best_idx]}" "${pkts_out[$best_idx]}" "${ack_share[$best_idx]}"
+	"${dgrams_in[$best_idx]}" "${dgrams_out[$best_idx]}" "${pkts_out[$best_idx]}" "${ack_share[$best_idx]}" "${sec21[$best_idx]}"

@@ -2,7 +2,10 @@
 //! [`H3Handler`] that runs the router of the HTTP/2 framework, its middlewares and endpoints.
 //!
 //! A complete request is copied into a pooled request buffer, the one an [`AutoStream`] holds,
-//! and its route looked up once. The future of the router (middlewares around the endpoint) is
+//! with a clone of the data of the server that an earlier request of the worker used (or a new
+//! clone, with `fresh_data`): a request clones no shared counter in the steady state (ruling
+//! T16-a), and its route looked up once. The URI is put together from the pseudo-header fields
+//! with the offsets that parsing it would find, without parsing it. The future of the router (middlewares around the endpoint) is
 //! pinned into a pooled slot and polled once, inline, in the turn that completed the request,
 //! inside `catch_unwind`: a panic answers 500 on that stream only (spec section 5.12). A future
 //! that completes is answered at once; one that waits is parked in its slot, whose waker records
@@ -12,8 +15,10 @@
 //!
 //! Responses are encoded with the static table of QPACK. The field lines of `:status`,
 //! `content-type`, `content-encoding` and `vary` are kept encoded per combination of their
-//! values (a few of them per worker, the least recently used replaced), the line of `date` once a
-//! second; `content-length` and the other fields are encoded per response. A body sent by
+//! values (a few of them per worker, the least recently used replaced, the last one used looked
+//! at first, without making its key), the line of `date` once a second; `content-length` and the
+//! other fields are encoded per response, in a second pass over the fields that only a response
+//! with such fields takes. A body sent by
 //! reference ([`AutoStream::shared_body`], the cached files of
 //! [`StaticFiles`](crate::http::StaticFiles)) leaves without a copy ([`BodyRef`]).
 //!
@@ -148,7 +153,10 @@ where
   content_length: bool,
   counters: HandlerCounters,
   data: D::Data,
+  // Clones of `data` that requests used, for the next ones, unless `fresh_data`
+  datas: VectorUsize<D::Data>,
   date: Option<DateLine>,
+  fresh_data: bool,
   dispatch: D,
   error_cb: EC,
   head: ResponseHead,
@@ -167,7 +175,7 @@ where
   /// `content_length`, responses with content carry `content-length`, and with `date` a `date`
   /// header.
   pub(crate) fn new(
-    data: D::Data,
+    (data, fresh_data): (D::Data, bool),
     (content_length, date): (bool, bool),
     dispatch: D,
     error_cb: EC,
@@ -176,7 +184,9 @@ where
       content_length,
       counters: HandlerCounters::default(),
       data,
+      datas: VectorUsize::new(),
       date: if date { Some(DateLine::new()?) } else { None },
+      fresh_data,
       dispatch,
       error_cb,
       head: ResponseHead::new(),
@@ -228,6 +238,7 @@ where
   /// Frees all but a few request buffers and, if no request waits, all but a few slots: for a
   /// worker that has had no connection for a while.
   pub(crate) fn trim_idle(&mut self) {
+    self.datas.truncate(IDLE_KEEP);
     self.msgs.truncate(IDLE_KEEP);
     self.slots.trim_idle(IDLE_KEEP);
   }
@@ -293,7 +304,10 @@ where
         self.answer_plain(cx, false, StatusCode::ServiceUnavailable, msg)
       }
       SlotPoll::Done((auto_stream, rslt)) => {
-        let AutoStream { req, shared_body, .. } = auto_stream;
+        let AutoStream { data, req, shared_body, .. } = auto_stream;
+        if !self.fresh_data && self.datas.len() < MAX_MSGS {
+          let _rslt = self.datas.push(data);
+        }
         let head = req.method == Method::Head;
         let mut msg = req.msg_data;
         match rslt {
@@ -369,8 +383,11 @@ where
       (self.error_cb)(crate::Error::from(Http2ServerFrameworkError::OperationModeMismatch).into());
       return self.answer_plain(cx, head, StatusCode::InternalServerError, msg);
     }
-    let auto_stream =
-      AutoStream::new(self.data.clone(), cx.peer(), None, Request::new(method, msg));
+    let data = match self.datas.pop() {
+      Some(elem) => elem,
+      None => self.data.clone(),
+    };
+    let auto_stream = AutoStream::new(data, cx.peer(), None, Request::new(method, msg));
     let fut = self.dispatch.call(auto_stream, matches);
     let idx = self.slots.insert(fut, cx.conn(), req.stream)?;
     self.poll(cx, idx)
@@ -424,24 +441,14 @@ fn fill_request(msg: &mut MsgBufferString, req: &H3Request<'_>) -> Result<Method
   let Ok(method) = Method::from_canonical_bytes(req.method) else {
     return Err(StatusCode::NotImplemented);
   };
-  let authority = if req.authority.is_empty() {
-    req.fields.iter().find(|el| el.0 == b"host").map_or(&[][..], |el| el.1)
-  } else {
-    req.authority
-  };
+  let authority = if req.authority.is_empty() { req.host } else { req.authority };
   let (Ok(scheme), Ok(authority), Ok(path)) =
     (from_utf8_basic(req.scheme), from_utf8_basic(authority), from_utf8_basic(req.path))
   else {
     return Err(StatusCode::BadRequest);
   };
-  {
-    let mut uri = msg.uri.reset();
-    uri.push_str(scheme);
-    uri.push_str("://");
-    uri.push_str(authority);
-    uri.push_str(path);
-  }
-  for (name, value) in req.fields {
+  msg.uri.set_from_parts(scheme, authority, path);
+  for (name, value) in req.fields.iter() {
     let (Ok(name), Ok(value)) = (from_utf8_basic(name), from_utf8_basic(value)) else {
       return Err(StatusCode::BadRequest);
     };
@@ -501,6 +508,8 @@ struct Block {
 struct ResponseHead {
   blocks: VectorUsize<Block>,
   key: VectorUsize<u8>,
+  // The block used last
+  last: Option<usize>,
   lower: VectorUsize<u8>,
   section: VectorUsize<u8>,
   uses: u64,
@@ -511,6 +520,7 @@ impl ResponseHead {
     Self {
       blocks: VectorUsize::new(),
       key: VectorUsize::new(),
+      last: None,
       lower: VectorUsize::new(),
       section: VectorUsize::new(),
       uses: 0,
@@ -527,15 +537,23 @@ impl ResponseHead {
     date: Option<&[u8]>,
   ) -> crate::Result<&[u8]> {
     let [mut content_type, mut content_encoding, mut vary] = [None; 3];
+    // If a field is left for the second pass below
+    let mut others = false;
     for header in headers.iter() {
       let slot = match known(header.name.as_bytes()) {
         Some(Known::ContentType) => &mut content_type,
         Some(Known::ContentEncoding) => &mut content_encoding,
         Some(Known::Vary) => &mut vary,
-        _ => continue,
+        Some(Known::ContentLength | Known::ConnectionSpecific) => continue,
+        Some(Known::Date) | None => {
+          others = true;
+          continue;
+        }
       };
       if slot.is_none() {
         *slot = Some(header.value.as_bytes());
+      } else {
+        others = true;
       }
     }
     self.section.clear();
@@ -552,6 +570,9 @@ impl ResponseHead {
     if let Some(elem) = length {
       let mut digits = [0u8; 20];
       encode_static_line(b"content-length", decimal(elem, &mut digits), &mut self.section)?;
+    }
+    if !others {
+      return Ok(self.section.as_slice());
     }
     let mut firsts = [true; 3];
     for header in headers.iter() {
@@ -591,18 +612,25 @@ impl ResponseHead {
     if values > MAX_BLOCK_KEY {
       return Ok(None);
     }
+    // The last block used first, then the others, compared without making the key
+    let last = self.last.filter(|el| {
+      self.blocks.get(*el).is_some_and(|block| key_matches(block.key.as_slice(), status, fields))
+    });
+    let found = last
+      .or_else(|| self.blocks.iter().position(|el| key_matches(el.key.as_slice(), status, fields)));
+    if let Some(idx) = found {
+      if let Some(block) = self.blocks.get_mut(idx) {
+        block.last_use = self.uses;
+      }
+      self.last = Some(idx);
+      return Ok(Some(idx));
+    }
     self.key.clear();
     self.key.extend_from_copyable_slice(&status.to_be_bytes())?;
     for field in fields {
       let len = field.map_or(u16::MAX, |el| u16::try_from(el.len()).unwrap_or(u16::MAX));
       self.key.extend_from_copyable_slice(&len.to_be_bytes())?;
       self.key.extend_from_copyable_slice(field.unwrap_or_default())?;
-    }
-    if let Some(idx) = self.blocks.iter().position(|el| el.key.as_slice() == self.key.as_slice()) {
-      if let Some(block) = self.blocks.get_mut(idx) {
-        block.last_use = self.uses;
-      }
-      return Ok(Some(idx));
     }
     let idx = if self.blocks.len() < MAX_BLOCKS {
       let block = Block { key: VectorUsize::new(), last_use: 0, lines: VectorUsize::new() };
@@ -620,12 +648,36 @@ impl ResponseHead {
     block.lines.clear();
     block.last_use = self.uses;
     write_block(status, fields, &mut block.lines)?;
+    self.last = Some(idx);
     Ok(Some(idx))
   }
 }
 
+// If `key` is the key of a block of `status` and `fields`: the status, then for each field the
+// length of its value (`u16::MAX` for none) and the value, as `ResponseHead::block` makes it.
+fn key_matches(key: &[u8], status: u16, fields: [Option<&[u8]>; 3]) -> bool {
+  let Some((head, mut rest)) = key.split_first_chunk::<2>() else {
+    return false;
+  };
+  if *head != status.to_be_bytes() {
+    return false;
+  }
+  for field in fields {
+    let Some((len, after)) = rest.split_first_chunk::<2>() else {
+      return false;
+    };
+    let value = field.unwrap_or_default();
+    let expected = field.map_or(u16::MAX, |el| u16::try_from(el.len()).unwrap_or(u16::MAX));
+    if *len != expected.to_be_bytes() || !after.starts_with(value) {
+      return false;
+    }
+    rest = after.get(value.len()..).unwrap_or_default();
+  }
+  rest.is_empty()
+}
+
 // The fields of a response that the encoder treats apart.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Known {
   ConnectionSpecific,
   ContentEncoding,
@@ -635,27 +687,22 @@ enum Known {
   Vary,
 }
 
+// By the length of the name first: one comparison at most for most names (ruling T16-a).
 fn known(name: &[u8]) -> Option<Known> {
   let is = |known: KnownHeaderName| name.eq_ignore_ascii_case(<&str>::from(known).as_bytes());
-  if is(KnownHeaderName::ContentType) {
-    Some(Known::ContentType)
-  } else if is(KnownHeaderName::ContentEncoding) {
-    Some(Known::ContentEncoding)
-  } else if is(KnownHeaderName::Vary) {
-    Some(Known::Vary)
-  } else if is(KnownHeaderName::ContentLength) {
-    Some(Known::ContentLength)
-  } else if is(KnownHeaderName::Date) {
-    Some(Known::Date)
-  } else if is(KnownHeaderName::Connection)
-    || is(KnownHeaderName::KeepAlive)
-    || is(KnownHeaderName::ProxyConnection)
-    || is(KnownHeaderName::TransferEncoding)
-    || is(KnownHeaderName::Upgrade)
-  {
-    Some(Known::ConnectionSpecific)
-  } else {
-    None
+  match name.len() {
+    4 if is(KnownHeaderName::Vary) => Some(Known::Vary),
+    4 if is(KnownHeaderName::Date) => Some(Known::Date),
+    7 if is(KnownHeaderName::Upgrade) => Some(Known::ConnectionSpecific),
+    10 if is(KnownHeaderName::Connection) || is(KnownHeaderName::KeepAlive) => {
+      Some(Known::ConnectionSpecific)
+    }
+    12 if is(KnownHeaderName::ContentType) => Some(Known::ContentType),
+    14 if is(KnownHeaderName::ContentLength) => Some(Known::ContentLength),
+    16 if is(KnownHeaderName::ContentEncoding) => Some(Known::ContentEncoding),
+    16 if is(KnownHeaderName::ProxyConnection) => Some(Known::ConnectionSpecific),
+    17 if is(KnownHeaderName::TransferEncoding) => Some(Known::ConnectionSpecific),
+    _ => None,
   }
 }
 
@@ -917,6 +964,150 @@ where
     self.free.clear();
     for idx in (0..self.slots.len()).rev() {
       let _rslt = self.free.push(u32::try_from(idx).unwrap_or(u32::MAX));
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use crate::{
+    collections::VectorUsize,
+    http::{
+      Header, Headers, KnownHeaderName, StatusCode,
+      http3_server_framework::router_handler::{Known, ResponseHead, known},
+    },
+    http3::encode_static,
+  };
+  use alloc::vec::Vec;
+
+  // The fields of the encoder as one comparison after the other found them before ruling T16-a.
+  fn known_one_by_one(name: &[u8]) -> Option<Known> {
+    let is = |known: KnownHeaderName| name.eq_ignore_ascii_case(<&str>::from(known).as_bytes());
+    if is(KnownHeaderName::ContentType) {
+      Some(Known::ContentType)
+    } else if is(KnownHeaderName::ContentEncoding) {
+      Some(Known::ContentEncoding)
+    } else if is(KnownHeaderName::Vary) {
+      Some(Known::Vary)
+    } else if is(KnownHeaderName::ContentLength) {
+      Some(Known::ContentLength)
+    } else if is(KnownHeaderName::Date) {
+      Some(Known::Date)
+    } else if is(KnownHeaderName::Connection)
+      || is(KnownHeaderName::KeepAlive)
+      || is(KnownHeaderName::ProxyConnection)
+      || is(KnownHeaderName::TransferEncoding)
+      || is(KnownHeaderName::Upgrade)
+    {
+      Some(Known::ConnectionSpecific)
+    } else {
+      None
+    }
+  }
+
+  // Ruling T16-a: the fields that the encoder treats apart are found by the length of the name
+  // first, with the same answers, whatever the case of the name.
+  #[test]
+  fn known_fields_by_length_match_one_by_one() {
+    let names = [
+      "content-type",
+      "Content-Type",
+      "content-encoding",
+      "CONTENT-ENCODING",
+      "vary",
+      "Vary",
+      "content-length",
+      "date",
+      "DATE",
+      "connection",
+      "keep-alive",
+      "proxy-connection",
+      "transfer-encoding",
+      "upgrade",
+      "server",
+      "x-vary",
+      "dat",
+      "content-typ",
+      "content-types",
+      "content-encodinG",
+      "proxy-connectio",
+      "",
+      "etag",
+      "location",
+      "keep_alive",
+    ];
+    for name in names {
+      assert_eq!(known(name.as_bytes()), known_one_by_one(name.as_bytes()), "{name}");
+    }
+  }
+
+  fn headers(fields: &[(&str, &str)]) -> Headers {
+    let mut rslt = Headers::new();
+    for (name, value) in fields {
+      rslt.push_from_iter(Header::from_name_and_value(name, [*value])).unwrap();
+    }
+    rslt
+  }
+
+  // Ruling T16-a: blocks found without making their key, the last one used first, and responses
+  // without other fields encoded in one pass give the sections that the plain static encoding of
+  // their fields gives, whatever the order in which combinations come and go.
+  // A response: its status, the fields that its handler wrote, and the lines expected of it
+  type Case = (
+    StatusCode,
+    &'static [(&'static str, &'static str)],
+    &'static [(&'static [u8], &'static [u8])],
+  );
+
+  #[test]
+  fn sections_match_the_static_encoding_of_their_fields() {
+    let cases: [Case; 6] = [
+      (
+        StatusCode::Ok,
+        &[("content-type", "text/plain")],
+        &[(b":status", b"200"), (b"content-type", b"text/plain")],
+      ),
+      (
+        StatusCode::Ok,
+        &[("content-type", "text/css"), ("content-encoding", "br"), ("vary", "accept-encoding")],
+        &[
+          (b":status", b"200"),
+          (b"content-type", b"text/css"),
+          (b"content-encoding", b"br"),
+          (b"vary", b"accept-encoding"),
+        ],
+      ),
+      (StatusCode::NotFound, &[], &[(b":status", b"404")]),
+      (
+        StatusCode::Ok,
+        &[("Server", "rimu"), ("content-type", "text/plain"), ("content-type", "x/y")],
+        &[
+          (b":status", b"200"),
+          (b"content-type", b"text/plain"),
+          (b"server", b"rimu"),
+          (b"content-type", b"x/y"),
+        ],
+      ),
+      (
+        StatusCode::Ok,
+        &[("content-type", "text/plain"), ("connection", "close"), ("content-length", "9")],
+        &[(b":status", b"200"), (b"content-type", b"text/plain")],
+      ),
+      (
+        StatusCode::Ok,
+        &[("content-type", "text/plai"), ("date", "x")],
+        &[(b":status", b"200"), (b"content-type", b"text/plai"), (b"date", b"x")],
+      ),
+    ];
+    let mut head = ResponseHead::new();
+    let mut expected = VectorUsize::new();
+    let order: Vec<usize> = (0..4).flat_map(|_| [0, 0, 1, 2, 0, 3, 4, 5, 1, 1, 5]).collect();
+    for idx in order {
+      let (status, fields, lines) = cases[idx];
+      expected.clear();
+      encode_static(lines, &mut expected).unwrap();
+      let section = head.encode(status, &headers(fields), None, None).unwrap();
+      assert_eq!(section, expected.as_slice(), "case {idx}");
     }
   }
 }

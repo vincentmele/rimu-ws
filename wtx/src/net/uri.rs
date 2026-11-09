@@ -614,11 +614,57 @@ where
 }
 
 impl Uri<alloc::string::String> {
+  /// Makes this `scheme://authority` followed by `path`, reusing this buffer, with the offsets
+  /// that [`Self::new`] would find: the `://` that ends the scheme is where it was put, unless
+  /// `scheme` holds a `:` (a request's scheme never does), when the whole is parsed.
+  #[cfg(feature = "http3-server-framework")]
+  pub(crate) fn set_from_parts(&mut self, scheme: &str, authority: &str, path: &str) {
+    let uri = &mut self.uri;
+    uri.clear();
+    uri.push_str(scheme);
+    uri.push_str("://");
+    uri.push_str(authority);
+    uri.push_str(path);
+    if scheme.contains(':') {
+      self.process();
+      return;
+    }
+    let Self { authority_start, fragment_start, href_start, initial_len, port, query_start, uri } =
+      self;
+    // What `process_indices` finds after the `://` (a copy of it, so that the path of the other
+    // protocols, which parse, stays as it is)
+    let len: u16 = uri.len().try_into().unwrap_or(u16::MAX);
+    let valid_uri = uri.get(..len.into()).unwrap_or_default();
+    let authority: u8 = scheme.len().wrapping_add(3).try_into().unwrap_or(0);
+    let href: u8 = {
+      let after_authority = valid_uri.get(authority.into()..).unwrap_or_default();
+      bytes_pos1(after_authority, b'/')
+        .and_then(|idx| usize::from(authority).wrapping_add(idx).try_into().ok())
+        .unwrap_or_else(|| len.try_into().unwrap_or_default())
+    };
+    let query = {
+      let after_href = valid_uri.get(usize::from(href)..).unwrap_or_default();
+      bytes_pos1(after_href, b'?')
+        .and_then(|idx| usize::from(href).wrapping_add(idx).try_into().ok())
+        .unwrap_or(len)
+    };
+    let fragment = {
+      let after_path = uri.get(query.into()..).unwrap_or_default();
+      bytes_pos1(after_path, b'#')
+        .and_then(|idx| usize::from(query).wrapping_add(idx).try_into().ok())
+        .unwrap_or(len)
+    };
+    (*initial_len, *authority_start, *href_start, *query_start, *fragment_start) =
+      (len, authority, href, query, fragment);
+    *port = Self::process_port(uri.get(..usize::from(href)));
+  }
+
   /// Makes this a copy of `other`, reusing this buffer and taking its parsed offsets instead of
   /// parsing again.
   #[cfg(feature = "http2")]
   pub(crate) fn copy_from(&mut self, other: &Self) {
-    let Self { authority_start, fragment_start, href_start, initial_len, port, query_start, uri } = self;
+    let Self { authority_start, fragment_start, href_start, initial_len, port, query_start, uri } =
+      self;
     uri.clear();
     uri.push_str(&other.uri);
     *authority_start = other.authority_start;
@@ -717,6 +763,37 @@ where
 #[cfg(test)]
 mod tests {
   use crate::{collections::Clear, net::UriString};
+
+  // Ruling T16-a: a URI put together from the parts of a request has the offsets that parsing the
+  // whole of it gives, without the search for `://`.
+  #[cfg(feature = "http3-server-framework")]
+  #[test]
+  fn uri_from_parts_matches_parsing() {
+    use alloc::{format, string::String};
+    let long = "a".repeat(300);
+    let cases = [
+      ("https", "localhost:8443", "/baseline2?a=1&b=1"),
+      ("https", "localhost", "/static/x.css#frag?no"),
+      ("http", "example.com:80", "/"),
+      ("https", "h", "*"),
+      ("", "localhost:8443", ""),
+      ("https", "", "/p?q"),
+      ("https", "a/b", "/c?d#e"),
+      ("ws", "x:1", "/p"),
+      ("https", long.as_str(), "/p?q"),
+      (long.as_str(), "h", "/p"),
+    ];
+    for (scheme, authority, path) in cases {
+      let mut uri = UriString::new(String::from("stale://x/y?z"));
+      uri.set_from_parts(scheme, authority, path);
+      let parsed = UriString::new(format!("{scheme}://{authority}{path}"));
+      assert_eq!(uri, parsed, "{scheme} {authority} {path}");
+      assert_eq!(
+        (uri.path(), uri.query(), uri.port()),
+        (parsed.path(), parsed.query(), parsed.port())
+      );
+    }
+  }
 
   #[test]
   fn dynamic_methods_have_correct_behavior() {
