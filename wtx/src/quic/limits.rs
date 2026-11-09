@@ -231,7 +231,12 @@ impl QuicParams {
   /// when that worker has fewer than the one that received it (spec section 5.11). Only with
   /// [`Self::cid_steering`]: without it the packets that follow would reach the first worker.
   ///
-  /// Defaults to `true`.
+  /// Defaults to `true`, measured (task 17 via task 19, EC2 batch of 9 Nov 2026,
+  /// `docs/benchmarks/pass4.md`): off, HttpArena baseline-h3 used 7.4 % less server CPU per request
+  /// at equal requests per second, but static-h3 served 4.4 % fewer requests per second, lower in
+  /// every pass (within that run's 5 % spread). HttpArena scores requests per second, and the
+  /// placement exists for the imbalance of the kernel's 4-tuple hash on the board (spec section
+  /// 5.11), so it stays on.
   #[inline]
   pub const fn balance(&self) -> bool {
     self.balance
@@ -256,7 +261,8 @@ impl QuicParams {
   /// each, instead of going one at a time to the end of their body in the order in which they
   /// were written (the bytes written by copy take turns either way).
   ///
-  /// Defaults to `false`, one body to its end at a time (task 19 measures it).
+  /// Defaults to `false`, one body to its end at a time (measured neutral, task 16's EC2 batch,
+  /// `docs/benchmarks/pass1.md`).
   #[inline]
   pub const fn bodies_round_robin(&self) -> bool {
     self.bodies_round_robin
@@ -269,7 +275,10 @@ impl QuicParams {
   /// ([`Self::balance`]). Off, new connections stay on the worker that the kernel picks; spare
   /// connection IDs are not issued yet, so a connection has one connection ID either way.
   ///
-  /// Defaults to `true`.
+  /// Defaults to `true`, measured (task 17 via task 19, EC2 batch of 9 Nov 2026,
+  /// `docs/benchmarks/pass4.md`): the kernel's hash instead used 6.8 % less server CPU per request
+  /// on HttpArena baseline-h3 at -0.2 % requests per second, and 2.0 % fewer requests per second on
+  /// static-h3 (within the spread); kept for the same reasons as [`Self::balance`].
   #[inline]
   pub const fn cid_steering(&self) -> bool {
     self.cid_steering
@@ -333,7 +342,11 @@ impl QuicParams {
 
   /// The most bytes in flight on a connection, whatever its congestion window.
   ///
-  /// Defaults to 256 KiB.
+  /// Defaults to 256 KiB, measured (task 19, EC2 batch of 9 Nov 2026, `docs/benchmarks/pass4.md`):
+  /// on the loopback HttpArena static-h3 overruns the client's receive buffer at 256 KiB (about
+  /// 35,000 packets lost per 6-second window), while 160 KiB and 192 KiB lose none, but they served
+  /// 3.4 % and 3.6 % fewer requests per second (within the spread), and requests per second are
+  /// what is scored.
   #[inline]
   pub const fn max_in_flight(&self) -> usize {
     self.max_in_flight
@@ -365,7 +378,10 @@ impl QuicParams {
 
   /// If sending is paced over the round trip time.
   ///
-  /// Defaults to `true`.
+  /// Defaults to `true`. Off measured -5.8 % requests per second on HttpArena static-h3 (task 16's
+  /// EC2 batch, `docs/benchmarks/pass1.md`), but -44 % server CPU per request in the profile of 9
+  /// Nov 2026: a paced worker sends while the client still holds its last datagrams, so the kernel
+  /// takes a fresh, zeroed page for nearly every 32 KiB sent (`docs/benchmarks/pass4.md`).
   #[inline]
   pub const fn pacing(&self) -> bool {
     self.pacing
@@ -374,7 +390,8 @@ impl QuicParams {
   /// The datagrams that the pacer lets go at once, from 1 to 64: its bucket holds that many
   /// datagrams and fills at 1.25 congestion windows per smoothed RTT (task 19, ruling T19-c).
   ///
-  /// Defaults to 64, one GSO train.
+  /// Defaults to 64, one GSO train, measured (task 19, EC2 batch of 9 Nov 2026,
+  /// `docs/benchmarks/pass4.md`): 16 served 64 % fewer requests per second on HttpArena static-h3.
   #[inline]
   pub const fn pacing_burst(&self) -> u16 {
     self.pacing_burst
@@ -397,7 +414,10 @@ impl QuicParams {
   /// for its probe timeout. Off, an ACK frame goes only when ack-eliciting packets arrived since
   /// the last one.
   ///
-  /// Defaults to `true`.
+  /// Defaults to `true`, measured (task 19, EC2 batch of 9 Nov 2026, `docs/benchmarks/pass4.md`):
+  /// off, HttpArena static-h3 carried only 67 % of the acknowledgments its response flushes owed
+  /// and resent 2.3 times the frames; its +1.1 % requests per second and -16 % server CPU per
+  /// request were within the spread, so not a win.
   #[inline]
   pub const fn repeat_ack(&self) -> bool {
     self.repeat_ack
@@ -764,6 +784,18 @@ mod tests {
     assert_eq!(params.set_pacing_burst(0).pacing_burst(), 1);
     assert_eq!(params.set_pacing_burst(65).pacing_burst(), 64);
     assert!(params.set_flush_in_slot_order(true).flush_in_slot_order());
+  }
+
+  // Task 19 step 4 (EC2 batch of 9 Nov 2026, docs/benchmarks/pass4.md), with task 17's knobs
+  // (ruling T17-b): no variant won by the plan's rule, so the transfer and placement defaults stay.
+  #[test]
+  fn transfer_defaults_are_the_measured_ones() {
+    let params = QuicParams::default();
+    assert!(params.cid_steering() && params.balance());
+    assert_eq!(params.max_in_flight(), 256 << 10);
+    assert!(params.pacing() && params.repeat_ack());
+    assert_eq!(params.pacing_burst(), 64);
+    assert!(!params.bodies_round_robin() && !params.pmtu_probe_after_rtt());
   }
 
   #[test]

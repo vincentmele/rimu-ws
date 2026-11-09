@@ -135,14 +135,17 @@ pub struct UdpParams {
   /// Bytes of the socket's [`TxArena`]. Defaults to [`TxArena::DEFAULT_BYTES`], 512 × 1500.
   pub tx_arena_bytes: usize,
   /// The datagrams of one send at most (one `UDP_SEGMENT` train), from 1 to 64, the kernel's
-  /// limit. Defaults to 64 (task 19 measures it).
+  /// limit. Defaults to 64 (32 measured neutral, task 16's EC2 batch, `docs/benchmarks/pass1.md`).
   pub max_train_segments: u16,
   /// Zero-copy sends (`IORING_OP_SENDMSG_ZC`, Linux 6.0, with the copy report of Linux 6.2): the
   /// kernel sends from the arena instead of copying each train into pages of its own, and the
   /// train's bytes stay the kernel's until its notification (see the
   /// [module documentation](self)). Where the kernel refuses, the socket copies instead
   /// ([`UdpStats::zc_fallbacks`]). Without `CAP_IPC_LOCK` the pinned bytes count against
-  /// `RLIMIT_MEMLOCK`. Defaults to `false` (task 19 measures it, ruling T19-b).
+  /// `RLIMIT_MEMLOCK`. Defaults to `false`, measured (task 19, EC2 batch of 9 Nov 2026,
+  /// `docs/benchmarks/pass4.md`): on the loopback of HttpArena the kernel copies every zero-copy
+  /// train on delivery into pages it zeroes, and static-h3 lost 4.2 % of its requests per second,
+  /// baseline-h3 0.8 % with 2.4 % more server CPU per request.
   pub zerocopy: bool,
 }
 
@@ -1791,7 +1794,8 @@ mod tests {
     assert_eq!((params.rcvbuf, params.sndbuf), (4 << 20, 4 << 20));
     assert_eq!((params.tx_arena_bytes, params.max_train_segments), (TxArena::DEFAULT_BYTES, 64));
     assert!(params.reuseport);
-    // Ruling T19-b: zero-copy sends stay off until the EC2 batch measures them
+    // Ruling T19-b and task 19 step 4: zero-copy sends lost on both profiles (the loopback copies
+    // them anyway), so they stay off
     assert!(!params.zerocopy);
   }
 
