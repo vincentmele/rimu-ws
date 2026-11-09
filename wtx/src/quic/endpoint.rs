@@ -167,10 +167,18 @@ impl WorkerLoads {
     self.workers
   }
 
-  // A connection placed on `worker` closed, or did not open
+  // A connection placed on `worker` closed, or did not open. The count never goes below zero.
+  // A loop of `compare_exchange_weak`, which `core` and `portable-atomic` both have (review N1).
   fn closed(&self, worker: u8) {
-    if let Some(elem) = self.counts.get(usize::from(worker)) {
-      let _rslt = elem.try_update(Ordering::Relaxed, Ordering::Relaxed, |el| el.checked_sub(1));
+    let Some(elem) = self.counts.get(usize::from(worker)) else {
+      return;
+    };
+    let mut current = elem.load(Ordering::Relaxed);
+    while let Some(next) = current.checked_sub(1) {
+      match elem.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => break,
+        Err(actual) => current = actual,
+      }
     }
   }
 

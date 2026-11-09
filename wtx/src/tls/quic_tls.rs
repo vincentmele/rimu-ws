@@ -799,6 +799,14 @@ fn next_rng<RNG>(seed: &mut [u8; RNG_SEED_LEN]) -> crate::Result<RNG>
 where
   RNG: CryptoRng + CryptoSeedableRng,
 {
+  // A generator whose seed is longer than the one that the state keeps does not build (review
+  // N3); the check below stays for a seed whose bytes are not inline
+  const {
+    assert!(
+      size_of::<RNG::Seed>() <= RNG_SEED_LEN,
+      "the generator of a QUIC handshake needs a seed of at most 32 bytes"
+    );
+  }
   let mut rng_seed = RNG::Seed::default();
   let dst = rng_seed.lease_mut();
   let Some(src) = seed.get(..dst.len()) else {

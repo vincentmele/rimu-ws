@@ -11,8 +11,8 @@
 //! The length of the DCID of a long header, byte 5, is not read: the DCIDs that matter have one,
 //! ours of 8 bytes and the at least 8 bytes of the first Initial packet of a client (RFC 9000
 //! section 7.2). A long header with an empty DCID is steered by the byte after it, the length of
-//! its SCID, to some worker, which drops it, or forwards it if it names another one: no packet of
-//! a connection of ours is lost to it.
+//! its SCID, to some worker, which drops it: its DCID is shorter than ours and than the first DCID
+//! of a client (review N2). No packet of a connection of ours is lost to it.
 
 /// The instructions of the program of [`steering_cbpf`].
 pub const STEERING_PROGRAM_LEN: usize = 12;
