@@ -277,7 +277,10 @@ impl QpackDecoder {
   /// once it is decoded. A replay has the effects of a decode: a stream that would block blocks,
   /// and the Section Acknowledgment is queued. `memo` is this decoder's: it replays only what was
   /// decoded against the table of this decoder since its last `new` or `reset`.
-  #[cfg_attr(not(test), allow(dead_code, reason = "connections take the static references too"))]
+  #[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "connections use `decode_with_memo_ref`; tests decode without it")
+  )]
   pub(crate) fn decode_with_memo<const N: usize>(
     &mut self,
     memo: &mut DecodeMemo<N>,

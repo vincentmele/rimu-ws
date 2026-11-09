@@ -370,8 +370,6 @@ pub(crate) enum SegData {
 pub(crate) enum Source<'any> {
   /// Bytes that are copied.
   Bytes(&'any [u8]),
-  /// Pieces that are copied one after the other: the bytes of them joined, in one copy.
-  Gather(&'any [&'any [u8]]),
   /// A body that is held by reference.
   Body(BodyRef),
 }
@@ -744,14 +742,6 @@ impl Streams {
       Source::Bytes(bytes) => {
         tx.append_bytes(bytes, tx_blocks, seg_queues)?;
         bytes.len()
-      }
-      Source::Gather(pieces) => {
-        let mut len = 0usize;
-        for piece in pieces {
-          tx.append_bytes(piece, tx_blocks, seg_queues)?;
-          len = len.wrapping_add(piece.len());
-        }
-        len
       }
       Source::Body(body) => {
         let len = usize::try_from(body.len()).unwrap_or(usize::MAX);

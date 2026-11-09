@@ -74,8 +74,6 @@ const RETAIN_MAX: usize = 4096;
 /// The bytes that the decoder stream may have unsent before more decoder output waits in the
 /// decoder (review V3).
 const DECODER_UNSENT_MAX: usize = 4096;
-/// The pieces of a field section that [`H3ReqCtx::respond`] takes at most.
-pub(crate) const MAX_SECTION_PIECES: usize = 5;
 /// Boxes of connections that the pool keeps at most.
 const MAX_POOLED: usize = 256;
 // Room for what follows a blocked field section on its stream, on top of the limits of a request
@@ -180,6 +178,7 @@ pub(crate) struct H3ReqCtx<'c, 'a> {
     allow(dead_code, reason = "the server framework encodes its own sections")
   )]
   fields: &'c mut VectorUsize<u8>,
+  frame: &'c mut VectorUsize<u8>,
   responded: bool,
   stream: StreamId,
 }
@@ -198,15 +197,15 @@ impl H3ReqCtx<'_, '_> {
     self.cx.peer()
   }
 
-  /// Answers with the field section made of the pieces of `section` joined, encoded with QPACK by
-  /// the static table, and `body`: one write of a HEADERS frame, a DATA frame (if `body` is not
-  /// empty) and the FIN, which leave in one STREAM frame when they fit in a packet (spec section
-  /// 5.3). The frame headers are made on the stack and every piece is copied once, straight into
-  /// the stream (ruling T16-a). At most [`MAX_SECTION_PIECES`] pieces.
+  /// Answers with the field section `encoded_headers`, encoded with QPACK by the static table,
+  /// and `body`: one write of a HEADERS frame, a DATA frame (if `body` is not empty) and the
+  /// FIN, which leave in one STREAM frame when they fit in a packet (spec section 5.3).
   #[inline]
-  pub(crate) fn respond(&mut self, section: &[&[u8]], body: &[u8]) -> crate::Result<()> {
+  pub(crate) fn respond(&mut self, encoded_headers: &[u8], body: &[u8]) -> crate::Result<()> {
     self.check_once()?;
-    write_response(self.cx, self.stream, section, Some(body))?;
+    let rslt = write_response(self.cx, self.frame, self.stream, encoded_headers, body);
+    keep_small(self.frame);
+    rslt?;
     self.responded = true;
     Ok(())
   }
@@ -214,17 +213,24 @@ impl H3ReqCtx<'_, '_> {
   /// [`Self::respond`] with a body that is not copied: the HEADERS frame and the header of the
   /// DATA frame are written by copy, then the body by reference, with the FIN.
   #[inline]
-  pub(crate) fn respond_body(&mut self, section: &[&[u8]], body: BodyRef) -> crate::Result<()> {
+  pub(crate) fn respond_body(
+    &mut self,
+    encoded_headers: &[u8],
+    body: BodyRef,
+  ) -> crate::Result<()> {
     self.check_once()?;
+    let frame = &mut *self.frame;
+    frame.clear();
+    push_frame_header(frame, H3FrameTy::Headers, encoded_headers.len())?;
+    frame.extend_from_copyable_slice(encoded_headers)?;
     if body.is_empty() {
-      write_response(self.cx, self.stream, section, Some(&[]))?;
+      self.cx.write(self.stream, frame, true)?;
     } else {
-      let len = usize::try_from(body.len()).unwrap_or(usize::MAX);
-      let mut data_header = [0u8; 16];
-      let data_header = frame_header(H3FrameTy::Data, len, &mut data_header)?;
-      write_head(self.cx, self.stream, section, data_header)?;
+      push_frame_header(frame, H3FrameTy::Data, usize::try_from(body.len()).unwrap_or(usize::MAX))?;
+      self.cx.write(self.stream, frame, false)?;
       self.cx.write_body(self.stream, body, true)?;
     }
+    keep_small(frame);
     self.responded = true;
     Ok(())
   }
@@ -240,8 +246,9 @@ impl H3ReqCtx<'_, '_> {
     self.check_once()?;
     self.fields.clear();
     encode_static(fields, self.fields)?;
-    let rslt = write_response(self.cx, self.stream, &[self.fields.as_slice()], Some(body));
+    let rslt = write_response(self.cx, self.frame, self.stream, self.fields, body);
     keep_small(self.fields);
+    keep_small(self.frame);
     rslt?;
     self.responded = true;
     Ok(())
@@ -264,6 +271,7 @@ pub(crate) struct H3App<H> {
   /// What answers the requests.
   pub handler: H,
   fields: VectorUsize<u8>,
+  frame: VectorUsize<u8>,
   params: H3Params,
   pool: VectorUsize<Box<H3Conn>>,
   // The bytes that the boxes of the pool take
@@ -298,7 +306,14 @@ where
   /// The connections of a worker, with `params`, whose requests `handler` answers.
   #[inline]
   pub(crate) const fn new(handler: H, params: H3Params) -> Self {
-    Self { handler, fields: VectorUsize::new(), params, pool: VectorUsize::new(), pool_bytes: 0 }
+    Self {
+      handler,
+      fields: VectorUsize::new(),
+      frame: VectorUsize::new(),
+      params,
+      pool: VectorUsize::new(),
+      pool_bytes: 0,
+    }
   }
 
   /// Resumes the parked request of `stream` ([`H3Handler::resume`]), from the context of its
@@ -336,6 +351,7 @@ where
       self.pool_bytes = self.pool_bytes.saturating_sub(conn.heap_bytes());
     }
     self.fields = VectorUsize::new();
+    self.frame = VectorUsize::new();
   }
 
   /// The boxes that wait in the pool.
@@ -359,7 +375,7 @@ where
   /// The capacity of the response buffers of the worker.
   #[cfg(test)]
   pub(crate) fn scratch_bytes(&self) -> usize {
-    self.fields.capacity()
+    self.frame.capacity().saturating_add(self.fields.capacity())
   }
 
   // Calls the handler with request `idx`, complete.
@@ -376,9 +392,9 @@ where
     if req.head.content_length().is_some_and(|el| el != body_len) {
       return stream_error(conn, cx, idx, H3ErrorCode::MessageError);
     }
-    let Self { fields, handler, .. } = self;
+    let Self { fields, frame, handler, .. } = self;
     let request = req.request();
-    let mut rcx = H3ReqCtx { cx, fields, responded: false, stream: req.id };
+    let mut rcx = H3ReqCtx { cx, fields, frame, responded: false, stream: req.id };
     let outcome = handler.on_request(&mut rcx, &request);
     let responded = rcx.responded;
     after_handler(conn, cx, idx, outcome, responded)
@@ -610,7 +626,8 @@ where
     self.fields.clear();
     encode_static(&[(b":status", status)], &mut self.fields)?;
     // A stream that the client stopped can not be answered: the stop is what it gets
-    let _rslt = write_response(cx, id, &[self.fields.as_slice()], Some(&[]));
+    let _rslt = write_response(cx, &mut self.frame, id, &self.fields, &[]);
+    keep_small(&mut self.frame);
     cx.stop_sending(id, H3ErrorCode::NoError.code());
     conn.decoder.on_stream_cancelled(id.0)?;
     conn.free_req(idx);
@@ -626,8 +643,8 @@ where
     let idx = conn
       .req_idx(stream)
       .filter(|el| conn.reqs.get(*el).is_some_and(|req| req.phase == Phase::Parked));
-    let Self { fields, handler, .. } = self;
-    let mut rcx = H3ReqCtx { cx, fields, responded: false, stream };
+    let Self { fields, frame, handler, .. } = self;
+    let mut rcx = H3ReqCtx { cx, fields, frame, responded: false, stream };
     let outcome = handler.resume(&mut rcx, stream);
     let responded = rcx.responded;
     match (idx, outcome) {
@@ -1290,6 +1307,16 @@ fn open_uni(cx: &mut ConnCtx<'_, H3ConnState>) -> crate::Result<StreamId> {
 }
 
 // Appends the header of a frame of `ty` whose payload has `len` bytes.
+fn push_frame_header(out: &mut VectorUsize<u8>, ty: H3FrameTy, len: usize) -> crate::Result<()> {
+  let mut header = [0u8; 16];
+  let len = u64::try_from(len).unwrap_or(u64::MAX);
+  let Some(header_len) = encode_frame_header(ty, len, &mut header) else {
+    cold_path();
+    return Err(crate::Error::Http3(Http3Error::BufferTooSmall));
+  };
+  out.extend_from_copyable_slice(header.get(..header_len).unwrap_or_default())?;
+  Ok(())
+}
 
 // Refuses stream `id`, which has no request: after a GOAWAY.
 fn reject(
@@ -1382,67 +1409,31 @@ fn unexpected_frame() -> crate::Error {
   close(H3ErrorCode::FrameUnexpected, Http3Error::UnexpectedFrame)
 }
 
-// One write of a HEADERS frame of `encoded_headers`, a DATA frame of `body` if it is not empty and
-// the FIN, put together in `frame`.
+// A HEADERS frame of `encoded_headers`, a DATA frame of `body` if it is not empty and the FIN, put
+// together in `frame` and written once; a body that would grow `frame` past what it keeps goes with
+// a write of its own after the frame headers (carried from task 13).
 fn write_response(
   cx: &mut ConnCtx<'_, H3ConnState>,
+  frame: &mut VectorUsize<u8>,
   stream: StreamId,
-  section: &[&[u8]],
-  body: Option<&[u8]>,
+  encoded_headers: &[u8],
+  body: &[u8],
 ) -> crate::Result<()> {
-  let body = body.unwrap_or_default();
+  frame.clear();
+  push_frame_header(frame, H3FrameTy::Headers, encoded_headers.len())?;
+  frame.extend_from_copyable_slice(encoded_headers)?;
   if body.is_empty() {
-    return write_pieces(cx, stream, section, &[], true);
+    return cx.write(stream, frame, true);
   }
-  let mut data_header = [0u8; 16];
-  let data_header = frame_header(H3FrameTy::Data, body.len(), &mut data_header)?;
-  write_pieces(cx, stream, section, &[data_header, body], true)
-}
-
-// The HEADERS frame of the pieces of `section` joined, then `after`, without the FIN.
-fn write_head(
-  cx: &mut ConnCtx<'_, H3ConnState>,
-  stream: StreamId,
-  section: &[&[u8]],
-  after: &[u8],
-) -> crate::Result<()> {
-  write_pieces(cx, stream, section, &[after], false)
-}
-
-// The HEADERS frame of the pieces of `section` joined, then the pieces of `after`, in one gathered
-// write: the frame header on the stack, every piece copied once into the stream.
-fn write_pieces(
-  cx: &mut ConnCtx<'_, H3ConnState>,
-  stream: StreamId,
-  section: &[&[u8]],
-  after: &[&[u8]],
-  fin: bool,
-) -> crate::Result<()> {
-  let len = section.iter().fold(0usize, |acc, el| acc.wrapping_add(el.len()));
-  let mut headers_header = [0u8; 16];
-  let headers_header = frame_header(H3FrameTy::Headers, len, &mut headers_header)?;
-  let mut pieces: [&[u8]; MAX_SECTION_PIECES + 3] = [&[]; MAX_SECTION_PIECES + 3];
-  let count = section.len().wrapping_add(after.len()).wrapping_add(1);
-  if section.len() > MAX_SECTION_PIECES || after.len() > 2 {
-    cold_path();
-    return Err(crate::Error::Http3(Http3Error::BufferTooSmall));
+  push_frame_header(frame, H3FrameTy::Data, body.len())?;
+  // A body that would make the buffer grow past what it keeps goes with a write of its own: the
+  // stream copies it either way (carried from task 13)
+  if frame.len().saturating_add(body.len()) > KEEP_SCRATCH {
+    cx.write(stream, frame, false)?;
+    return cx.write(stream, body, true);
   }
-  for (to, from) in pieces.iter_mut().zip(
-    core::iter::once(headers_header).chain(section.iter().copied()).chain(after.iter().copied()),
-  ) {
-    *to = from;
-  }
-  cx.write_gather(stream, pieces.get(..count).unwrap_or_default(), fin)
-}
-
-// The header of a frame of `ty` and `len` bytes, in `buffer`.
-fn frame_header(ty: H3FrameTy, len: usize, buffer: &mut [u8; 16]) -> crate::Result<&[u8]> {
-  let len = u64::try_from(len).unwrap_or(u64::MAX);
-  let Some(header_len) = encode_frame_header(ty, len, buffer) else {
-    cold_path();
-    return Err(crate::Error::Http3(Http3Error::BufferTooSmall));
-  };
-  Ok(buffer.get(..header_len).unwrap_or_default())
+  frame.extend_from_copyable_slice(body)?;
+  cx.write(stream, frame, true)
 }
 
 #[cfg(test)]

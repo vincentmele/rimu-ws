@@ -8,7 +8,11 @@
 
 use crate::{
   collections::VectorUsize,
-  http3::{Http3Error, h3_conn_state::Budget, qpack::StaticRef},
+  http3::{
+    Http3Error,
+    h3_conn_state::Budget,
+    qpack::{STATIC_TABLE, StaticRef},
+  },
   quic::StreamId,
 };
 use core::hint::cold_path;
@@ -124,9 +128,11 @@ impl RequestHead {
       return None;
     }
     Some(self.fields().map(|(name, value)| {
-      // SAFETY: names are made of `tchar` (`push` checked `LOWER_TCHAR`) and, with `non_ascii`
-      // false, every value byte is below 0x80 (`push` checked `ASCII`, or the value is one of the
-      // static table, all ASCII): ASCII bytes are valid UTF-8
+      // SAFETY: a name is either a literal that `push` checked against `LOWER_TCHAR` or, by the
+      // precondition of `push`'s static reference, a name of the static table; with `non_ascii`
+      // false every value is either checked by `push` against `ASCII` or, by that precondition
+      // with `with_value`, a value of the static table. Every name and value of the table is ASCII
+      // (the test of this module), and ASCII bytes are valid UTF-8
       unsafe { (core::str::from_utf8_unchecked(name), core::str::from_utf8_unchecked(value)) }
     }))
   }
@@ -220,6 +226,12 @@ impl RequestHead {
   /// ([`Http3Error::BufferedLimit`] if they can not). `sref`, the static table entry that gave its
   /// name (or name and value), classifies the field without comparing its name (ruling T16-a):
   /// the outcome is that of the same field given as a literal.
+  ///
+  /// Precondition of `sref`: `name` is the name of the entry of the static table of QPACK at
+  /// `sref.idx`, and with `sref.with_value` `value` is its value too, as the decoder gives them
+  /// (checked in debug builds). The checks of a name, and with `with_value` of a value, are not
+  /// made again for such a field: they hold for every entry of the table (the test of this
+  /// module), and the ASCII text of [`Self::ascii_fields`] relies on it.
   pub(crate) fn push(
     &mut self,
     name: &[u8],
@@ -232,6 +244,10 @@ impl RequestHead {
     if let Some(elem) = sref
       && let Some(kind) = STATIC_KINDS.get(usize::from(elem.idx)).copied()
     {
+      debug_assert_eq!(STATIC_TABLE.get(usize::from(elem.idx)).map(|el| el.0), Some(name));
+      debug_assert!(
+        !elem.with_value || STATIC_TABLE.get(usize::from(elem.idx)).map(|el| el.1) == Some(value)
+      );
       // A value of the table passes the checks of its name (the test of this module)
       return match kind {
         StaticKind::Pseudo(idx) => {
@@ -565,6 +581,28 @@ mod tests {
     request::{ASCII, FIELD, LOWER_TCHAR, RequestHead, SCHEME_CHAR, TCHAR, VISIBLE, class},
   };
   use alloc::{format, string::String, vec, vec::Vec};
+
+  // The precondition of the static reference of `push` is checked in debug builds: a name that is
+  // not the entry's is a programming error.
+  #[cfg(debug_assertions)]
+  #[should_panic(expected = "assertion")]
+  #[test]
+  fn static_reference_with_another_name_is_caught_in_debug_builds() {
+    let mut head = RequestHead::new();
+    let sref = Some(StaticRef { idx: 31, with_value: false });
+    let _rslt = head.push(b"x-not-accept-encoding", b"br", sref, 16_384, &mut Budget::new(1 << 20));
+  }
+
+  // What the static reference of `push` relies on: every name and value of the static table is
+  // ASCII (the text of `ascii_fields`), every name a lowercase token.
+  #[test]
+  fn static_table_is_ascii_and_its_names_are_lowercase_tokens() {
+    for (name, value) in STATIC_TABLE {
+      assert!(name.is_ascii() && value.is_ascii(), "{name:?}");
+      let bare = name.strip_prefix(b":").unwrap_or(name);
+      assert!(!bare.is_empty() && bare.iter().all(|el| class(*el) & LOWER_TCHAR != 0), "{name:?}");
+    }
+  }
 
   // Ruling T16-a (fields validated once): a head whose fields are all ASCII hands them out as text
   // without a second UTF-8 check, in their order; one with a byte of obs-text in a value hands out
