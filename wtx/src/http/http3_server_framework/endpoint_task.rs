@@ -669,14 +669,17 @@ where
     let endpoint = self.endpoint.stats();
     let handler = self.app.handler.counters();
     let qpack = self.app.qpack_counters();
+    let udp = self.socket.stats();
     cell.0.store(&Http3WorkerStats {
       ack_only_out: endpoint.ack_only_out,
+      bytes_out: endpoint.bytes_out,
       cid_steering: self.steering,
       conns: endpoint.conns.into(),
       data_blocked_in: endpoint.data_blocked_in,
       datagrams_in: endpoint.datagrams_in,
       datagrams_out: endpoint.datagrams_out,
       fin_flushes: endpoint.fin_flushes,
+      fin_flushes_ack_owed: endpoint.fin_flushes_ack_owed,
       fin_flushes_acked: endpoint.fin_flushes_acked,
       fins_out: endpoint.fins_out,
       forwarded: endpoint.forwarded,
@@ -684,6 +687,7 @@ where
       frames_resent: endpoint.frames_resent,
       handler_panics: handler.panics,
       idle_trims: self.idle_trims,
+      pacer_holds: endpoint.pacer_holds,
       packets_lost: endpoint.packets_lost,
       packets_out: endpoint.packets_out,
       parked: u64::try_from(self.app.handler.parked()).unwrap_or(u64::MAX),
@@ -694,9 +698,15 @@ where
       requests: handler.requests,
       retries: endpoint.retries,
       stateless_resets: endpoint.resets,
+      stream_bytes_copied: endpoint.stream_bytes_copied,
+      stream_bytes_out: endpoint.stream_bytes_out,
       stream_data_blocked_in: endpoint.stream_data_blocked_in,
       streams_blocked_in: endpoint.streams_blocked_in,
-      udp_send_errors: self.socket.stats().send_errors,
+      trains_out: udp.trains_out,
+      udp_send_errors: udp.send_errors,
+      zc_copied: udp.zc_copied,
+      zc_fallbacks: udp.zc_fallbacks,
+      zc_sends: udp.zc_sends,
     });
   }
 }

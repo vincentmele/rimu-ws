@@ -51,6 +51,8 @@ pub(crate) struct RecvTracker {
   // The smallest packet number that is accepted, never below `base`
   floor: u64,
   largest: Option<u64>,
+  // The largest ack-eliciting packet number received
+  largest_eliciting: Option<u64>,
   // When `largest` arrived, for the ACK Delay field
   largest_time_us: u64,
   // Ranges below the window that no ACK frame of ours reported, from the pools while there are
@@ -69,6 +71,7 @@ impl RecvTracker {
       bits: [0; WORDS],
       floor: 0,
       largest: None,
+      largest_eliciting: None,
       largest_time_us: 0,
       spilled: None,
       unreported_low: None,
@@ -79,6 +82,14 @@ impl RecvTracker {
   #[inline]
   pub(crate) const fn ack_pending(&self) -> bool {
     self.ack_pending
+  }
+
+  /// If an ack-eliciting packet arrived that the peer may not know was received: no ACK frame of
+  /// ours that reported it was acknowledged yet, sent or not (ruling T19-d). An ACK frame then has
+  /// something to report ([`Self::write_ack`]).
+  #[inline]
+  pub(crate) fn ack_unconfirmed(&self) -> bool {
+    self.largest_eliciting.is_some_and(|elem| elem >= self.floor)
   }
 
   /// If `pn` was received already, or can not be accepted anymore.
@@ -162,6 +173,9 @@ impl RecvTracker {
     }
     if ack_eliciting {
       self.ack_pending = true;
+      if self.largest_eliciting.is_none_or(|elem| pn > elem) {
+        self.largest_eliciting = Some(pn);
+      }
       if self.unreported_low.is_none_or(|elem| pn < elem) {
         self.unreported_low = Some(pn);
       }
@@ -421,6 +435,35 @@ mod tests {
     tracker.on_packet(2, true, 0, &mut pools);
     assert!(written_ack(&tracker, 0).is_some());
     assert!(tracker.ack_pending());
+  }
+
+  // Ruling T19-d: the acknowledgment of an ack-eliciting packet is owed until the peer
+  // acknowledges a packet that carried it, whether or not an ACK frame of ours reported it.
+  #[test]
+  fn ack_is_unconfirmed_until_the_peer_acknowledges_one_of_ours() {
+    let mut tracker = RecvTracker::new();
+    let mut pools = QuicPools::new();
+    assert!(!tracker.ack_unconfirmed());
+    // An ACK-only packet needs no acknowledgment
+    tracker.on_packet(0, false, 0, &mut pools);
+    assert!(!tracker.ack_unconfirmed());
+    tracker.on_packet(1, true, 0, &mut pools);
+    assert!(tracker.ack_unconfirmed());
+    // Sent is not received
+    tracker.on_ack_sent(&mut pools);
+    assert!(!tracker.ack_pending() && tracker.ack_unconfirmed());
+    // An older ACK of ours confirms less
+    tracker.on_ack_of_our_ack(0, &mut pools);
+    assert!(tracker.ack_unconfirmed());
+    assert!(written_ack(&tracker, 0).is_some());
+    tracker.on_ack_of_our_ack(1, &mut pools);
+    assert!(!tracker.ack_unconfirmed());
+    // Then nothing is left to report
+    assert!(written_ack(&tracker, 0).is_none());
+    tracker.on_packet(2, false, 0, &mut pools);
+    assert!(!tracker.ack_unconfirmed());
+    tracker.on_packet(3, true, 0, &mut pools);
+    assert!(tracker.ack_unconfirmed());
   }
 
   #[test]

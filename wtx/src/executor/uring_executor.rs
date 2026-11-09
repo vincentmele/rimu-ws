@@ -2563,7 +2563,7 @@ impl Reactor {
         #[cfg(feature = "quic")]
         KIND_UDP_RECV => self.on_udp_recv(idx, generation, res, flags),
         #[cfg(feature = "quic")]
-        KIND_UDP_SEND => self.on_udp_send(idx, generation, res),
+        KIND_UDP_SEND => self.on_udp_send(idx, generation, res, flags),
         #[cfg(feature = "quic")]
         KIND_MSG_RING => self.on_msg_ring(idx, generation),
         #[cfg(feature = "quic")]

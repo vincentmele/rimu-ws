@@ -43,47 +43,57 @@ pub struct Http3WorkerStats {
   /// Packets sent that were not ack-eliciting, other than CONNECTION_CLOSE: those that carry
   /// acknowledgments and padding only.
   pub ack_only_out: u64,
+  /// Bytes of the datagrams sent (ruling T19-a: over [`Self::datagrams_out`], how full they are).
+  pub bytes_out: u64,
   /// If the datagrams of the worker are steered by connection ID (spec section 5.11), or reach it
   /// by the hash of the kernel (an attach of the steering program that failed, or a single
   /// worker that was not asked to steer).
   pub cid_steering: bool,
   /// Connections open, those whose handshake is under way included.
   pub conns: u64,
+  /// DATA_BLOCKED frames received: a client held back by the credit of its connection (spec
+  /// section 2.1: none expected).
+  pub data_blocked_in: u64,
   /// Datagrams received, each segment of a coalesced one counted.
   pub datagrams_in: u64,
   /// Datagrams sent.
   pub datagrams_out: u64,
-  /// Datagrams handed to another worker: a datagram that the kernel coalesced (GRO) counts once
-  /// here, and arrives at that worker as its segments, one inbox entry each.
-  pub forwarded: u64,
-  /// Datagrams for another worker that its inbox could not take, dropped.
-  pub forward_dropped: u64,
-  /// DATA_BLOCKED frames received: a client held back by the credit of its connection (spec
-  /// section 2.1: none expected).
-  pub data_blocked_in: u64,
   /// Flushes of a connection that finished at least one response (sent the FIN of a stream).
   pub fin_flushes: u64,
+  /// Of [`Self::fin_flushes`], those that started with an acknowledgment owed: ack-eliciting
+  /// packets arrived since the last ACK frame, or the peer may lack one, as no packet that carried
+  /// it was acknowledged (ruling T19-d). With `QuicParams::repeat_ack` each of them carries an ACK
+  /// frame: [`Self::fin_flushes_acked`] covers them all.
+  pub fin_flushes_ack_owed: u64,
   /// Of [`Self::fin_flushes`], those whose packets carried an ACK frame: the responses that leave
-  /// with the acknowledgment of the requests they answer (spec section 2.1: all of them).
+  /// with the acknowledgment of the requests they answer (spec section 2.1: all of those that owe
+  /// one, [`Self::fin_flushes_ack_owed`]).
   pub fin_flushes_acked: u64,
   /// STREAM frames sent with the FIN of their stream, the first time: responses finished.
   /// Responses per packet are this over [`Self::packets_out`] (spec section 2.1).
   pub fins_out: u64,
+  /// Datagrams for another worker that its inbox could not take, dropped.
+  pub forward_dropped: u64,
+  /// Datagrams handed to another worker: a datagram that the kernel coalesced (GRO) counts once
+  /// here, and arrives at that worker as its segments, one inbox entry each.
+  pub forwarded: u64,
   /// STREAM frames sent again after a loss.
   pub frames_resent: u64,
   /// Panics of handlers, each answered with 500 on its stream.
   pub handler_panics: u64,
   /// Times the pools of the worker were trimmed after it had no connection for a while.
   pub idle_trims: u64,
+  /// Times the pacer held a packet back, which ended a flush (ruling T19-c).
+  pub pacer_holds: u64,
   /// Packets declared lost.
   pub packets_lost: u64,
   /// Packets sent, each packet of a coalesced datagram counted.
   pub packets_out: u64,
-  /// Requests parked now: their handlers wait.
-  pub parked: u64,
   /// Requests whose handler would have waited past the parked requests a worker keeps, answered
   /// with 503.
   pub park_refused: u64,
+  /// Requests parked now: their handlers wait.
+  pub parked: u64,
   /// Probe timeouts that fired.
   pub pto_probes: u64,
   /// Of [`Self::qpack_sections`], those that the decode memo replayed: the memo's hit rate is
@@ -97,13 +107,31 @@ pub struct Http3WorkerStats {
   pub retries: u64,
   /// Stateless resets sent.
   pub stateless_resets: u64,
+  /// Of the bytes that handlers wrote to streams, those written by copy into the send queues; a
+  /// body by reference (a static file) is not (ruling T19-a: the copies per byte sent are
+  /// `1 + stream_bytes_copied / stream_bytes_out` in user space, the copy into the packet
+  /// included, plus the kernel's copy of each train that is not sent zero-copy).
+  pub stream_bytes_copied: u64,
+  /// Bytes of stream data written into packets, those sent again after a loss included (ruling
+  /// T19-a: over [`Self::datagrams_out`], the payload of a datagram).
+  pub stream_bytes_out: u64,
   /// STREAM_DATA_BLOCKED frames received: a client held back by the credit of a stream.
   pub stream_data_blocked_in: u64,
   /// STREAMS_BLOCKED frames received: a client at the limit of its streams (spec section 2.1: none
   /// expected).
   pub streams_blocked_in: u64,
+  /// Sends of datagrams: GSO trains, each of one datagram or more (ruling T19-a: datagrams per
+  /// train are [`Self::datagrams_out`] over this).
+  pub trains_out: u64,
   /// Sends of datagrams that failed (their packets count as lost).
   pub udp_send_errors: u64,
+  /// Zero-copy sends whose notification said that the kernel copied the bytes after all (a
+  /// loopback peer).
+  pub zc_copied: u64,
+  /// Times zero-copy sends were turned off for the socket of the worker, refused by the kernel.
+  pub zc_fallbacks: u64,
+  /// Of [`Self::trains_out`], those sent zero-copy (`UdpParams::zerocopy`, ruling T19-b).
+  pub zc_sends: u64,
 }
 
 /// The counters of the workers of an [`Http3ServerFramework`], updated by each worker as it goes
@@ -159,7 +187,7 @@ impl Default for StatsCell {
 }
 
 impl StatsCell {
-  const LEN: usize = 26;
+  const LEN: usize = 35;
 
   fn load(&self) -> Http3WorkerStats {
     let mut values = [0u64; Self::LEN];
@@ -168,11 +196,13 @@ impl StatsCell {
     }
     let [
       ack_only_out,
+      bytes_out,
       conns,
       data_blocked_in,
       datagrams_in,
       datagrams_out,
       fin_flushes,
+      fin_flushes_ack_owed,
       fin_flushes_acked,
       fins_out,
       forward_dropped,
@@ -180,6 +210,7 @@ impl StatsCell {
       frames_resent,
       handler_panics,
       idle_trims,
+      pacer_holds,
       packets_lost,
       packets_out,
       park_refused,
@@ -190,18 +221,26 @@ impl StatsCell {
       requests,
       retries,
       stateless_resets,
+      stream_bytes_copied,
+      stream_bytes_out,
       stream_data_blocked_in,
       streams_blocked_in,
+      trains_out,
       udp_send_errors,
+      zc_copied,
+      zc_fallbacks,
+      zc_sends,
     ] = values;
     Http3WorkerStats {
       ack_only_out,
+      bytes_out,
       cid_steering: self.cid_steering.load(Ordering::Relaxed),
       conns,
       data_blocked_in,
       datagrams_in,
       datagrams_out,
       fin_flushes,
+      fin_flushes_ack_owed,
       fin_flushes_acked,
       fins_out,
       forward_dropped,
@@ -209,6 +248,7 @@ impl StatsCell {
       frames_resent,
       handler_panics,
       idle_trims,
+      pacer_holds,
       packets_lost,
       packets_out,
       park_refused,
@@ -219,9 +259,15 @@ impl StatsCell {
       requests,
       retries,
       stateless_resets,
+      stream_bytes_copied,
+      stream_bytes_out,
       stream_data_blocked_in,
       streams_blocked_in,
+      trains_out,
       udp_send_errors,
+      zc_copied,
+      zc_fallbacks,
+      zc_sends,
     }
   }
 
@@ -229,11 +275,13 @@ impl StatsCell {
     self.cid_steering.store(stats.cid_steering, Ordering::Relaxed);
     let values: [u64; Self::LEN] = [
       stats.ack_only_out,
+      stats.bytes_out,
       stats.conns,
       stats.data_blocked_in,
       stats.datagrams_in,
       stats.datagrams_out,
       stats.fin_flushes,
+      stats.fin_flushes_ack_owed,
       stats.fin_flushes_acked,
       stats.fins_out,
       stats.forward_dropped,
@@ -241,6 +289,7 @@ impl StatsCell {
       stats.frames_resent,
       stats.handler_panics,
       stats.idle_trims,
+      stats.pacer_holds,
       stats.packets_lost,
       stats.packets_out,
       stats.park_refused,
@@ -251,9 +300,15 @@ impl StatsCell {
       stats.requests,
       stats.retries,
       stats.stateless_resets,
+      stats.stream_bytes_copied,
+      stats.stream_bytes_out,
       stats.stream_data_blocked_in,
       stats.streams_blocked_in,
+      stats.trains_out,
       stats.udp_send_errors,
+      stats.zc_copied,
+      stats.zc_fallbacks,
+      stats.zc_sends,
     ];
     for (cell, value) in self.values.iter().zip(values) {
       cell.store(value, Ordering::Relaxed);

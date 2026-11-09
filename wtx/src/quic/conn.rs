@@ -46,7 +46,7 @@ use crate::{
     AckFrame, Cid, ConnCtx, ConnHandle, DatagramMeta, Frame, FrameReader, FrameWriter, HpBatch,
     PacketKeys, PacketTy, QUIC_V1, QuicApp, QuicError, Space, TransportErrorCode, TransportParams,
     TxArena,
-    cc::CongestionControl as _,
+    cc::{CongestionControl as _, PACING_BURST_DATAGRAMS},
     initial_keys,
     key_phase::{Generation, KeyPhase, confidentiality_limit, integrity_limit, threshold_for},
     keys_from_secret_with,
@@ -153,6 +153,12 @@ pub(crate) struct ConnParams {
   pub(crate) max_udp_payload_size: u64,
   /// If sending is paced.
   pub(crate) pacing: bool,
+  /// The datagrams that the pacer lets go at once ([`crate::quic::QuicParams::pacing_burst`]).
+  pub(crate) pacing_burst: u16,
+  /// If the first packet of a flush with stream data carries an ACK frame while an acknowledgment
+  /// of ack-eliciting packets may not have reached the peer
+  /// ([`crate::quic::QuicParams::repeat_ack`]).
+  pub(crate) repeat_ack: bool,
   /// The most bytes in flight, whatever the congestion window.
   pub(crate) max_in_flight: usize,
   /// If the streams whose next bytes are a body take turns, a STREAM frame each, instead of going
@@ -260,6 +266,8 @@ impl Default for ConnParams {
       max_ack_delay_ms: 25,
       max_udp_payload_size: 1472,
       pacing: true,
+      pacing_burst: PACING_BURST_DATAGRAMS,
+      repeat_ack: true,
       max_in_flight: 256 << 10,
       bodies_round_robin: false,
       pmtu_probe_after_rtt: false,
@@ -314,6 +322,13 @@ pub(crate) struct ConnStats {
   /// Of [`Self::fin_flushes`], those whose packets carried an ACK frame of the 1-RTT space: the
   /// answers that leave with the acknowledgment of what they answer.
   pub(crate) fin_flushes_acked: u64,
+  /// Of [`Self::fin_flushes`], those that started with an acknowledgment owed in the 1-RTT space:
+  /// one that no ACK frame reported yet, or one that the peer may not have, as no packet that
+  /// carried it was acknowledged (ruling T19-d). With [`ConnParams::repeat_ack`] each of them
+  /// carries an ACK frame.
+  pub(crate) fin_flushes_ack_owed: u64,
+  /// Times the pacer held a packet in flight back: a flush that stopped for it.
+  pub(crate) pacer_holds: u64,
   /// DATA_BLOCKED frames received.
   pub(crate) data_blocked_in: u64,
   /// STREAM_DATA_BLOCKED frames received.
@@ -342,6 +357,8 @@ impl ConnStats {
     pto_probes: 0,
     fin_flushes: 0,
     fin_flushes_acked: 0,
+    fin_flushes_ack_owed: 0,
+    pacer_holds: 0,
     data_blocked_in: 0,
     stream_data_blocked_in: 0,
     streams_blocked_in: 0,
@@ -567,6 +584,7 @@ where
       let _closing = self.apply_app_close(now_us);
     }
     let fins = self.streams.fins_out();
+    let ack_owed = self.data.recv.ack_pending() || self.data.recv.ack_unconfirmed();
     self.flush_acked = false;
     let rslt = self.flush_datagrams(now_us, tx, pools);
     if self.streams.fins_out() != fins {
@@ -574,6 +592,7 @@ where
       self.count(|el| {
         el.fin_flushes = el.fin_flushes.wrapping_add(1);
         el.fin_flushes_acked = el.fin_flushes_acked.wrapping_add(u64::from(acked));
+        el.fin_flushes_ack_owed = el.fin_flushes_ack_owed.wrapping_add(u64::from(ack_owed));
       });
     }
     if self.recovery.timer_stale {
@@ -927,6 +946,13 @@ where
   #[inline]
   pub(crate) fn stream_tally(&self) -> (u64, u64) {
     (self.streams.fins_out(), self.streams.frames_resent())
+  }
+
+  /// The bytes of stream data written into packets, those sent again included, and the bytes
+  /// that the application wrote to streams by copy (ruling T19-a).
+  #[inline]
+  pub(crate) fn stream_bytes(&self) -> (u64, u64) {
+    self.streams.bytes_out_and_copied()
   }
 
   // Counts something, while the connection is open
@@ -1310,8 +1336,13 @@ where
     }
     let window = self.recovery.window(max_in_flight);
     let srtt = self.recovery.rtt.smoothed_us;
-    let release = self.recovery.pacer.release_time(now_us, len, window, srtt, self.max_datagram);
+    let burst = self.params.pacing_burst;
+    let release =
+      self.recovery.pacer.release_time(now_us, len, (window, srtt), self.max_datagram, burst);
     self.recovery.pacer_release_us = release;
+    if release.is_some() {
+      self.count(|el| el.pacer_holds = el.pacer_holds.wrapping_add(1));
+    }
     release.is_none()
   }
 
@@ -2330,6 +2361,7 @@ where
     let key_update_after = self.params.key_update_threshold;
     let pto_us = self.pto_us();
     let params = self.params;
+    let full_room = out.len() >= MIN_DATAGRAM_LEN;
     let Some(sp) = space_mut(&mut self.data, &mut self.handshake, space) else {
       return Ok(None);
     };
@@ -2400,7 +2432,17 @@ where
       let reason = if app && self.close.requested { self.streams.close_reason() } else { &[] };
       let _written = fw.write_connection_close(app, code, (!app).then_some(0), reason);
     } else {
-      if sp.recv.ack_pending()
+      // The first packet of the flush that sends stream data repeats an acknowledgment that the
+      // peer may lack (ruling T19-d), in a datagram with room for the data too, so that the ACK
+      // never goes alone
+      let repeat = space == Space::Data
+        && params.repeat_ack
+        && allow_ae
+        && !self.flush_acked
+        && full_room
+        && self.streams.wants_send()
+        && sp.recv.ack_unconfirmed();
+      if (sp.recv.ack_pending() || repeat)
         && let Some(largest) = sp.recv.largest()
         && let Some(written) = sp.recv.write_ack(&mut fw, self.params.ack_delay_exponent, now_us)
       {
@@ -5201,5 +5243,79 @@ mod tests {
     let chacha = QuicHp::with_batches(CipherSuite::Chacha20Poly1305Sha256, &key, true, true);
     assert!(!chacha.unwrap().batches());
     assert!(!QuicHp::new(CipherSuite::Aes128GcmSha256, &key[..16]).unwrap().batches());
+  }
+
+  // Ruling T19-d: a response that leaves over several flushes carries the acknowledgment of its
+  // request again in the flushes after the first while the client may not have it: here the
+  // datagram that carried it is lost, and the client, which closes a stream only once its request
+  // is acknowledged (spec section 2.1), would wait for its own probe timeout. Once the client
+  // acknowledged a packet with that acknowledgment, no flush repeats it.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn response_flushes_repeat_an_acknowledgment_the_client_may_lack() {
+    let body = crate::misc::SharedBytes::from_slice(&[7; 30_000]);
+    for repeat in [false, true] {
+      let mut opts = LinkOpts::new(None);
+      opts.server.repeat_ack = repeat;
+      // A few datagrams in flight at a time: the response takes several flushes
+      opts.server.max_in_flight = 6 * 1472;
+      let response = BodyRef::new(body.clone(), 0..30_000).unwrap();
+      opts.server_app = TestApp::new(Behavior::RespondBody(b"", response));
+      let mut link = settled(&opts);
+      let now_us = link.now_us;
+      let id = link
+        .client
+        .with_ctx(now_us, |cx| {
+          let id = cx.open_bidi()?;
+          cx.write(id, b"GET /", true)?;
+          Ok::<_, crate::Error>(id)
+        })
+        .unwrap();
+      let _ = link.client.flush(link.now_us);
+      assert_eq!(link.deliver_to_server(), 1);
+      let before = *link.server.conn.stats();
+      let _ = link.server.flush(link.now_us);
+      let mut datagrams = link.server.take_datagrams();
+      assert!(datagrams.len() >= 3, "{}", datagrams.len());
+      // The first datagram, with the acknowledgment of the request, is lost
+      for datagram in datagrams.iter_mut().skip(1) {
+        link.client.recv(link.now_us, datagram, SERVER_ADDR);
+      }
+      assert!(link.client.conn.data.ack_eliciting_in_flight > 0);
+      let mut rounds = 0;
+      while !link.client.app.streams.get(&id.0).is_some_and(|el| el.fin) {
+        rounds += 1;
+        assert!(rounds < 50, "the response did not finish");
+        let _ = link.client.flush(link.now_us);
+        let _ = link.deliver_to_server();
+        let _ = link.server.flush(link.now_us);
+        let _ = link.deliver_to_client();
+        link.advance(1_000);
+      }
+      let after = *link.server.conn.stats();
+      let (flushes, acked) = (
+        after.fin_flushes - before.fin_flushes,
+        after.fin_flushes_acked - before.fin_flushes_acked,
+      );
+      let owed = after.fin_flushes_ack_owed - before.fin_flushes_ack_owed;
+      assert_eq!(flushes, 1, "repeat {repeat}");
+      // The flush that finished the response owed the acknowledgment and did not carry it, or
+      // carried every one it owed: the first flush after the loss repeated it, and the client
+      // may have confirmed it before the last one
+      if repeat {
+        assert_eq!(acked, owed);
+      } else {
+        assert_eq!((owed, acked), (1, 0));
+      }
+      // The client has the acknowledgment of its request with the response, or still waits
+      let waits = link.client.conn.data.ack_eliciting_in_flight > 0;
+      assert_eq!(waits, !repeat, "repeat {repeat}");
+      // Acknowledged by the client, the acknowledgment is not repeated
+      let _ = link.client.flush(link.now_us);
+      let _ = link.deliver_to_server();
+      if repeat {
+        assert!(!link.server.conn.data.recv.ack_unconfirmed());
+      }
+    }
   }
 }

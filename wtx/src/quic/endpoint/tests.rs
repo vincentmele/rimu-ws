@@ -1067,6 +1067,16 @@ fn endpoint_sums_the_counters_of_the_measurement() {
   let blocked = (stats.data_blocked_in, stats.stream_data_blocked_in, stats.streams_blocked_in);
   assert_eq!(blocked, (0, 0, 0));
   assert_eq!((stats.packets_lost, stats.pto_probes, stats.frames_resent), (0, 0, 0));
+  // Ruling T19-a: every flush that finished a response and owed an acknowledgment carried it;
+  // the datagram bytes and the stream bytes of the responses, written by copy, are summed
+  assert_eq!(stats.fin_flushes_ack_owed - before.fin_flushes_ack_owed, flushes, "{stats:?}");
+  let response = RESPONSE.len() as u64;
+  assert_eq!(stats.stream_bytes_out - before.stream_bytes_out, 4 * 64 * response, "{stats:?}");
+  assert_eq!(stats.stream_bytes_copied - before.stream_bytes_copied, 4 * 64 * response);
+  let bytes = stats.bytes_out - before.bytes_out;
+  let datagrams = stats.datagrams_out - before.datagrams_out;
+  assert!(bytes > 4 * 64 * response && bytes <= datagrams * 1472, "{stats:?}");
+  assert_eq!(stats.pacer_holds, 0, "{stats:?}");
 }
 
 // Ruling T16-b: a flush writes the connections in the order in which they came to have something

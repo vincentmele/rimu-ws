@@ -38,6 +38,9 @@
 //! | `ARENA_H3_BODIES` | `complete`, `round-robin` | `complete` | `QuicParams::set_bodies_round_robin` (bodies by reference: one to its end, or a frame each in turn) |
 //! | `ARENA_H3_HP` | `ring`, `batched` | `ring` | `QuicParams::set_batched_header_protection` (`batched`: the masks of the 1-RTT packets of a flush eight at a time on AES-NI, task 18; ChaCha20 and CPUs without AES-NI stay one at a time) |
 //! | `ARENA_H3_QPACK` | `0`, `4096` | `0` | `H3Params::qpack_max_table_capacity` and `qpack_blocked_streams`: `0` none (the library default), `4096` a dynamic table of 4096 bytes with 100 blocked streams (task 18, ruling T18-c) |
+//! | `ARENA_H3_ZC` | `0`, `1` | `0` | `UdpParams::zerocopy` (`1`: trains sent with `IORING_OP_SENDMSG_ZC`, each kept until its notification; a kernel that refuses falls back to copying, counted; task 19, ruling T19-b) |
+//! | `ARENA_H3_PACING_BURST` | 1 to 64 | 64 | `QuicParams::set_pacing_burst` (datagrams the pacer lets go at once; task 19, ruling T19-c) |
+//! | `ARENA_H3_REPEAT_ACK` | `0`, `1` | `1` | `QuicParams::set_repeat_ack` (`1`: a flush with stream data repeats an acknowledgment the client may lack; task 19, ruling T19-d) |
 //!
 //! With TLS on, SIGUSR1 prints the sums of the counters of the h3 workers on one line starting with
 //! `h3-stats` (what `h3-bench.sh` reads), and SIGINT or SIGTERM prints them with one line per
@@ -281,6 +284,16 @@ mod knobs {
       if let Some(elem) = one_of(&var, "ARENA_H3_HP", &[("ring", false), ("batched", true)])? {
         quic = quic.set_batched_header_protection(elem);
       }
+      // Task 19 (rulings T19-b to T19-d)
+      if let Some(elem) = flag(&var, "ARENA_H3_ZC")? {
+        udp.zerocopy = elem;
+      }
+      if let Some(elem) = number(&var, "ARENA_H3_PACING_BURST", 1, 64)? {
+        quic = quic.set_pacing_burst(u16::try_from(elem).map_err(|err| err.to_string())?);
+      }
+      if let Some(elem) = flag(&var, "ARENA_H3_REPEAT_ACK")? {
+        quic = quic.set_repeat_ack(elem);
+      }
       let mut h3 = H3Params::default();
       if let Some(elem) = one_of(&var, "ARENA_H3_QPACK", &[("0", false), ("4096", true)])? {
         // Ruling T18-c: the dynamic table that task 18 measures, or none
@@ -297,7 +310,7 @@ mod knobs {
       format!(
         "headers={} data={} gro={} recv_buffers={} tx_arena={} rcvbuf={} sndbuf={} train={} \
          flush_order={} steering={} balance={} pin={} max_in_flight={} pacing={} pmtu_probe={} \
-         bodies={} hp={} qpack={}",
+         bodies={} hp={} qpack={} zc={} pacing_burst={} repeat_ack={}",
         pick(self.headers == Headers::Min, "min", "full"),
         pick(self.data == Data::Reuse, "reuse", "fresh"),
         u8::from(udp.gro),
@@ -316,6 +329,9 @@ mod knobs {
         pick(quic.bodies_round_robin(), "round-robin", "complete"),
         pick(quic.batched_header_protection(), "batched", "ring"),
         self.h3.qpack_max_table_capacity,
+        u8::from(udp.zerocopy),
+        quic.pacing_burst(),
+        u8::from(quic.repeat_ack()),
       )
     }
   }
@@ -416,12 +432,13 @@ mod stats_signals {
   }
 
   #[derive(Default)]
-  struct Counters([u64; 23]);
+  struct Counters([u64; 32]);
 
   impl Counters {
     // The first twelve as before task 16, then the counters of spec section 2.1 (ruling T16-c),
-    // then the QPACK sections decoded and those the decode memo replayed (ruling T18-c)
-    const NAMES: [&'static str; 23] = [
+    // then the QPACK sections decoded and those the decode memo replayed (ruling T18-c), then the
+    // transfer counters of task 19 (ruling T19-a)
+    const NAMES: [&'static str; 32] = [
       "conns",
       "requests",
       "datagrams_in",
@@ -445,6 +462,15 @@ mod stats_signals {
       "frames_resent",
       "qpack_sections",
       "qpack_memo_hits",
+      "bytes_out",
+      "stream_bytes_out",
+      "stream_bytes_copied",
+      "trains_out",
+      "fin_flushes_ack_owed",
+      "pacer_holds",
+      "zc_sends",
+      "zc_copied",
+      "zc_fallbacks",
     ];
 
     fn of(worker: &Http3WorkerStats) -> Self {
@@ -472,6 +498,15 @@ mod stats_signals {
         worker.frames_resent,
         worker.qpack_sections,
         worker.qpack_memo_hits,
+        worker.bytes_out,
+        worker.stream_bytes_out,
+        worker.stream_bytes_copied,
+        worker.trains_out,
+        worker.fin_flushes_ack_owed,
+        worker.pacer_holds,
+        worker.zc_sends,
+        worker.zc_copied,
+        worker.zc_fallbacks,
       ])
     }
 
@@ -662,6 +697,9 @@ mod knob_tests {
     assert_eq!((knobs.data, knobs.headers), (Data::Reuse, Headers::Min));
     // Task 18: header protection one packet at a time and no QPACK dynamic table, as the library
     assert!(!knobs.quic.batched_header_protection());
+    // Task 19: copying sends, bursts of one train, the repeated acknowledgment, as the library
+    assert!(!knobs.udp.zerocopy && !udp.zerocopy);
+    assert_eq!((knobs.quic.pacing_burst(), knobs.quic.repeat_ack()), (64, true));
     assert_eq!(knobs.h3, H3Params::default());
     // Ruling T16-h: the benchmark path has GRO on, the library default has it off
     assert!(knobs.udp.gro && !udp.gro);
@@ -681,15 +719,18 @@ mod knob_tests {
       ("ARENA_H3_HP", "batched"),
       ("ARENA_H3_MAX_IN_FLIGHT", "131072"),
       ("ARENA_H3_PACING", "0"),
+      ("ARENA_H3_PACING_BURST", "16"),
       ("ARENA_H3_PIN", "0"),
       ("ARENA_H3_PMTU_PROBE", "rtt"),
       ("ARENA_H3_QPACK", "4096"),
       ("ARENA_H3_RCVBUF", "1048576"),
       ("ARENA_H3_RECV_BUFFERS", "512"),
+      ("ARENA_H3_REPEAT_ACK", "0"),
       ("ARENA_H3_SNDBUF", "2097152"),
       ("ARENA_H3_STEERING", "kernel"),
       ("ARENA_H3_TRAIN", "32"),
       ("ARENA_H3_TX_ARENA", "1536000"),
+      ("ARENA_H3_ZC", "1"),
     ])
     .unwrap();
     let quic = knobs.quic;
@@ -697,6 +738,8 @@ mod knob_tests {
     assert!(!quic.pacing() && quic.pmtu_probe_after_rtt() && !quic.cid_steering());
     assert_eq!(quic.max_in_flight(), 131_072);
     assert!(quic.batched_header_protection());
+    // Task 19 (rulings T19-b to T19-d)
+    assert_eq!((quic.pacing_burst(), quic.repeat_ack(), knobs.udp.zerocopy), (16, false, true));
     // Ruling T18-c: a dynamic table of 4096 bytes and 100 blocked streams, the rest as the library
     let h3 = H3Params { qpack_max_table_capacity: 4096, qpack_blocked_streams: 100, ..knobs.h3 };
     assert_eq!(knobs.h3, h3);
@@ -729,6 +772,9 @@ mod knob_tests {
       "data=fresh",
       "hp=batched",
       "qpack=4096",
+      "pacing_burst=16",
+      "repeat_ack=0",
+      "zc=1",
     ] {
       assert!(line.contains(name), "{line}");
     }
@@ -748,6 +794,10 @@ mod knob_tests {
       ("ARENA_H3_FLUSH_ORDER", "random"),
       ("ARENA_H3_HP", "aesni"),
       ("ARENA_H3_QPACK", "1024"),
+      ("ARENA_H3_ZC", "on"),
+      ("ARENA_H3_PACING_BURST", "0"),
+      ("ARENA_H3_PACING_BURST", "65"),
+      ("ARENA_H3_REPEAT_ACK", "2"),
     ] {
       let err = parse(&[(name, value)]).unwrap_err();
       assert!(err.contains(name), "{err}");

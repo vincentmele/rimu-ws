@@ -250,6 +250,7 @@ struct Opts {
   rfc9110: Option<bool>,
   root: PathBuf,
   workers: usize,
+  zerocopy: bool,
 }
 
 impl Opts {
@@ -265,6 +266,7 @@ impl Opts {
       rfc9110: None,
       root: static_dir(name),
       workers: 1,
+      zerocopy: false,
     }
   }
 }
@@ -337,7 +339,7 @@ fn serve(opts: Opts) -> Served {
   .set_local_runtimes(NonZeroUsize::new(opts.workers))
   .set_pin_workers(false)
   .set_shutdown(signal.clone(), opts.drain)
-  .set_udp_params(UdpParams { reuseport, ..UdpParams::new() })
+  .set_udp_params(UdpParams { reuseport, zerocopy: opts.zerocopy, ..UdpParams::new() })
   .set_local_runtime_cb(move || {
     if let Some(elem) = count {
       _count_allocations_in(elem);
@@ -614,6 +616,13 @@ fn baseline2_route_answers_2() {
   // The packet counters of task 15: packets carry the datagrams, the ACK-only ones are a part
   assert!(worker.datagrams_out > 0 && worker.packets_out >= worker.datagrams_out, "{worker:?}");
   assert!(worker.ack_only_out <= worker.packets_out, "{worker:?}");
+  // Ruling T19-a: the datagrams leave in trains; the stream bytes of the responses, written by
+  // copy, fit in the bytes of the datagrams; every flush that owed an acknowledgment carried it
+  assert!(worker.trains_out > 0 && worker.trains_out <= worker.datagrams_out, "{worker:?}");
+  assert!(worker.stream_bytes_out > 0 && worker.stream_bytes_out < worker.bytes_out, "{worker:?}");
+  assert!(worker.stream_bytes_copied > 0, "{worker:?}");
+  assert_eq!(worker.fin_flushes_acked, worker.fin_flushes_ack_owed, "{worker:?}");
+  assert_eq!((worker.zc_sends, worker.zc_fallbacks), (0, 0), "{worker:?}");
   assert_eq!(client.conn.state(), ConnState::Confirmed);
   assert!(served.errors().is_empty(), "{:?}", served.errors());
 }
@@ -656,6 +665,48 @@ fn static_file_br_twin_served_by_reference() {
   assert_eq!((rsp.field(b"content-encoding"), rsp.body.as_slice()), (None, css.as_slice()));
   assert_eq!(rsp.field(b"vary"), Some(&b"accept-encoding"[..]));
   assert_eq!(status(&client.get("/static/missing.css", &[])), b"404");
+}
+
+// Ruling T19-b: with zero-copy sends, static files of several trains arrive whole, request after
+// request, and every train went zero-copy (or, on a kernel that refuses, the worker fell back to
+// copying once, and they arrive all the same).
+#[cfg_attr(miri, ignore)]
+#[test]
+fn static_files_arrive_whole_with_zero_copy_sends() {
+  let mut opts = Opts::new("zerocopy");
+  opts.zerocopy = true;
+  let files: Vec<(String, Vec<u8>)> = [1_000usize, 70_000, 300_000]
+    .iter()
+    .enumerate()
+    .map(|(idx, len)| {
+      let bytes: Vec<u8> = (0..*len).map(|el| ((el * 7 + idx) % 253) as u8).collect();
+      (format!("f{idx}.bin"), bytes)
+    })
+    .collect();
+  for (name, bytes) in &files {
+    std::fs::write(opts.root.join(name), bytes).unwrap();
+  }
+  let served = serve(opts);
+  let mut client = Client::connect(served.addr);
+  for _ in 0..4 {
+    for (name, bytes) in &files {
+      let rsp = client.get(&format!("/static/{name}"), &[]);
+      assert_eq!(status(&rsp), b"200");
+      assert!(rsp.body == *bytes, "{name}: {} bytes of {}", rsp.body.len(), bytes.len());
+    }
+  }
+  served.wait_stats(|el| el[0].requests == 12);
+  let worker = served.worker(0);
+  if worker.zc_fallbacks == 0 {
+    assert!(worker.zc_sends > 0, "{worker:?}");
+    assert!(worker.zc_sends <= worker.trains_out, "{worker:?}");
+  } else {
+    assert_eq!((worker.zc_fallbacks, worker.zc_sends), (1, 0), "{worker:?}");
+  }
+  // The bodies went by reference: written by copy are the fields only
+  assert!(worker.stream_bytes_copied < 1_000, "{worker:?}");
+  assert!(worker.stream_bytes_out >= 4 * 371_000, "{worker:?}");
+  assert!(served.errors().is_empty(), "{:?}", served.errors());
 }
 
 // Decision Q2 (fix in passing of task 16): with the default fields the `.br` twin of a file still
@@ -1457,18 +1508,20 @@ fn qpack_sections_and_memo_hits_are_counted() {
 }
 
 // Ruling T16-c: every counter of a worker, the ones of the measurement of spec section 2.1 (and
-// task 18's QPACK counters) included, comes back from the cell that the worker stores it in as it
+// task 18's QPACK counters, task 19's transfer counters) included, comes back from the cell that the worker stores it in as it
 // was stored.
 #[test]
 fn worker_stats_round_trip_through_their_cell() {
   let stats = Http3WorkerStats {
     ack_only_out: 1,
+    bytes_out: 27,
     cid_steering: true,
     conns: 2,
     data_blocked_in: 3,
     datagrams_in: 4,
     datagrams_out: 5,
     fin_flushes: 6,
+    fin_flushes_ack_owed: 28,
     fin_flushes_acked: 7,
     fins_out: 8,
     forward_dropped: 9,
@@ -1476,6 +1529,7 @@ fn worker_stats_round_trip_through_their_cell() {
     frames_resent: 11,
     handler_panics: 12,
     idle_trims: 13,
+    pacer_holds: 29,
     packets_lost: 14,
     packets_out: 15,
     park_refused: 16,
@@ -1486,9 +1540,15 @@ fn worker_stats_round_trip_through_their_cell() {
     requests: 21,
     retries: 22,
     stateless_resets: 23,
+    stream_bytes_copied: 30,
+    stream_bytes_out: 31,
     stream_data_blocked_in: 24,
     streams_blocked_in: 25,
+    trains_out: 32,
     udp_send_errors: 26,
+    zc_copied: 33,
+    zc_fallbacks: 34,
+    zc_sends: 35,
   };
   let cell = crate::http::http3_server_framework::StatsCell::default();
   cell.store(&stats);

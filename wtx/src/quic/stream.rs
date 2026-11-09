@@ -492,6 +492,10 @@ pub(crate) struct StreamsCold {
   /// DATA_BLOCKED and STREAM_DATA_BLOCKED frames sent.
   #[cfg(test)]
   blocked_sent: u32,
+  // Bytes that the application wrote by copy (ruling T19-a)
+  bytes_copied: u64,
+  // Bytes of stream data written into packets, those sent again included (ruling T19-a)
+  bytes_out: u64,
   close_reason: [u8; CLOSE_REASON_LEN],
   close_reason_len: u8,
   close_request: Option<u64>,
@@ -524,6 +528,8 @@ impl StreamsCold {
     let fresh = Self {
       #[cfg(test)]
       blocked_sent: 0,
+      bytes_copied: 0,
+      bytes_out: 0,
       close_reason: [0; CLOSE_REASON_LEN],
       close_reason_len: 0,
       close_request: None,
@@ -644,6 +650,13 @@ impl Streams {
   #[inline]
   pub(crate) fn fins_out(&self) -> u64 {
     self.cold.as_ref().map_or(0, |el| el.fins_out)
+  }
+
+  /// The bytes of stream data written into packets, those sent again included, and the bytes
+  /// that the application wrote by copy.
+  #[inline]
+  pub(crate) fn bytes_out_and_copied(&self) -> (u64, u64) {
+    self.cold.as_ref().map_or((0, 0), |el| (el.bytes_out, el.bytes_copied))
   }
 
   /// STREAM frames sent again.
@@ -1169,6 +1182,47 @@ mod tests {
     let stats = link.server.conn.stats();
     let blocked = (stats.data_blocked_in, stats.stream_data_blocked_in, stats.streams_blocked_in);
     assert_eq!(blocked, (1, 1, 1));
+  }
+
+  // Ruling T19-a: the stream bytes written into packets, and of them those that the application
+  // wrote by copy (a body by reference is copied once, into the packet), are counted; bytes
+  // sent again after a loss count again.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn stream_bytes_out_and_copied_are_counted() {
+    const SMALL: &[u8] = &[1; 700];
+    const LARGE: &[u8] = &[2; 5000];
+    let body = crate::misc::SharedBytes::from_slice(&[3; 9000]);
+    let mut opts = LinkOpts::new(None);
+    let body = BodyRef::new(body, 0..9000).unwrap();
+    opts.server_app = TestApp::new(Behavior::Mixed { small: SMALL, body, large: LARGE });
+    let mut link = settled(&opts);
+    let (out, copied) = link.server.conn.stream_bytes();
+    for _ in 0..3 {
+      let id = open_bidi(&mut link).unwrap();
+      write(&mut link, id, b"GET /", true);
+    }
+    link.run();
+    let (out2, copied2) = link.server.conn.stream_bytes();
+    assert_eq!(copied2 - copied, (SMALL.len() + LARGE.len()) as u64);
+    assert_eq!(out2 - out, (SMALL.len() + LARGE.len() + 9000) as u64);
+    // A response whose datagrams are all lost is sent again, and counted again
+    let id = open_bidi(&mut link).unwrap();
+    write(&mut link, id, b"GET /", true);
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
+    let _ = link.server.flush(link.now_us);
+    assert!(!link.server.take_datagrams().is_empty());
+    let mut rounds = 0;
+    while !link.client.app.streams.get(&id.0).is_some_and(|el| el.fin) {
+      rounds += 1;
+      assert!(rounds < 20, "the response was not sent again");
+      assert!(link.advance_to_next_event());
+      link.run();
+    }
+    let (out3, copied3) = link.server.conn.stream_bytes();
+    assert_eq!(copied3 - copied2, SMALL.len() as u64);
+    assert_eq!(out3 - out2, 2 * SMALL.len() as u64);
   }
 
   // Ruling T16-b (task 19's measurement): bodies go one at a time to their end, or, with

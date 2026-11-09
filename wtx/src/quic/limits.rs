@@ -1,7 +1,7 @@
 //! The settings of a QUIC endpoint ([`QuicParams`]) and the limits on what a peer can make it do
 //! (spec section 5.12, [`QuicLimits`]), each with a production default.
 
-use crate::quic::ConnParams;
+use crate::quic::{ConnParams, cc::PACING_BURST_DATAGRAMS};
 
 // One second, the window of the per-second budgets
 const BUDGET_WINDOW_US: u64 = 1_000_000;
@@ -212,7 +212,9 @@ pub struct QuicParams {
   max_streams_uni: u64,
   max_udp_payload_size: u64,
   pacing: bool,
+  pacing_burst: u16,
   pmtu_probe_after_rtt: bool,
+  repeat_ack: bool,
   stream_window: u64,
 }
 
@@ -365,6 +367,15 @@ impl QuicParams {
     self.pacing
   }
 
+  /// The datagrams that the pacer lets go at once, from 1 to 64: its bucket holds that many
+  /// datagrams and fills at 1.25 congestion windows per smoothed RTT (task 19, ruling T19-c).
+  ///
+  /// Defaults to 64, one GSO train.
+  #[inline]
+  pub const fn pacing_burst(&self) -> u16 {
+    self.pacing_burst
+  }
+
   /// If the first probe of path MTU discovery waits one smoothed RTT after the handshake is
   /// confirmed, instead of going with the first flush after it.
   ///
@@ -372,6 +383,20 @@ impl QuicParams {
   #[inline]
   pub const fn pmtu_probe_after_rtt(&self) -> bool {
     self.pmtu_probe_after_rtt
+  }
+
+  /// If the first packet of a flush that sends stream data carries an ACK frame of the 1-RTT
+  /// space whenever the peer may lack an acknowledgment of its ack-eliciting packets: no packet
+  /// that carried one was acknowledged yet (ruling T19-d). A response that leaves over several
+  /// flushes then carries the acknowledgment of its request in each, so that losing the first
+  /// does not leave a client that closes a stream only once its request is acknowledged waiting
+  /// for its probe timeout. Off, an ACK frame goes only when ack-eliciting packets arrived since
+  /// the last one.
+  ///
+  /// Defaults to `true`.
+  #[inline]
+  pub const fn repeat_ack(&self) -> bool {
+    self.repeat_ack
   }
 
   /// The receive window of a stream, in bytes.
@@ -520,11 +545,33 @@ impl QuicParams {
     self
   }
 
+  /// Mutable version of [`Self::pacing_burst`], clamped to 1 to 64.
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub const fn set_pacing_burst(mut self, value: u16) -> Self {
+    self.pacing_burst = if value == 0 {
+      1
+    } else if value > PACING_BURST_DATAGRAMS {
+      PACING_BURST_DATAGRAMS
+    } else {
+      value
+    };
+    self
+  }
+
   /// Mutable version of [`Self::pmtu_probe_after_rtt`].
   #[inline]
   #[must_use = must_use_itself_doc!()]
   pub const fn set_pmtu_probe_after_rtt(mut self, value: bool) -> Self {
     self.pmtu_probe_after_rtt = value;
+    self
+  }
+
+  /// Mutable version of [`Self::repeat_ack`].
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub const fn set_repeat_ack(mut self, value: bool) -> Self {
+    self.repeat_ack = value;
     self
   }
 
@@ -549,6 +596,8 @@ impl QuicParams {
       max_ack_delay_ms: self.max_ack_delay_ms,
       max_udp_payload_size: self.max_udp_payload_size,
       pacing: self.pacing,
+      pacing_burst: self.pacing_burst,
+      repeat_ack: self.repeat_ack,
       max_in_flight: self.max_in_flight,
       bodies_round_robin: self.bodies_round_robin,
       pmtu_probe_after_rtt: self.pmtu_probe_after_rtt,
@@ -581,7 +630,9 @@ impl Default for QuicParams {
       max_streams_uni: MAX_STREAMS_UNI,
       max_udp_payload_size: 1472,
       pacing: true,
+      pacing_burst: PACING_BURST_DATAGRAMS,
       pmtu_probe_after_rtt: false,
+      repeat_ack: true,
       stream_window: 1 << 20,
     }
   }
@@ -667,6 +718,8 @@ mod tests {
     assert!(!params.bodies_round_robin());
     assert!(!params.pmtu_probe_after_rtt());
     assert!(!params.batched_header_protection());
+    assert_eq!(params.pacing_burst(), 64);
+    assert!(params.repeat_ack());
     assert_eq!(params.limits(), &QuicLimits::default());
     assert_eq!(ConnLimits::default(), QuicLimits::default().into());
     // The connections of the defaults have the defaults of a connection
@@ -692,6 +745,7 @@ mod tests {
       (conn.bodies_round_robin, conn.pmtu_probe_after_rtt, conn.batched_hp),
       (default.bodies_round_robin, default.pmtu_probe_after_rtt, default.batched_hp)
     );
+    assert_eq!((conn.pacing_burst, conn.repeat_ack), (default.pacing_burst, default.repeat_ack));
     // The switches of the measurements of tasks 16 and 19 reach the connections
     let on = params
       .set_bodies_round_robin(true)
@@ -699,6 +753,12 @@ mod tests {
       .set_batched_header_protection(true)
       .conn_params();
     assert!(on.bodies_round_robin && on.pmtu_probe_after_rtt && on.batched_hp);
+    // Task 19: the pacing burst and the repeated acknowledgment reach the connections, the burst
+    // clamped to 1 to 64
+    let task19 = params.set_pacing_burst(16).set_repeat_ack(false).conn_params();
+    assert_eq!((task19.pacing_burst, task19.repeat_ack), (16, false));
+    assert_eq!(params.set_pacing_burst(0).pacing_burst(), 1);
+    assert_eq!(params.set_pacing_burst(65).pacing_burst(), 64);
     assert!(params.set_flush_in_slot_order(true).flush_in_slot_order());
   }
 

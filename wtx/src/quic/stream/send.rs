@@ -741,6 +741,10 @@ impl Streams {
     let len = match source {
       Source::Bytes(bytes) => {
         tx.append_bytes(bytes, tx_blocks, seg_queues)?;
+        if let Some(cold) = self.cold.as_deref_mut() {
+          let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+          cold.bytes_copied = cold.bytes_copied.wrapping_add(len);
+        }
         bytes.len()
       }
       Source::Body(body) => {
@@ -987,8 +991,9 @@ impl Streams {
     tx.copy_unsent(data_len, fw);
     tx.sent = tx.sent.wrapping_add(len);
     tx.fin_sent |= fin;
-    if fin && let Some(cold) = self.cold.as_deref_mut() {
-      cold.fins_out = cold.fins_out.wrapping_add(1);
+    if let Some(cold) = self.cold.as_deref_mut() {
+      cold.bytes_out = cold.bytes_out.wrapping_add(len);
+      cold.fins_out = cold.fins_out.wrapping_add(u64::from(fin));
     }
     let more = tx.sent < tx.end;
     self.flow.tx_sent = self.flow.tx_sent.wrapping_add(len);
@@ -1147,6 +1152,7 @@ impl Streams {
         frame_refs.queue_set_front(&self.lost, rest);
       }
       if let Some(cold) = self.cold.as_deref_mut() {
+        cold.bytes_out = cold.bytes_out.wrapping_add(sent);
         cold.retransmitted = cold.retransmitted.wrapping_add(1);
         cold.resent_acked = cold.resent_acked.wrapping_add(u64::from(resent_acked));
       }

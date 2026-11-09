@@ -4,11 +4,11 @@
 //! The window counts the bytes of the packets in flight, which [`crate::quic::recovery`] tracks:
 //! ACK-only packets and probes of path MTU discovery are not counted (RFC 9002 section 7.7,
 //! ruling T9-e). Pacing spreads the packets of a window over a round trip, at 1.25 times the
-//! window per smoothed RTT, but lets a burst of one GSO train (64 datagrams) go at once, so that a
-//! loopback or a short flight is never held back.
+//! window per smoothed RTT, but lets a burst of one GSO train (64 datagrams by default) go at once,
+//! so that a loopback or a short flight is never held back.
 
-/// The datagrams of one GSO train: what pacing lets go at once.
-pub(crate) const PACING_BURST_DATAGRAMS: usize = 64;
+/// The datagrams of one GSO train: what pacing lets go at once by default, and at most.
+pub(crate) const PACING_BURST_DATAGRAMS: u16 = 64;
 
 // RFC 9002 section 7.2: the initial window is at most 14,720 bytes, at least two datagrams
 const INITIAL_WINDOW_CAP: usize = 14_720;
@@ -160,19 +160,20 @@ impl Pacer {
   }
 
   /// When a datagram of `size` bytes can leave, at `now_us`, with `window` and the smoothed RTT
-  /// `srtt_us`, the bucket holding `PACING_BURST_DATAGRAMS` datagrams of `max_datagram` bytes:
-  /// `None` if it can now. A smoothed RTT of zero, which only a fake clock gives, paces nothing.
+  /// `srtt_us`, the bucket holding `burst` datagrams of `max_datagram` bytes (from 1 to
+  /// [`PACING_BURST_DATAGRAMS`]): `None` if it can now. A smoothed RTT of zero, which only a fake
+  /// clock gives, paces nothing.
   #[inline]
   pub(crate) fn release_time(
     &mut self,
     now_us: u64,
     size: usize,
-    window: usize,
-    srtt_us: u64,
+    (window, srtt_us): (usize, u64),
     max_datagram: usize,
+    burst: u16,
   ) -> Option<u64> {
-    let capacity =
-      u64::try_from(max_datagram.saturating_mul(PACING_BURST_DATAGRAMS)).unwrap_or(u64::MAX);
+    let burst = usize::from(burst.clamp(1, PACING_BURST_DATAGRAMS));
+    let capacity = u64::try_from(max_datagram.saturating_mul(burst)).unwrap_or(u64::MAX);
     let window = u64::try_from(window).unwrap_or(u64::MAX).max(1);
     let elapsed = now_us.saturating_sub(self.last_us);
     self.last_us = self.last_us.max(now_us);
@@ -267,30 +268,50 @@ mod tests {
   #[test]
   fn pacing_does_not_gate_a_single_train() {
     const MSS: usize = 1200;
+    const B: u16 = PACING_BURST_DATAGRAMS;
     let (window, srtt_us) = (1_000_000, 10_000);
     let mut pacer = Pacer::new();
     let now_us = 5_000_000;
-    for _ in 0..PACING_BURST_DATAGRAMS {
-      assert_eq!(pacer.release_time(now_us, MSS, window, srtt_us, MSS), None);
+    for _ in 0..B {
+      assert_eq!(pacer.release_time(now_us, MSS, (window, srtt_us), MSS, B), None);
       pacer.on_sent(MSS);
     }
     // 1200 bytes at 125 bytes per microsecond: 9.6 microseconds, rounded up
-    let release = pacer.release_time(now_us, MSS, window, srtt_us, MSS);
+    let release = pacer.release_time(now_us, MSS, (window, srtt_us), MSS, B);
     assert_eq!(release, Some(now_us + 10));
-    assert_eq!(pacer.release_time(now_us + 9, MSS, window, srtt_us, MSS), Some(now_us + 10));
-    assert_eq!(pacer.release_time(now_us + 10, MSS, window, srtt_us, MSS), None);
+    assert_eq!(pacer.release_time(now_us + 9, MSS, (window, srtt_us), MSS, B), Some(now_us + 10));
+    assert_eq!(pacer.release_time(now_us + 10, MSS, (window, srtt_us), MSS, B), None);
     pacer.on_sent(MSS);
     // An idle connection gets its burst back, never more
     let later = now_us + 1_000_000;
-    for _ in 0..PACING_BURST_DATAGRAMS {
-      assert_eq!(pacer.release_time(later, MSS, window, srtt_us, MSS), None);
+    for _ in 0..B {
+      assert_eq!(pacer.release_time(later, MSS, (window, srtt_us), MSS, B), None);
       pacer.on_sent(MSS);
     }
-    assert!(pacer.release_time(later, MSS, window, srtt_us, MSS).is_some());
+    assert!(pacer.release_time(later, MSS, (window, srtt_us), MSS, B).is_some());
     // Without an RTT sample of note (zero on a fake clock) nothing is paced
     for _ in 0..1000 {
-      assert_eq!(pacer.release_time(later, MSS, window, 0, MSS), None);
+      assert_eq!(pacer.release_time(later, MSS, (window, 0), MSS, B), None);
       pacer.on_sent(MSS);
+    }
+  }
+
+  // Task 19 (ruling T19-c): a smaller burst lets that many datagrams go at once, then spreads the
+  // rest at the same rate; a burst outside 1 to 64 is clamped.
+  #[test]
+  fn pacing_burst_caps_what_goes_at_once() {
+    const MSS: usize = 1200;
+    let (window, srtt_us) = (1_000_000, 10_000);
+    for (asked, taken) in [(16u16, 16usize), (1, 1), (0, 1), (64, 64), (200, 64)] {
+      let mut pacer = Pacer::new();
+      let now_us = 5_000_000;
+      for nth in 0..taken {
+        let release = pacer.release_time(now_us, MSS, (window, srtt_us), MSS, asked);
+        assert_eq!(release, None, "{asked}: datagram {nth}");
+        pacer.on_sent(MSS);
+      }
+      let release = pacer.release_time(now_us, MSS, (window, srtt_us), MSS, asked);
+      assert_eq!(release, Some(now_us + 10), "{asked}");
     }
   }
 }

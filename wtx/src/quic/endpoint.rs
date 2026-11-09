@@ -125,6 +125,16 @@ pub(crate) struct EndpointStats {
   pub(crate) fin_flushes: u64,
   /// Of [`Self::fin_flushes`], those that carried an ACK frame of the 1-RTT space.
   pub(crate) fin_flushes_acked: u64,
+  /// Of [`Self::fin_flushes`], those that started with an acknowledgment owed (ruling T19-d).
+  pub(crate) fin_flushes_ack_owed: u64,
+  /// Bytes of the datagrams sent.
+  pub(crate) bytes_out: u64,
+  /// Bytes of stream data written into packets, those sent again included (ruling T19-a).
+  pub(crate) stream_bytes_out: u64,
+  /// Bytes that applications wrote to streams by copy (ruling T19-a).
+  pub(crate) stream_bytes_copied: u64,
+  /// Times the pacer held a packet back.
+  pub(crate) pacer_holds: u64,
   /// DATA_BLOCKED frames received.
   pub(crate) data_blocked_in: u64,
   /// STREAM_DATA_BLOCKED frames received.
@@ -1147,10 +1157,10 @@ where
 /// what grew since the last one added to [`EndpointStats`]. What a connection counts after its
 /// last flush (a frame received just before it closes) is not summed.
 #[derive(Clone, Copy, Debug)]
-struct Tally([u64; 12]);
+struct Tally([u64; 17]);
 
 impl Tally {
-  const ZERO: Self = Self([0; 12]);
+  const ZERO: Self = Self([0; 17]);
 
   fn of<A, RNG, TCX>(conn: &QuicConn<A, RNG, TCX>) -> Self
   where
@@ -1160,6 +1170,7 @@ impl Tally {
   {
     let el = conn.stats();
     let (fins_out, frames_resent) = conn.stream_tally();
+    let (stream_bytes_out, stream_bytes_copied) = conn.stream_bytes();
     Self([
       el.datagrams_out,
       el.packets_out,
@@ -1173,6 +1184,11 @@ impl Tally {
       el.packets_lost,
       el.pto_probes,
       frames_resent,
+      el.fin_flushes_ack_owed,
+      el.bytes_out,
+      stream_bytes_out,
+      stream_bytes_copied,
+      el.pacer_holds,
     ])
   }
 
@@ -1191,6 +1207,11 @@ impl Tally {
       &mut stats.packets_lost,
       &mut stats.pto_probes,
       &mut stats.frames_resent,
+      &mut stats.fin_flushes_ack_owed,
+      &mut stats.bytes_out,
+      &mut stats.stream_bytes_out,
+      &mut stats.stream_bytes_copied,
+      &mut stats.pacer_holds,
     ];
     for ((field, now), then) in fields.into_iter().zip(self.0).zip(before.0) {
       *field = field.wrapping_add(now.wrapping_sub(then));
