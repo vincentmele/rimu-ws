@@ -6,7 +6,7 @@
 //! from the free lists until it gives it back, once closed or aborted.
 
 use crate::quic::{
-  QuicError, TransportErrorCode,
+  HpBatch, QuicError, TransportErrorCode,
   conn::{ConnCold, HandshakeSpaces},
   key_phase::KeySlot,
   recv_tracker::RecvSpill,
@@ -88,6 +88,9 @@ pub(crate) struct QuicPools {
   pub(crate) streams_cold: FreeList<Box<StreamsCold>>,
   /// Stream data to send that does not fit in a stream slot.
   pub(crate) tx_blocks: FreeList<Box<TxBlock>>,
+  /// The 1-RTT packets of the flush under way whose header protection waits for a batch (ruling
+  /// T18-b); empty between flushes.
+  pub(crate) hp_batch: HpBatch,
 }
 
 impl QuicPools {
@@ -108,6 +111,7 @@ impl QuicPools {
       stream_slots: StreamSlots::new(),
       streams_cold: FreeList::new(),
       tx_blocks: FreeList::new(),
+      hp_batch: HpBatch::new(),
     }
   }
 

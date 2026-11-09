@@ -60,7 +60,7 @@ impl Entry {
 #[derive(Debug)]
 pub(crate) struct DecodeMemo<const N: usize> {
   entries: [Entry; N],
-  #[cfg(test)]
+  /// The sections replayed, since the memo was made: the worker counts them (ruling T18-c).
   pub(crate) hits: u64,
   uses: u64,
 }
@@ -68,12 +68,7 @@ pub(crate) struct DecodeMemo<const N: usize> {
 impl<const N: usize> DecodeMemo<N> {
   /// A memo with nothing kept, which allocates nothing.
   pub(crate) fn new() -> Self {
-    Self {
-      entries: core::array::from_fn(|_| Entry::new()),
-      #[cfg(test)]
-      hits: 0,
-      uses: 0,
-    }
+    Self { entries: core::array::from_fn(|_| Entry::new()), hits: 0, uses: 0 }
   }
 
   /// The bytes that the kept fields take on the heap.
@@ -119,10 +114,7 @@ impl<const N: usize> DecodeMemo<N> {
       return None;
     }
     entry.last_use = uses;
-    #[cfg(test)]
-    {
-      self.hits = self.hits.wrapping_add(1);
-    }
+    self.hits = self.hits.wrapping_add(1);
     Some(MemoFields { bytes: entry.bytes.as_slice(), fields: entry.fields.iter() })
   }
 

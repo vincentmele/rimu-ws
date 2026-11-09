@@ -1434,8 +1434,31 @@ fn requests_reuse_the_clones_of_the_data_only_when_asked() {
   }
 }
 
-// Ruling T16-c: every counter of a worker, the ones of the measurement of spec section 2.1
-// included, comes back from the cell that the worker stores it in as it was stored.
+// Ruling T18-c: the field sections that the worker decoded, and those that its decode memo
+// replayed, reach the stats: the same request eight times on one connection decodes its head once
+// and replays it seven times. A connection of its own starts with an empty memo.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn qpack_sections_and_memo_hits_are_counted() {
+  let served = serve(Opts::new("qpack-memo"));
+  let mut client = Client::connect(served.addr);
+  for _ in 0..8 {
+    assert_eq!(client.get("/baseline2?a=1&b=1", &[]).body, b"2");
+  }
+  served.wait_stats(|el| el[0].requests == 8);
+  let worker = served.worker(0);
+  assert_eq!((worker.qpack_sections, worker.qpack_memo_hits), (8, 7), "{worker:?}");
+  let mut other = Client::connect(served.addr);
+  assert_eq!(other.get("/baseline2?a=1&b=1", &[]).body, b"2");
+  served.wait_stats(|el| el[0].requests == 9);
+  let worker = served.worker(0);
+  assert_eq!((worker.qpack_sections, worker.qpack_memo_hits), (9, 7), "{worker:?}");
+  assert!(served.errors().is_empty(), "{:?}", served.errors());
+}
+
+// Ruling T16-c: every counter of a worker, the ones of the measurement of spec section 2.1 (and
+// task 18's QPACK counters) included, comes back from the cell that the worker stores it in as it
+// was stored.
 #[test]
 fn worker_stats_round_trip_through_their_cell() {
   let stats = Http3WorkerStats {
@@ -1458,12 +1481,14 @@ fn worker_stats_round_trip_through_their_cell() {
     park_refused: 16,
     parked: 17,
     pto_probes: 18,
-    requests: 19,
-    retries: 20,
-    stateless_resets: 21,
-    stream_data_blocked_in: 22,
-    streams_blocked_in: 23,
-    udp_send_errors: 24,
+    qpack_memo_hits: 19,
+    qpack_sections: 20,
+    requests: 21,
+    retries: 22,
+    stateless_resets: 23,
+    stream_data_blocked_in: 24,
+    streams_blocked_in: 25,
+    udp_send_errors: 26,
   };
   let cell = crate::http::http3_server_framework::StatsCell::default();
   cell.store(&stats);

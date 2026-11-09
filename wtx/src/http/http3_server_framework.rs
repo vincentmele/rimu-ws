@@ -86,6 +86,11 @@ pub struct Http3WorkerStats {
   pub park_refused: u64,
   /// Probe timeouts that fired.
   pub pto_probes: u64,
+  /// Of [`Self::qpack_sections`], those that the decode memo replayed: the memo's hit rate is
+  /// their ratio (ruling T18-c).
+  pub qpack_memo_hits: u64,
+  /// Field sections of requests decoded, heads and trailers.
+  pub qpack_sections: u64,
   /// Requests given to handlers.
   pub requests: u64,
   /// Retry packets sent.
@@ -154,7 +159,7 @@ impl Default for StatsCell {
 }
 
 impl StatsCell {
-  const LEN: usize = 24;
+  const LEN: usize = 26;
 
   fn load(&self) -> Http3WorkerStats {
     let mut values = [0u64; Self::LEN];
@@ -180,6 +185,8 @@ impl StatsCell {
       park_refused,
       parked,
       pto_probes,
+      qpack_memo_hits,
+      qpack_sections,
       requests,
       retries,
       stateless_resets,
@@ -207,6 +214,8 @@ impl StatsCell {
       park_refused,
       parked,
       pto_probes,
+      qpack_memo_hits,
+      qpack_sections,
       requests,
       retries,
       stateless_resets,
@@ -237,6 +246,8 @@ impl StatsCell {
       stats.park_refused,
       stats.parked,
       stats.pto_probes,
+      stats.qpack_memo_hits,
+      stats.qpack_sections,
       stats.requests,
       stats.retries,
       stats.stateless_resets,

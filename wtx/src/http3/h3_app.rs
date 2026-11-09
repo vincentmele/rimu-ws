@@ -90,7 +90,8 @@ pub struct H3Params {
   /// The advertised `SETTINGS_QPACK_MAX_TABLE_CAPACITY`: the bytes of the dynamic table that the
   /// encoders of clients may use.
   ///
-  /// Defaults to 0 (no dynamic table) until the measurement of task 18 decides.
+  /// Defaults to 0 (no dynamic table) until the measurement of task 18 decides: 0 against 4096
+  /// with 100 blocked streams (ruling T18-c, arena-h2's `ARENA_H3_QPACK`), on EC2.
   pub qpack_max_table_capacity: u32,
   /// The advertised `SETTINGS_QPACK_BLOCKED_STREAMS`.
   ///
@@ -276,6 +277,18 @@ pub(crate) struct H3App<H> {
   pool: VectorUsize<Box<H3Conn>>,
   // The bytes that the boxes of the pool take
   pool_bytes: usize,
+  qpack: QpackCounters,
+}
+
+/// The field sections of requests that the connections of a worker decoded, and those of them
+/// that the decode memo replayed (spec 5.9): the hit rate of the memo is their ratio (ruling
+/// T18-c).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct QpackCounters {
+  /// Field sections decoded, heads and trailers, replays included.
+  pub(crate) sections: u64,
+  /// Of [`Self::sections`], those that the memo replayed.
+  pub(crate) memo_hits: u64,
 }
 
 // What reading the bytes of a request stream came to.
@@ -313,7 +326,14 @@ where
       params,
       pool: VectorUsize::new(),
       pool_bytes: 0,
+      qpack: QpackCounters { sections: 0, memo_hits: 0 },
     }
+  }
+
+  /// See [`QpackCounters`].
+  #[inline]
+  pub(crate) const fn qpack_counters(&self) -> QpackCounters {
+    self.qpack
   }
 
   /// Resumes the parked request of `stream` ([`H3Handler::resume`]), from the context of its
@@ -701,6 +721,7 @@ where
     let is_head = req.phase == Phase::Head;
     // The fields are checked, and the decoded size counted, as they are decoded: a short section
     // can reference a large entry many times
+    let hits = memo.hits;
     let outcome = if is_head {
       req.head.clear();
       let head = &mut req.head;
@@ -714,7 +735,11 @@ where
       })
     };
     match outcome {
-      Ok(DecodeOutcome::Done { .. }) => {}
+      Ok(DecodeOutcome::Done { .. }) => {
+        let qpack = &mut self.qpack;
+        qpack.sections = qpack.sections.wrapping_add(1);
+        qpack.memo_hits = qpack.memo_hits.wrapping_add(memo.hits.wrapping_sub(hits));
+      }
       Ok(DecodeOutcome::Blocked { required_insert_count }) => {
         req.blocked = true;
         blocked.push((id, required_insert_count))?;

@@ -26,6 +26,8 @@ variant's spread across the 3 passes, measured on the metric in question.
 
 These are measured by the counters added in Task 16 (`Http3WorkerStats`: `fins_out`, `fin_flushes`,
 `fin_flushes_acked`, `*_blocked_in`, `packets_lost`, `pto_probes`, `frames_resent`).
+On static-h3 only 64 % of response flushes carry an ACK (target: all): its responses go out in long trains. That gap
+is handed to Task 19.
 
 ## 2. The request path (Ruling T16-a)
 | step | A/B | baseline-h3 req/s | server CPU µs/req | static-h3 req/s | CPU µs/req |
@@ -64,9 +66,11 @@ baseline-h3 base: 5,788k req/s, 2.10 µs/req (rps spread 0.1 %, CPU spread 1.3 %
 | round-robin bodies (`bodies-rr`) | not run | −1.2 % / +4.3 % | keep one body to completion |
 | fresh data per request (`data-fresh`) | −0.9 % / +9.5 % | not run | semantics, not a perf default: fresh stays the library default (T16-e); reuse is opt-in |
 
-**Library defaults changed: none.** GRO is the only WIN, and the rule would have made `UdpParams::gro` default on.
-**Ruling T16-h** keeps it off. With GRO, 256 receive buffers of 64 KiB make one socket's ring about 16.8 MiB, which
-alone exceeds spec §5.4's 16 MiB pool budget per worker, and the win is +0.8 % on one profile. arena-h2, the
+**Library defaults changed: none.** GRO is the only WIN confirmed without a loss on the other profile, and the rule
+would have made `UdpParams::gro` default on (`balance-off` was a baseline-h3 WIN too, held back because static-h3 was
+not run: Task 17). **Ruling T16-h** keeps GRO off. With GRO, 256 receive buffers of 64 KiB make one socket's ring
+256 × 65,536 B = exactly 16 MiB (16.8 MB), which equals spec §5.4's 16 MiB per-worker budget by itself, leaving
+nothing for the other pools (48 workers: 768 MiB), and the win is +0.8 % on one profile. arena-h2, the
 benchmark path, turns GRO on by default: `ARENA_H3_GRO` is `1` unless set to `0`. The kit's `base` therefore runs
 with GRO. Its old `gro-on` variant becomes `gro-off`, and a `gro-ring64` variant (GRO on with 64 receive buffers,
 about 4 MiB) measures whether a ring within the budget keeps the win, so the library default can be revisited.

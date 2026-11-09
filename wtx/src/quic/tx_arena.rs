@@ -95,6 +95,18 @@ impl TxArena {
     local: Option<IpAddr>,
     max_len: usize,
   ) -> Option<&mut [u8]> {
+    self.begin_at(peer, local, max_len).map(|el| el.1)
+  }
+
+  /// [`Self::begin`] that also returns where the bytes start in the buffer of the arena, which
+  /// [`Self::buffer_mut`] gives (for the header protection that waits for a batch, ruling T18-b).
+  #[inline]
+  pub(crate) fn begin_at(
+    &mut self,
+    peer: SocketAddr,
+    local: Option<IpAddr>,
+    max_len: usize,
+  ) -> Option<(usize, &mut [u8])> {
     self.begun = None;
     let capacity = self.buffer.len();
     if max_len == 0 || max_len > capacity.min(max_train_bytes(&peer)) {
@@ -129,7 +141,14 @@ impl TxArena {
       return None;
     }
     self.begun = Some(Begun { after_newest, local, max_len, peer, start });
-    self.buffer.get_mut(start..start.wrapping_add(max_len))
+    Some((start, self.buffer.get_mut(start..start.wrapping_add(max_len))?))
+  }
+
+  /// The whole buffer of the arena: datagrams committed but not sent yet can still be changed in
+  /// place through it, at the offsets that [`Self::begin_at`] gave.
+  #[inline]
+  pub(crate) fn buffer_mut(&mut self) -> &mut [u8] {
+    self.buffer.as_slice_mut()
   }
 
   /// Takes the first `len` bytes of the datagram that [`Self::begin`] handed out. They join the

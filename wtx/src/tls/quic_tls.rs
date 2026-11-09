@@ -105,7 +105,7 @@ pub(crate) fn trim_idle_states() {
 }
 
 /// The traffic secrets of one encryption level, from which the connection derives its packet
-/// protection keys with [`crate::quic::keys_from_secret`].
+/// protection keys with [`crate::quic::keys_from_secret_with`].
 ///
 /// Dropping it overwrites both secrets. They are `Copy` arrays: a copy taken out of it is not
 /// wiped.

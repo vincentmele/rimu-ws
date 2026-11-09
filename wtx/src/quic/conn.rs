@@ -43,18 +43,19 @@
 use crate::{
   crypto::AEAD_TAG_LEN,
   quic::{
-    AckFrame, Cid, ConnCtx, ConnHandle, DatagramMeta, Frame, FrameReader, FrameWriter, PacketKeys,
-    PacketTy, QUIC_V1, QuicApp, QuicError, Space, TransportErrorCode, TransportParams, TxArena,
+    AckFrame, Cid, ConnCtx, ConnHandle, DatagramMeta, Frame, FrameReader, FrameWriter, HpBatch,
+    PacketKeys, PacketTy, QUIC_V1, QuicApp, QuicError, Space, TransportErrorCode, TransportParams,
+    TxArena,
     cc::CongestionControl as _,
     initial_keys,
     key_phase::{Generation, KeyPhase, confidentiality_limit, integrity_limit, threshold_for},
-    keys_from_secret,
+    keys_from_secret_with,
     limits::{ConnLimits, RateBudget},
     open_payload, parse_header,
     pmtud::Pmtud,
     pn_len_for,
     pools::{CRYPTO_BUFFER_LEN, CryptoBuffer, FrameRefPool, FrameRefQueue, QuicPools},
-    protect,
+    protect, protect_deferred,
     recovery::{self, Recovery},
     recv_tracker::{AckWritten, RecvTracker},
     remove_header_protection,
@@ -160,6 +161,9 @@ pub(crate) struct ConnParams {
   /// If the first probe of path MTU discovery waits a smoothed RTT after the confirmation of the
   /// handshake ([`crate::quic::QuicParams::pmtu_probe_after_rtt`]).
   pub(crate) pmtu_probe_after_rtt: bool,
+  /// If the header protection of the 1-RTT packets of a flush is computed in batches
+  /// ([`crate::quic::QuicParams::batched_header_protection`]).
+  pub(crate) batched_hp: bool,
   /// The packets sealed with one key of 1-RTT packets after which a key update starts, if it is
   /// below the threshold of the cipher suite.
   pub(crate) key_update_threshold: u64,
@@ -259,6 +263,7 @@ impl Default for ConnParams {
       max_in_flight: 256 << 10,
       bodies_round_robin: false,
       pmtu_probe_after_rtt: false,
+      batched_hp: false,
       key_update_threshold: u64::MAX,
       #[cfg(test)]
       test_confidentiality_limit: u32::MAX,
@@ -583,24 +588,67 @@ where
     tx: &mut TxArena,
     pools: &mut QuicPools,
   ) -> FlushOutcome {
+    // With batched header protection the 1-RTT packets wait in `pools.hp_batch`, which is
+    // protected whenever it fills and at the end, before any of its datagrams leaves (ruling T18-b)
+    let batched = self.data.keys.as_ref().is_some_and(|el| el.local.hp().batches());
+    let rslt = self.flush_datagrams_with(now_us, tx, pools, batched);
+    if batched {
+      self.protect_batch(now_us, tx, pools);
+    }
+    rslt
+  }
+
+  // Protects the 1-RTT packets that wait in `pools.hp_batch` with one batch of masks.
+  fn protect_batch(&mut self, now_us: u64, tx: &mut TxArena, pools: &mut QuicPools) {
+    if pools.hp_batch.len() == 0 {
+      return;
+    }
+    let rslt = match self.data.keys.as_ref() {
+      Some(keys) => pools.hp_batch.apply(keys.local.hp(), tx.buffer_mut()),
+      None => {
+        pools.hp_batch.truncate(0);
+        Err(crate::Error::ProgrammingError)
+      }
+    };
+    if let Err(err) = rslt {
+      cold_path();
+      self.close_on_error(now_us, &err);
+    }
+  }
+
+  // `batched`: the 1-RTT packets go into `pools.hp_batch` instead of being protected at once.
+  fn flush_datagrams_with(
+    &mut self,
+    now_us: u64,
+    tx: &mut TxArena,
+    pools: &mut QuicPools,
+    batched: bool,
+  ) -> FlushOutcome {
     loop {
       if !self.wants_send() {
         return FlushOutcome::Done;
       }
       // A probe of path MTU discovery goes alone, in a datagram of its size
       if let Some(size) = self.mtu_probe_due()
-        && let Some(buffer) = tx.begin(self.peer, self.local, size)
+        && let Some((start, buffer)) = tx.begin_at(self.peer, self.local, size)
         && buffer.len() >= size
       {
-        match self.write_mtu_probe(now_us, buffer, size, pools) {
+        let waiting = pools.hp_batch.len();
+        let hp_at = batched.then_some(start);
+        match self.write_mtu_probe(now_us, buffer, size, hp_at, pools) {
           // Not now: the other packets go
-          Ok(0) => {}
+          Ok(0) => pools.hp_batch.truncate(waiting),
           Ok(len) => {
             self.on_datagram_sent(tx, len);
+            if pools.hp_batch.is_full() {
+              self.protect_batch(now_us, tx, pools);
+            }
             continue;
           }
           Err(err) => {
             cold_path();
+            // A packet that waits for its mask is in bytes that do not go
+            pools.hp_batch.truncate(waiting);
             self.close_on_error(now_us, &err);
             continue;
           }
@@ -610,7 +658,7 @@ where
       if max_len == 0 {
         return FlushOutcome::Done;
       }
-      let Some(buffer) = tx.begin(self.peer, self.local, max_len) else {
+      let Some((start, buffer)) = tx.begin_at(self.peer, self.local, max_len) else {
         return FlushOutcome::ArenaFull;
       };
       // The arena can give less than asked for, the room left in the train that the datagram
@@ -619,12 +667,23 @@ where
         return FlushOutcome::ArenaFull;
       }
       let short = buffer.len() < max_len;
-      match self.write_datagram(now_us, buffer, pools) {
-        Ok(0) if short => return FlushOutcome::ArenaFull,
-        Ok(0) => return FlushOutcome::Done,
-        Ok(len) => self.on_datagram_sent(tx, len),
+      let waiting = pools.hp_batch.len();
+      let hp_at = batched.then_some(start);
+      match self.write_datagram(now_us, buffer, hp_at, pools) {
+        Ok(0) => {
+          pools.hp_batch.truncate(waiting);
+          return if short { FlushOutcome::ArenaFull } else { FlushOutcome::Done };
+        }
+        Ok(len) => {
+          self.on_datagram_sent(tx, len);
+          if pools.hp_batch.is_full() {
+            self.protect_batch(now_us, tx, pools);
+          }
+        }
         Err(err) => {
           cold_path();
+          // A packet that waits for its mask is in bytes that do not go
+          pools.hp_batch.truncate(waiting);
           if self.state == ConnState::Closing {
             return FlushOutcome::Done;
           }
@@ -1255,11 +1314,14 @@ where
   // A 1-RTT packet of a PING and PADDING that fills a datagram of `size` bytes, ack-eliciting and
   // not counted by congestion control (ruling T9-e). Returns its length, zero if it can not go
   // now.
+  // `hp_at`: where `buffer` starts in the arena, if the header protection of the probe waits for
+  // a batch.
   fn write_mtu_probe(
     &mut self,
     now_us: u64,
     buffer: &mut [u8],
     size: usize,
+    hp_at: Option<usize>,
     pools: &mut QuicPools,
   ) -> crate::Result<usize> {
     let (dcid, scid, key_phase) = (self.peer_cid, self.local_cid, self.key.local_phase);
@@ -1303,7 +1365,7 @@ where
       space: Space::Data,
       start: 0,
     };
-    let len = self.seal(now_us, buffer, &packet)?;
+    let len = self.seal(now_us, buffer, &packet, hp_at.map(|el| (el, &mut pools.hp_batch)))?;
     self.pmtud.on_probe_sent(pn);
     self.count(|el| el.mtu_probes = el.mtu_probes.wrapping_add(1));
     Ok(len)
@@ -1655,9 +1717,10 @@ where
       ));
     };
     let data_keys = &mut self.data.keys;
+    let batched_hp = self.params.batched_hp;
     if space == Space::Data {
       // Nothing is read after the handshake: TLS closes the connection
-      feed(tls, space, data, None, data_keys)?;
+      feed(tls, space, data, None, data_keys, batched_hp)?;
       return self.on_tls_progress(now_us, app, pools);
     }
     let Some(hs) = self.handshake.as_deref_mut() else {
@@ -1671,14 +1734,14 @@ where
       (handshake_rx, None)
     };
     let direct = rx.accept(offset, data, pools)?;
-    feed(tls, space, direct, handshake_keys.as_deref_mut(), data_keys)?;
+    feed(tls, space, direct, handshake_keys.as_deref_mut(), data_keys, batched_hp)?;
     loop {
       let buffered = rx.buffered();
       if buffered.is_empty() {
         break;
       }
       let len = buffered.len();
-      feed(tls, space, buffered, handshake_keys.as_deref_mut(), data_keys)?;
+      feed(tls, space, buffered, handshake_keys.as_deref_mut(), data_keys, batched_hp)?;
       rx.consume(len, pools);
     }
     self.on_tls_progress(now_us, app, pools)
@@ -1992,8 +2055,15 @@ where
     Ok(())
   }
 
-  // Seals `packet`, which is in `buffer`, and records it.
-  fn seal(&mut self, now_us: u64, buffer: &mut [u8], packet: &OpenPacket) -> crate::Result<usize> {
+  // Seals `packet`, which is in `buffer`, and records it. With `hp`, where `buffer` starts in the
+  // arena and the batch, a 1-RTT packet leaves its header protection to the batch (ruling T18-b).
+  fn seal(
+    &mut self,
+    now_us: u64,
+    buffer: &mut [u8],
+    packet: &OpenPacket,
+    hp: Option<(usize, &mut HpBatch)>,
+  ) -> crate::Result<usize> {
     let Some(sp) = space_mut(&mut self.data, &mut self.handshake, packet.space) else {
       return Err(crate::Error::ProgrammingError);
     };
@@ -2010,8 +2080,13 @@ where
         field.copy_from_slice(&[0x40 | (b0 & 0x3f), b1]);
       }
     }
-    let len =
-      protect(&keys.local, bytes, packet.pn_offset, packet.pn, packet.pn_len, packet.payload_len)?;
+    let fields = (packet.pn_offset, packet.pn, packet.pn_len, packet.payload_len);
+    let len = match hp {
+      Some((at, batch)) if packet.space == Space::Data => {
+        protect_deferred(&keys.local, bytes, fields, at.wrapping_add(packet.start), batch)?
+      }
+      _ => protect(&keys.local, bytes, fields.0, fields.1, fields.2, fields.3)?,
+    };
     if self.state == ConnState::Closing {
       sp.sent.skip();
     } else {
@@ -2138,11 +2213,13 @@ where
   }
 
   // One datagram: a packet of each space with something to send, padded and sealed. Returns its
-  // length, zero if nothing fit.
+  // length, zero if nothing fit. `hp_at`: where `buffer` starts in the arena, if the header
+  // protection of its 1-RTT packet waits for a batch.
   fn write_datagram(
     &mut self,
     now_us: u64,
     buffer: &mut [u8],
+    hp_at: Option<usize>,
     pools: &mut QuicPools,
   ) -> crate::Result<usize> {
     let closing = self.state == ConnState::Closing;
@@ -2204,7 +2281,7 @@ where
     let mut ack_eliciting = false;
     let mut in_flight = false;
     for packet in packets.iter().flatten() {
-      let _len = self.seal(now_us, buffer, packet)?;
+      let _len = self.seal(now_us, buffer, packet, hp_at.map(|el| (el, &mut pools.hp_batch)))?;
       sent_handshake |= packet.space == Space::Handshake;
       ack_eliciting |= packet.ack_eliciting;
       in_flight |= packet.ack_eliciting || packet.padded;
@@ -3073,12 +3150,14 @@ impl HandshakeSpaces {
 
 // Feeds TLS and installs the keys of every secret that it yields, in the slot of the level, which
 // TLS requires after every feed. The secrets are dropped, and so wiped, once their keys are made.
+// The 1-RTT keys have batched header protection if `batched_hp` (ruling T18-b).
 fn feed<const IS_CLIENT: bool, RNG, TCX>(
   tls: &mut QuicTls<IS_CLIENT, RNG, TCX>,
   space: Space,
   data: &[u8],
   mut handshake_keys: Option<&mut Option<PacketKeys>>,
   data_keys: &mut Option<PacketKeys>,
+  batched_hp: bool,
 ) -> crate::Result<()>
 where
   RNG: CryptoRng + CryptoSeedableRng,
@@ -3097,8 +3176,9 @@ where
         QuicError::TlsSecretsNotTaken,
       ));
     };
-    let local = keys_from_secret(secrets.suite, secrets.tx.as_slice())?;
-    let remote = keys_from_secret(secrets.suite, secrets.rx.as_slice())?;
+    let batched = batched_hp && secrets.space == Space::Data;
+    let local = keys_from_secret_with(secrets.suite, secrets.tx.as_slice(), batched)?;
+    let remote = keys_from_secret_with(secrets.suite, secrets.rx.as_slice(), batched)?;
     *slot = Some(PacketKeys { local, remote });
   }
   Ok(())
@@ -5037,5 +5117,85 @@ mod tests {
     assert_eq!(link.server.conn.state(), ConnState::Draining);
     let _ = link.server.flush(link.now_us);
     assert!(link.server.take_datagrams().is_empty());
+  }
+
+  // Ruling T18-b: with batched header protection the 1-RTT packets of a flush are protected in
+  // batches of up to eight, before the flush returns, and the client opens every one of them: a
+  // response of many packets arrives whole, with no packet dropped. ChaCha20, or a CPU without
+  // AES-NI, protects one packet at a time whatever the setting, and so does the default.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn batched_header_protection_packets_open_at_the_peer() {
+    const RESPONSE: &[u8; 40_000] = &[b'h'; 40_000];
+    let suites = [
+      CipherSuite::Aes128GcmSha256,
+      CipherSuite::Aes256GcmSha384,
+      CipherSuite::Chacha20Poly1305Sha256,
+    ];
+    for suite in suites {
+      for batched in [false, true] {
+        let mut opts = LinkOpts::new(Some(suite));
+        opts.server.batched_hp = batched;
+        opts.server_app = TestApp::new(Behavior::Respond(RESPONSE));
+        let mut link = settled(&opts);
+        let now_us = link.now_us;
+        let id = link
+          .client
+          .with_ctx(now_us, |cx| {
+            let id = cx.open_bidi()?;
+            cx.write(id, b"GET /", true)?;
+            Ok::<_, crate::Error>(id)
+          })
+          .unwrap();
+        let _ = link.client.flush(link.now_us);
+        assert_eq!(link.deliver_to_server(), 1);
+        let _ = link.server.flush(link.now_us);
+        // Nothing waits once the flush returned
+        assert_eq!(link.server.parts.pools.hp_batch.len(), 0);
+        assert!(link.deliver_to_client() >= 9, "{suite:?}: the first flush sends a window");
+        link.run();
+        let log = link.client.app.streams.get(&id.0).unwrap();
+        assert!(log.fin, "{suite:?} batched {batched}");
+        assert_eq!(log.data.as_slice(), RESPONSE.as_slice(), "{suite:?} batched {batched}");
+        assert_eq!(link.client.conn.stats().packets_dropped, 0, "{suite:?} batched {batched}");
+        let batch = &link.server.parts.pools.hp_batch;
+        let batches = batched
+          && suite != CipherSuite::Chacha20Poly1305Sha256
+          && crate::quic::crypto::has_aes_ni();
+        if batches {
+          assert!(batch.masked >= 30, "{suite:?}: {} packets masked in batches", batch.masked);
+          assert_eq!(batch.largest, crate::quic::crypto::HP_BATCH_LEN, "{suite:?}");
+        } else {
+          assert_eq!(batch.masked, 0, "{suite:?} batched {batched}");
+        }
+      }
+    }
+  }
+
+  // Ruling T18-b: without AES-NI the batched setting falls back to the header protection of the
+  // backend, which computes the same masks one at a time.
+  #[test]
+  fn batched_header_protection_falls_back_without_aes_ni() {
+    use crate::quic::crypto::QuicHp;
+    let key = [0x42; 32];
+    for suite in [CipherSuite::Aes128GcmSha256, CipherSuite::Aes256GcmSha384] {
+      let key = &key[..usize::from(suite.cipher_key_len())];
+      let fallback = QuicHp::with_batches(suite, key, true, false).unwrap();
+      assert!(!fallback.batches());
+      let samples: Vec<[u8; 16]> = (0..20u8).map(|el| [el; 16]).collect();
+      let mut lhs = vec![[0; 5]; 20];
+      fallback.masks(&samples, &mut lhs).unwrap();
+      if crate::quic::crypto::has_aes_ni() {
+        let batched = QuicHp::with_batches(suite, key, true, true).unwrap();
+        assert!(batched.batches());
+        let mut rhs = vec![[0; 5]; 20];
+        batched.masks(&samples, &mut rhs).unwrap();
+        assert_eq!(lhs, rhs, "{suite:?}");
+      }
+      assert_ne!(lhs[0], lhs[1]);
+    }
+    let chacha = QuicHp::with_batches(CipherSuite::Chacha20Poly1305Sha256, &key, true, true);
+    assert!(!chacha.unwrap().batches());
+    assert!(!QuicHp::new(CipherSuite::Aes128GcmSha256, &key[..16]).unwrap().batches());
   }
 }

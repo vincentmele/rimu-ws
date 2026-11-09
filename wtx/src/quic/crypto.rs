@@ -19,6 +19,11 @@
 //!   the slot) and the HKDF state that a backend keeps inside of itself while deriving are out of
 //!   its reach.
 
+/// If the CPU has AES-NI, which batched header protection needs.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+pub(crate) use crate::crypto::has_aes_ni;
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+use crate::crypto::{Aes128HpAesNi, Aes256HpAesNi};
 use crate::{
   collections::ArrayVectorCopy,
   crypto::{
@@ -53,6 +58,12 @@ const SHORT_HEADER_MASK: u8 = 0x1f;
 const SAMPLE_OFFSET: usize = MAX_PN_LEN;
 const SAMPLE_LEN: usize = 16;
 
+/// If the CPU has AES-NI, which batched header protection needs: never, but on x86-64.
+#[cfg(not(all(target_arch = "x86_64", feature = "std")))]
+pub(crate) const fn has_aes_ni() -> bool {
+  false
+}
+
 const _: () = {
   assert!(AEAD_NONCE_LEN == IV_LEN as usize);
   assert!(MAX_HASH_LEN >= MAX_KEY_LEN);
@@ -63,22 +74,80 @@ const _: () = {
 pub(crate) type QuicAead = TrafficAead;
 
 /// The header protection of one of the supported cipher suites, with its key already expanded.
+///
+/// The `Batched` variants, AES on AES-NI, compute a batch of masks eight blocks at a time
+/// ([`QuicHp::masks`], ruling T18-b); the others one mask at a time.
 #[derive(Debug)]
 pub(crate) enum QuicHp {
   Aes128(Aes128HpGlobal),
   Aes256(Aes256HpGlobal),
   Chacha(Chacha20HpGlobal),
+  #[cfg(all(target_arch = "x86_64", feature = "std"))]
+  Aes128Batched(Aes128HpAesNi),
+  #[cfg(all(target_arch = "x86_64", feature = "std"))]
+  Aes256Batched(Aes256HpAesNi),
 }
 
 impl QuicHp {
-  /// Expands `key`, which has the key length of `suite`.
+  /// Expands `key`, which has the key length of `suite`, for the header protection of the backend.
+  #[cfg(test)]
   #[inline]
   pub(crate) fn new(suite: CipherSuite, key: &[u8]) -> crate::Result<Self> {
+    Self::with_batches(suite, key, false, false)
+  }
+
+  /// [`Self::new`], but with `batched` an AES suite gets the batched masks of AES-NI if `aes_ni`,
+  /// the CPU has it. ChaCha20, or AES without AES-NI, keep the backend.
+  #[inline]
+  pub(crate) fn with_batches(
+    suite: CipherSuite,
+    key: &[u8],
+    batched: bool,
+    aes_ni: bool,
+  ) -> crate::Result<Self> {
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if batched && aes_ni {
+      match suite {
+        CipherSuite::Aes128GcmSha256 => return Ok(Self::Aes128Batched(Aes128HpAesNi::new(key)?)),
+        CipherSuite::Aes256GcmSha384 => return Ok(Self::Aes256Batched(Aes256HpAesNi::new(key)?)),
+        CipherSuite::Chacha20Poly1305Sha256 => {}
+      }
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
+    let _ = (batched, aes_ni);
     Ok(match suite {
       CipherSuite::Aes128GcmSha256 => Self::Aes128(Aes128HpGlobal::new(key)?),
       CipherSuite::Aes256GcmSha384 => Self::Aes256(Aes256HpGlobal::new(key)?),
       CipherSuite::Chacha20Poly1305Sha256 => Self::Chacha(Chacha20HpGlobal::new(key)?),
     })
+  }
+
+  /// If the masks of a batch are computed together ([`Self::masks`]), and not one at a time.
+  #[inline]
+  pub(crate) const fn batches(&self) -> bool {
+    match self {
+      Self::Aes128(_) | Self::Aes256(_) | Self::Chacha(_) => false,
+      #[cfg(all(target_arch = "x86_64", feature = "std"))]
+      Self::Aes128Batched(_) | Self::Aes256Batched(_) => true,
+    }
+  }
+
+  /// The mask of each sample into the element of `out` at the same index; the lengths match.
+  #[inline]
+  pub(crate) fn masks(
+    &self,
+    samples: &[[u8; SAMPLE_LEN]],
+    out: &mut [[u8; 5]],
+  ) -> crate::Result<()> {
+    match self {
+      Self::Aes128(el) => el.masks(samples, out),
+      Self::Aes256(el) => el.masks(samples, out),
+      Self::Chacha(el) => el.masks(samples, out),
+      #[cfg(all(target_arch = "x86_64", feature = "std"))]
+      Self::Aes128Batched(el) => el.masks(samples, out),
+      #[cfg(all(target_arch = "x86_64", feature = "std"))]
+      Self::Aes256Batched(el) => el.masks(samples, out),
+    }
   }
 
   #[inline]
@@ -87,7 +156,123 @@ impl QuicHp {
       Self::Aes128(el) => el.mask(sample),
       Self::Aes256(el) => el.mask(sample),
       Self::Chacha(el) => el.mask(sample),
+      #[cfg(all(target_arch = "x86_64", feature = "std"))]
+      Self::Aes128Batched(el) => el.mask(sample),
+      #[cfg(all(target_arch = "x86_64", feature = "std"))]
+      Self::Aes256Batched(el) => el.mask(sample),
     }
+  }
+}
+
+/// The header protection of the 1-RTT packets of a flush, deferred (ruling T18-b): each packet is
+/// sealed without it and its sample waits here; once [`HP_BATCH_LEN`] wait, or the flush ends, one
+/// batch of masks ([`QuicHp::masks`]) protects them in the arena, before any of them leaves.
+///
+/// Entries name packets by their offset in the buffer of the arena, so a batch belongs to one
+/// flush of one connection: it is empty when the flush returns.
+#[derive(Debug)]
+pub(crate) struct HpBatch {
+  len: u8,
+  // Per packet: where it starts in the arena, the offset of its packet number from there, and the
+  // length of the packet number
+  packets: [(usize, u16, u8); HP_BATCH_LEN],
+  samples: [[u8; SAMPLE_LEN]; HP_BATCH_LEN],
+  /// Packets that a batch protected.
+  #[cfg(test)]
+  pub(crate) masked: u64,
+  /// The most packets of one batch.
+  #[cfg(test)]
+  pub(crate) largest: usize,
+}
+
+/// The packets of a batch at most: the lanes of the AES-NI masks.
+pub(crate) const HP_BATCH_LEN: usize = 8;
+
+impl HpBatch {
+  /// An empty batch.
+  #[inline]
+  pub(crate) const fn new() -> Self {
+    Self {
+      len: 0,
+      packets: [(0, 0, 0); HP_BATCH_LEN],
+      samples: [[0; SAMPLE_LEN]; HP_BATCH_LEN],
+      #[cfg(test)]
+      masked: 0,
+      #[cfg(test)]
+      largest: 0,
+    }
+  }
+
+  /// If no more packets fit.
+  #[inline]
+  pub(crate) const fn is_full(&self) -> bool {
+    self.len() >= HP_BATCH_LEN
+  }
+
+  /// The packets waiting.
+  #[inline]
+  pub(crate) const fn len(&self) -> usize {
+    self.len as usize
+  }
+
+  /// Forgets the packets past the first `len`: those of a datagram that did not go.
+  #[inline]
+  pub(crate) fn truncate(&mut self, len: usize) {
+    if len < self.len() {
+      self.len = u8::try_from(len).unwrap_or(0);
+    }
+  }
+
+  /// Protects the waiting packets, which `bytes` holds at the offsets they were given with, with
+  /// `hp`, and empties the batch whatever happens.
+  #[inline]
+  pub(crate) fn apply(&mut self, hp: &QuicHp, bytes: &mut [u8]) -> crate::Result<()> {
+    let len = self.len();
+    self.len = 0;
+    if len == 0 {
+      return Ok(());
+    }
+    let mut masks = [[0u8; 5]; HP_BATCH_LEN];
+    let (Some(samples), Some(out), Some(packets)) =
+      (self.samples.get(..len), masks.get_mut(..len), self.packets.get(..len))
+    else {
+      return Err(programming_error());
+    };
+    hp.masks(samples, out)?;
+    #[cfg(test)]
+    {
+      self.masked = self.masked.wrapping_add(u64::try_from(len).unwrap_or(u64::MAX));
+      self.largest = self.largest.max(len);
+    }
+    for ((start, pn_offset, pn_len), mask) in packets.iter().zip(masks) {
+      let Some(packet) = bytes.get_mut(*start..) else {
+        return Err(programming_error());
+      };
+      apply_mask(packet, usize::from(*pn_offset), usize::from(*pn_len), mask)?;
+    }
+    Ok(())
+  }
+
+  // Adds the packet at `start` of the arena, sealed by [`seal_packet`]; `false` if full.
+  #[inline]
+  fn push(
+    &mut self,
+    start: usize,
+    pn_offset: usize,
+    pn_len: usize,
+    sample: [u8; SAMPLE_LEN],
+  ) -> bool {
+    let idx = self.len();
+    let (Ok(pn_offset), Ok(pn_len)) = (u16::try_from(pn_offset), u8::try_from(pn_len)) else {
+      return false;
+    };
+    let (Some(packet), Some(slot)) = (self.packets.get_mut(idx), self.samples.get_mut(idx)) else {
+      return false;
+    };
+    *packet = (start, pn_offset, pn_len);
+    *slot = sample;
+    self.len = self.len.wrapping_add(1);
+    true
   }
 }
 
@@ -162,14 +347,17 @@ impl DirectionalKeys {
     let hkdf = Scrub::new(suite.hkdf_from_prk(self.secret.as_slice())?);
     let secret =
       Scrub::new(hkdf_expand_label::<MAX_HASH_LEN>(None, b"quic ku", suite.hash_len(), &hkdf)?);
-    Self::derive(suite, secret.as_slice(), Some(&self.hp_key))
+    // The header protection of the next generation is that of this one, batched or not
+    Self::derive(suite, secret.as_slice(), Some(&self.hp_key), self.hp.batches())
   }
 
-  // `hp_key` is the header protection key of the previous generation, if any
+  // `hp_key` is the header protection key of the previous generation, if any; `batched` asks for
+  // batched header protection where the CPU and the suite allow it
   fn derive(
     suite: CipherSuite,
     secret: &[u8],
     hp_key: Option<&ArrayVectorCopy<u8, MAX_KEY_LEN>>,
+    batched: bool,
   ) -> crate::Result<Self> {
     if secret.len() != usize::from(suite.hash_len()) {
       cold_path();
@@ -185,7 +373,7 @@ impl DirectionalKeys {
     };
     let hp_key = Scrub::new(hp_key);
     let aead = QuicAead::new(suite, key.as_slice())?;
-    let hp = QuicHp::new(suite, hp_key.as_slice())?;
+    let hp = QuicHp::with_batches(suite, hp_key.as_slice(), batched, batched && has_aes_ni())?;
     Ok(Self {
       aead,
       hp,
@@ -255,7 +443,18 @@ pub(crate) fn keys_from_secret(
   suite: CipherSuite,
   secret: &[u8],
 ) -> crate::Result<DirectionalKeys> {
-  DirectionalKeys::derive(suite, secret, None)
+  DirectionalKeys::derive(suite, secret, None, false)
+}
+
+/// [`keys_from_secret`] whose header protection computes batches of masks together if
+/// `batched_hp` and the CPU and the suite allow it: AES on AES-NI ([`QuicHp::batches`]).
+#[inline]
+pub(crate) fn keys_from_secret_with(
+  suite: CipherSuite,
+  secret: &[u8],
+  batched_hp: bool,
+) -> crate::Result<DirectionalKeys> {
+  DirectionalKeys::derive(suite, secret, None, batched_hp)
 }
 
 /// Opens the payload of the packet in `packet`, which goes from the first byte of the packet to
@@ -301,6 +500,41 @@ pub(crate) fn protect(
   pn_len: usize,
   payload_len: usize,
 ) -> crate::Result<usize> {
+  let (packet_len, sample) = seal_packet(keys, packet, pn_offset, pn, pn_len, payload_len)?;
+  let mask = keys.hp.mask(&sample)?;
+  apply_mask(packet, pn_offset, pn_len, mask)?;
+  Ok(packet_len)
+}
+
+/// [`protect`] whose header protection waits in `batch`, if it has room, for the packet that
+/// starts at `start` of the buffer that [`HpBatch::apply`] is given later (ruling T18-b);
+/// otherwise the packet is protected at once.
+#[inline]
+pub(crate) fn protect_deferred(
+  keys: &DirectionalKeys,
+  packet: &mut [u8],
+  (pn_offset, pn, pn_len, payload_len): (usize, u64, usize, usize),
+  start: usize,
+  batch: &mut HpBatch,
+) -> crate::Result<usize> {
+  let (packet_len, sample) = seal_packet(keys, packet, pn_offset, pn, pn_len, payload_len)?;
+  if batch.is_full() || !batch.push(start, pn_offset, pn_len, sample) {
+    let mask = keys.hp.mask(&sample)?;
+    apply_mask(packet, pn_offset, pn_len, mask)?;
+  }
+  Ok(packet_len)
+}
+
+// Seals the payload of the packet as [`protect`] does, without header protection. Returns the
+// length of the packet and its sample.
+fn seal_packet(
+  keys: &DirectionalKeys,
+  packet: &mut [u8],
+  pn_offset: usize,
+  pn: u64,
+  pn_len: usize,
+  payload_len: usize,
+) -> crate::Result<(usize, [u8; SAMPLE_LEN])> {
   if pn_offset == 0 || !(1..=MAX_PN_LEN).contains(&pn_len) {
     return Err(programming_error());
   }
@@ -324,16 +558,26 @@ pub(crate) fn protect(
   let tag = keys.aead.seal_in_place(nonce(&keys.iv, pn), header, payload)?;
   tag_dst.copy_from_slice(&tag);
   keys.packets_sealed.set(keys.packets_sealed.get().wrapping_add(1));
-  let Some(protected) = packet.get_mut(..packet_len) else {
+  let Some(protected) = packet.get(..packet_len) else {
     return Err(error(QuicError::BufferTooSmall));
   };
-  let mask = keys.hp.mask(&sample(protected, pn_offset)?)?;
-  let Some(first) = protected.first_mut() else {
+  Ok((packet_len, sample(protected, pn_offset)?))
+}
+
+// Header protection with `mask` on the packet that starts `packet`: the low bits of the first byte
+// and the `pn_len` bytes of the packet number at `pn_offset`.
+fn apply_mask(
+  packet: &mut [u8],
+  pn_offset: usize,
+  pn_len: usize,
+  mask: [u8; 5],
+) -> crate::Result<()> {
+  let Some(first) = packet.first_mut() else {
     return Err(error(QuicError::Truncated));
   };
   *first ^= mask[0] & first_byte_mask(*first);
-  xor_packet_number(protected, pn_offset, pn_len, mask);
-  Ok(packet_len)
+  let _pn = xor_packet_number(packet, pn_offset, pn_len, mask);
+  Ok(())
 }
 
 /// Removes header protection (RFC 9001 section 5.4) from the packet in `packet`, in place.

@@ -668,6 +668,7 @@ where
     };
     let endpoint = self.endpoint.stats();
     let handler = self.app.handler.counters();
+    let qpack = self.app.qpack_counters();
     cell.0.store(&Http3WorkerStats {
       ack_only_out: endpoint.ack_only_out,
       cid_steering: self.steering,
@@ -688,6 +689,8 @@ where
       parked: u64::try_from(self.app.handler.parked()).unwrap_or(u64::MAX),
       park_refused: handler.park_refused,
       pto_probes: endpoint.pto_probes,
+      qpack_memo_hits: qpack.memo_hits,
+      qpack_sections: qpack.sections,
       requests: handler.requests,
       retries: endpoint.retries,
       stateless_resets: endpoint.resets,

@@ -49,9 +49,11 @@ pub(crate) use app::{BodyRef, ConnCtx, ConnHandle, QuicApp};
 pub use cid::{Cid, MAX_CID_LEN};
 pub(crate) use conn::{ConnParams, ConnState, FlushOutcome, QuicConn};
 use core::net::{IpAddr, SocketAddr};
+#[cfg(test)]
+pub(crate) use crypto::keys_from_secret;
 pub(crate) use crypto::{
-  DirectionalKeys, PacketKeys, initial_keys, keys_from_secret, open_payload, protect,
-  remove_header_protection, wipe,
+  DirectionalKeys, HpBatch, PacketKeys, initial_keys, keys_from_secret_with, open_payload, protect,
+  protect_deferred, remove_header_protection, wipe,
 };
 pub use endpoint::WorkerLoads;
 #[cfg_attr(

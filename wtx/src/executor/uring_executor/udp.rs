@@ -89,11 +89,12 @@ pub struct UdpParams {
   pub recv_buffer_len: u32,
   /// Generic receive offload (`UDP_GRO`): the kernel coalesces datagrams of a flow that arrive
   /// together into one and reports their size in [`DatagramMeta::segment_size`]; the receive
-  /// buffers are then 64 KiB each (256 of them: about 16.8 MiB per socket). Defaults to `false`
-  /// (ruling T16-h): on, it measured 2.8 % less server CPU per request at 0.8 % more requests per
-  /// second on HttpArena baseline-h3 (task 16, EC2; static-h3 unchanged within the spread), but its
-  /// ring alone passes the 16 MiB pool budget of a worker (spec section 5.4). Turn it on where the
-  /// memory is there, with fewer [`Self::recv_buffers`] to keep the ring small.
+  /// buffers are then 64 KiB each (256 of them: 256 x 65,536 B, exactly 16 MiB or 16.8 MB, per
+  /// socket). Defaults to `false` (ruling T16-h): on, it measured 2.8 % less server CPU per request
+  /// at 0.8 % more requests per second on HttpArena baseline-h3 (task 16, EC2; static-h3 unchanged
+  /// within the spread), but its ring alone equals the 16 MiB pool budget of a worker (spec section
+  /// 5.4) by itself, leaving nothing for the other pools (48 workers: 768 MiB). Turn it on where
+  /// the memory is there, with fewer [`Self::recv_buffers`] to keep the ring small.
   pub gro: bool,
   /// The `SO_RCVBUF` asked for. The kernel caps it at `net.core.rmem_max`, which is never raised
   /// here; what it granted is in [`UdpStats::rcvbuf`]. Defaults to 4 MiB.

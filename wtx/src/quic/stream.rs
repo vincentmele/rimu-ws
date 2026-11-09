@@ -1395,30 +1395,37 @@ mod tests {
   }
 
   // A second round of 4,096 requests on warm pools allocates nothing on the server: small
-  // responses, bodies by reference and responses that take a block of the send queue alike.
+  // responses, bodies by reference and responses that take a block of the send queue alike, with
+  // header protection one packet at a time or in batches (ruling T18-b).
   #[cfg_attr(miri, ignore)]
   #[test]
   fn steady_streams_allocate_nothing_after_warmup() {
     static OTHERS: AtomicU64 = AtomicU64::new(0);
     static SERVER: AtomicU64 = AtomicU64::new(0);
-    let body = BodyRef::new(crate::misc::SharedBytes::from_slice(&[7; 3000]), 0..3000).unwrap();
-    let mut opts = LinkOpts::new(None);
-    opts.counters = Some((&SERVER, &OTHERS));
-    opts.server_app = TestApp::new(Behavior::Mixed { small: RESPONSE, body, large: LARGE });
-    _count_allocations_in(&OTHERS);
-    let mut link = settled(&opts);
-    let _ = run_requests(&mut link, 4096, 64, |_| b"GET /".to_vec(), false);
-    // The counter sees the server, which warmed its pools
-    let before = SERVER.load(Ordering::Relaxed);
-    assert!(before > 0);
-    let responses = run_requests(&mut link, 4096, 64, |_| b"GET /".to_vec(), false);
-    let allocations = SERVER.load(Ordering::Relaxed) - before;
-    assert_eq!(allocations, 0, "{allocations} allocations in 4096 requests");
-    // The indices of the streams of the second round start at 4,096, 1 modulo 3
-    let kinds = |skip| responses.iter().skip(skip).step_by(3);
-    assert!(kinds(0).all(|el| el.len() == 3000));
-    assert!(kinds(1).all(|el| el == LARGE));
-    assert!(kinds(2).all(|el| el == RESPONSE));
+    for batched in [false, true] {
+      let body = BodyRef::new(crate::misc::SharedBytes::from_slice(&[7; 3000]), 0..3000).unwrap();
+      let mut opts = LinkOpts::new(None);
+      opts.counters = Some((&SERVER, &OTHERS));
+      opts.server.batched_hp = batched;
+      opts.server_app = TestApp::new(Behavior::Mixed { small: RESPONSE, body, large: LARGE });
+      _count_allocations_in(&OTHERS);
+      let mut link = settled(&opts);
+      let _ = run_requests(&mut link, 4096, 64, |_| b"GET /".to_vec(), false);
+      // The counter sees the server, which warmed its pools
+      let before = SERVER.load(Ordering::Relaxed);
+      assert!(before > 0);
+      let responses = run_requests(&mut link, 4096, 64, |_| b"GET /".to_vec(), false);
+      let allocations = SERVER.load(Ordering::Relaxed) - before;
+      assert_eq!(allocations, 0, "{allocations} allocations in 4096 requests, batched {batched}");
+      // The indices of the streams of the second round start at 4,096, 1 modulo 3
+      let kinds = |skip| responses.iter().skip(skip).step_by(3);
+      assert!(kinds(0).all(|el| el.len() == 3000));
+      assert!(kinds(1).all(|el| el == LARGE));
+      assert!(kinds(2).all(|el| el == RESPONSE));
+      if batched && crate::quic::crypto::has_aes_ni() {
+        assert!(link.server.parts.pools.hp_batch.masked > 0);
+      }
+    }
   }
 
   // A second round of streams whose data comes out of order and whose lines the application

@@ -5,6 +5,8 @@ pub(crate) mod global;
 mod ring;
 #[cfg(feature = "crypto-ruco")]
 mod ruco;
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+pub(crate) mod x86_aesni;
 
 use crate::crypto::CryptoError;
 

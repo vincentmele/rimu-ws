@@ -7,13 +7,14 @@
 //! only h2c is served), `DATASET_PATH` (default `/data/dataset.json`), `STATIC_DIR` (default
 //! `/data/static`), `ARENA_PARAMS` (`permissive` for `HttpRecvParams::with_permissive_params`, as
 //! upstream's wtx-http2 entry does; otherwise the library defaults) and the `ARENA_H3_*` switches
-//! of the table below. The h3 limits are the defaults of `H3Params`, as in the HttpArena entry;
+//! of the table below. The h3 limits are the defaults of `H3Params`, as in the HttpArena entry
+//! (`ARENA_H3_QPACK` changes the QPACK settings only);
 //! `ARENA_PARAMS` is for h1 and h2 only.
 //!
 //! # The h3 switches (ruling T16-b)
 //!
 //! Each selects, at start, one setting of the h3 server, so that one build measures the A/Bs of
-//! tasks 16, 17 and 19 (the EC2 variant phase of `/mnt/nvme1tb/claude-tmp/aws-h3`). Unset, each is
+//! tasks 16 to 19 (the EC2 variant phase of `/mnt/nvme1tb/claude-tmp/aws-h3`). Unset, each is
 //! the library default, but for `ARENA_H3_GRO`. A value outside the table stops the program; the server prints the
 //! settings it runs with on one line starting with `arena-h2: h3 knobs`.
 //!
@@ -21,7 +22,7 @@
 //! |---|---|---|---|
 //! | `ARENA_H3_HEADERS` | `min`, `full` | `min` | `min`: `content-type` only, no middleware (like cnetmod and zix, not RFC 9110-compliant; decision Q2); `full`: `Http3ServerFramework::set_rfc9110_headers(true)` and the `server` middleware, as on h2 |
 //! | `ARENA_H3_DATA` | `reuse`, `fresh` | `reuse` | `Http3ServerFramework::set_reuse_data` (`reuse`: the opt-in, the library default is `fresh`; the data, an `Arc` of the dataset, is never changed by the handlers) |
-//! | `ARENA_H3_GRO` | `0`, `1` | `1` | `UdpParams::gro` (on: receive buffers of 64 KiB). On here although the library default is off (ruling T16-h: the ring of a socket, about 16.8 MiB, passes a worker's 16 MiB pool budget; the benchmark has the memory) |
+//! | `ARENA_H3_GRO` | `0`, `1` | `1` | `UdpParams::gro` (on: receive buffers of 64 KiB). On here although the library default is off (ruling T16-h: the ring of a socket, 256 x 65,536 B = exactly 16 MiB, equals a worker's 16 MiB pool budget by itself, leaving nothing for the other pools, 768 MiB over 48 workers; the benchmark has the memory) |
 //! | `ARENA_H3_RECV_BUFFERS` | 1 to 32768 | 256 | `UdpParams::recv_buffers` |
 //! | `ARENA_H3_TX_ARENA` | bytes, 65536 or more | 768000 | `UdpParams::tx_arena_bytes` |
 //! | `ARENA_H3_RCVBUF` | bytes | 4194304 | `UdpParams::rcvbuf` (capped by `net.core.rmem_max`) |
@@ -35,6 +36,8 @@
 //! | `ARENA_H3_PACING` | `0`, `1` | `1` | `QuicParams::set_pacing` |
 //! | `ARENA_H3_PMTU_PROBE` | `now`, `rtt` | `now` | `QuicParams::set_pmtu_probe_after_rtt` (`rtt`: the first probe one smoothed RTT after the handshake) |
 //! | `ARENA_H3_BODIES` | `complete`, `round-robin` | `complete` | `QuicParams::set_bodies_round_robin` (bodies by reference: one to its end, or a frame each in turn) |
+//! | `ARENA_H3_HP` | `ring`, `batched` | `ring` | `QuicParams::set_batched_header_protection` (`batched`: the masks of the 1-RTT packets of a flush eight at a time on AES-NI, task 18; ChaCha20 and CPUs without AES-NI stay one at a time) |
+//! | `ARENA_H3_QPACK` | `0`, `4096` | `0` | `H3Params::qpack_max_table_capacity` and `qpack_blocked_streams`: `0` none (the library default), `4096` a dynamic table of 4096 bytes with 100 blocked streams (task 18, ruling T18-c) |
 //!
 //! With TLS on, SIGUSR1 prints the sums of the counters of the h3 workers on one line starting with
 //! `h3-stats` (what `h3-bench.sh` reads), and SIGINT or SIGTERM prints them with one line per
@@ -153,6 +156,7 @@ fn spawn_h3(
   .set_error_cb(error_cb)
   .set_reuse_data(knobs.data == knobs::Data::Reuse)
   .set_local_runtime_cb(runtime)
+  .set_h3_params(knobs.h3)
   .set_pin_workers(knobs.pin_workers)
   .set_quic_params(knobs.quic)
   .set_udp_params(knobs.udp);
@@ -191,7 +195,7 @@ fn runtime() -> rimu_ws::Result<UringRuntime> {
 
 /// The `ARENA_H3_*` switches: see the table of the program's documentation.
 mod knobs {
-  use rimu_ws::{executor::UdpParams, quic::QuicParams};
+  use rimu_ws::{executor::UdpParams, http3::H3Params, quic::QuicParams};
 
   /// The response fields of h3.
   #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -215,6 +219,7 @@ mod knobs {
   #[derive(Clone, Copy, Debug)]
   pub(super) struct H3Knobs {
     pub(super) data: Data,
+    pub(super) h3: H3Params,
     pub(super) headers: Headers,
     pub(super) pin_workers: bool,
     pub(super) quic: QuicParams,
@@ -273,7 +278,16 @@ mod knobs {
       if let Some(elem) = one_of(&var, "ARENA_H3_BODIES", &bodies)? {
         quic = quic.set_bodies_round_robin(elem);
       }
-      Ok(Self { data, headers, pin_workers, quic, udp })
+      if let Some(elem) = one_of(&var, "ARENA_H3_HP", &[("ring", false), ("batched", true)])? {
+        quic = quic.set_batched_header_protection(elem);
+      }
+      let mut h3 = H3Params::default();
+      if let Some(elem) = one_of(&var, "ARENA_H3_QPACK", &[("0", false), ("4096", true)])? {
+        // Ruling T18-c: the dynamic table that task 18 measures, or none
+        (h3.qpack_max_table_capacity, h3.qpack_blocked_streams) =
+          if elem { (4096, 100) } else { (0, 0) };
+      }
+      Ok(Self { data, h3, headers, pin_workers, quic, udp })
     }
 
     /// The settings, `name=value` each, for the log of the server.
@@ -283,7 +297,7 @@ mod knobs {
       format!(
         "headers={} data={} gro={} recv_buffers={} tx_arena={} rcvbuf={} sndbuf={} train={} \
          flush_order={} steering={} balance={} pin={} max_in_flight={} pacing={} pmtu_probe={} \
-         bodies={}",
+         bodies={} hp={} qpack={}",
         pick(self.headers == Headers::Min, "min", "full"),
         pick(self.data == Data::Reuse, "reuse", "fresh"),
         u8::from(udp.gro),
@@ -300,6 +314,8 @@ mod knobs {
         u8::from(quic.pacing()),
         pick(quic.pmtu_probe_after_rtt(), "rtt", "now"),
         pick(quic.bodies_round_robin(), "round-robin", "complete"),
+        pick(quic.batched_header_protection(), "batched", "ring"),
+        self.h3.qpack_max_table_capacity,
       )
     }
   }
@@ -400,11 +416,12 @@ mod stats_signals {
   }
 
   #[derive(Default)]
-  struct Counters([u64; 21]);
+  struct Counters([u64; 23]);
 
   impl Counters {
-    // The first twelve as before task 16, then the counters of spec section 2.1 (ruling T16-c)
-    const NAMES: [&'static str; 21] = [
+    // The first twelve as before task 16, then the counters of spec section 2.1 (ruling T16-c),
+    // then the QPACK sections decoded and those the decode memo replayed (ruling T18-c)
+    const NAMES: [&'static str; 23] = [
       "conns",
       "requests",
       "datagrams_in",
@@ -426,6 +443,8 @@ mod stats_signals {
       "packets_lost",
       "pto_probes",
       "frames_resent",
+      "qpack_sections",
+      "qpack_memo_hits",
     ];
 
     fn of(worker: &Http3WorkerStats) -> Self {
@@ -451,6 +470,8 @@ mod stats_signals {
         worker.packets_lost,
         worker.pto_probes,
         worker.frames_resent,
+        worker.qpack_sections,
+        worker.qpack_memo_hits,
       ])
     }
 
@@ -617,7 +638,7 @@ struct Rating {
 #[cfg(test)]
 mod knob_tests {
   use super::knobs::{Data, H3Knobs, Headers};
-  use rimu_ws::{executor::UdpParams, quic::QuicParams};
+  use rimu_ws::{executor::UdpParams, http3::H3Params, quic::QuicParams};
 
   fn parse(vars: &[(&str, &str)]) -> Result<H3Knobs, String> {
     H3Knobs::from_vars(|name| vars.iter().find(|el| el.0 == name).map(|el| el.1.to_string()))
@@ -639,6 +660,9 @@ mod knob_tests {
     );
     assert!(knobs.pin_workers);
     assert_eq!((knobs.data, knobs.headers), (Data::Reuse, Headers::Min));
+    // Task 18: header protection one packet at a time and no QPACK dynamic table, as the library
+    assert!(!knobs.quic.batched_header_protection());
+    assert_eq!(knobs.h3, H3Params::default());
     // Ruling T16-h: the benchmark path has GRO on, the library default has it off
     assert!(knobs.udp.gro && !udp.gro);
     assert!(!parse(&[("ARENA_H3_GRO", "0")]).unwrap().udp.gro);
@@ -654,10 +678,12 @@ mod knob_tests {
       ("ARENA_H3_FLUSH_ORDER", "slot"),
       ("ARENA_H3_GRO", "1"),
       ("ARENA_H3_HEADERS", "full"),
+      ("ARENA_H3_HP", "batched"),
       ("ARENA_H3_MAX_IN_FLIGHT", "131072"),
       ("ARENA_H3_PACING", "0"),
       ("ARENA_H3_PIN", "0"),
       ("ARENA_H3_PMTU_PROBE", "rtt"),
+      ("ARENA_H3_QPACK", "4096"),
       ("ARENA_H3_RCVBUF", "1048576"),
       ("ARENA_H3_RECV_BUFFERS", "512"),
       ("ARENA_H3_SNDBUF", "2097152"),
@@ -670,6 +696,17 @@ mod knob_tests {
     assert!(!quic.balance() && quic.bodies_round_robin() && quic.flush_in_slot_order());
     assert!(!quic.pacing() && quic.pmtu_probe_after_rtt() && !quic.cid_steering());
     assert_eq!(quic.max_in_flight(), 131_072);
+    assert!(quic.batched_header_protection());
+    // Ruling T18-c: a dynamic table of 4096 bytes and 100 blocked streams, the rest as the library
+    let h3 = H3Params { qpack_max_table_capacity: 4096, qpack_blocked_streams: 100, ..knobs.h3 };
+    assert_eq!(knobs.h3, h3);
+    assert_eq!(
+      H3Params { qpack_max_table_capacity: 0, qpack_blocked_streams: 0, ..h3 },
+      H3Params::default()
+    );
+    let ring = parse(&[("ARENA_H3_HP", "ring"), ("ARENA_H3_QPACK", "0")]).unwrap();
+    assert!(!ring.quic.batched_header_protection());
+    assert_eq!(ring.h3, H3Params::default());
     let udp = knobs.udp;
     assert!(udp.gro);
     assert_eq!(
@@ -684,7 +721,15 @@ mod knob_tests {
     assert!(!kernel.quic.cid_steering() && !kernel.quic.balance());
     // The line that the server prints names every knob
     let line = knobs.line();
-    for name in ["gro=1", "recv_buffers=512", "train=32", "steering=kernel", "data=fresh"] {
+    for name in [
+      "gro=1",
+      "recv_buffers=512",
+      "train=32",
+      "steering=kernel",
+      "data=fresh",
+      "hp=batched",
+      "qpack=4096",
+    ] {
       assert!(line.contains(name), "{line}");
     }
   }
@@ -701,6 +746,8 @@ mod knob_tests {
       ("ARENA_H3_MAX_IN_FLIGHT", "-1"),
       ("ARENA_H3_STEERING", "hash"),
       ("ARENA_H3_FLUSH_ORDER", "random"),
+      ("ARENA_H3_HP", "aesni"),
+      ("ARENA_H3_QPACK", "1024"),
     ] {
       let err = parse(&[(name, value)]).unwrap_err();
       assert!(err.contains(name), "{err}");

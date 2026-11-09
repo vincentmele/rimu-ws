@@ -197,6 +197,7 @@ impl From<QuicLimits> for ConnLimits {
 pub struct QuicParams {
   ack_delay_exponent: u8,
   balance: bool,
+  batched_header_protection: bool,
   bodies_round_robin: bool,
   cid_steering: bool,
   conn_window: u64,
@@ -232,6 +233,17 @@ impl QuicParams {
   #[inline]
   pub const fn balance(&self) -> bool {
     self.balance
+  }
+
+  /// If the header protection of the 1-RTT packets of a flush is computed in batches of up to
+  /// eight packets, with AES-NI, instead of one packet at a time by the crypto backend (ruling
+  /// T18-b). Only AES suites on a CPU with AES-NI batch; ChaCha20, or a CPU without AES-NI, keep
+  /// the backend whatever this says.
+  ///
+  /// Defaults to `false`, one at a time (task 18 measures it).
+  #[inline]
+  pub const fn batched_header_protection(&self) -> bool {
+    self.batched_header_protection
   }
 
   /// If the streams whose next bytes are a body sent by reference take turns, one STREAM frame
@@ -387,6 +399,14 @@ impl QuicParams {
     self
   }
 
+  /// Mutable version of [`Self::batched_header_protection`].
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub const fn set_batched_header_protection(mut self, value: bool) -> Self {
+    self.batched_header_protection = value;
+    self
+  }
+
   /// Mutable version of [`Self::bodies_round_robin`].
   #[inline]
   #[must_use = must_use_itself_doc!()]
@@ -532,6 +552,7 @@ impl QuicParams {
       max_in_flight: self.max_in_flight,
       bodies_round_robin: self.bodies_round_robin,
       pmtu_probe_after_rtt: self.pmtu_probe_after_rtt,
+      batched_hp: self.batched_header_protection,
       limits: self.limits.into(),
       ..ConnParams::default()
     }
@@ -545,6 +566,7 @@ impl Default for QuicParams {
     Self {
       ack_delay_exponent: 3,
       balance: true,
+      batched_header_protection: false,
       bodies_round_robin: false,
       cid_steering: true,
       conn_window: 16 << 20,
@@ -644,6 +666,7 @@ mod tests {
     assert!(!params.flush_in_slot_order());
     assert!(!params.bodies_round_robin());
     assert!(!params.pmtu_probe_after_rtt());
+    assert!(!params.batched_header_protection());
     assert_eq!(params.limits(), &QuicLimits::default());
     assert_eq!(ConnLimits::default(), QuicLimits::default().into());
     // The connections of the defaults have the defaults of a connection
@@ -666,12 +689,16 @@ mod tests {
       (default.max_udp_payload_size, default.pacing, default.max_in_flight, default.limits)
     );
     assert_eq!(
-      (conn.bodies_round_robin, conn.pmtu_probe_after_rtt),
-      (default.bodies_round_robin, default.pmtu_probe_after_rtt)
+      (conn.bodies_round_robin, conn.pmtu_probe_after_rtt, conn.batched_hp),
+      (default.bodies_round_robin, default.pmtu_probe_after_rtt, default.batched_hp)
     );
     // The switches of the measurements of tasks 16 and 19 reach the connections
-    let on = params.set_bodies_round_robin(true).set_pmtu_probe_after_rtt(true).conn_params();
-    assert!(on.bodies_round_robin && on.pmtu_probe_after_rtt);
+    let on = params
+      .set_bodies_round_robin(true)
+      .set_pmtu_probe_after_rtt(true)
+      .set_batched_header_protection(true)
+      .conn_params();
+    assert!(on.bodies_round_robin && on.pmtu_probe_after_rtt && on.batched_hp);
     assert!(params.set_flush_in_slot_order(true).flush_in_slot_order());
   }
 
