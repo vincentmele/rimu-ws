@@ -90,12 +90,15 @@ pub struct H3Params {
   /// The advertised `SETTINGS_QPACK_MAX_TABLE_CAPACITY`: the bytes of the dynamic table that the
   /// encoders of clients may use.
   ///
-  /// Defaults to 0 (no dynamic table) until the measurement of task 18 decides: 0 against 4096
-  /// with 100 blocked streams (ruling T18-c, arena-h2's `ARENA_H3_QPACK`), on EC2.
+  /// Defaults to 0 (no dynamic table), measured (task 18, ruling T18-c, EC2 batch of 9 Nov 2026,
+  /// `docs/benchmarks/pass3.md`): 4096 bytes with 100 blocked streams lost 2.8 % of requests per
+  /// second on HttpArena baseline-h3 (spread 0.4 %), the client spending 3 % more CPU per request
+  /// on its table, for a decode memo hit rate of 100 % either way; static-h3 was unchanged within
+  /// its spread.
   pub qpack_max_table_capacity: u32,
   /// The advertised `SETTINGS_QPACK_BLOCKED_STREAMS`.
   ///
-  /// Defaults to 0.
+  /// Defaults to 0, which goes with no dynamic table.
   pub qpack_blocked_streams: u16,
   /// The advertised `SETTINGS_MAX_FIELD_SECTION_SIZE`, which the field sections of requests are
   /// held to (RFC 9114 section 4.2.2): a request whose head or trailers decode to more is answered

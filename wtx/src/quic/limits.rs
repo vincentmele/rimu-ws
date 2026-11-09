@@ -242,7 +242,11 @@ impl QuicParams {
   /// T18-b). Only AES suites on a CPU with AES-NI batch; ChaCha20, or a CPU without AES-NI, keep
   /// the backend whatever this says.
   ///
-  /// Defaults to `false`, one at a time (task 18 measures it).
+  /// Defaults to `false`, one at a time, measured (task 18, EC2 batch of 9 Nov 2026,
+  /// `docs/benchmarks/pass3.md`): neutral on HttpArena baseline-h3 (-0.4 % requests per second,
+  /// -0.3 % server CPU per request, within the spread); on static-h3 +0.9 % requests per second and
+  /// -12 % CPU per request, but within that run's CPU spread of 20-26 %, so not a win by the plan's
+  /// rule. A quieter static-h3 measurement may revisit it.
   #[inline]
   pub const fn batched_header_protection(&self) -> bool {
     self.batched_header_protection

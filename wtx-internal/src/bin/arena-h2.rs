@@ -36,8 +36,8 @@
 //! | `ARENA_H3_PACING` | `0`, `1` | `1` | `QuicParams::set_pacing` |
 //! | `ARENA_H3_PMTU_PROBE` | `now`, `rtt` | `now` | `QuicParams::set_pmtu_probe_after_rtt` (`rtt`: the first probe one smoothed RTT after the handshake) |
 //! | `ARENA_H3_BODIES` | `complete`, `round-robin` | `complete` | `QuicParams::set_bodies_round_robin` (bodies by reference: one to its end, or a frame each in turn) |
-//! | `ARENA_H3_HP` | `ring`, `batched` | `ring` | `QuicParams::set_batched_header_protection` (`batched`: the masks of the 1-RTT packets of a flush eight at a time on AES-NI, task 18; ChaCha20 and CPUs without AES-NI stay one at a time) |
-//! | `ARENA_H3_QPACK` | `0`, `4096` | `0` | `H3Params::qpack_max_table_capacity` and `qpack_blocked_streams`: `0` none (the library default), `4096` a dynamic table of 4096 bytes with 100 blocked streams (task 18, ruling T18-c) |
+//! | `ARENA_H3_HP` | `ring`, `batched` | `ring` | `QuicParams::set_batched_header_protection` (`batched`: the masks of the 1-RTT packets of a flush eight at a time on AES-NI, task 18; ChaCha20 and CPUs without AES-NI stay one at a time; measured: no win, `ring` stays, pass3.md) |
+//! | `ARENA_H3_QPACK` | `0`, `4096` | `0` | `H3Params::qpack_max_table_capacity` and `qpack_blocked_streams`: `0` none (the library default), `4096` a dynamic table of 4096 bytes with 100 blocked streams (task 18, ruling T18-c; measured: a loss on baseline-h3, `0` stays, pass3.md) |
 //! | `ARENA_H3_ZC` | `0`, `1` | `0` | `UdpParams::zerocopy` (`1`: trains sent with `IORING_OP_SENDMSG_ZC`, each kept until its notification; a kernel that refuses falls back to copying, counted; task 19, ruling T19-b) |
 //! | `ARENA_H3_PACING_BURST` | 1 to 64 | 64 | `QuicParams::set_pacing_burst` (datagrams the pacer lets go at once; task 19, ruling T19-c) |
 //! | `ARENA_H3_REPEAT_ACK` | `0`, `1` | `1` | `QuicParams::set_repeat_ack` (`1`: a flush with stream data repeats an acknowledgment the client may lack; task 19, ruling T19-d) |

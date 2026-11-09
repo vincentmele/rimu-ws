@@ -1376,3 +1376,14 @@ fn waiting_bytes_over_the_buffer_budget_get_413() {
     assert_eq!(server_close(&net, client), None);
   }
 }
+
+// Task 18 (ruling T18-c): the defaults are the measured ones; no QPACK dynamic table (4096 bytes
+// lost 2.8 % on baseline-h3, docs/benchmarks/pass3.md), and the limits of task 13.
+#[test]
+fn h3_params_defaults_are_the_measured_ones() {
+  let params = H3Params::default();
+  assert_eq!((params.qpack_max_table_capacity, params.qpack_blocked_streams), (0, 0));
+  assert_eq!(params.max_field_section_size, 16 * 1024);
+  assert_eq!(params.max_request_body, 1 << 20);
+  assert_eq!(params.max_buffered_body_per_conn, 16 << 20);
+}
