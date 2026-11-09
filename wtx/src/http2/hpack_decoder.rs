@@ -1,11 +1,13 @@
 use crate::{
   collections::VectorUsize,
-  http::{_HeaderNameBuffer, HeaderName, KnownHeaderName, Method, Protocol, StatusCode},
+  http::{
+    _HeaderNameBuffer, HeaderName, KnownHeaderName, Method, Protocol, StatusCode,
+    huffman::huffman_decode,
+  },
   http2::{
     Http2Error, Http2ErrorCode,
     hpack_header::{HpackHeaderBasic, HpackHeaderName},
     hpack_headers::HpackHeaders,
-    huffman::huffman_decode,
     misc::protocol_err,
   },
   misc::{Usize, from_utf8_basic},
@@ -392,5 +394,44 @@ impl TryFrom<u8> for DecodeIdx {
         }
       }
     })
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use crate::{
+    collections::VectorUsize,
+    http::huffman::{huffman_decode, huffman_encode},
+    http2::hpack_decoder::HpackDecoder,
+  };
+  use alloc::{string::String, vec::Vec};
+
+  // HPACK reads its Huffman strings through the module shared with QPACK: the RFC 7541 C.4.1
+  // string codes both ways and the C.4.1 header block decodes.
+  #[test]
+  fn huffman_moved_http2_tests_still_pass() {
+    let coded = hexd!(b"f1e3c2e5f23a6ba0ab90f4ff");
+    let mut decoded = VectorUsize::new();
+    huffman_decode(&coded, &mut decoded).unwrap();
+    assert_eq!(decoded.as_slice(), b"www.example.com");
+    let mut encoded = VectorUsize::new();
+    huffman_encode(b"www.example.com", &mut encoded).unwrap();
+    assert_eq!(encoded.as_slice(), &coded);
+
+    let mut dec = HpackDecoder::new();
+    dec.set_max_bytes(4096);
+    let mut fields: Vec<(String, String)> = Vec::new();
+    dec
+      .decode(&hexd!(b"828684418cf1e3c2e5f23a6ba0ab90f4ff"), |(_, name, value)| {
+        fields.push((name.str().into(), value.into()));
+        Ok(())
+      })
+      .unwrap();
+    let expected =
+      [(":method", "GET"), (":scheme", "http"), (":path", "/"), (":authority", "www.example.com")];
+    assert_eq!(fields.len(), expected.len());
+    for ((name, value), (expected_name, expected_value)) in fields.iter().zip(expected) {
+      assert_eq!((name.as_str(), value.as_str()), (expected_name, expected_value));
+    }
   }
 }

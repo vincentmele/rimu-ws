@@ -62,9 +62,7 @@ mod http2_buffer;
 mod http2_error;
 mod http2_error_code;
 mod http2_status;
-mod huffman;
-mod huffman_tables;
-mod misc;
+pub(crate) mod misc;
 mod ping_frame;
 #[allow(
   dead_code,

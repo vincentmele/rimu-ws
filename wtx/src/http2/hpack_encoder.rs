@@ -10,10 +10,9 @@
 
 use crate::{
   collections::VectorUsize,
-  http::{Header, KnownHeaderName, Method, StatusCode},
+  http::{Header, KnownHeaderName, Method, StatusCode, huffman::huffman_encode},
   http2::{
-    Http2Error, hpack_header::HpackHeaderBasic, hpack_headers::HpackHeaders,
-    huffman::huffman_encode, misc::protocol_err,
+    Http2Error, hpack_header::HpackHeaderBasic, hpack_headers::HpackHeaders, misc::protocol_err,
   },
   misc::{Usize, bytes_transfer::shift_copyable_chunks, random_state, unlikely_unreachable},
   rng::Rng,

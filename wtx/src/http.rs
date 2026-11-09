@@ -18,6 +18,14 @@ pub mod http2_server_framework;
 mod http_client;
 mod http_error;
 mod http_recv_params;
+#[cfg(any(feature = "http2", feature = "http3"))]
+#[cfg_attr(
+  not(feature = "http2"),
+  allow(dead_code, reason = "QPACK writes its literals raw, only HPACK encodes Huffman strings")
+)]
+pub(crate) mod huffman;
+#[cfg(any(feature = "http2", feature = "http3"))]
+mod huffman_tables;
 mod method;
 mod mime;
 mod misc;
@@ -25,6 +33,9 @@ mod msg_buffer;
 mod msg_builder;
 mod msg_data;
 mod operation_mode;
+#[allow(dead_code, reason = "the HTTP/3 connection of task 13 runs the QPACK codecs")]
+#[cfg(feature = "http3")]
+pub(crate) mod prefix_int;
 mod protocol;
 mod request;
 mod response;

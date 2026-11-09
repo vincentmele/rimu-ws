@@ -327,6 +327,12 @@ pub enum Error {
   /// Non-fatal HTTP/2 stream error
   #[cfg(feature = "http2")]
   Http2FlowControl(crate::http2::Http2Error, u32),
+  /// An HTTP/3 element is invalid or could not be written. Nothing is closed because of it.
+  #[cfg(feature = "http3")]
+  Http3(crate::http3::Http3Error),
+  /// An HTTP/3 connection must be closed with the HTTP/3 or QPACK error code.
+  #[cfg(feature = "http3")]
+  Http3Close(crate::http3::H3ErrorCode, crate::http3::Http3Error),
   #[doc = associated_element_doc!()]
   Net(crate::net::NetError),
   #[cfg(feature = "postgres")]
