@@ -1070,6 +1070,8 @@ fn endpoint_sums_the_counters_of_the_measurement() {
   // Ruling T19-a: every flush that finished a response and owed an acknowledgment carried it;
   // the datagram bytes and the stream bytes of the responses, written by copy, are summed
   assert_eq!(stats.fin_flushes_ack_owed - before.fin_flushes_ack_owed, flushes, "{stats:?}");
+  let owed_acked = stats.fin_flushes_owed_and_acked - before.fin_flushes_owed_and_acked;
+  assert_eq!(owed_acked, flushes, "{stats:?}");
   let response = RESPONSE.len() as u64;
   assert_eq!(stats.stream_bytes_out - before.stream_bytes_out, 4 * 64 * response, "{stats:?}");
   assert_eq!(stats.stream_bytes_copied - before.stream_bytes_copied, 4 * 64 * response);

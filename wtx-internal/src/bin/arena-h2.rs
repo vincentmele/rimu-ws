@@ -431,14 +431,20 @@ mod stats_signals {
     });
   }
 
-  #[derive(Default)]
-  struct Counters([u64; 32]);
+  struct Counters([u64; 33]);
+
+  // Arrays of more than 32 elements have no `Default`
+  impl Default for Counters {
+    fn default() -> Self {
+      Self([0; 33])
+    }
+  }
 
   impl Counters {
     // The first twelve as before task 16, then the counters of spec section 2.1 (ruling T16-c),
     // then the QPACK sections decoded and those the decode memo replayed (ruling T18-c), then the
     // transfer counters of task 19 (ruling T19-a)
-    const NAMES: [&'static str; 32] = [
+    const NAMES: [&'static str; 33] = [
       "conns",
       "requests",
       "datagrams_in",
@@ -471,6 +477,7 @@ mod stats_signals {
       "zc_sends",
       "zc_copied",
       "zc_fallbacks",
+      "fin_flushes_owed_and_acked",
     ];
 
     fn of(worker: &Http3WorkerStats) -> Self {
@@ -507,6 +514,7 @@ mod stats_signals {
         worker.zc_sends,
         worker.zc_copied,
         worker.zc_fallbacks,
+        worker.fin_flushes_owed_and_acked,
       ])
     }
 

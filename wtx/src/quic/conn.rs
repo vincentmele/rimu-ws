@@ -327,7 +327,10 @@ pub(crate) struct ConnStats {
   /// carried it was acknowledged (ruling T19-d). With [`ConnParams::repeat_ack`] each of them
   /// carries an ACK frame.
   pub(crate) fin_flushes_ack_owed: u64,
-  /// Times the pacer held a packet in flight back: a flush that stopped for it.
+  /// Of [`Self::fin_flushes_ack_owed`], those that carried an ACK frame: over the owed ones, a
+  /// share that can not exceed 1.
+  pub(crate) fin_flushes_owed_and_acked: u64,
+  /// Flushes that stopped with ack-eliciting data that the pacer held back.
   pub(crate) pacer_holds: u64,
   /// DATA_BLOCKED frames received.
   pub(crate) data_blocked_in: u64,
@@ -358,6 +361,7 @@ impl ConnStats {
     fin_flushes: 0,
     fin_flushes_acked: 0,
     fin_flushes_ack_owed: 0,
+    fin_flushes_owed_and_acked: 0,
     pacer_holds: 0,
     data_blocked_in: 0,
     stream_data_blocked_in: 0,
@@ -593,6 +597,8 @@ where
         el.fin_flushes = el.fin_flushes.wrapping_add(1);
         el.fin_flushes_acked = el.fin_flushes_acked.wrapping_add(u64::from(acked));
         el.fin_flushes_ack_owed = el.fin_flushes_ack_owed.wrapping_add(u64::from(ack_owed));
+        let owed_and_acked = u64::from(ack_owed && acked);
+        el.fin_flushes_owed_and_acked = el.fin_flushes_owed_and_acked.wrapping_add(owed_and_acked);
       });
     }
     if self.recovery.timer_stale {
@@ -695,6 +701,11 @@ where
       match self.write_datagram(now_us, buffer, hp_at, pools) {
         Ok(0) => {
           pools.hp_batch.truncate(waiting);
+          // Something ack-eliciting was wanted (an acknowledgment alone would have gone) and the
+          // pacer held it back
+          if self.recovery.pacer_release_us.is_some() {
+            self.count(|el| el.pacer_holds = el.pacer_holds.wrapping_add(1));
+          }
           return if short { FlushOutcome::ArenaFull } else { FlushOutcome::Done };
         }
         Ok(len) => {
@@ -1340,9 +1351,6 @@ where
     let release =
       self.recovery.pacer.release_time(now_us, len, (window, srtt), self.max_datagram, burst);
     self.recovery.pacer_release_us = release;
-    if release.is_some() {
-      self.count(|el| el.pacer_holds = el.pacer_holds.wrapping_add(1));
-    }
     release.is_none()
   }
 
@@ -5316,7 +5324,9 @@ mod tests {
         after.fin_flushes_acked - before.fin_flushes_acked,
       );
       let owed = after.fin_flushes_ack_owed - before.fin_flushes_ack_owed;
+      let owed_acked = after.fin_flushes_owed_and_acked - before.fin_flushes_owed_and_acked;
       assert_eq!(flushes, 1, "repeat {repeat}");
+      assert_eq!(owed_acked, if repeat { owed } else { 0 }, "repeat {repeat}");
       // The flush that finished the response owed the acknowledgment and did not carry it, or
       // carried every one it owed: the first flush after the loss repeated it, and the client
       // may have confirmed it before the last one
@@ -5335,6 +5345,51 @@ mod tests {
         assert!(!link.server.conn.data.recv.ack_unconfirmed());
       }
     }
+  }
+
+  // Ruling T19-a (review): a pacer hold counts a flush that stopped with ack-eliciting data held
+  // back, not one that had only an acknowledgment to send, which the pacer never holds.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn pacer_holds_count_only_data_held_back() {
+    const SMALL: &[u8] = &[1; 100];
+    let body = crate::misc::SharedBytes::from_slice(&[2; 4000]);
+    let mut opts = LinkOpts::new(None);
+    opts.server.pacing_burst = 1;
+    let body = BodyRef::new(body, 0..4000).unwrap();
+    opts.server_app = TestApp::new(Behavior::Mixed { small: SMALL, body, large: SMALL });
+    let mut link = settled(&opts);
+    // A smoothed RTT that paces (the fake clock gives none) and a clock that stands still
+    link.server.conn.recovery.rtt.smoothed_us = 10_000;
+    let holds = |link: &Link| link.server.conn.stats().pacer_holds;
+    let request = |link: &mut Link| {
+      let now_us = link.now_us;
+      let _id = link
+        .client
+        .with_ctx(now_us, |cx| {
+          let id = cx.open_bidi()?;
+          cx.write(id, b"GET /", true)
+        })
+        .unwrap();
+      let _ = link.client.flush(link.now_us);
+      assert_eq!(link.deliver_to_server(), 1);
+      let _ = link.server.flush(link.now_us);
+      link.server.take_datagrams().len()
+    };
+    // One datagram of response: the bucket of one datagram is spent, nothing waits
+    assert_eq!(request(&mut link), 1);
+    assert_eq!(holds(&link), 0);
+    // A PING to acknowledge: the ACK goes alone, which the pacer does not hold
+    link.client.conn.queue_test_frames(&PING);
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
+    let _ = link.server.flush(link.now_us);
+    assert_eq!(link.server.take_datagrams().len(), 1);
+    assert_eq!(holds(&link), 0);
+    // A body of three datagrams, held back at once (the ACK of its request goes alone): one flush
+    // that stops
+    let _ = request(&mut link);
+    assert_eq!(holds(&link), 1);
   }
 
   // Ruling T19-d (review): the repeated acknowledgment stays only in a packet that carries an

@@ -622,6 +622,7 @@ fn baseline2_route_answers_2() {
   assert!(worker.stream_bytes_out > 0 && worker.stream_bytes_out < worker.bytes_out, "{worker:?}");
   assert!(worker.stream_bytes_copied > 0, "{worker:?}");
   assert_eq!(worker.fin_flushes_acked, worker.fin_flushes_ack_owed, "{worker:?}");
+  assert_eq!(worker.fin_flushes_owed_and_acked, worker.fin_flushes_ack_owed, "{worker:?}");
   assert_eq!((worker.zc_sends, worker.zc_fallbacks), (0, 0), "{worker:?}");
   assert_eq!(client.conn.state(), ConnState::Confirmed);
   assert!(served.errors().is_empty(), "{:?}", served.errors());
@@ -1508,8 +1509,8 @@ fn qpack_sections_and_memo_hits_are_counted() {
 }
 
 // Ruling T16-c: every counter of a worker, the ones of the measurement of spec section 2.1 (and
-// task 18's QPACK counters, task 19's transfer counters) included, comes back from the cell that the worker stores it in as it
-// was stored.
+// task 18's QPACK counters, task 19's transfer counters) included, comes back from the cell that
+// the worker stores it in as it was stored.
 #[test]
 fn worker_stats_round_trip_through_their_cell() {
   let stats = Http3WorkerStats {
@@ -1523,6 +1524,7 @@ fn worker_stats_round_trip_through_their_cell() {
     fin_flushes: 6,
     fin_flushes_ack_owed: 28,
     fin_flushes_acked: 7,
+    fin_flushes_owed_and_acked: 36,
     fins_out: 8,
     forward_dropped: 9,
     forwarded: 10,

@@ -127,13 +127,15 @@ pub(crate) struct EndpointStats {
   pub(crate) fin_flushes_acked: u64,
   /// Of [`Self::fin_flushes`], those that started with an acknowledgment owed (ruling T19-d).
   pub(crate) fin_flushes_ack_owed: u64,
+  /// Of [`Self::fin_flushes_ack_owed`], those that carried an ACK frame.
+  pub(crate) fin_flushes_owed_and_acked: u64,
   /// Bytes of the datagrams sent.
   pub(crate) bytes_out: u64,
   /// Bytes of stream data written into packets, those sent again included (ruling T19-a).
   pub(crate) stream_bytes_out: u64,
   /// Bytes that applications wrote to streams by copy (ruling T19-a).
   pub(crate) stream_bytes_copied: u64,
-  /// Times the pacer held a packet back.
+  /// Flushes that stopped with ack-eliciting data that the pacer held back.
   pub(crate) pacer_holds: u64,
   /// DATA_BLOCKED frames received.
   pub(crate) data_blocked_in: u64,
@@ -1157,10 +1159,10 @@ where
 /// what grew since the last one added to [`EndpointStats`]. What a connection counts after its
 /// last flush (a frame received just before it closes) is not summed.
 #[derive(Clone, Copy, Debug)]
-struct Tally([u64; 17]);
+struct Tally([u64; 18]);
 
 impl Tally {
-  const ZERO: Self = Self([0; 17]);
+  const ZERO: Self = Self([0; 18]);
 
   fn of<A, RNG, TCX>(conn: &QuicConn<A, RNG, TCX>) -> Self
   where
@@ -1189,6 +1191,7 @@ impl Tally {
       stream_bytes_out,
       stream_bytes_copied,
       el.pacer_holds,
+      el.fin_flushes_owed_and_acked,
     ])
   }
 
@@ -1212,6 +1215,7 @@ impl Tally {
       &mut stats.stream_bytes_out,
       &mut stats.stream_bytes_copied,
       &mut stats.pacer_holds,
+      &mut stats.fin_flushes_owed_and_acked,
     ];
     for ((field, now), then) in fields.into_iter().zip(self.0).zip(before.0) {
       *field = field.wrapping_add(now.wrapping_sub(then));

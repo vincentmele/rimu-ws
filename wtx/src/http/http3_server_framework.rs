@@ -69,6 +69,9 @@ pub struct Http3WorkerStats {
   /// with the acknowledgment of the requests they answer (spec section 2.1: all of those that owe
   /// one, [`Self::fin_flushes_ack_owed`]).
   pub fin_flushes_acked: u64,
+  /// Of [`Self::fin_flushes_ack_owed`], those that carried an ACK frame: over the owed ones, the
+  /// share of owed acknowledgments carried, at most 1 (target 1).
+  pub fin_flushes_owed_and_acked: u64,
   /// STREAM frames sent with the FIN of their stream, the first time: responses finished.
   /// Responses per packet are this over [`Self::packets_out`] (spec section 2.1).
   pub fins_out: u64,
@@ -83,7 +86,7 @@ pub struct Http3WorkerStats {
   pub handler_panics: u64,
   /// Times the pools of the worker were trimmed after it had no connection for a while.
   pub idle_trims: u64,
-  /// Times the pacer held a packet back, which ended a flush (ruling T19-c).
+  /// Flushes that stopped with ack-eliciting data that the pacer held back (ruling T19-c).
   pub pacer_holds: u64,
   /// Packets declared lost.
   pub packets_lost: u64,
@@ -187,7 +190,7 @@ impl Default for StatsCell {
 }
 
 impl StatsCell {
-  const LEN: usize = 35;
+  const LEN: usize = 36;
 
   fn load(&self) -> Http3WorkerStats {
     let mut values = [0u64; Self::LEN];
@@ -204,6 +207,7 @@ impl StatsCell {
       fin_flushes,
       fin_flushes_ack_owed,
       fin_flushes_acked,
+      fin_flushes_owed_and_acked,
       fins_out,
       forward_dropped,
       forwarded,
@@ -242,6 +246,7 @@ impl StatsCell {
       fin_flushes,
       fin_flushes_ack_owed,
       fin_flushes_acked,
+      fin_flushes_owed_and_acked,
       fins_out,
       forward_dropped,
       forwarded,
@@ -283,6 +288,7 @@ impl StatsCell {
       stats.fin_flushes,
       stats.fin_flushes_ack_owed,
       stats.fin_flushes_acked,
+      stats.fin_flushes_owed_and_acked,
       stats.fins_out,
       stats.forward_dropped,
       stats.forwarded,

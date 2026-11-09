@@ -681,6 +681,7 @@ where
       fin_flushes: endpoint.fin_flushes,
       fin_flushes_ack_owed: endpoint.fin_flushes_ack_owed,
       fin_flushes_acked: endpoint.fin_flushes_acked,
+      fin_flushes_owed_and_acked: endpoint.fin_flushes_owed_and_acked,
       fins_out: endpoint.fins_out,
       forwarded: endpoint.forwarded,
       forward_dropped: self.forward_dropped,

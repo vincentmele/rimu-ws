@@ -22,13 +22,16 @@
 //! the kernel sends from the bytes of the arena, which it pins, instead of copying them into pages
 //! of its own (which it zeroes first under `init_on_alloc`). It reads them until the send's
 //! notification (`IORING_CQE_F_NOTIF`), which follows the completion of the send itself: a train
-//! is given back to the arena, and its slot freed, only once both arrived ([`SendWait`]), so that no
-//! byte of a train the kernel may still read is written again. A ring that does not know the
-//! operation, or a first zero-copy send that the kernel refuses (`EOPNOTSUPP`, `EINVAL`, or
-//! `ENOMEM` for the pinned pages over `RLIMIT_MEMLOCK`), turns it off for the socket, which then
-//! copies; each such fallback is counted ([`UdpStats::zc_fallbacks`]). The kernel may copy anyway
-//! (for a loopback peer it copies on delivery), which each notification reports
-//! ([`UdpStats::zc_copied`]).
+//! is given back to the arena, and its slot freed, only once both arrived ([`SendWait`]), so that
+//! no byte of a train the kernel may still read is written again. A ring that does not know the
+//! operation, a zero-copy send that the kernel refuses (`EOPNOTSUPP`), or a first zero-copy result
+//! of `EINVAL` or `ENOMEM` (the pinned pages over `RLIMIT_MEMLOCK`), turns it off for the socket,
+//! which then copies; each such fallback is counted ([`UdpStats::zc_fallbacks`]). The kernel may
+//! copy anyway (for a loopback peer it copies on delivery), which each notification reports
+//! ([`UdpStats::zc_copied`]). A socket closes only once every notification arrived; a runtime that
+//! is dropped with notifications outstanding (teardown only) closes the ring first, and the kernel
+//! keeps its own references to the pinned pages until it is done with them, whatever becomes of the
+//! arena.
 //!
 //! The datagrams that other workers forward to this one (spec section 5.11) arrive through the
 //! socket's [`UdpInbox`], whose pushes wake the socket's ring with an `IORING_OP_MSG_RING` sent
@@ -826,6 +829,8 @@ struct UdpShared {
   sends_inflight: Cell<u32>,
   // Trains go zero-copy: asked for, and not refused so far
   zerocopy: Cell<bool>,
+  // A result of a zero-copy send arrived
+  zc_results: Cell<bool>,
   // ---- closing
   closing: Cell<bool>,
   cancel_sent: Cell<bool>,
@@ -1019,7 +1024,9 @@ struct UdpEntry {
 impl UdpTable {
   /// Closes the sockets still open, when their runtime goes. The ring, dropped right after,
   /// takes what is in flight with it; the table, dropped after the ring, keeps what the kernel
-  /// was given of them until then.
+  /// was given of them until then. A zero-copy train whose notification did not arrive is the
+  /// only thing that may outlive that: the kernel holds references to its pinned pages until it
+  /// is done with them, so freeing the arena then is safe, if the bytes still leaving may change.
   pub(super) fn close_all(&mut self) {
     for shared in self.entries.get_mut().iter().filter_map(|el| el.socket.as_ref()) {
       // Its ring descriptor goes with the runtime
@@ -1188,6 +1195,7 @@ impl Reactor {
       sends: RefCell::new(sends),
       sends_inflight: Cell::new(0),
       zerocopy: Cell::new(zerocopy),
+      zc_results: Cell::new(false),
       closing: Cell::new(false),
       cancel_sent: Cell::new(false),
       inbox,
@@ -1259,15 +1267,6 @@ impl Reactor {
     };
     let counters = &shared.counters;
     let notification = cqueue::notif(flags);
-    if notification {
-      bump(&counters.zc_notifications);
-      if res.cast_unsigned() & NOTIF_USAGE_ZC_COPIED != 0 {
-        bump(&counters.zc_copied);
-      }
-    } else if res < 0 {
-      core::hint::cold_path();
-      bump(&counters.send_errors);
-    }
     let done = shared.sends.borrow_mut().complete(slot_idx, flags);
     let (released, zc) = match done {
       // A slot that holds no train is already free: a second entry on the free list would give
@@ -1279,11 +1278,25 @@ impl Reactor {
       SendDone::Waits { zc } => (None, zc),
       SendDone::Released { id, zc } => (Some(id), zc),
     };
-    // The result of a refused zero-copy send turns zero-copy off, whether a notification follows
-    // or not
-    if zc && !notification && zc_refused(res) && shared.zerocopy.replace(false) {
-      core::hint::cold_path();
-      bump(&counters.zc_fallbacks);
+    if notification {
+      bump(&counters.zc_notifications);
+      if res.cast_unsigned() & NOTIF_USAGE_ZC_COPIED != 0 {
+        bump(&counters.zc_copied);
+      }
+    } else {
+      if res < 0 {
+        core::hint::cold_path();
+        bump(&counters.send_errors);
+      }
+      // The result of a refused zero-copy send turns zero-copy off, whether a notification
+      // follows or not
+      if zc {
+        let first = !shared.zc_results.replace(true);
+        if zc_refused(res, first) && shared.zerocopy.replace(false) {
+          core::hint::cold_path();
+          bump(&counters.zc_fallbacks);
+        }
+      }
     }
     let Some(id) = released else {
       return;
@@ -1355,10 +1368,16 @@ impl Reactor {
 }
 
 /// If the result of a zero-copy send says that the kernel does not take zero-copy sends from this
-/// socket: the operation or its flags unknown, the socket unable to, or the pinned pages over the
-/// limit.
-fn zc_refused(res: i32) -> bool {
-  matches!(-res, libc::EOPNOTSUPP | libc::EINVAL | libc::ENOMEM)
+/// socket: the socket unable to (`EOPNOTSUPP`, whenever it comes), or, as the `first` zero-copy
+/// result of the socket, the operation or its flags unknown (`EINVAL`) or the pinned pages over the
+/// limit (`ENOMEM`). After a zero-copy send went, those two are a packet's failure or a passing
+/// shortage, which QUIC's loss recovery covers, and zero-copy stays on.
+fn zc_refused(res: i32, first: bool) -> bool {
+  match -res {
+    libc::EOPNOTSUPP => true,
+    libc::EINVAL | libc::ENOMEM => first,
+    _ => false,
+  }
 }
 
 /// The number of receive buffers and the length of each, the room before the payload included,
@@ -1889,35 +1908,49 @@ mod tests {
     }
   }
 
+  // The flags of a CQE (`IORING_CQE_F_MORE`, `IORING_CQE_F_NOTIF`)
+  const MORE_FLAG: u32 = 1 << 1;
+  const NOTIF_FLAG: u32 = 1 << 3;
+
+  // `bytes` to `peer` as one train in flight as a zero-copy send that was never submitted: the
+  // completions of a test stand in for the kernel's. Returns the user data of the send.
+  fn fake_zero_copy_send(sock: &UringUdpSocket, peer: SocketAddr, bytes: &[u8]) -> u32 {
+    let shared = &*sock.shared;
+    queue(sock, peer, None, bytes);
+    let id = sock.tx().pending().next().unwrap().id;
+    let slot_idx = {
+      let mut sends = shared.sends.borrow_mut();
+      let slot_idx = sends.free.pop().unwrap();
+      sends.slots[usize::from(slot_idx)].start(id, true);
+      slot_idx
+    };
+    sock.tx().mark_submitted(id);
+    shared.sends_inflight.set(shared.sends_inflight.get() + 1);
+    (u32::from(slot_idx) << 16) | sock.idx
+  }
+
+  // A completion of the send `packed` of `sock`, as the kernel's would arrive.
+  fn complete(sock: &UringUdpSocket, packed: u32, res: i32, flags: u32) {
+    crate::executor::uring_executor::with_reactor(|reactor| {
+      reactor.on_udp_send(packed, sock.generation, res, flags);
+      Ok(())
+    })
+    .unwrap();
+  }
+
   fn refused_zero_copy_send(more: bool) {
     let receiver = std_socket("127.0.0.1:0");
     let peer = receiver.local_addr().unwrap();
     UringRuntime::new().unwrap().block_on(async {
       let sock = UringUdpSocket::bind(V4, &UdpParams { zerocopy: true, ..params() }).unwrap();
       let shared = &*sock.shared;
-      queue(&sock, peer, None, b"refused");
-      let id = sock.tx().pending().next().unwrap().id;
-      let slot_idx = {
-        let mut sends = shared.sends.borrow_mut();
-        let slot_idx = sends.free.pop().unwrap();
-        sends.slots[usize::from(slot_idx)].start(id, true);
-        slot_idx
-      };
-      sock.tx().mark_submitted(id);
-      shared.sends_inflight.set(1);
-      let packed = (u32::from(slot_idx) << 16) | sock.idx;
-      let (more_flag, notif_flag) = (1 << 1, 1 << 3);
-      crate::executor::uring_executor::with_reactor(|reactor| {
-        let flags = if more { more_flag } else { 0 };
-        reactor.on_udp_send(packed, sock.generation, -libc::EOPNOTSUPP, flags);
-        assert!(!shared.zerocopy.get(), "more {more}");
-        assert_eq!(shared.sends_inflight.get(), u32::from(more));
-        if more {
-          reactor.on_udp_send(packed, sock.generation, 0, notif_flag);
-        }
-        Ok(())
-      })
-      .unwrap();
+      let packed = fake_zero_copy_send(&sock, peer, b"refused");
+      complete(&sock, packed, -libc::EOPNOTSUPP, if more { MORE_FLAG } else { 0 });
+      assert!(!shared.zerocopy.get(), "more {more}");
+      assert_eq!(shared.sends_inflight.get(), u32::from(more));
+      if more {
+        complete(&sock, packed, 0, NOTIF_FLAG);
+      }
       assert_eq!(shared.sends_inflight.get(), 0);
       assert!(sock.tx().begin(peer, None, 65_507).is_some());
       send(&sock, peer, None, b"copied");
@@ -1928,6 +1961,59 @@ mod tests {
     let mut buffer = [0; 16];
     let (len, _) = receiver.recv_from(&mut buffer).unwrap();
     assert_eq!(&buffer[..len], b"copied");
+  }
+
+  // Ruling T19-b (review): once zero-copy sends went, a send that fails with EINVAL or ENOMEM (a
+  // bad packet, memory short for a moment) counts as failed and leaves zero-copy on; EOPNOTSUPP
+  // turns it off whenever it comes. A first result of ENOMEM (the pinned pages over the limit)
+  // turns it off too.
+  #[test]
+  fn zero_copy_goes_off_for_a_refusal_not_for_a_failed_packet() {
+    let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9);
+    UringRuntime::new().unwrap().block_on(async {
+      let sock = UringUdpSocket::bind(V4, &UdpParams { zerocopy: true, ..params() }).unwrap();
+      let shared = &*sock.shared;
+      let packed = fake_zero_copy_send(&sock, peer, b"sent");
+      complete(&sock, packed, 4, MORE_FLAG);
+      complete(&sock, packed, 0, NOTIF_FLAG);
+      for errno in [libc::EINVAL, libc::ENOMEM] {
+        let packed = fake_zero_copy_send(&sock, peer, b"failed");
+        complete(&sock, packed, -errno, 0);
+        assert!(shared.zerocopy.get(), "errno {errno}");
+      }
+      let packed = fake_zero_copy_send(&sock, peer, b"refused");
+      complete(&sock, packed, -libc::EOPNOTSUPP, 0);
+      assert!(!shared.zerocopy.get());
+      let stats = sock.stats();
+      assert_eq!((stats.send_errors, stats.zc_fallbacks), (3, 1), "{stats:?}");
+      assert_eq!(shared.sends_inflight.get(), 0);
+      let first = UringUdpSocket::bind(V4, &UdpParams { zerocopy: true, ..params() }).unwrap();
+      let packed = fake_zero_copy_send(&first, peer, b"pinned");
+      complete(&first, packed, -libc::ENOMEM, 0);
+      assert!(!first.shared.zerocopy.get());
+      assert_eq!(first.stats().zc_fallbacks, 1);
+    });
+  }
+
+  // Ruling T19-b (review), at the level of the completions: with an arena of one train, the
+  // completion of a zero-copy send leaves its bytes the kernel's (the arena has no room), and the
+  // notification gives them back.
+  #[test]
+  fn a_zero_copy_train_goes_back_only_with_its_notification() {
+    let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9);
+    UringRuntime::new().unwrap().block_on(async {
+      let params = UdpParams { zerocopy: true, tx_arena_bytes: 2000, ..params() };
+      let sock = UringUdpSocket::bind(V4, &params).unwrap();
+      let packed = fake_zero_copy_send(&sock, peer, &[7; 2000]);
+      complete(&sock, packed, 2000, MORE_FLAG);
+      assert!(sock.tx().begin(peer, None, 1).is_none());
+      assert_eq!(sock.shared.sends_inflight.get(), 1);
+      complete(&sock, packed, 0, NOTIF_FLAG);
+      assert!(sock.tx().begin(peer, None, 2000).is_some());
+      assert_eq!(sock.shared.sends_inflight.get(), 0);
+      let stats = sock.stats();
+      assert_eq!((stats.zc_notifications, stats.send_errors), (1, 0), "{stats:?}");
+    });
   }
 
   // One datagram written into the arena; it joins the newest train if it can.
@@ -2465,11 +2551,17 @@ mod tests {
       let before = free();
       crate::executor::uring_executor::with_reactor(|reactor| {
         reactor.on_udp_send((7 << 16) | sock.idx, sock.generation, 0, 0);
+        // Nor does a stray failure or notification count (task 19 review)
+        reactor.on_udp_send((7 << 16) | sock.idx, sock.generation, -libc::EIO, 0);
+        reactor.on_udp_send((7 << 16) | sock.idx, sock.generation, i32::MIN, 1 << 3);
         Ok(())
       })
       .unwrap();
       assert_eq!(free(), before);
       assert_eq!(sock.shared.sends_inflight.get(), 0);
+      let stats = sock.stats();
+      let counted = (stats.send_errors, stats.zc_notifications, stats.zc_copied);
+      assert_eq!(counted, (0, 0, 0), "{stats:?}");
     });
   }
 
