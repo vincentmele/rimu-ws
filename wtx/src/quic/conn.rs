@@ -952,11 +952,11 @@ where
     self.cold.as_deref().map_or(&ConnStats::EMPTY, |el| &el.stats)
   }
 
-  /// STREAM frames sent with the FIN of their stream the first time, and STREAM frames sent
-  /// again.
+  /// STREAM frames sent with the FIN of their stream the first time, STREAM frames sent again,
+  /// and those of them that carried bytes already acknowledged.
   #[inline]
-  pub(crate) fn stream_tally(&self) -> (u64, u64) {
-    (self.streams.fins_out(), self.streams.frames_resent())
+  pub(crate) fn stream_tally(&self) -> (u64, u64, u64) {
+    (self.streams.fins_out(), self.streams.frames_resent(), self.streams.frames_resent_acked())
   }
 
   /// The bytes of stream data written into packets, those sent again included, and the bytes
@@ -4225,6 +4225,31 @@ mod tests {
     let _ = link.server.flush(link.now_us);
     assert_eq!(link.deliver_to_client(), 1);
     assert_eq!(link.client.conn.state(), ConnState::Draining);
+  }
+
+  // Task 21 (interop with the ngtcp2 example client, RFC 9000 section 13.2.4): a client in a run of
+  // ACK-only packets adds a PING once per smoothed RTT, which is more than the default budget of 64
+  // a second whenever that RTT is under 15 ms (the example client was closed with H3_EXCESSIVE_LOAD
+  // in a 1 MiB transfer on loopback under 5% loss). A peer that pings once per millisecond for a
+  // tenth of a second, 100 PINGs, is legal and must not be closed. Ignored: the limit is ruling
+  // T7-c's, and widening it, or scaling it with the RTT, is the controller's decision (task-21-report.md).
+  #[cfg_attr(miri, ignore)]
+  #[ignore = "T21: waits for the decision on the PING budget"]
+  #[test]
+  fn a_peer_that_pings_once_per_rtt_is_not_closed() {
+    let mut opts = LinkOpts::new(None);
+    // No path MTU probe from the client, whose PING the budget would count
+    opts.server.max_udp_payload_size = 1200;
+    let mut link = settled(&opts);
+    for _ in 0..100 {
+      link.client.conn.queue_test_frames(&PING);
+      let _ = link.client.flush(link.now_us);
+      assert_eq!(link.deliver_to_server(), 1);
+      assert_eq!(link.server.conn.state(), ConnState::Confirmed, "closed after a legal pinger");
+      let _ = link.server.flush(link.now_us);
+      let _ = link.server.take_datagrams();
+      link.now_us = link.now_us.wrapping_add(1_000);
+    }
   }
 
   // A PATH_CHALLENGE is answered in a datagram of 1200 bytes; past the budget the connection

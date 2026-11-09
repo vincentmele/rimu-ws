@@ -706,6 +706,7 @@ where
       forwarded: endpoint.forwarded,
       forward_dropped: self.forward_dropped,
       frames_resent: endpoint.frames_resent,
+      frames_resent_acked: endpoint.frames_resent_acked,
       handler_panics: handler.panics,
       idle_trims: self.idle_trims,
       pacer_holds: endpoint.pacer_holds,

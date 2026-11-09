@@ -1,0 +1,12 @@
+# The quic-go HTTP/3 client of h3-interop.sh (quic-go v0.65.0, pinned in quic-go-client/go.mod and
+# go.sum; Go from the local golang:1.27.3-trixie image, ruling T21-b).
+#
+#   docker build -f Dockerfile.quic-go -t rimu-h3-interop-quic-go .
+FROM golang:1.27.3-trixie AS builder
+WORKDIR /src
+COPY quic-go-client/ .
+RUN CGO_ENABLED=0 go build -mod=readonly -trimpath -o /quic-go-client .
+
+FROM gcr.io/distroless/static-debian13:nonroot
+COPY --from=builder /quic-go-client /quic-go-client
+ENTRYPOINT ["/quic-go-client"]

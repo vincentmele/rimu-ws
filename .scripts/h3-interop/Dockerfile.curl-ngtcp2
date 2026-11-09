@@ -1,0 +1,65 @@
+# curl (HTTP/3 over ngtcp2 + nghttp3 + quictls) and the ngtcp2 example client, for h3-interop.sh.
+#
+# Every source is a release tag, so that a rebuild gives the same clients (ruling T21-b). The
+# versions are recorded in the header of ../h3-interop.sh as well.
+#
+#   docker build -f Dockerfile.curl-ngtcp2 -t rimu-h3-interop-curl .
+#
+# Entry points: /opt/curl/bin/curl and /opt/ngtcp2/bin/client (the example client of ngtcp2).
+FROM ubuntu:24.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates git build-essential pkg-config \
+        autoconf automake autotools-dev libtool \
+        libev-dev zlib1g-dev g++-14 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+# quictls: OpenSSL with the QUIC API that ngtcp2 needs
+RUN git clone --depth 1 -b openssl-3.3.0-quic1 https://github.com/quictls/openssl quictls \
+    && cd quictls \
+    && ./config --prefix=/opt/quictls --libdir=lib enable-tls1_3 no-shared \
+    && make -j"$(nproc)" \
+    && make install_sw
+
+RUN git clone --depth 1 -b v1.19.0 --recursive https://github.com/ngtcp2/nghttp3 \
+    && cd nghttp3 \
+    && autoreconf -i \
+    && ./configure --prefix=/opt/nghttp3 --enable-lib-only \
+    && make -j"$(nproc)" \
+    && make install
+
+# The library and its example client (the examples need libev and a C++23 compiler)
+RUN git clone --depth 1 -b v1.26.0 --recursive https://github.com/ngtcp2/ngtcp2 \
+    && cd ngtcp2 \
+    && autoreconf -i \
+    && PKG_CONFIG_PATH=/opt/quictls/lib/pkgconfig:/opt/nghttp3/lib/pkgconfig \
+       LDFLAGS="-Wl,-rpath,/opt/quictls/lib:/opt/nghttp3/lib:/opt/ngtcp2/lib" CXX=g++-14 \
+       ./configure --prefix=/opt/ngtcp2 --with-openssl --with-libnghttp3 \
+    && make -j"$(nproc)" \
+    && make install \
+    && install -D examples/qtlsclient /opt/ngtcp2/bin/client
+
+RUN git clone --depth 1 -b curl-8_23_0 https://github.com/curl/curl curl \
+    && cd curl \
+    && autoreconf -fi \
+    && PKG_CONFIG_PATH=/opt/quictls/lib/pkgconfig:/opt/nghttp3/lib/pkgconfig:/opt/ngtcp2/lib/pkgconfig \
+       LDFLAGS="-Wl,-rpath,/opt/quictls/lib:/opt/nghttp3/lib:/opt/ngtcp2/lib" \
+       ./configure --prefix=/opt/curl --with-openssl=/opt/quictls --with-nghttp3=/opt/nghttp3 \
+           --with-ngtcp2=/opt/ngtcp2 --without-libpsl --disable-ldap --disable-docs \
+    && make -j"$(nproc)" \
+    && make install
+
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libev4t64 libstdc++6 zlib1g ca-certificates bash coreutils \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /opt/quictls/lib /opt/quictls/lib
+COPY --from=builder /opt/nghttp3/lib /opt/nghttp3/lib
+COPY --from=builder /opt/ngtcp2/lib /opt/ngtcp2/lib
+COPY --from=builder /opt/ngtcp2/bin /opt/ngtcp2/bin
+COPY --from=builder /opt/curl /opt/curl
+ENV PATH=/opt/curl/bin:/opt/ngtcp2/bin:$PATH \
+    LD_LIBRARY_PATH=/opt/quictls/lib:/opt/nghttp3/lib:/opt/ngtcp2/lib

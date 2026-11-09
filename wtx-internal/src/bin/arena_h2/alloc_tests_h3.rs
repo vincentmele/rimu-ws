@@ -370,6 +370,7 @@ impl Served {
       local_runtimes: NonZeroUsize::new(1),
       shutdown: Some((signal.clone(), Duration::from_secs(1))),
       static_root: env_or("STATIC_DIR", STATIC_ROOT),
+      test_routes: false,
     };
     let rc = move || {
       COUNTS.set(Some(counts));
@@ -801,7 +802,6 @@ impl Memory {
   fn peak_without_ring(&self) -> i64 {
     self.peak - self.ring as i64
   }
-
 
   fn report(&self, name: &str) -> String {
     format!(

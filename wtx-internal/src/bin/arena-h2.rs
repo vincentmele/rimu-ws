@@ -41,6 +41,10 @@
 //! | `ARENA_H3_ZC` | `0`, `1` | `0` | `UdpParams::zerocopy` (`1`: trains sent with `IORING_OP_SENDMSG_ZC`, each kept until its notification; a kernel that refuses falls back to copying, counted; task 19, ruling T19-b) |
 //! | `ARENA_H3_PACING_BURST` | 1 to 64 | 64 | `QuicParams::set_pacing_burst` (datagrams the pacer lets go at once; task 19, ruling T19-c) |
 //! | `ARENA_H3_REPEAT_ACK` | `0`, `1` | `1` | `QuicParams::set_repeat_ack` (`1`: a flush with stream data repeats an acknowledgment the client may lack; task 19, ruling T19-d) |
+//! | `ARENA_H3_PING_BUDGET` | 1 to 1000000 | 64 | `QuicLimits::ping_budget`, the PING frames a connection may send per second before it is closed with H3_EXCESSIVE_LOAD (task 21: `.scripts/h3-interop.sh` raises it to show that the ngtcp2 example client under loss trips only this limit) |
+//!
+//! `ARENA_TEST_ROUTES=1` adds `POST /echo` (the body back) to the h3 router, for
+//! `.scripts/h3-interop.sh`; off by default, and the HttpArena entry does not set it.
 //!
 //! With TLS on, SIGUSR1 prints the sums of the counters of the h3 workers on one line starting with
 //! `h3-stats` (what `h3-bench.sh` reads), and SIGINT or SIGTERM prints them with one line per
@@ -55,7 +59,7 @@ use rimu_ws::{
     StatusCode,
     http2_server_framework::{
       Get, Http2ServerFramework, HttpRouter, JsonReply, Middleware, Path, State, StaticFiles,
-      VerbatimParams, get,
+      VerbatimParams, get, post,
     },
     http3_server_framework::{Http3ServerFramework, Http3Stats, Http3WorkerStats},
   },
@@ -73,6 +77,15 @@ macro_rules! paths {
       ("/static/{*file}", Get(StaticFiles::new($static_root)?))
     )
   };
+  // The same with the route of the interop tests (ruling T21-c)
+  ($static_root:expr, echo) => {
+    rimu_ws::paths!(
+      ("/baseline2", get(endpoint_baseline2)),
+      ("/echo", post(endpoint_echo)),
+      ("/json/{count}", get(endpoint_json)),
+      ("/static/{*file}", Get(StaticFiles::new($static_root)?))
+    )
+  };
 }
 
 macro_rules! router {
@@ -81,6 +94,12 @@ macro_rules! router {
   };
   ($static_root:expr, no_middleware) => {
     HttpRouter::paths(paths!($static_root))
+  };
+  ($static_root:expr, echo) => {
+    HttpRouter::new(paths!($static_root, echo), ServerHeader)
+  };
+  ($static_root:expr, echo, no_middleware) => {
+    HttpRouter::paths(paths!($static_root, echo))
   };
 }
 
@@ -155,6 +174,7 @@ fn spawn_h3(
     local_runtimes: None,
     shutdown: None,
     static_root: static_dir(),
+    test_routes: test_routes(|name| std::env::var(name).ok()),
   };
   spawn_h3_with(cert, key, data, run, runtime_h3)
 }
@@ -171,6 +191,8 @@ struct H3Run {
   shutdown: Option<(rimu_ws::http::ShutdownSignal, core::time::Duration)>,
   /// The directory of `/static`.
   static_root: String,
+  /// If the router also has `/echo` (`ARENA_TEST_ROUTES`).
+  test_routes: bool,
 }
 
 /// [`spawn_h3`] with the choices of `run`, and the runtime of each worker built by `rc`.
@@ -184,7 +206,7 @@ fn spawn_h3_with<RC>(
 where
   RC: Clone + Fn() -> rimu_ws::Result<UringRuntime> + Send + 'static,
 {
-  let H3Run { addr, knobs, local_runtimes, shutdown, static_root } = run;
+  let H3Run { addr, knobs, local_runtimes, shutdown, static_root, test_routes } = run;
   let min_headers = knobs.headers == knobs::Headers::Min;
   let mut framework = Http3ServerFramework::<(), fn(rimu_ws::Error), UringExecutor, _, _, _>::new(
     UringExecutor::default(),
@@ -205,10 +227,14 @@ where
   }
   let stats = framework.stats();
   let handle = std::thread::spawn(move || -> rimu_ws::Result<()> {
-    let rslt = if min_headers {
-      framework.run_in_threads(&addr, router!(static_root.as_str(), no_middleware)?)
-    } else {
-      framework.set_rfc9110_headers(true).run_in_threads(&addr, router!(static_root.as_str())?)
+    let root = static_root.as_str();
+    let rslt = match (min_headers, test_routes) {
+      (true, false) => framework.run_in_threads(&addr, router!(root, no_middleware)?),
+      (true, true) => framework.run_in_threads(&addr, router!(root, echo, no_middleware)?),
+      (false, false) => framework.set_rfc9110_headers(true).run_in_threads(&addr, router!(root)?),
+      (false, true) => {
+        framework.set_rfc9110_headers(true).run_in_threads(&addr, router!(root, echo)?)
+      }
     };
     if let Err(err) = &rslt {
       eprintln!("arena-h2: the h3 server ended: {err}");
@@ -216,6 +242,12 @@ where
     rslt
   });
   Ok((stats, handle))
+}
+
+/// If the h3 server also serves `/echo`, the route of the interop matrix (`.scripts/h3-interop.sh`):
+/// off unless `ARENA_TEST_ROUTES=1` (ruling T21-c).
+fn test_routes(var: impl Fn(&str) -> Option<String>) -> bool {
+  var("ARENA_TEST_ROUTES").is_some_and(|v| v == "1")
 }
 
 fn error_cb(err: rimu_ws::Error) {
@@ -244,7 +276,11 @@ fn runtime_h3() -> rimu_ws::Result<UringRuntime> {
 
 /// The `ARENA_H3_*` switches: see the table of the program's documentation.
 mod knobs {
-  use rimu_ws::{executor::UdpParams, http3::H3Params, quic::QuicParams};
+  use rimu_ws::{
+    executor::UdpParams,
+    http3::H3Params,
+    quic::{QuicLimits, QuicParams},
+  };
 
   /// The response fields of h3.
   #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -340,6 +376,10 @@ mod knobs {
       if let Some(elem) = flag(&var, "ARENA_H3_REPEAT_ACK")? {
         quic = quic.set_repeat_ack(elem);
       }
+      if let Some(elem) = number(&var, "ARENA_H3_PING_BUDGET", 1, 1_000_000)? {
+        let ping_budget = u32::try_from(elem).map_err(|err| err.to_string())?;
+        quic = quic.set_limits(QuicLimits { ping_budget, ..*quic.limits() });
+      }
       let mut h3 = H3Params::default();
       if let Some(elem) = one_of(&var, "ARENA_H3_QPACK", &[("0", false), ("4096", true)])? {
         // Ruling T18-c: the dynamic table that task 18 measures, or none
@@ -356,7 +396,7 @@ mod knobs {
       format!(
         "headers={} data={} gro={} recv_buffers={} tx_arena={} rcvbuf={} sndbuf={} train={} \
          flush_order={} steering={} balance={} pin={} max_in_flight={} pacing={} pmtu_probe={} \
-         bodies={} hp={} qpack={} zc={} pacing_burst={} repeat_ack={}",
+         bodies={} hp={} qpack={} zc={} pacing_burst={} repeat_ack={} ping_budget={}",
         pick(self.headers == Headers::Min, "min", "full"),
         pick(self.data == Data::Reuse, "reuse", "fresh"),
         u8::from(udp.gro),
@@ -378,6 +418,7 @@ mod knobs {
         u8::from(udp.zerocopy),
         quic.pacing_burst(),
         u8::from(quic.repeat_ack()),
+        quic.limits().ping_budget,
       )
     }
   }
@@ -477,20 +518,21 @@ mod stats_signals {
     });
   }
 
-  struct Counters([u64; 33]);
+  struct Counters([u64; 34]);
 
   // Arrays of more than 32 elements have no `Default`
   impl Default for Counters {
     fn default() -> Self {
-      Self([0; 33])
+      Self([0; 34])
     }
   }
 
   impl Counters {
     // The first twelve as before task 16, then the counters of spec section 2.1 (ruling T16-c),
     // then the QPACK sections decoded and those the decode memo replayed (ruling T18-c), then the
-    // transfer counters of task 19 (ruling T19-a)
-    const NAMES: [&'static str; 33] = [
+    // transfer counters of task 19 (ruling T19-a), then the frames that carried acknowledged bytes
+    // (task 21: 0 expected)
+    const NAMES: [&'static str; 34] = [
       "conns",
       "requests",
       "datagrams_in",
@@ -524,6 +566,7 @@ mod stats_signals {
       "zc_copied",
       "zc_fallbacks",
       "fin_flushes_owed_and_acked",
+      "frames_resent_acked",
     ];
 
     fn of(worker: &Http3WorkerStats) -> Self {
@@ -561,6 +604,7 @@ mod stats_signals {
         worker.zc_copied,
         worker.zc_fallbacks,
         worker.fin_flushes_owed_and_acked,
+        worker.frames_resent_acked,
       ])
     }
 
@@ -629,6 +673,17 @@ async fn endpoint_baseline2(state: State<'_, ConnAux>) -> rimu_ws::Result<Verbat
   state.req.msg_data.headers.push_from_iter(Header::from_name_and_value(
     KnownHeaderName::ContentType.into(),
     ["text/plain"],
+  ))?;
+  Ok(VerbatimParams(StatusCode::Ok))
+}
+
+/// `POST /echo`: the body of the request, as it came, as the body of the response.
+async fn endpoint_echo(state: State<'_, ConnAux>) -> rimu_ws::Result<VerbatimParams> {
+  // The fields of the request are not the response's
+  state.req.msg_data.headers.clear();
+  state.req.msg_data.headers.push_from_iter(Header::from_name_and_value(
+    KnownHeaderName::ContentType.into(),
+    ["application/octet-stream"],
   ))?;
   Ok(VerbatimParams(StatusCode::Ok))
 }
@@ -729,9 +784,27 @@ struct Rating {
 mod alloc_tests_h3;
 
 #[cfg(test)]
+mod test_routes_tests {
+  use super::test_routes;
+
+  // Ruling T21-c: the route of the interop tests is off unless `ARENA_TEST_ROUTES` is `1`.
+  #[test]
+  fn echo_route_is_off_by_default() {
+    assert!(!test_routes(|_| None));
+    assert!(!test_routes(|_| Some("0".into())));
+    assert!(!test_routes(|_| Some("yes".into())));
+    assert!(test_routes(|name| (name == "ARENA_TEST_ROUTES").then(|| "1".into())));
+  }
+}
+
+#[cfg(test)]
 mod knob_tests {
   use super::knobs::{Data, H3Knobs, Headers};
-  use rimu_ws::{executor::UdpParams, http3::H3Params, quic::QuicParams};
+  use rimu_ws::{
+    executor::UdpParams,
+    http3::H3Params,
+    quic::{QuicLimits, QuicParams},
+  };
 
   fn parse(vars: &[(&str, &str)]) -> Result<H3Knobs, String> {
     H3Knobs::from_vars(|name| vars.iter().find(|el| el.0 == name).map(|el| el.1.to_string()))
@@ -759,6 +832,8 @@ mod knob_tests {
     assert!(!knobs.udp.zerocopy && !udp.zerocopy);
     assert_eq!((knobs.quic.pacing_burst(), knobs.quic.repeat_ack()), (64, true));
     assert_eq!(knobs.h3, H3Params::default());
+    // Task 21: the PING budget of the library
+    assert_eq!(knobs.quic.limits().ping_budget, QuicLimits::default().ping_budget);
     // Ruling T16-h: the benchmark path has GRO on, the library default has it off
     assert!(knobs.udp.gro && !udp.gro);
     assert!(!parse(&[("ARENA_H3_GRO", "0")]).unwrap().udp.gro);
@@ -778,6 +853,7 @@ mod knob_tests {
       ("ARENA_H3_MAX_IN_FLIGHT", "131072"),
       ("ARENA_H3_PACING", "0"),
       ("ARENA_H3_PACING_BURST", "16"),
+      ("ARENA_H3_PING_BUDGET", "5000"),
       ("ARENA_H3_PIN", "0"),
       ("ARENA_H3_PMTU_PROBE", "rtt"),
       ("ARENA_H3_QPACK", "4096"),
@@ -798,6 +874,9 @@ mod knob_tests {
     assert!(quic.batched_header_protection());
     // Task 19 (rulings T19-b to T19-d)
     assert_eq!((quic.pacing_burst(), quic.repeat_ack(), knobs.udp.zerocopy), (16, false, true));
+    // Task 21: the limit changes, the rest of the limits do not
+    let limits = QuicLimits { ping_budget: 5000, ..QuicLimits::default() };
+    assert_eq!(*quic.limits(), limits);
     // Ruling T18-c: a dynamic table of 4096 bytes and 100 blocked streams, the rest as the library
     let h3 = H3Params { qpack_max_table_capacity: 4096, qpack_blocked_streams: 100, ..knobs.h3 };
     assert_eq!(knobs.h3, h3);
@@ -833,6 +912,7 @@ mod knob_tests {
       "pacing_burst=16",
       "repeat_ack=0",
       "zc=1",
+      "ping_budget=5000",
     ] {
       assert!(line.contains(name), "{line}");
     }
@@ -856,6 +936,8 @@ mod knob_tests {
       ("ARENA_H3_PACING_BURST", "0"),
       ("ARENA_H3_PACING_BURST", "65"),
       ("ARENA_H3_REPEAT_ACK", "2"),
+      ("ARENA_H3_PING_BUDGET", "0"),
+      ("ARENA_H3_PING_BUDGET", "many"),
     ] {
       let err = parse(&[(name, value)]).unwrap_err();
       assert!(err.contains(name), "{err}");

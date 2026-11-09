@@ -1067,6 +1067,7 @@ fn endpoint_sums_the_counters_of_the_measurement() {
   let blocked = (stats.data_blocked_in, stats.stream_data_blocked_in, stats.streams_blocked_in);
   assert_eq!(blocked, (0, 0, 0));
   assert_eq!((stats.packets_lost, stats.pto_probes, stats.frames_resent), (0, 0, 0));
+  assert_eq!(stats.frames_resent_acked, 0);
   // Ruling T19-a: every flush that finished a response and owed an acknowledgment carried it;
   // the datagram bytes and the stream bytes of the responses, written by copy, are summed
   assert_eq!(stats.fin_flushes_ack_owed - before.fin_flushes_ack_owed, flushes, "{stats:?}");

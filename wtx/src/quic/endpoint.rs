@@ -150,6 +150,8 @@ pub(crate) struct EndpointStats {
   pub(crate) pto_probes: u64,
   /// STREAM frames sent again.
   pub(crate) frames_resent: u64,
+  /// STREAM frames sent that carried bytes the peer had acknowledged (expected 0).
+  pub(crate) frames_resent_acked: u64,
   /// Retry packets sent.
   pub(crate) retries: u64,
   /// Datagrams handed to another worker: a datagram that the kernel coalesced (GRO) counts once
@@ -1241,10 +1243,10 @@ where
 /// what grew since the last one added to [`EndpointStats`]. What a connection counts after its
 /// last flush (a frame received just before it closes) is not summed.
 #[derive(Clone, Copy, Debug)]
-struct Tally([u64; 18]);
+struct Tally([u64; 19]);
 
 impl Tally {
-  const ZERO: Self = Self([0; 18]);
+  const ZERO: Self = Self([0; 19]);
 
   fn of<A, RNG, TCX>(conn: &QuicConn<A, RNG, TCX>) -> Self
   where
@@ -1253,7 +1255,7 @@ impl Tally {
     TCX: TlsCtxSk,
   {
     let el = conn.stats();
-    let (fins_out, frames_resent) = conn.stream_tally();
+    let (fins_out, frames_resent, frames_resent_acked) = conn.stream_tally();
     let (stream_bytes_out, stream_bytes_copied) = conn.stream_bytes();
     Self([
       el.datagrams_out,
@@ -1274,6 +1276,7 @@ impl Tally {
       stream_bytes_copied,
       el.pacer_holds,
       el.fin_flushes_owed_and_acked,
+      frames_resent_acked,
     ])
   }
 
@@ -1298,6 +1301,7 @@ impl Tally {
       &mut stats.stream_bytes_copied,
       &mut stats.pacer_holds,
       &mut stats.fin_flushes_owed_and_acked,
+      &mut stats.frames_resent_acked,
     ];
     for ((field, now), then) in fields.into_iter().zip(self.0).zip(before.0) {
       *field = field.wrapping_add(now.wrapping_sub(then));

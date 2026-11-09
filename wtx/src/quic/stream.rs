@@ -680,6 +680,13 @@ impl Streams {
     self.cold.as_ref().map_or(0, |el| el.retransmitted)
   }
 
+  /// STREAM frames that carried bytes the peer had acknowledged: sent again by mistake, or sent
+  /// again because the stream had no room to remember the acknowledgment.
+  #[inline]
+  pub(crate) fn frames_resent_acked(&self) -> u64 {
+    self.cold.as_ref().map_or(0, |el| el.resent_acked)
+  }
+
   /// STREAM frames sent again, and ranges sent again although they were acknowledged.
   #[inline]
   #[cfg(test)]

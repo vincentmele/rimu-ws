@@ -1529,6 +1529,7 @@ fn worker_stats_round_trip_through_their_cell() {
     forward_dropped: 9,
     forwarded: 10,
     frames_resent: 11,
+    frames_resent_acked: 39,
     handler_panics: 12,
     idle_trims: 13,
     pacer_holds: 29,

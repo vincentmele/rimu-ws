@@ -82,6 +82,9 @@ pub struct Http3WorkerStats {
   pub forwarded: u64,
   /// STREAM frames sent again after a loss.
   pub frames_resent: u64,
+  /// STREAM frames sent that carried bytes the peer had already acknowledged: always 0 unless
+  /// the stream had no room to remember an acknowledgment.
+  pub frames_resent_acked: u64,
   /// Panics of handlers, each answered with 500 on its stream.
   pub handler_panics: u64,
   /// Times the pools of the worker were trimmed after it had no connection for a while.
@@ -198,7 +201,7 @@ impl Default for StatsCell {
 }
 
 impl StatsCell {
-  const LEN: usize = 38;
+  const LEN: usize = 39;
 
   fn load(&self) -> Http3WorkerStats {
     let mut values = [0u64; Self::LEN];
@@ -220,6 +223,7 @@ impl StatsCell {
       forward_dropped,
       forwarded,
       frames_resent,
+      frames_resent_acked,
       handler_panics,
       idle_trims,
       pacer_holds,
@@ -261,6 +265,7 @@ impl StatsCell {
       forward_dropped,
       forwarded,
       frames_resent,
+      frames_resent_acked,
       handler_panics,
       idle_trims,
       pacer_holds,
@@ -305,6 +310,7 @@ impl StatsCell {
       stats.forward_dropped,
       stats.forwarded,
       stats.frames_resent,
+      stats.frames_resent_acked,
       stats.handler_panics,
       stats.idle_trims,
       stats.pacer_holds,
