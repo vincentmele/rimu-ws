@@ -101,7 +101,7 @@ mod tests {
     flow::top_up,
     testing::{Behavior, Link, LinkOpts, TestApp, encode_frames},
   };
-  use alloc::rc::Rc;
+  use alloc::{rc::Rc, vec::Vec};
 
   fn settled(opts: &LinkOpts) -> Link {
     let mut link = Link::new(opts);
@@ -158,6 +158,106 @@ mod tests {
     let now_us = link.now_us;
     assert_eq!(link.client.with_ctx(now_us, |cx| cx.unsent_bytes()), 0);
     assert_eq!(link.server.conn.state(), ConnState::Confirmed);
+  }
+
+  fn open_bidi(link: &mut Link) -> crate::quic::StreamId {
+    let now_us = link.now_us;
+    link.client.with_ctx(now_us, |cx| cx.open_bidi()).unwrap()
+  }
+
+  // Ruling T8-g: a peer that sends a whole stream window after a gap at its start, as one whose
+  // first packet was lost does, trips no limit, and the stream reaches the application once the
+  // gap is filled.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn full_window_after_a_gap_is_delivered() {
+    const PIECE: usize = 1000;
+    let mut link = settled(&LinkOpts::new(None));
+    let window = usize::try_from(crate::quic::ConnParams::default().stream_window).unwrap();
+    let id = open_bidi(&mut link);
+    let data: Vec<u8> = (0..window).map(|el| (el % 253) as u8).collect();
+    for (nth, offset) in (PIECE..window).step_by(PIECE).enumerate() {
+      let end = (offset + PIECE).min(window);
+      let piece = &data[offset..end];
+      let frame =
+        Frame::Stream { id: id.0, offset: offset as u64, data: piece, fin: end == window };
+      client_sends(&mut link, &[frame]);
+      assert_eq!(link.server.conn.state(), ConnState::Confirmed, "{offset}");
+      // The acknowledgments make room for more packets of the client
+      if nth % 64 == 63 {
+        link.run();
+      }
+    }
+    assert!(link.server.app.streams.get(&id.0).is_none());
+    let frame = Frame::Stream { id: id.0, offset: 0, data: &data[..PIECE], fin: false };
+    client_sends(&mut link, &[frame]);
+    let log = &link.server.app.streams[&id.0];
+    assert!(log.fin && log.data == data);
+    assert_eq!(link.server.conn.streams().held_blocks(), 0);
+    assert_eq!(link.server.conn.state(), ConnState::Confirmed);
+  }
+
+  // Ruling T8-g: early data is held in blocks that count whole. A peer within its credit that
+  // sends small pieces across the edges of blocks, on several streams, trips no limit, even with
+  // caps as small as the windows.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn pieces_across_block_edges_within_credit_trip_no_limit() {
+    let mut opts = LinkOpts::new(None);
+    opts.server.stream_window = 64 << 10;
+    opts.server.conn_window = 64 << 10;
+    opts.server.limits.max_out_of_order_bytes_per_stream = 64 << 10;
+    opts.server.limits.max_out_of_order_bytes_per_conn = 64 << 10;
+    let mut link = settled(&opts);
+    // On each stream two bytes across the edge of its first two blocks, 4,097 bytes of credit
+    for _ in 0..15 {
+      let id = open_bidi(&mut link);
+      let frame = Frame::Stream { id: id.0, offset: 4095, data: b"xy", fin: false };
+      client_sends(&mut link, &[frame]);
+      assert_eq!(link.server.conn.state(), ConnState::Confirmed, "{id:?}");
+    }
+    // 30 blocks for less than 16 of credit
+    assert_eq!(link.server.conn.streams().held_blocks(), 30);
+  }
+
+  // Ruling T8-g: caps below the windows bound the credit that is given, at first and with every
+  // MAX_STREAM_DATA and MAX_DATA, and an upload goes through within them.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn credit_never_exceeds_a_smaller_cap() {
+    const STREAM_CAP: u64 = 64 << 10;
+    const CONN_CAP: u64 = 256 << 10;
+    let mut opts = LinkOpts::new(None);
+    opts.server.limits.max_out_of_order_bytes_per_stream = STREAM_CAP as u32;
+    opts.server.limits.max_out_of_order_bytes_per_conn = CONN_CAP as u32;
+    let mut link = settled(&opts);
+    assert_eq!(link.client.conn.streams().conn_credit().2, CONN_CAP);
+    let len = 1u32 << 20;
+    let body: Rc<[u8]> = (0..len).map(|el| (el % 247) as u8).collect();
+    let now_us = link.now_us;
+    let id = link
+      .client
+      .with_ctx(now_us, |cx| {
+        let id = cx.open_bidi()?;
+        cx.write_body(id, BodyRef::new(body.clone(), 0..len)?, true)?;
+        Ok::<_, crate::Error>(id)
+      })
+      .unwrap();
+    let client_slots = &link.client.parts.pools.stream_slots;
+    assert_eq!(link.client.conn.streams().send_credit(client_slots, id), Some(STREAM_CAP));
+    for _ in 0..4096 {
+      let server = link.server.conn.streams();
+      if let Some((max, consumed)) = server.recv_credit(&link.server.parts.pools.stream_slots, id) {
+        assert!(max - consumed <= STREAM_CAP, "{max} {consumed}");
+      }
+      let (max, consumed, _) = server.conn_credit();
+      assert!(max - consumed <= CONN_CAP, "{max} {consumed}");
+      if !link.step() {
+        break;
+      }
+    }
+    let log = &link.server.app.streams[&id.0];
+    assert!(log.fin && log.data == *body);
   }
 
   // Rule: data past the credit of a stream or of the connection is a FLOW_CONTROL_ERROR (RFC 9000

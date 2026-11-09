@@ -21,17 +21,22 @@ pub struct QuicLimits {
   ///
   /// Defaults to 256.
   pub max_ack_ranges: usize,
-  /// The most memory, in bytes, that the received stream data of a connection can take while it
-  /// waits for earlier data or is retained by the application. It is held in blocks of 4 KiB,
-  /// which count whole. Going past it is a connection error (PROTOCOL_VIOLATION).
+  /// The most bytes of received stream data that a connection holds while they wait for earlier
+  /// data or are retained by the application. The credit of the connection that is given to the
+  /// peer is at most this, so that a peer within its credit never goes past it. The data is held
+  /// in blocks of 4 KiB, which count whole: on top of this, each stream that holds blocks may take
+  /// three more, the blocks at the edges of its data and one for retained bytes. Going past that is
+  /// a connection error (PROTOCOL_VIOLATION).
   ///
-  /// Defaults to 4 MiB.
+  /// Defaults to 16 MiB, the connection window.
   pub max_out_of_order_bytes_per_conn: u32,
-  /// How far, in bytes, the received data of a stream that waits for earlier data can reach past
-  /// the first byte that the application was not given, the bytes that it retains included.
-  /// Going past it is a connection error (PROTOCOL_VIOLATION).
+  /// How far, in bytes, the received data of a stream can reach past the first byte that the
+  /// application consumed, the bytes that wait for earlier data and the ones that it retains
+  /// included. The credit of each stream that is given to the peer is at most this, so that a
+  /// peer within its credit never goes past it. Going past it is a connection error
+  /// (PROTOCOL_VIOLATION).
   ///
-  /// Defaults to 256 KiB.
+  /// Defaults to 1 MiB, the stream window.
   pub max_out_of_order_bytes_per_stream: u32,
   /// The most separate ranges of received data that a stream holds while it waits for the data
   /// before them, at most 32. One more is a connection error (PROTOCOL_VIOLATION).
@@ -62,8 +67,8 @@ impl Default for QuicLimits {
     Self {
       excessive_load_app_code: 0x0107,
       max_ack_ranges: 256,
-      max_out_of_order_bytes_per_conn: 4 << 20,
-      max_out_of_order_bytes_per_stream: 256 << 10,
+      max_out_of_order_bytes_per_conn: 16 << 20,
+      max_out_of_order_bytes_per_stream: 1 << 20,
       max_out_of_order_ranges: 32,
       ping_budget: 64,
       path_challenge_budget: 16,
@@ -113,8 +118,8 @@ mod tests {
     let limits = QuicLimits::default();
     assert_eq!(limits.excessive_load_app_code, 0x0107);
     assert_eq!(limits.max_ack_ranges, 256);
-    assert_eq!(limits.max_out_of_order_bytes_per_conn, 4 << 20);
-    assert_eq!(limits.max_out_of_order_bytes_per_stream, 256 << 10);
+    assert_eq!(limits.max_out_of_order_bytes_per_conn, 16 << 20);
+    assert_eq!(limits.max_out_of_order_bytes_per_stream, 1 << 20);
     assert_eq!(limits.max_out_of_order_ranges, 32);
     assert_eq!(limits.ping_budget, 64);
     assert_eq!(limits.path_challenge_budget, 16);

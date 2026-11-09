@@ -128,6 +128,20 @@ pub(crate) struct ConnParams {
 }
 
 impl ConnParams {
+  /// The credit given to the peer for the connection: its window, at most the bytes that it can
+  /// make the connection hold ([`QuicLimits::max_out_of_order_bytes_per_conn`], ruling T8-g).
+  #[inline]
+  pub(crate) fn conn_credit(&self) -> u64 {
+    self.conn_window.min(u64::from(self.limits.max_out_of_order_bytes_per_conn))
+  }
+
+  /// The credit given to the peer for each stream: its window, at most the bytes that it can make
+  /// a stream hold ([`QuicLimits::max_out_of_order_bytes_per_stream`], ruling T8-g).
+  #[inline]
+  pub(crate) fn stream_credit(&self) -> u64 {
+    self.stream_window.min(u64::from(self.limits.max_out_of_order_bytes_per_stream))
+  }
+
   /// The transport parameters that describe these parameters (RFC 9000 section 18.2), sent by an
   /// endpoint whose CID is `local_cid`. A server gives `original_dcid`, the destination CID of the
   /// first Initial packet of the client.
@@ -142,10 +156,10 @@ impl ConnParams {
       max_idle_timeout_ms: self.max_idle_timeout_ms,
       stateless_reset_token: None,
       max_udp_payload_size: self.max_udp_payload_size,
-      initial_max_data: self.conn_window,
-      initial_max_stream_data_bidi_local: self.stream_window,
-      initial_max_stream_data_bidi_remote: self.stream_window,
-      initial_max_stream_data_uni: self.stream_window,
+      initial_max_data: self.conn_credit(),
+      initial_max_stream_data_bidi_local: self.stream_credit(),
+      initial_max_stream_data_bidi_remote: self.stream_credit(),
+      initial_max_stream_data_uni: self.stream_credit(),
       // The windows of the index arrays of the streams
       initial_max_streams_bidi: self.max_streams_bidi.min(BIDI_WINDOW as u64),
       initial_max_streams_uni: self.max_streams_uni.min(UNI_REMOTE_WINDOW as u64),

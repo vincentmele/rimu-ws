@@ -355,6 +355,7 @@ impl Stream {
       ready: Links::NONE,
       ready_in: None,
       rx: RecvPart {
+        blocks: 0,
         consumed: 0,
         final_size: None,
         high: 0,
@@ -406,6 +407,7 @@ impl Stream {
     self.ready = Links::NONE;
     self.ready_in = None;
     let rx = &mut self.rx;
+    rx.blocks = 0;
     rx.consumed = 0;
     rx.final_size = None;
     rx.high = 0;
@@ -519,6 +521,8 @@ enum RxState {
 
 #[derive(Debug)]
 struct RecvPart {
+  // Receive blocks held, the ones out for a call of the application included
+  blocks: u32,
   // What the application consumed when credit was last counted: `read - keep`
   consumed: u64,
   final_size: Option<u64>,
@@ -568,34 +572,30 @@ impl RecvPart {
   }
 
   // Forgets the waiting data that the application was given, and the blocks that held only that
-  fn drop_below_read(&mut self, blocks: &mut FreeList<Box<RxBlock>>, held: &mut u32) {
+  fn drop_below_read(&mut self, blocks: &mut FreeList<Box<RxBlock>>, held: &mut Held) {
     self.ooo.remove_below(self.read);
     let gone = self
       .ooo_blocks
       .partition_point(|el| el.no.wrapping_add(1).wrapping_mul(RX_BLOCK) <= self.read);
     for elem in self.ooo_blocks.drain(..gone) {
       if let Some(block) = elem.data {
-        give_rx_block(blocks, held, block);
+        held.give(blocks, &mut self.blocks, block);
       }
     }
   }
 
-  // Gives back every block; returns how many
-  fn release(&mut self, blocks: &mut FreeList<Box<RxBlock>>) -> u32 {
-    let mut count = 0u32;
+  // Gives back the blocks that are here, not one that is out for a call of the application
+  fn release(&mut self, blocks: &mut FreeList<Box<RxBlock>>, held: &mut Held) {
     if let Some(block) = self.keep_block.take() {
-      blocks.give(block);
-      count = count.wrapping_add(1);
+      held.give(blocks, &mut self.blocks, block);
     }
     for elem in self.ooo_blocks.drain(..) {
       if let Some(block) = elem.data {
-        blocks.give(block);
-        count = count.wrapping_add(1);
+        held.give(blocks, &mut self.blocks, block);
       }
     }
     self.ooo = RangeSet::new();
     self.keep = 0;
-    count
   }
 
   // `bytes` become the retained bytes, which there were none of
@@ -603,12 +603,12 @@ impl RecvPart {
     &mut self,
     bytes: &[u8],
     blocks: &mut FreeList<Box<RxBlock>>,
-    held: &mut u32,
+    held: &mut Held,
     limits: &QuicLimits,
   ) -> crate::Result<()> {
     let len = bytes.len();
     if len > INLINE_LEN {
-      let mut block = take_rx_block(blocks, held, limits)?;
+      let mut block = held.take(blocks, &mut self.blocks, limits)?;
       if let Some(dst) = block.get_mut(..len) {
         dst.copy_from_slice(bytes);
       }
@@ -618,6 +618,52 @@ impl RecvPart {
     }
     self.keep = len;
     Ok(())
+  }
+}
+
+// The receive blocks held by the streams of a connection
+#[derive(Clone, Copy, Debug)]
+struct Held {
+  blocks: u32,
+  // The streams that hold at least one
+  streams: u32,
+}
+
+impl Held {
+  // `block` goes back from a part that holds `own` blocks
+  fn give(&mut self, blocks: &mut FreeList<Box<RxBlock>>, own: &mut u32, block: Box<RxBlock>) {
+    blocks.give(block);
+    self.blocks = self.blocks.saturating_sub(1);
+    if *own == 1 {
+      self.streams = self.streams.saturating_sub(1);
+    }
+    *own = own.saturating_sub(1);
+  }
+
+  // A block for a part that holds `own` blocks. The cap of the connection is the bytes that its
+  // credit allows and, as blocks count whole, three blocks for each stream that holds some: a
+  // stream holds data within the bytes of its credit that it did not consume, whose first and
+  // last blocks may hold little of it, and the bytes that it retains in a block of their own. A
+  // peer within its credit never goes past it (ruling T8-g).
+  fn take(
+    &mut self,
+    blocks: &mut FreeList<Box<RxBlock>>,
+    own: &mut u32,
+    limits: &QuicLimits,
+  ) -> crate::Result<Box<RxBlock>> {
+    let streams = u64::from(self.streams).wrapping_add(u64::from(*own == 0));
+    let max = u64::from(limits.max_out_of_order_bytes_per_conn)
+      .div_ceil(RX_BLOCK)
+      .saturating_add(streams.saturating_mul(3));
+    if u64::from(self.blocks) >= max {
+      return Err(out_of_order_limit());
+    }
+    if *own == 0 {
+      self.streams = self.streams.wrapping_add(1);
+    }
+    self.blocks = self.blocks.wrapping_add(1);
+    *own = own.wrapping_add(1);
+    Ok(blocks.take().unwrap_or_else(|| Box::new([0; RX_BLOCK_LEN])))
   }
 }
 
@@ -1001,8 +1047,7 @@ pub(crate) struct ConnCold {
   close_reason: [u8; CLOSE_REASON_LEN],
   close_reason_len: u8,
   close_request: Option<u64>,
-  // Receive blocks held by the streams
-  held_blocks: u32,
+  held: Held,
   path_challenges: RateBudget,
   // The credit of a stream that the peer gives: client-initiated bidirectional ones and our
   // unidirectional ones
@@ -1027,7 +1072,7 @@ impl ConnCold {
       close_reason: [0; CLOSE_REASON_LEN],
       close_reason_len: 0,
       close_request: None,
-      held_blocks: 0,
+      held: Held { blocks: 0, streams: 0 },
       path_challenges: RateBudget::default(),
       peer_bidi_credit: 0,
       peer_uni_credit: 0,
@@ -1095,7 +1140,7 @@ impl Streams {
       cold: Some(ConnCold::take(params, pools)),
       ctrl: List::EMPTY,
       fin_only: 0,
-      flow: ConnFlow::new(params.conn_window),
+      flow: ConnFlow::new(params.conn_credit()),
       is_client,
       large: List::EMPTY,
       owed: 0,
@@ -1109,6 +1154,25 @@ impl Streams {
   #[cfg(test)]
   pub(crate) const fn bidi_limit(&self) -> u64 {
     self.bidi.meta.limit
+  }
+
+  /// The credit of the connection: (given to the peer, consumed of it, given by the peer).
+  #[cfg(test)]
+  pub(crate) const fn conn_credit(&self) -> (u64, u64, u64) {
+    (self.flow.rx_max, self.flow.rx_consumed, self.flow.tx_max)
+  }
+
+  /// The credit given to the peer on stream `id` and what it consumed of it: (limit, consumed).
+  #[cfg(test)]
+  pub(crate) fn recv_credit(&self, slots: &StreamSlots, id: StreamId) -> Option<(u64, u64)> {
+    let stream = slots.get(self.app_slot(id)?)?;
+    Some((stream.rx.max, stream.rx.consumed))
+  }
+
+  /// The credit that the peer gives on stream `id`.
+  #[cfg(test)]
+  pub(crate) fn send_credit(&self, slots: &StreamSlots, id: StreamId) -> Option<u64> {
+    Some(slots.get(self.app_slot(id)?)?.tx.max)
   }
 
   /// DATA_BLOCKED and STREAM_DATA_BLOCKED frames sent.
@@ -1128,7 +1192,7 @@ impl Streams {
   /// Receive blocks held by the streams.
   #[inline]
   pub(crate) fn held_blocks(&self) -> u32 {
-    self.cold.as_ref().map_or(0, |el| el.held_blocks)
+    self.cold.as_ref().map_or(0, |el| el.held.blocks)
   }
 
   /// Takes a use of the budget of PATH_CHALLENGE frames: `false` if it is spent.
@@ -1152,7 +1216,7 @@ impl Streams {
   /// DATA_BLOCKED: the peer has no connection credit left.
   #[inline]
   pub(crate) fn on_data_blocked(&mut self, params: &ConnParams) {
-    if self.flow.rx_consumed.saturating_add(params.conn_window) > self.flow.rx_max {
+    if self.flow.rx_consumed.saturating_add(params.conn_credit()) > self.flow.rx_max {
       self.owed |= OWED_MAX_DATA;
     }
   }
@@ -1293,8 +1357,9 @@ impl Streams {
       // A repeat, or a reset after the FIN was given
       RxState::Done | RxState::None => return Ok(()),
     };
-    let released = rx.release(rx_blocks);
-    self.release_held(released);
+    if let Some(cold) = self.cold.as_deref_mut() {
+      rx.release(rx_blocks, &mut cold.held);
+    }
     self.flow.on_consumed(final_size.saturating_sub(rx.consumed));
     rx.consumed = final_size;
     rx.read = final_size;
@@ -1425,7 +1490,7 @@ impl Streams {
       return Ok(());
     };
     let rx = &mut stream.rx;
-    let more = rx.consumed.saturating_add(params.stream_window) > rx.max;
+    let more = rx.consumed.saturating_add(params.stream_credit()) > rx.max;
     if rx.state == RxState::Recv && rx.final_size.is_none() && more && !rx.max_owed {
       rx.max_owed = true;
       self.ctrl_add(&mut pools.stream_slots, slot);
@@ -1489,7 +1554,7 @@ impl Streams {
         continue;
       }
       if let Some(stream) = stream_slots.get_mut(slot) {
-        let _count = stream.rx.release(rx_blocks);
+        stream.rx.release(rx_blocks, &mut Held { blocks: 0, streams: 0 });
         stream.tx.release(tx_blocks);
       }
       stream_slots.free(slot);
@@ -1560,8 +1625,9 @@ impl Streams {
     if rx.state != RxState::Recv {
       return;
     }
-    let released = rx.release(rx_blocks);
-    self.release_held(released);
+    if let Some(cold) = self.cold.as_deref_mut() {
+      rx.release(rx_blocks, &mut cold.held);
+    }
     // What arrived is consumed
     self.flow.on_consumed(rx.high.saturating_sub(rx.consumed));
     rx.consumed = rx.high;
@@ -1684,8 +1750,9 @@ impl Streams {
       return;
     };
     let id = stream.id;
-    let released = stream.rx.release(rx_blocks);
-    self.release_held(released);
+    if let Some(cold) = self.cold.as_deref_mut() {
+      stream.rx.release(rx_blocks, &mut cold.held);
+    }
     self.unsent = self.unsent.saturating_sub(stream.tx.end.saturating_sub(stream.tx.sent));
     stream.tx.release(tx_blocks);
     stream_slots.free(slot);
@@ -1710,9 +1777,9 @@ impl Streams {
       return Err(closed());
     };
     let (by_client, rx_max, tx_max) = match kind {
-      Kind::Bidi => (true, Some(params.stream_window), Some(cold.peer_bidi_credit)),
+      Kind::Bidi => (true, Some(params.stream_credit()), Some(cold.peer_bidi_credit)),
       Kind::UniLocal => (self.is_client, None, Some(cold.peer_uni_credit)),
-      Kind::UniRemote => (!self.is_client, Some(params.stream_window), None),
+      Kind::UniRemote => (!self.is_client, Some(params.stream_credit()), None),
     };
     let slot = pools.stream_slots.alloc()?;
     if let Some(stream) = pools.stream_slots.get_mut(slot) {
@@ -1765,7 +1832,7 @@ impl Streams {
       let Some(cold) = self.cold.as_deref_mut() else {
         break;
       };
-      let held = &mut cold.held_blocks;
+      let held = &mut cold.held;
       rx.drop_below_read(rx_blocks, held);
       let next = rx.next_run(direct);
       let (piece, len) = if rx.keep > 0 {
@@ -1829,7 +1896,7 @@ impl Streams {
       let Some(cold) = self.cold.as_deref_mut() else {
         break;
       };
-      let held = &mut cold.held_blocks;
+      let held = &mut cold.held;
       match piece {
         Piece::Direct => {
           if live && retained > 0 {
@@ -1844,7 +1911,7 @@ impl Streams {
             }
             rx.keep_block = Some(block);
           } else {
-            give_rx_block(rx_blocks, held, block);
+            held.give(rx_blocks, &mut rx.blocks, block);
           }
           rx.keep = if live { retained } else { 0 };
         }
@@ -1868,15 +1935,14 @@ impl Streams {
                 elem.data = Some(block);
               }
             }
-            _ => give_rx_block(rx_blocks, held, block),
+            _ => held.give(rx_blocks, &mut rx.blocks, block),
           }
         }
         Piece::Fin => {}
       }
       if live && fin {
         rx.state = RxState::Done;
-        let released = rx.release(rx_blocks);
-        *held = held.saturating_sub(released);
+        rx.release(rx_blocks, held);
       }
       if live {
         self.on_read(stream_slots, params, slot);
@@ -1973,7 +2039,7 @@ impl Streams {
     let due = rx.state == RxState::Recv
       && rx.final_size.is_none()
       && !rx.max_owed
-      && top_up(rx.consumed, rx.max, params.stream_window).is_some();
+      && top_up(rx.consumed, rx.max, params.stream_credit()).is_some();
     if due {
       rx.max_owed = true;
       self.ctrl_add(slots, slot);
@@ -2005,7 +2071,7 @@ impl Streams {
   }
 
   fn owe_max_data_if_due(&mut self, params: &ConnParams) {
-    if self.flow.max_data_due(params.conn_window).is_some() {
+    if self.flow.max_data_due(params.conn_credit()).is_some() {
       self.owed |= OWED_MAX_DATA;
     }
   }
@@ -2120,8 +2186,8 @@ impl Streams {
       let idx = match rx.ooo_blocks.binary_search_by_key(&no, |el| el.no) {
         Ok(idx) => idx,
         Err(idx) => {
-          let held = self.cold.as_deref_mut().map(|el| &mut el.held_blocks).ok_or_else(closed)?;
-          let block = take_rx_block(rx_blocks, held, limits)?;
+          let held = self.cold.as_deref_mut().map(|el| &mut el.held).ok_or_else(closed)?;
+          let block = held.take(rx_blocks, &mut rx.blocks, limits)?;
           rx.ooo_blocks.try_reserve(1).map_err(|_err| exhausted())?;
           rx.ooo_blocks.insert(idx, OooBlock { data: Some(block), no });
           idx
@@ -2167,12 +2233,6 @@ impl Streams {
     }
   }
 
-  fn release_held(&mut self, count: u32) {
-    if let Some(cold) = self.cold.as_deref_mut() {
-      cold.held_blocks = cold.held_blocks.saturating_sub(count);
-    }
-  }
-
   fn unlink_ready(&mut self, slots: &mut StreamSlots, slot: u32) {
     let Some(stream) = slots.get_mut(slot) else {
       return;
@@ -2198,7 +2258,7 @@ impl Streams {
     wrote: &mut bool,
   ) -> crate::Result<bool> {
     if self.owed & OWED_MAX_DATA != 0 {
-      let max = self.flow.rx_consumed.saturating_add(params.conn_window);
+      let max = self.flow.rx_consumed.saturating_add(params.conn_credit());
       if max > self.flow.rx_max {
         if !fw.write_max_data(max) {
           return Ok(false);
@@ -2351,7 +2411,7 @@ impl Streams {
         *wrote = true;
       }
       if rx.max_owed {
-        let max = rx.consumed.saturating_add(params.stream_window);
+        let max = rx.consumed.saturating_add(params.stream_credit());
         if rx.state == RxState::Recv && rx.final_size.is_none() && max > rx.max {
           if !fw.write_max_stream_data(id, max) {
             return Ok(false);
@@ -2437,12 +2497,12 @@ fn append_to_keep(
   direct: &mut &[u8],
   next: usize,
   blocks: &mut FreeList<Box<RxBlock>>,
-  held: &mut u32,
+  held: &mut Held,
   limits: &QuicLimits,
 ) -> crate::Result<usize> {
-  let RecvPart { inline, keep, keep_block, ooo_blocks, read, .. } = rx;
+  let RecvPart { blocks: own, inline, keep, keep_block, ooo_blocks, read, .. } = rx;
   if keep_block.is_none() && keep.wrapping_add(next) > INLINE_LEN {
-    let mut block = take_rx_block(blocks, held, limits)?;
+    let mut block = held.take(blocks, own, limits)?;
     if let Some((dst, src)) = block.get_mut(..*keep).zip(inline.get(..*keep)) {
       dst.copy_from_slice(src);
     }
@@ -2483,29 +2543,9 @@ fn append_to_keep(
   Ok(added)
 }
 
-fn give_rx_block(blocks: &mut FreeList<Box<RxBlock>>, held: &mut u32, block: Box<RxBlock>) {
-  *held = held.saturating_sub(1);
-  blocks.give(block);
-}
-
 // The entry of stream `index` in an index array of `len` entries
 fn pos(len: usize, index: u64) -> usize {
   usize::try_from(index % u64::try_from(len).unwrap_or(u64::MAX).max(1)).unwrap_or(0)
-}
-
-// A receive block, which the cap of the connection allows
-fn take_rx_block(
-  blocks: &mut FreeList<Box<RxBlock>>,
-  held: &mut u32,
-  limits: &QuicLimits,
-) -> crate::Result<Box<RxBlock>> {
-  let max =
-    usize::try_from(limits.max_out_of_order_bytes_per_conn).unwrap_or(usize::MAX) / RX_BLOCK_LEN;
-  if usize::try_from(*held).unwrap_or(usize::MAX) >= max {
-    return Err(out_of_order_limit());
-  }
-  *held = held.wrapping_add(1);
-  Ok(blocks.take().unwrap_or_else(|| Box::new([0; RX_BLOCK_LEN])))
 }
 
 #[inline(always)]
@@ -3100,27 +3140,32 @@ mod tests {
     assert_eq!(server_close(&link), transport(TransportErrorCode::StreamLimitError));
   }
 
-  // Data that waits for earlier data is bounded by stream (how far ahead), by ranges and by
-  // connection (blocks held): one byte more is a PROTOCOL_VIOLATION.
+  // Data that waits for earlier data is bounded by stream (how far ahead) and by connection (bytes
+  // held), which bound the credit given to the peer (ruling T8-g), and by ranges: one more is a
+  // connection error, FLOW_CONTROL_ERROR for the bytes and PROTOCOL_VIOLATION for the ranges.
   #[cfg_attr(miri, ignore)]
   #[test]
   fn out_of_order_limits_are_connection_errors() {
     let stream = |id: u64, offset: u64| Frame::Stream { id, offset, data: b"x", fin: false };
-    let cases: [(fn(&mut LinkOpts), Vec<Frame<'static>>); 3] = [
+    let flow = TransportErrorCode::FlowControlError;
+    let cases: [(fn(&mut LinkOpts), Vec<Frame<'static>>, TransportErrorCode); 3] = [
       (
         |el| el.server.limits.max_out_of_order_bytes_per_stream = 8192,
         vec![stream(0, 8191), stream(0, 8192)],
+        flow,
       ),
       (
         |el| el.server.limits.max_out_of_order_ranges = 4,
         vec![stream(0, 10), stream(0, 20), stream(0, 30), stream(0, 40), stream(0, 50)],
+        TransportErrorCode::ProtocolViolation,
       ),
       (
         |el| el.server.limits.max_out_of_order_bytes_per_conn = 8192,
-        vec![stream(0, 5000), stream(4, 5000), stream(8, 5000)],
+        vec![stream(0, 5000), stream(4, 3000), stream(8, 190)],
+        flow,
       ),
     ];
-    for (change, frames) in cases {
+    for (change, frames, code) in cases {
       let mut opts = LinkOpts::new(None);
       change(&mut opts);
       let mut link = settled(&opts);
@@ -3130,7 +3175,7 @@ mod tests {
         assert_eq!(link.server.conn.state(), ConnState::Confirmed, "{frame:?}");
       }
       client_sends(&mut link, &[*last]);
-      assert_eq!(server_close(&link), transport(TransportErrorCode::ProtocolViolation), "{last:?}");
+      assert_eq!(server_close(&link), transport(code), "{last:?}");
     }
   }
 
