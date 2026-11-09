@@ -1069,6 +1069,20 @@ mod tests {
     assert!(set.is_empty());
   }
 
+  // Task 20 fix 1: one stream past the slots in use grows the table by a bounded chunk, not by as
+  // much again, at the size of the benchmark's load (64 connections with 64 streams: 4,096 slots).
+  #[test]
+  fn stream_slot_growth_is_bounded_past_the_steady_state() {
+    let mut slots = StreamSlots::new();
+    for _ in 0..4096 {
+      let _ = slots.alloc().unwrap();
+    }
+    let before = slots.entries.capacity();
+    let _ = slots.alloc().unwrap();
+    let grown = slots.entries.capacity() - before;
+    assert!(grown <= super::table::GROW_SLOTS, "the table grew by {grown} slots of {before}");
+  }
+
   // A freed slot is used again, with a new generation that frame references of the stream that
   // left it do not match, and an idle trim keeps a few slots once none is in use.
   #[test]

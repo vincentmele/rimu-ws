@@ -60,6 +60,7 @@ use crate::{
   sync::{Arc, AtomicU32},
   tls::{QuicTls, TlsConfig, TlsCtxSk},
 };
+use alloc::vec::Vec;
 use core::{
   hint::cold_path,
   net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -257,8 +258,9 @@ where
   shutdown: bool,
   // When the connections that drain themselves after a shutdown are closed, if they are not yet
   shutdown_deadline_us: Option<u64>,
-  // Room for every connection is reserved once, so that a connection never moves
-  slots: Vector<usize, Slot<A, RNG, TCX>>,
+  // The places of the connections, made a chunk at a time up to `max_conns_per_worker`; a
+  // connection never moves
+  slots: SlotTable<A, RNG, TCX>,
   stateless: StatelessQueue,
   stats: EndpointStats,
   timers: TimerWheel,
@@ -316,7 +318,7 @@ where
       rng,
       shutdown: false,
       shutdown_deadline_us: None,
-      slots: Vector::with_exact_capacity(conns)?,
+      slots: SlotTable::new(conns),
       stateless: StatelessQueue::new(),
       stats: EndpointStats::default(),
       timers: TimerWheel::new(conns, 0)?,
@@ -538,6 +540,11 @@ where
   pub(crate) fn trim_idle(&mut self) {
     if self.live == 0 {
       self.pools.trim_idle();
+      // The places of connections that are gone, unless something still points at one
+      if self.dirty.is_empty() && self.fired.is_empty() {
+        self.slots.clear();
+        self.free = NO_SLOT;
+      }
     }
   }
 
@@ -590,10 +597,10 @@ where
       return Some(idx);
     }
     let idx = self.slots.len();
-    if idx >= self.slots.capacity() {
+    if idx >= self.slots.cap {
       return None;
     }
-    self.slots.push(Slot::EMPTY).ok()?;
+    self.slots.push(Slot { generation: self.slots.generation_floor, ..Slot::EMPTY }).ok()?;
     Some(idx)
   }
 
@@ -727,7 +734,7 @@ where
 
   // If a slot is free for one more connection: at most `max_conns_per_worker`.
   fn has_room(&self) -> bool {
-    self.free != NO_SLOT || self.slots.len() < self.slots.capacity()
+    self.free != NO_SLOT || self.slots.len() < self.slots.cap
   }
 
   // The slot of `conn`, if its connection is still there.
@@ -1098,7 +1105,7 @@ where
   fn drop(&mut self) {
     // The connections that `abort_all` did not end go with the pools, without the application
     let Self { loads, pools, slots, worker, .. } = self;
-    for slot in slots.as_slice_mut() {
+    for slot in slots.iter_mut() {
       if let Some(conn) = slot.conn.as_mut() {
         conn.discard(pools);
         if let Some(elem) = loads {
@@ -1125,6 +1132,75 @@ enum Route {
   // Dropped, or answered with a stateless packet
   Done,
   Forward(u8),
+}
+
+/// The slots per chunk of a [`SlotTable`]: about 68 KB of slots.
+const SLOT_CHUNK: usize = 16;
+
+/// The [`Slot`]s of an endpoint: chunks of [`SLOT_CHUNK`] made when the slots before them are in
+/// use, up to a cap, so that a worker holds the slots of the connections it has had at once and
+/// not those of the most it could have (4096 slots are 17 MB). A slot never moves: a chunk is a
+/// vector with its room reserved whole. [`Self::clear`] frees the chunks of an idle worker and
+/// keeps the generations above those of the slots it freed, so that a handle of a connection that
+/// is gone names no connection.
+struct SlotTable<A, RNG, TCX>
+where
+  A: QuicApp,
+{
+  cap: usize,
+  chunks: Vec<Vec<Slot<A, RNG, TCX>>>,
+  /// The generation of a slot that is made, above those of the slots that [`Self::clear`] freed.
+  generation_floor: u32,
+  len: usize,
+}
+
+impl<A, RNG, TCX> SlotTable<A, RNG, TCX>
+where
+  A: QuicApp,
+{
+  const fn new(cap: usize) -> Self {
+    Self { cap, chunks: Vec::new(), generation_floor: 0, len: 0 }
+  }
+
+  fn clear(&mut self) {
+    for slot in self.chunks.iter().flatten() {
+      self.generation_floor = self.generation_floor.max(slot.generation.wrapping_add(1));
+    }
+    self.chunks = Vec::new();
+    self.len = 0;
+  }
+
+  fn get(&self, idx: usize) -> Option<&Slot<A, RNG, TCX>> {
+    self.chunks.get(idx / SLOT_CHUNK)?.get(idx % SLOT_CHUNK)
+  }
+
+  fn get_mut(&mut self, idx: usize) -> Option<&mut Slot<A, RNG, TCX>> {
+    self.chunks.get_mut(idx / SLOT_CHUNK)?.get_mut(idx % SLOT_CHUNK)
+  }
+
+  fn iter_mut(&mut self) -> impl Iterator<Item = &mut Slot<A, RNG, TCX>> {
+    self.chunks.iter_mut().flatten()
+  }
+
+  const fn len(&self) -> usize {
+    self.len
+  }
+
+  fn push(&mut self, slot: Slot<A, RNG, TCX>) -> Result<(), ()> {
+    if self.len >= self.cap {
+      return Err(());
+    }
+    if self.len % SLOT_CHUNK == 0 {
+      let mut chunk = Vec::new();
+      chunk.try_reserve_exact(SLOT_CHUNK).map_err(|_err| ())?;
+      self.chunks.try_reserve(1).map_err(|_err| ())?;
+      self.chunks.push(chunk);
+    }
+    let chunk = self.chunks.last_mut().ok_or(())?;
+    chunk.push(slot);
+    self.len = self.len.wrapping_add(1);
+    Ok(())
+  }
 }
 
 // The place of a connection, kept with what the endpoint knows of it.

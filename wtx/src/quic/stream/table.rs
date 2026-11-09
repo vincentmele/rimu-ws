@@ -22,6 +22,11 @@ pub(super) const MAX_SLOTS: usize = 1 << 14;
 
 pub(super) const NO_SLOT: u32 = u32::MAX;
 
+/// The slots that the table makes room for at a time (about 0.8 MB), so that one stream past the
+/// slots in use grows the table by this much and not by as much again (`Vec` doubles), which at
+/// 4,096 slots of 3.2 KB would be 13 MB.
+pub(crate) const GROW_SLOTS: usize = 256;
+
 /// The streams of the connections of a worker: a slab of slots with generations, grown on demand
 /// up to 16,384 slots, whose slots are used again without allocating. A frame reference names a
 /// stream by slot and generation, so that a stream that is gone is not mistaken for the next one
@@ -60,7 +65,7 @@ impl StreamSlots {
   }
 
   /// The bytes that the slots take at their capacity.
-#[cfg(all(feature = "_h3-loopback-client", feature = "http3-server-framework"))]
+  #[cfg(all(feature = "_h3-loopback-client", feature = "http3-server-framework"))]
   pub(crate) fn bytes(&self) -> usize {
     self.entries.capacity().saturating_mul(size_of::<SlotEntry>())
   }
@@ -93,7 +98,10 @@ impl StreamSlots {
         return Err(exhausted());
       }
       let idx = u32::try_from(self.entries.len()).map_err(|_err| exhausted())?;
-      self.entries.try_reserve(1).map_err(|_err| exhausted())?;
+      if self.entries.len() == self.entries.capacity() {
+        let room = GROW_SLOTS.min(self.cap.saturating_sub(self.entries.len())).max(1);
+        self.entries.try_reserve_exact(room).map_err(|_err| exhausted())?;
+      }
       self.entries.push(SlotEntry {
         generation: self.generation_floor,
         live: false,

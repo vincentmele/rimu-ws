@@ -34,6 +34,9 @@ pub(crate) type TxBlock = [u8; TX_BLOCK_LEN];
 const CHUNK_REFS: usize = 8;
 // Chunks of the frame reference pool at most: 2^15 of about 200 bytes
 const MAX_CHUNKS: usize = 1 << 15;
+/// The chunks that the frame reference pool makes room for at a time (about 100 KB), so that one
+/// chunk past those in use grows the pool by this much and not by as much again (`Vec` doubles).
+pub(crate) const GROW_CHUNKS: usize = 512;
 // Entries of a free list at most
 const MAX_FREE: usize = 1024;
 // Entries kept by an idle pool
@@ -432,6 +435,10 @@ impl FrameRefPool {
         return Err(exhausted());
       }
       let idx = u32::try_from(self.chunks.len()).map_err(|_err| exhausted())?;
+      if self.chunks.len() == self.chunks.capacity() {
+        let room = GROW_CHUNKS.min(self.max_chunks.saturating_sub(self.chunks.len())).max(1);
+        self.chunks.try_reserve_exact(room).map_err(|_err| exhausted())?;
+      }
       self.chunks.push(Chunk::EMPTY);
       idx
     } else {
@@ -610,6 +617,23 @@ mod tests {
     pool.free(range);
     let mut range = FrameRefRange::EMPTY;
     pool.push(&mut range, FrameRef::HandshakeDone).unwrap();
+  }
+
+  // Task 20 fix 1: one chunk past those in use grows the pool by a bounded amount, not by as much
+  // again, at the size of the benchmark's load (64 connections with 64 streams: 4,096 chunks).
+  #[test]
+  fn frame_ref_pool_growth_is_bounded_past_the_steady_state() {
+    let mut pool = FrameRefPool::new(super::MAX_CHUNKS);
+    let mut range = FrameRefRange::EMPTY;
+    for _ in 0..4096 * super::CHUNK_REFS {
+      pool.push(&mut range, FrameRef::HandshakeDone).unwrap();
+    }
+    assert_eq!(pool.live_chunks(), 4096);
+    let before = pool.chunks.capacity();
+    let mut next = FrameRefRange::EMPTY;
+    pool.push(&mut next, FrameRef::HandshakeDone).unwrap();
+    let grown = pool.chunks.capacity() - before;
+    assert!(grown <= super::GROW_CHUNKS, "the pool grew by {grown} chunks of {before}");
   }
 
   #[test]

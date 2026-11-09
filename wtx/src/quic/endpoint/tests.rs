@@ -1107,3 +1107,32 @@ fn flush_order_is_arrival_or_slot() {
     assert_eq!(peers, expected, "slot order {slot_order}");
   }
 }
+
+// Task 20 fix 1: the slots of the connections are made a chunk at a time, up to the cap, and an
+// idle worker frees them keeping the generations above those of the slots it freed.
+#[test]
+fn slot_table_grows_a_chunk_at_a_time_and_clear_keeps_handles_stale() {
+  use super::{SLOT_CHUNK, Slot, SlotTable};
+  use crate::tls::SkCtx;
+  let mut table = SlotTable::<TestApp, ChaCha20, SkCtx>::new(2 * SLOT_CHUNK + 1);
+  assert!(table.chunks.is_empty() && table.get(0).is_none());
+  for nth in 0..=SLOT_CHUNK {
+    table.push(Slot { generation: 7 + nth as u32, ..Slot::EMPTY }).unwrap();
+  }
+  // 17 slots are two chunks, each with room for its slots reserved whole
+  assert_eq!((table.len(), table.chunks.len()), (SLOT_CHUNK + 1, 2));
+  assert!(table.chunks.iter().all(|el| el.capacity() == SLOT_CHUNK));
+  assert_eq!(table.get(SLOT_CHUNK).map(|el| el.generation), Some(7 + SLOT_CHUNK as u32));
+  assert!(table.get(SLOT_CHUNK + 1).is_none());
+  for _ in SLOT_CHUNK + 1..2 * SLOT_CHUNK + 1 {
+    table.push(Slot::EMPTY).unwrap();
+  }
+  assert!(table.push(Slot::EMPTY).is_err(), "past the cap");
+  let before = table.get(0).map(|el| &raw const *el);
+  table.get_mut(0).unwrap().dirty = true;
+  assert_eq!(before, table.get(0).map(|el| &raw const *el), "a slot never moves");
+  table.clear();
+  assert_eq!((table.len(), table.chunks.len()), (0, 0));
+  // No handle of before names a slot made after: its generation was 7 + SLOT_CHUNK at most
+  assert_eq!(table.generation_floor, 8 + SLOT_CHUNK as u32);
+}
