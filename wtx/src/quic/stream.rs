@@ -1886,8 +1886,8 @@ impl Streams {
       };
       let rx = &mut stream.rx;
       let held = &mut cold.held;
-      // Still receiving: the application did not fail and did not ask the peer to stop. A block that
-      // was out for the call goes back in any case, before an error goes up.
+      // Still receiving: the application did not fail and did not ask the peer to stop. A block
+      // that was out for the call goes back in any case, before an error goes up.
       let live = rslt.is_ok() && rx.state == RxState::Recv;
       let mut kept = Ok(());
       match piece {
