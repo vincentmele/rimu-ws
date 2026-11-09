@@ -42,6 +42,11 @@ pub(crate) trait QuicApp {
 
   /// The peer abandoned the sending part of stream `id` (RESET_STREAM) with the application
   /// error `code`: nothing more arrives on it.
+  ///
+  /// The sending part of a bidirectional stream stays open: the stream keeps its slot, and holds
+  /// back the stream credit of the peer (MAX_STREAMS), until the application finishes it (a write
+  /// with the FIN, then its acknowledgment) or resets it with [`ConnCtx::reset`]. An application
+  /// that drops the request should reset it.
   fn on_stream_reset(
     &mut self,
     cx: &mut ConnCtx<'_, Self::ConnState>,

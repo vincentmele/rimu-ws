@@ -771,7 +771,8 @@ impl SendPart {
         seg
       } else {
         let mut block = blocks.take().unwrap_or_else(|| Box::new([0; TX_BLOCK_LEN]));
-        let (head, tail) = bytes.split_at(bytes.len().min(TX_BLOCK_LEN));
+        let (head, tail) =
+          bytes.split_at_checked(bytes.len().min(TX_BLOCK_LEN)).unwrap_or_default();
         if let Some(dst) = block.get_mut(..head.len()) {
           dst.copy_from_slice(head);
         }
@@ -1821,7 +1822,8 @@ impl Streams {
   where
     A: QuicApp,
   {
-    let mut inline = [0u8; INLINE_LEN];
+    // Retained bytes of the slot, for a call: set up on that path only
+    let mut inline: Option<[u8; INLINE_LEN]> = None;
     loop {
       if self.cold.as_ref().is_none_or(|el| el.close_request.is_some()) {
         break;
@@ -1851,10 +1853,11 @@ impl Streams {
         if added == 0 && !fin {
           break;
         }
-        if rx.keep_block.is_none()
-          && let Some((dst, src)) = inline.get_mut(..rx.keep).zip(rx.inline.get(..rx.keep))
-        {
-          dst.copy_from_slice(src);
+        if rx.keep_block.is_none() {
+          let buffer = inline.get_or_insert_with(|| [0; INLINE_LEN]);
+          if let Some((dst, src)) = buffer.get_mut(..rx.keep).zip(rx.inline.get(..rx.keep)) {
+            dst.copy_from_slice(src);
+          }
         }
         (Piece::Keep(rx.keep_block.take()), rx.keep)
       } else if !direct.is_empty() {
@@ -1881,7 +1884,7 @@ impl Streams {
       let bytes = match &piece {
         Piece::Direct => direct,
         Piece::Keep(Some(block)) => block.get(..len).unwrap_or_default(),
-        Piece::Keep(None) => inline.get(..len).unwrap_or_default(),
+        Piece::Keep(None) => inline.as_ref().and_then(|el| el.get(..len)).unwrap_or_default(),
         Piece::Block { block, pos, .. } => {
           block.get(*pos..pos.wrapping_add(len)).unwrap_or_default()
         }
@@ -2209,7 +2212,8 @@ impl Streams {
         .get_mut(idx)
         .and_then(|el| el.data.as_deref_mut())
         .ok_or(crate::Error::ProgrammingError)?;
-      let (head, tail) = rest.split_at(rest.len().min(RX_BLOCK_LEN.wrapping_sub(pos)));
+      let take = rest.len().min(RX_BLOCK_LEN.wrapping_sub(pos));
+      let (head, tail) = rest.split_at_checked(take).unwrap_or_default();
       if let Some(dst) = block.get_mut(pos..pos.wrapping_add(head.len())) {
         dst.copy_from_slice(head);
       }
@@ -2520,8 +2524,8 @@ fn append_to_keep(
     *keep_block = Some(block);
   }
   let area: &mut [u8] = match keep_block {
-    Some(block) => &mut block[..],
-    None => &mut inline[..],
+    Some(block) => block.as_mut_slice(),
+    None => inline.as_mut_slice(),
   };
   let room = area.len().wrapping_sub(*keep);
   if room == 0 {
@@ -2532,7 +2536,9 @@ fn append_to_keep(
     ));
   }
   let added = room.min(next);
-  let dst = area.get_mut(*keep..keep.wrapping_add(added)).unwrap_or_default();
+  let Some(dst) = area.get_mut(*keep..keep.wrapping_add(added)) else {
+    return Err(crate::Error::ProgrammingError);
+  };
   if direct.is_empty() {
     let no = *read / RX_BLOCK;
     let pos = usize::try_from(*read % RX_BLOCK).unwrap_or(0);
@@ -2545,7 +2551,9 @@ fn append_to_keep(
       .ok_or(crate::Error::ProgrammingError)?;
     dst.copy_from_slice(src);
   } else {
-    let (head, tail) = direct.split_at(added);
+    let Some((head, tail)) = direct.split_at_checked(added) else {
+      return Err(crate::Error::ProgrammingError);
+    };
     dst.copy_from_slice(head);
     *direct = tail;
   }
