@@ -14,6 +14,7 @@ pub(crate) const PATH_CEILING_V4: usize = 1472;
 /// The largest UDP payload of an IPv6 path of 1500 bytes.
 pub(crate) const PATH_CEILING_V6: usize = 1452;
 /// The size of every datagram before discovery (RFC 9000 section 14).
+#[cfg(test)]
 pub(crate) const MIN_MTU: usize = 1200;
 
 // The sizes that are tried after a lost probe, from the largest

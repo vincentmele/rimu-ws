@@ -4,75 +4,79 @@
 //! Everything here is sans-I/O: decoders return slices of their input, encoders write into
 //! buffers of the caller and connections are fed datagrams and drained into a [`TxArena`].
 
-#[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
+#[allow(dead_code, reason = "the application interface, which the HTTP/3 layer of task 13 uses")]
 mod app;
-#[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
 mod cc;
 mod cid;
-#[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
+mod cid_table;
 mod conn;
-#[allow(dead_code, reason = "consumed by the connection of the later QUIC tasks")]
 mod crypto;
-#[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
+#[allow(
+  dead_code,
+  reason = "created by the HTTP/3 server of task 14, driven by the driver of task 11"
+)]
+mod endpoint;
 mod flow;
-#[allow(dead_code, reason = "consumed by the connection of the later QUIC tasks")]
 mod frame;
 #[cfg(any(test, feature = "_fuzz"))]
 #[doc(hidden)]
 pub mod frame_check;
-#[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
 mod key_phase;
 mod limits;
-#[allow(dead_code, reason = "consumed by the connection and the endpoint of the later QUIC tasks")]
 mod packet;
 #[cfg(any(test, feature = "_fuzz"))]
 #[doc(hidden)]
 pub mod packet_check;
-#[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
 mod pmtud;
-#[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
 mod pools;
 mod quic_error;
-#[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
 mod recovery;
-#[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
 mod recv_tracker;
-#[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
 mod sent;
-#[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
+#[cfg(all(feature = "libc", target_os = "linux"))]
+mod steer;
 mod stream;
 #[cfg(test)]
 pub(crate) mod testing;
+mod timer_wheel;
+mod token;
 mod transport_params;
 mod tx_arena;
 mod varint;
 mod writer;
 
-#[allow(unused_imports, reason = "reached through the endpoint of the later QUIC tasks")]
 pub(crate) use app::{BodyRef, ConnCtx, QuicApp};
 pub use cid::{Cid, MAX_CID_LEN};
-#[allow(unused_imports, reason = "reached through the endpoint of the later QUIC tasks")]
-pub(crate) use conn::{ConnParams, ConnState, ConnStats, FlushOutcome, QuicConn};
+pub(crate) use conn::{ConnParams, ConnState, FlushOutcome, QuicConn};
 use core::net::{IpAddr, SocketAddr};
-#[allow(unused_imports, reason = "consumed by the connection of the later tasks")]
 pub(crate) use crypto::{
-  DirectionalKeys, PacketKeys, QuicAead, QuicHp, initial_keys, keys_from_secret, open_payload,
-  protect, remove_header_protection, wipe,
+  DirectionalKeys, PacketKeys, initial_keys, keys_from_secret, open_payload, protect,
+  remove_header_protection, wipe,
 };
-#[allow(unused_imports, reason = "consumed by the connection of the later tasks")]
+pub use endpoint::WorkerLoads;
+#[allow(unused_imports, reason = "created by the HTTP/3 server of task 14")]
+pub(crate) use endpoint::{Endpoint, EndpointStats, RecvOutcome};
 pub(crate) use frame::{AckFrame, Frame, FrameReader, FrameWriter, Space};
-pub use limits::QuicLimits;
-#[allow(unused_imports, reason = "consumed by the connection and endpoint of the later tasks")]
+pub use limits::{QuicLimits, QuicParams};
 pub(crate) use packet::{
-  PacketHeader, PacketTy, QUIC_V1, decode_pn, parse_header, pn_len_for, write_retry,
-  write_version_negotiation,
+  PacketTy, QUIC_V1, decode_pn, parse_header, pn_len_for, write_retry, write_version_negotiation,
 };
 pub use quic_error::{QuicError, TransportErrorCode};
-#[allow(unused_imports, reason = "reached through the endpoint of the later QUIC tasks")]
+#[cfg(all(feature = "libc", target_os = "linux"))]
+pub use steer::{STEERING_PROGRAM_LEN, SteeringProgram, steering_cbpf};
+#[allow(
+  unused_imports,
+  reason = "the application interface, which the HTTP/3 layer of task 13 uses"
+)]
 pub(crate) use stream::StreamId;
+#[allow(unused_imports, reason = "created once per process by the HTTP/3 server of task 14")]
+pub(crate) use token::EndpointKeys;
 pub use transport_params::TransportParams;
 pub use tx_arena::{TrainId, TxArena, TxTrain};
-#[allow(unused_imports, reason = "consumed by the frame codec of the later tasks")]
+#[allow(
+  unused_imports,
+  reason = "for tests and the QPACK and HTTP/3 codecs of tasks 12 and 13"
+)]
 pub(crate) use varint::{VARINT_MAX, decode_varint, encode_varint, varint_len};
 
 /// Where a datagram came from and went to.

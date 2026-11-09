@@ -49,7 +49,7 @@ use crate::{
     initial_keys,
     key_phase::{Generation, KeyPhase, confidentiality_limit, integrity_limit, threshold_for},
     keys_from_secret,
-    limits::{QuicLimits, RateBudget},
+    limits::{ConnLimits, RateBudget},
     open_payload, parse_header,
     pmtud::Pmtud,
     pn_len_for,
@@ -73,6 +73,9 @@ use core::{
   net::{IpAddr, SocketAddr},
 };
 
+/// The connection IDs of the peer that a connection stores, the `active_connection_id_limit`
+/// that it sends.
+pub(crate) const ACTIVE_CID_LIMIT: usize = 2;
 // RFC 9000 section 8.1
 const AMPLIFICATION_FACTOR: u64 = 3;
 // The datagram size until path MTU discovery finds a larger one
@@ -93,6 +96,11 @@ const MIN_PN_AND_PAYLOAD_LEN: usize = 4;
 const PING_FRAME: [u8; 1] = [0x01];
 // Probes sent after a probe timeout (RFC 9002 section 6.2.4)
 const PTO_PROBES: u8 = 2;
+// The RETIRE_CONNECTION_ID frames that can be owed at once: more is a CONNECTION_ID_LIMIT_ERROR
+// (RFC 9000 section 5.1.2 asks for at least twice the active_connection_id_limit)
+const MAX_RETIRES_OWED: u64 = 16;
+// The bytes at the end of a stateless reset that are its token (RFC 9000 section 10.3)
+const RESET_TOKEN_LEN: usize = 16;
 const SHORT_RESERVED_BITS: u8 = 0x18;
 const SPACES: [Space; 3] = [Space::Initial, Space::Handshake, Space::Data];
 
@@ -155,19 +163,20 @@ pub(crate) struct ConnParams {
   #[cfg(test)]
   pub(crate) test_integrity_limit: u32,
   /// Abuse limits.
-  pub(crate) limits: QuicLimits,
+  pub(crate) limits: ConnLimits,
 }
 
 impl ConnParams {
   /// The credit given to the peer for the connection: its window, at most the bytes that it can
-  /// make the connection hold ([`QuicLimits::max_out_of_order_bytes_per_conn`], ruling T8-g).
+  /// make the connection hold
+  /// ([`crate::quic::QuicLimits::max_out_of_order_bytes_per_conn`], ruling T8-g).
   #[inline]
   pub(crate) fn conn_credit(&self) -> u64 {
     self.conn_window.min(u64::from(self.limits.max_out_of_order_bytes_per_conn))
   }
 
   /// The credit given to the peer for each stream: its window, at most the bytes that it can make
-  /// a stream hold ([`QuicLimits::max_out_of_order_bytes_per_stream`], ruling T8-g).
+  /// a stream hold ([`crate::quic::QuicLimits::max_out_of_order_bytes_per_stream`], ruling T8-g).
   #[inline]
   pub(crate) fn stream_credit(&self) -> u64 {
     self.stream_window.min(u64::from(self.limits.max_out_of_order_bytes_per_stream))
@@ -197,7 +206,7 @@ impl ConnParams {
       ack_delay_exponent: self.ack_delay_exponent,
       max_ack_delay_ms: self.max_ack_delay_ms,
       disable_active_migration: false,
-      active_connection_id_limit: 2,
+      active_connection_id_limit: ACTIVE_CID_LIMIT as u64,
       initial_source_connection_id: Some(local_cid),
       retry_source_connection_id: None,
     }
@@ -242,7 +251,7 @@ impl Default for ConnParams {
       test_confidentiality_limit: u32::MAX,
       #[cfg(test)]
       test_integrity_limit: u32::MAX,
-      limits: QuicLimits::default(),
+      limits: ConnLimits::default(),
     }
   }
 }
@@ -356,11 +365,27 @@ where
   state: ConnState,
   streams: Streams,
   tls: Option<QuicTls<IS_CLIENT, RNG, TCX>>,
-  // Raw frames for the next 1-RTT packet, boxed so that tests measure about the size of the
-  // connection that they do not have
-  #[allow(clippy::box_collection, reason = "the box keeps the connection of tests small")]
+  // What only tests keep, boxed so that tests measure about the size of the connection that
+  // they do not have
   #[cfg(test)]
-  test_frames: Option<Box<alloc::vec::Vec<u8>>>,
+  test_client: Option<Box<TestClient>>,
+}
+
+/// What a connection of tests keeps: raw frames to send and, for the client, the Retry that it
+/// followed and what the server sent.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct TestClient {
+  /// Raw frames for the next 1-RTT packet.
+  pub(crate) frames: alloc::vec::Vec<u8>,
+  /// NEW_CONNECTION_ID frames received.
+  pub(crate) new_connection_ids: u32,
+  /// The stateless reset token of the transport parameters of the server.
+  pub(crate) peer_reset_token: Option<[u8; 16]>,
+  /// The source CID of the Retry that the client followed.
+  pub(crate) retry_scid: Option<Cid>,
+  /// The token of that Retry, which its Initial packets carry.
+  pub(crate) retry_token: alloc::vec::Vec<u8>,
 }
 
 impl<A, RNG, TCX> QuicConn<A, RNG, TCX, false>
@@ -369,10 +394,13 @@ where
   RNG: CryptoRng,
   TCX: TlsCtxSk,
 {
-  /// The connection that the first Initial packet of a client opens, which `meta` came with and
-  /// whose destination CID is `client_dcid`. `tls` sends the transport parameters of
-  /// [`ConnParams::transport_params`] with `local_cid` and `client_dcid`. The state of the
-  /// handshake comes from `pools`. The datagram is then given to [`Self::recv_datagram`].
+  /// The connection that an Initial packet of a client opens, which `meta` came with and whose
+  /// destination CID is `client_dcid`: the first one, or the one that answers a Retry, whose
+  /// token validated the address of the client (`address_validated`, RFC 9000 section 8.1.2).
+  /// `tls` sends the transport parameters of [`ConnParams::transport_params`] with `local_cid`
+  /// and the original destination CID, and, after a Retry, `client_dcid` as its source CID. The
+  /// state of the handshake comes from `pools`. The datagram is then given to
+  /// [`Self::recv_datagram`].
   #[inline]
   pub(crate) fn new_server(
     params: &ConnParams,
@@ -382,12 +410,18 @@ where
     tls: QuicTls<false, RNG, TCX>,
     now_us: u64,
     pools: &mut QuicPools,
+    address_validated: bool,
   ) -> crate::Result<Self> {
-    let original_dcid = Cid::new(client_dcid)?;
+    let dcid = Cid::new(client_dcid)?;
+    // The Initial keys come from the CID that the client sends its Initial packets to (RFC 9001
+    // section 5.2), the one of its Retry after one
     let initial = initial_keys(client_dcid, true)?;
     // The CID of the client is in the header of its first Initial packet
-    let handshake = HandshakeSpaces::take(initial, original_dcid, pools);
-    Ok(Self::with_parts(params, local_cid, Cid::default(), meta, tls, handshake, now_us, pools))
+    let handshake = HandshakeSpaces::take(initial, dcid, pools);
+    let mut this =
+      Self::with_parts(params, local_cid, Cid::default(), meta, tls, handshake, now_us, pools);
+    this.address_validated = address_validated;
+    Ok(this)
   }
 }
 
@@ -518,6 +552,10 @@ where
   /// outside of the callbacks of [`QuicApp`], such as a handler that finished later. A close that
   /// it asks for is applied when `f` returns.
   #[inline]
+  #[allow(
+    dead_code,
+    reason = "for the handlers that finish later, which the server of task 14 runs"
+  )]
   pub(crate) fn with_ctx<R>(
     &mut self,
     now_us: u64,
@@ -621,7 +659,19 @@ where
       // More room under the amplification limit, which may let the timer be armed
       self.recovery.timer_stale = true;
     }
+    // A packet that fails to open loses its bytes (RFC 9001 section 5.3)
+    let tail = datagram.last_chunk::<RESET_TOKEN_LEN>().copied();
+    let processed = self.stats().packets_in;
     let rslt = self.recv_packets(now_us, datagram, app, pools);
+    if rslt.is_ok()
+      && self.stats().packets_in == processed
+      && matches!(self.state, ConnState::Handshake | ConnState::Confirmed)
+      && tail.is_some_and(|el| self.is_peer_reset(&el))
+    {
+      // A stateless reset of the peer (RFC 9000 section 10.3.1)
+      self.enter_draining(now_us);
+      return Ok(());
+    }
     if self.recovery.timer_stale
       && matches!(self.state, ConnState::Handshake | ConnState::Confirmed)
     {
@@ -651,6 +701,13 @@ where
         self.drop_packet();
         break;
       };
+      #[cfg(test)]
+      if IS_CLIENT && ty == PacketTy::Retry {
+        let token = header.token.to_vec();
+        let packet = rest.to_vec();
+        self.on_retry(scid, &token, &packet, pools);
+        break;
+      }
       // Coalesced packets have the same destination CID (RFC 9000 section 12.2)
       if *first_dcid.get_or_insert(dcid) != dcid {
         self.drop_packet();
@@ -747,6 +804,7 @@ where
     let mut rslt = Ok(());
     let mut lost = LostCtx {
       ack_eliciting_in_flight,
+      cold,
       crypto_lost,
       handshake_done_owed,
       max_datagram: *max_datagram,
@@ -875,6 +933,87 @@ where
     Ok(())
   }
 
+  // NEW_CONNECTION_ID (RFC 9000 sections 5.1.1, 5.1.2 and 19.15, ruling T10-d): the CID is
+  // stored, the ones below Retire Prior To are retired, packets go to a CID that is not.
+  fn on_new_connection_id(
+    &mut self,
+    now_us: u64,
+    seq: u64,
+    retire_prior_to: u64,
+    cid: &[u8],
+    reset_token: &[u8; RESET_TOKEN_LEN],
+  ) -> crate::Result<()> {
+    let budget = self.params.limits.new_connection_id_budget;
+    if !self.cold.as_deref_mut().is_none_or(|el| el.new_cids.take(budget, now_us)) {
+      return Err(self.excessive_load(now_us));
+    }
+    let Some(cold) = self.cold.as_deref_mut() else {
+      return Ok(());
+    };
+    // A peer that uses no CID can not give one
+    if self.peer_cid.is_empty() {
+      return Err(violation(QuicError::ConnectionIdInvalid));
+    }
+    let cid = Cid::new(cid)?;
+    if cold.peer_cids.iter().all(Option::is_none)
+      && let Some(first) = cold.peer_cids.first_mut()
+    {
+      *first = Some(PeerCid { cid: self.peer_cid, reset_token: None, seq: 0 });
+    }
+    // A repeat must be the same; a CID can not come back with another sequence number
+    let known = cold.peer_cids.iter().flatten().find(|el| el.seq == seq);
+    if let Some(elem) = known
+      && (elem.cid != cid || elem.reset_token != Some(*reset_token))
+    {
+      return Err(violation(QuicError::ConnectionIdInvalid));
+    }
+    let is_new = known.is_none();
+    if is_new && cold.peer_cids.iter().flatten().any(|el| el.cid == cid) {
+      return Err(violation(QuicError::ConnectionIdInvalid));
+    }
+    if retire_prior_to > cold.retire_prior_to {
+      if retire_prior_to.saturating_sub(cold.retire_next) > MAX_RETIRES_OWED {
+        cold_path();
+        return Err(crate::Error::QuicClose(
+          TransportErrorCode::ConnectionIdLimitError,
+          QuicError::ConnectionIdLimit,
+        ));
+      }
+      cold.retire_prior_to = retire_prior_to;
+      for elem in &mut cold.peer_cids {
+        if elem.is_some_and(|el| el.seq < retire_prior_to) {
+          *elem = None;
+        }
+      }
+    }
+    // One that was retired already is owed its RETIRE_CONNECTION_ID, which the range covers
+    if is_new && seq >= cold.retire_prior_to {
+      let Some(free) = cold.peer_cids.iter_mut().find(|el| el.is_none()) else {
+        cold_path();
+        return Err(crate::Error::QuicClose(
+          TransportErrorCode::ConnectionIdLimitError,
+          QuicError::ConnectionIdLimit,
+        ));
+      };
+      *free = Some(PeerCid { cid, reset_token: Some(*reset_token), seq });
+    }
+    if cold.peer_cid_seq < cold.retire_prior_to
+      && let Some(next) = cold.peer_cids.iter().flatten().min_by_key(|el| el.seq)
+    {
+      self.peer_cid = next.cid;
+      cold.peer_cid_seq = next.seq;
+    }
+    Ok(())
+  }
+
+  // If `tail`, the last bytes of a datagram that could not be processed, is the stateless reset
+  // token of a CID of the peer.
+  fn is_peer_reset(&self, tail: &[u8; RESET_TOKEN_LEN]) -> bool {
+    self.cold.as_deref().is_some_and(|cold| {
+      cold.peer_cids.iter().flatten().any(|el| el.reset_token.as_ref() == Some(tail))
+    })
+  }
+
   // If the peer completed address validation: always for a server, which the handshake validates
   // to the client; for a client once a Handshake packet of it was acknowledged or the handshake is
   // confirmed (RFC 9002 appendix A.6).
@@ -900,7 +1039,15 @@ where
       requeue_crypto_in_flight(&mut hs.handshake, pools)?;
     }
     let Self {
-      data, handshake, handshake_done_owed, max_datagram, pmtud, recovery, streams, ..
+      cold,
+      data,
+      handshake,
+      handshake_done_owed,
+      max_datagram,
+      pmtud,
+      recovery,
+      streams,
+      ..
     } = self;
     let Some(sp) = space_mut(data, handshake, space) else {
       return Ok(());
@@ -919,6 +1066,7 @@ where
     let PacketSpace { ack_eliciting_in_flight, crypto_lost, .. } = sp;
     let mut lost = LostCtx {
       ack_eliciting_in_flight,
+      cold,
       crypto_lost,
       handshake_done_owed,
       max_datagram: *max_datagram,
@@ -1015,7 +1163,7 @@ where
       return Ok(0);
     };
     let Some((header_len, pn_offset, _)) =
-      write_header(buffer, Space::Data, &dcid, &scid, pn, pn_len, key_phase)
+      write_header(buffer, Space::Data, &dcid, &scid, (pn, pn_len), key_phase, &[])
     else {
       return Ok(0);
     };
@@ -1107,10 +1255,14 @@ where
   // Checks the CIDs of the transport parameters of the peer (RFC 9000 section 7.3).
   fn check_peer_params(&self, params: &TransportParams) -> crate::Result<()> {
     let original_dcid = self.handshake.as_ref().map(|el| el.original_dcid);
+    #[cfg(test)]
+    let retry_scid = self.test_client.as_deref().and_then(|el| el.retry_scid);
+    #[cfg(not(test))]
+    let retry_scid = None;
     let mismatch = params.initial_source_connection_id != Some(self.peer_cid)
       || (IS_CLIENT
         && (params.original_destination_connection_id != original_dcid
-          || params.retry_source_connection_id.is_some()));
+          || params.retry_source_connection_id != retry_scid));
     if mismatch {
       return Err(crate::Error::QuicClose(
         TransportErrorCode::TransportParameterError,
@@ -1138,16 +1290,6 @@ where
       Some(keys) => self.key.prepare_next(keys, pools),
       None => Ok(()),
     }
-  }
-
-  // The Initial and Handshake spaces, wiped, and the TLS state go back to their pools; their
-  // packets leave the bytes in flight (RFC 9002 section 6.4).
-  fn release_handshake(&mut self, pools: &mut QuicPools) {
-    if let Some(elem) = self.handshake.take() {
-      HandshakeSpaces::give(elem, &mut self.recovery, pools);
-    }
-    // Back to the thread's pools, zeroed
-    self.tls = None;
   }
 
   fn crypto_unsent(&self, space: Space) -> &[u8] {
@@ -1249,7 +1391,7 @@ where
     ack: &AckFrame<'_>,
     pools: &mut QuicPools,
   ) -> crate::Result<()> {
-    let max_ranges = self.params.limits.max_ack_ranges;
+    let max_ranges = usize::try_from(self.params.limits.max_ack_ranges).unwrap_or(usize::MAX);
     let max_in_flight = self.params.max_in_flight;
     let Self {
       data,
@@ -1328,6 +1470,7 @@ where
             }
             // Also late, before a copy owed for its loss went (review J8)
             FrameRef::HandshakeDone => *handshake_done_owed = false,
+            FrameRef::RetireConnectionId { .. } => {}
             _ => {
               if rslt.is_ok() {
                 rslt = streams.on_frame_acked(frame, pools);
@@ -1459,6 +1602,10 @@ where
     let is_complete = tls.is_complete();
     if let Some(elem) = peer_params {
       self.check_peer_params(&elem)?;
+      #[cfg(test)]
+      if IS_CLIENT {
+        self.test_client.get_or_insert_default().peer_reset_token = elem.stateless_reset_token;
+      }
       self.has_peer_params = true;
       self.peer_ack_delay_exponent = elem.ack_delay_exponent;
       self.peer_idle_timeout_ms = elem.max_idle_timeout_ms;
@@ -1614,8 +1761,26 @@ where
           ack_eliciting = true;
           self.streams.on_streams_blocked(bidi);
         }
-        // Connection IDs belong to the endpoint
-        Frame::NewConnectionId { .. } | Frame::RetireConnectionId(_) | Frame::PathResponse(_) => {
+        Frame::NewConnectionId { seq, retire_prior_to, cid, reset_token } => {
+          ack_eliciting = true;
+          #[cfg(test)]
+          if IS_CLIENT {
+            let state = self.test_client.get_or_insert_default();
+            state.new_connection_ids = state.new_connection_ids.wrapping_add(1);
+          }
+          self.on_new_connection_id(now_us, seq, retire_prior_to, cid, reset_token)?;
+        }
+        Frame::RetireConnectionId(_) => {
+          ack_eliciting = true;
+          // A server gives one CID, sequence 0, which every packet of the client is sent to (spec
+          // section 5.4): retiring it, or a CID that was never given, is a violation (RFC 9000
+          // section 19.16)
+          if !IS_CLIENT {
+            return Err(violation(QuicError::ConnectionIdInvalid));
+          }
+        }
+        // Path validation is the endpoint's
+        Frame::PathResponse(_) => {
           ack_eliciting = true;
         }
       }
@@ -1771,28 +1936,20 @@ where
       || !sp.crypto_lost.is_empty()
       || probe;
     if space == Space::Data {
-      wants |=
-        self.handshake_done_owed || self.path_response.is_some() || self.streams.wants_send();
+      wants |= self.handshake_done_owed
+        || self.path_response.is_some()
+        || self.streams.wants_send()
+        || self.cold.as_deref().is_some_and(|el| el.retire_next < el.retire_prior_to);
       #[cfg(test)]
       {
-        wants |= self.test_frames.as_ref().is_some_and(|el| !el.is_empty());
+        wants |= self.test_client.as_ref().is_some_and(|el| !el.frames.is_empty());
       }
     }
     wants
   }
 
   fn enter_closed(&mut self, app: &mut A, pools: &mut QuicPools) {
-    self.state = ConnState::Closed;
-    self.release_handshake(pools);
-    self.key.release(pools);
-    self.data.clear(pools);
-    self.streams.release(pools);
-    if let Some(elem) = self.cold.take() {
-      pools.conn_cold.give(elem);
-    }
-    self.close_owed = false;
-    self.handshake_done_owed = false;
-    self.path_response = None;
+    self.release_all(pools);
     app.on_closed(&mut self.app_state);
   }
 
@@ -1854,7 +2011,7 @@ where
       streams: Streams::new(params, IS_CLIENT, pools),
       tls: Some(tls),
       #[cfg(test)]
-      test_frames: None,
+      test_client: None,
     }
   }
 
@@ -2004,8 +2161,15 @@ where
       key_phase = self.key.local_phase;
     }
     let pn_len = pn_len_for(pn, sp.largest_acked);
+    #[cfg(test)]
+    let token = match &self.test_client {
+      Some(elem) if IS_CLIENT && space == Space::Initial => elem.retry_token.as_slice(),
+      _ => &[],
+    };
+    #[cfg(not(test))]
+    let token = &[];
     let Some((header_len, pn_offset, length_at)) =
-      write_header(out, space, &dcid, &scid, pn, pn_len, key_phase)
+      write_header(out, space, &dcid, &scid, (pn, pn_len), key_phase, token)
     else {
       return Ok(None);
     };
@@ -2056,15 +2220,26 @@ where
           ack_eliciting = true;
           full_datagram = true;
         }
+        if let Some(cold) = self.cold.as_deref_mut() {
+          while cold.retire_next < cold.retire_prior_to
+            && fw.write_frame(&Frame::RetireConnectionId(cold.retire_next))
+          {
+            pools
+              .frame_refs
+              .push(&mut frames, FrameRef::RetireConnectionId { seq: cold.retire_next })?;
+            cold.retire_next = cold.retire_next.wrapping_add(1);
+            ack_eliciting = true;
+          }
+        }
       }
       // Raw frames of a test go whatever the window, as a peer that injects them would
       #[cfg(test)]
       if space == Space::Data
-        && let Some(elem) = self.test_frames.as_deref_mut()
-        && !elem.is_empty()
-        && fw.write_bytes(elem)
+        && let Some(elem) = self.test_client.as_deref_mut()
+        && !elem.frames.is_empty()
+        && fw.write_bytes(&elem.frames)
       {
-        elem.clear();
+        elem.frames.clear();
         ack_eliciting = true;
       }
       if allow_ae {
@@ -2111,6 +2286,45 @@ where
   }
 }
 
+impl<A, RNG, TCX, const IS_CLIENT: bool> QuicConn<A, RNG, TCX, IS_CLIENT>
+where
+  A: QuicApp,
+{
+  /// [`Self::abort`] without telling the application: for an endpoint that is dropped, with the
+  /// pools, without an application to tell.
+  #[inline]
+  pub(crate) fn discard(&mut self, pools: &mut QuicPools) {
+    if self.state != ConnState::Closed {
+      self.release_all(pools);
+    }
+  }
+
+  // Closed: everything goes back to the pools.
+  fn release_all(&mut self, pools: &mut QuicPools) {
+    self.state = ConnState::Closed;
+    self.release_handshake(pools);
+    self.key.release(pools);
+    self.data.clear(pools);
+    self.streams.release(pools);
+    if let Some(elem) = self.cold.take() {
+      pools.conn_cold.give(elem);
+    }
+    self.close_owed = false;
+    self.handshake_done_owed = false;
+    self.path_response = None;
+  }
+
+  // The Initial and Handshake spaces, wiped, and the TLS state go back to their pools; their
+  // packets leave the bytes in flight (RFC 9002 section 6.4).
+  fn release_handshake(&mut self, pools: &mut QuicPools) {
+    if let Some(elem) = self.handshake.take() {
+      HandshakeSpaces::give(elem, &mut self.recovery, pools);
+    }
+    // Back to the thread's pools, zeroed
+    self.tls = None;
+  }
+}
+
 #[cfg(test)]
 impl<A, RNG, TCX, const IS_CLIENT: bool> QuicConn<A, RNG, TCX, IS_CLIENT>
 where
@@ -2144,10 +2358,11 @@ where
 
   /// Declares lost every 1-RTT packet in flight, as loss detection would.
   pub(crate) fn declare_in_flight_lost(&mut self, pools: &mut QuicPools) {
-    let Self { data, handshake_done_owed, max_datagram, pmtud, recovery, streams, .. } = self;
+    let Self { cold, data, handshake_done_owed, max_datagram, pmtud, recovery, streams, .. } = self;
     let PacketSpace { ack_eliciting_in_flight, crypto_lost, sent, .. } = data;
     let mut lost = LostCtx {
       ack_eliciting_in_flight,
+      cold,
       crypto_lost,
       handshake_done_owed,
       max_datagram: *max_datagram,
@@ -2216,9 +2431,59 @@ where
     self.recovery.pto_count
   }
 
+  /// A Retry of the server, `packet`, with the source CID `scid` and `token` (RFC 9000 section
+  /// 17.2.5.2): a client that did not get a packet of the server yet follows the first one whose
+  /// integrity tag is valid, sends its Initial packets to `scid`, with the token and keys from
+  /// `scid`, and sends its first flight again.
+  fn on_retry(&mut self, scid: Cid, token: &[u8], packet: &[u8], pools: &mut QuicPools) {
+    let followed = self.test_client.as_deref().is_some_and(|el| el.retry_scid.is_some());
+    let Some(hs) = self.handshake.as_deref_mut().filter(|_| !self.peer_cid_known && !followed)
+    else {
+      return;
+    };
+    let mut expected = alloc::vec![0; packet.len() + 64];
+    let local = self.local_cid;
+    let Ok(len) = crate::quic::write_retry(
+      local.as_slice(),
+      scid.as_slice(),
+      hs.original_dcid.as_slice(),
+      token,
+      &mut expected,
+    ) else {
+      return;
+    };
+    if expected.get(..len) != Some(packet) {
+      return;
+    }
+    let Ok(keys) = initial_keys(scid.as_slice(), false) else {
+      return;
+    };
+    hs.initial.discard(&mut self.recovery, pools);
+    hs.initial.keys = Some(keys);
+    self.peer_cid = scid;
+    let state = self.test_client.get_or_insert_default();
+    state.retry_scid = Some(scid);
+    state.retry_token = token.to_vec();
+  }
+
+  /// What the client of tests learned.
+  pub(crate) fn test_client(&self) -> Option<&TestClient> {
+    self.test_client.as_deref()
+  }
+
+  /// The CID that the packets of the connection are sent to.
+  pub(crate) const fn peer_cid(&self) -> &Cid {
+    &self.peer_cid
+  }
+
+  /// If the address of the peer is validated.
+  pub(crate) const fn address_validated(&self) -> bool {
+    self.address_validated
+  }
+
   /// Sends `frames`, raw, in the next 1-RTT packet.
   pub(crate) fn queue_test_frames(&mut self, frames: &[u8]) {
-    self.test_frames.get_or_insert_default().extend_from_slice(frames);
+    self.test_client.get_or_insert_default().frames.extend_from_slice(frames);
   }
 
   /// The streams.
@@ -2275,20 +2540,46 @@ where
 /// processed, no budget is spent and nothing is counted.
 #[derive(Debug)]
 pub(crate) struct ConnCold {
+  // NEW_CONNECTION_ID frames, for their budget
+  new_cids: RateBudget,
   // Packets that failed to open, for the integrity limit
   open_failures: u64,
   path_challenges: RateBudget,
+  // The CIDs that the peer gave (RFC 9000 section 5.1.1), the one of its handshake, sequence 0,
+  // included once a NEW_CONNECTION_ID arrived: at most the `active_connection_id_limit` that it
+  // was given (ruling T10-d)
+  peer_cids: [Option<PeerCid>; ACTIVE_CID_LIMIT],
+  // The sequence number of the CID of the peer that packets are sent to
+  peer_cid_seq: u64,
   pings: RateBudget,
+  // The CIDs of the peer below this sequence number are retired: RETIRE_CONNECTION_ID is owed for
+  // the ones from `retire_next`, as a range
+  retire_next: u64,
+  retire_prior_to: u64,
   stats: ConnStats,
+}
+
+// A connection ID of the peer and its stateless reset token, which the one of its handshake has
+// not.
+#[derive(Clone, Copy, Debug)]
+struct PeerCid {
+  cid: Cid,
+  reset_token: Option<[u8; RESET_TOKEN_LEN]>,
+  seq: u64,
 }
 
 impl ConnCold {
   // From the pool, or new
   fn take(pools: &mut QuicPools) -> Box<Self> {
     let fresh = Self {
+      new_cids: RateBudget::default(),
       open_failures: 0,
       path_challenges: RateBudget::default(),
+      peer_cids: [None; ACTIVE_CID_LIMIT],
+      peer_cid_seq: 0,
       pings: RateBudget::default(),
+      retire_next: 0,
+      retire_prior_to: 0,
       stats: ConnStats::EMPTY,
     };
     match pools.conn_cold.take() {
@@ -2305,6 +2596,7 @@ impl ConnCold {
 // flight, path MTU discovery.
 struct LostCtx<'any> {
   ack_eliciting_in_flight: &'any mut u32,
+  cold: &'any mut Option<Box<ConnCold>>,
   crypto_lost: &'any mut FrameRefQueue,
   handshake_done_owed: &'any mut bool,
   max_datagram: usize,
@@ -2334,6 +2626,13 @@ impl LostCtx<'_> {
         FrameRef::Crypto { .. } => pools.frame_refs.queue_push(self.crypto_lost, frame),
         FrameRef::HandshakeDone => {
           *self.handshake_done_owed = true;
+          Ok(())
+        }
+        // Owed again, with the ones after it (owed as a range)
+        FrameRef::RetireConnectionId { seq } => {
+          if let Some(elem) = self.cold.as_deref_mut() {
+            elem.retire_next = elem.retire_next.min(seq);
+          }
           Ok(())
         }
         _ => self.streams.on_frame_lost(frame, pools),
@@ -2828,9 +3127,9 @@ fn write_header(
   space: Space,
   dcid: &Cid,
   scid: &Cid,
-  pn: u64,
-  pn_len: usize,
+  (pn, pn_len): (u64, usize),
   key_phase: bool,
+  token: &[u8],
 ) -> Option<(usize, usize, Option<usize>)> {
   let pn_bits = u8::try_from(pn_len.wrapping_sub(1)).ok()? & 0b11;
   let mut w = Writer::new(out);
@@ -2849,8 +3148,9 @@ fn write_header(
     w.put_u8(u8::try_from(scid.len()).ok()?).ok()?;
     w.put(scid.as_slice()).ok()?;
     if space == Space::Initial {
-      // No token
-      w.varint(0).ok()?;
+      // The token of a Retry, which only a client sends
+      w.varint(u64::try_from(token.len()).ok()?).ok()?;
+      w.put(token).ok()?;
     }
     let at = w.pos();
     w.zeros(LENGTH_FIELD_LEN).ok()?;
@@ -2923,7 +3223,7 @@ mod tests {
     sp.sent.skip();
     let mut out = vec![0; 2048];
     let (header_len, pn_offset, length_at) =
-      super::write_header(&mut out, space, &dcid, &scid, pn, 4, false).unwrap();
+      super::write_header(&mut out, space, &dcid, &scid, (pn, 4), false, &[]).unwrap();
     out[0] |= reserved;
     out[header_len..header_len + payload.len()].copy_from_slice(payload);
     if let Some(at) = length_at {
@@ -4444,5 +4744,116 @@ mod tests {
     let pools = &link.client.parts.pools;
     assert_eq!(link.client.conn.streams().send_credit(&pools.stream_slots, id), Some(4096 + 4096));
     assert_eq!(link.client.conn.streams().conn_credit().2, server_max);
+  }
+
+  // NEW_CONNECTION_ID frames of the client in one packet, which the server receives.
+  fn client_new_cids(link: &mut Link, frames: &[(u64, u64, [u8; 8], [u8; 16])]) {
+    let frames: Vec<_> = frames
+      .iter()
+      .map(|(seq, retire_prior_to, cid, reset_token)| Frame::NewConnectionId {
+        seq: *seq,
+        retire_prior_to: *retire_prior_to,
+        cid,
+        reset_token,
+      })
+      .collect();
+    link.client.conn.queue_test_frames(&encode_frames(&frames));
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
+  }
+
+  // Ruling T10-d: the server keeps the CIDs that the client gives, up to the
+  // active_connection_id_limit of 2 that it sent; one more is a CONNECTION_ID_LIMIT_ERROR, and a
+  // repeat changes nothing.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn peer_cids_are_kept_up_to_the_limit() {
+    let mut link = settled(&LinkOpts::new(None));
+    client_new_cids(&mut link, &[(1, 0, [0xa1; 8], [1; 16])]);
+    assert_eq!(link.server.conn.state(), ConnState::Confirmed);
+    client_new_cids(&mut link, &[(1, 0, [0xa1; 8], [1; 16])]);
+    assert_eq!(link.server.conn.state(), ConnState::Confirmed);
+    client_new_cids(&mut link, &[(2, 0, [0xa2; 8], [2; 16])]);
+    assert_eq!(server_close_code(&link), Some(TransportErrorCode::ConnectionIdLimitError.code()));
+  }
+
+  // Ruling T10-d: a Retire Prior To that retires the CID in use moves the server to another one,
+  // and the server owes a RETIRE_CONNECTION_ID for each retired one, again if it is lost.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn retire_prior_to_moves_to_another_cid_and_retires() {
+    let mut link = settled(&LinkOpts::new(None));
+    client_new_cids(&mut link, &[(1, 1, [0xa1; 8], [1; 16]), (2, 2, [0xa2; 8], [2; 16])]);
+    let server = &link.server.conn;
+    assert_eq!(server.state(), ConnState::Confirmed);
+    assert_eq!(server.peer_cid, Cid::new(&[0xa2; 8]).unwrap());
+    let cold = server.cold.as_deref().unwrap();
+    assert_eq!((cold.retire_next, cold.retire_prior_to, cold.peer_cid_seq), (0, 2, 2));
+    // The client takes the packets to its new CID
+    link.client.conn.local_cid = Cid::new(&[0xa2; 8]).unwrap();
+    let _ = link.server.flush(link.now_us);
+    let datagrams = link.server.take_datagrams();
+    assert!(!datagrams.is_empty());
+    assert!(datagrams.iter().all(|el| el[1..9] == [0xa2; 8]));
+    assert_eq!(link.server.conn.cold.as_deref().unwrap().retire_next, 2);
+    // Lost: owed again
+    link.server.conn.declare_in_flight_lost(&mut link.server.parts.pools);
+    assert_eq!(link.server.conn.cold.as_deref().unwrap().retire_next, 0);
+    let _ = link.server.flush(link.now_us);
+    assert_eq!(link.server.conn.cold.as_deref().unwrap().retire_next, 2);
+    // A CID that is retired already when it arrives is not kept: its retirement is owed
+    client_new_cids(&mut link, &[(3, 3, [0xa3; 8], [3; 16]), (1, 0, [0xa1; 8], [1; 16])]);
+    let cold = link.server.conn.cold.as_deref().unwrap();
+    assert_eq!((cold.retire_next, cold.retire_prior_to), (2, 3));
+    assert!(cold.peer_cids.iter().flatten().all(|el| el.seq == 3));
+  }
+
+  // Ruling T10-d: the CIDs of a client that sends none, a repeat that differs, a CID with two
+  // sequence numbers, the retirement of the CID of the server or of one never given and too many
+  // retirements owed are connection errors.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn connection_id_frames_that_break_the_rules_are_errors() {
+    let violation = Some(TransportErrorCode::ProtocolViolation.code());
+    let cases: [(&[(u64, u64, [u8; 8], [u8; 16])], Option<u64>); 3] = [
+      (&[(1, 0, [0xa1; 8], [1; 16]), (1, 0, [0xa1; 8], [9; 16])], violation),
+      (&[(1, 0, [0xa1; 8], [1; 16]), (2, 1, [0xa1; 8], [2; 16])], violation),
+      (&[(20, 20, [0xa1; 8], [1; 16])], Some(TransportErrorCode::ConnectionIdLimitError.code())),
+    ];
+    for (frames, code) in cases {
+      let mut link = settled(&LinkOpts::new(None));
+      client_new_cids(&mut link, frames);
+      assert_eq!(server_close_code(&link), code, "{frames:?}");
+    }
+    let mut link = settled(&LinkOpts::new(None));
+    link.server.conn.peer_cid = Cid::default();
+    client_new_cids(&mut link, &[(1, 0, [0xa1; 8], [1; 16])]);
+    assert_eq!(server_close_code(&link), violation);
+    for seq in [0, 1, 5] {
+      let mut link = settled(&LinkOpts::new(None));
+      link.client.conn.queue_test_frames(&encode_frames(&[Frame::RetireConnectionId(seq)]));
+      let _ = link.client.flush(link.now_us);
+      assert_eq!(link.deliver_to_server(), 1);
+      assert_eq!(server_close_code(&link), violation, "{seq}");
+    }
+  }
+
+  // Ruling T10-d (RFC 9000 section 10.3.1): a datagram that does not open and ends with the reset
+  // token of a CID of the client is a stateless reset: the connection drains, silently.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn stateless_reset_of_the_peer_drains() {
+    let mut link = settled(&LinkOpts::new(None));
+    client_new_cids(&mut link, &[(1, 0, [0xa1; 8], [7; 16])]);
+    let mut datagram = vec![0x45u8; 60];
+    datagram[1..9].copy_from_slice(link.server.conn.local_cid.as_slice());
+    // Not a token of the client: dropped
+    link.server.recv(link.now_us, &mut datagram.clone(), CLIENT_ADDR);
+    assert_eq!(link.server.conn.state(), ConnState::Confirmed);
+    datagram[44..].copy_from_slice(&[7; 16]);
+    link.server.recv(link.now_us, &mut datagram, CLIENT_ADDR);
+    assert_eq!(link.server.conn.state(), ConnState::Draining);
+    let _ = link.server.flush(link.now_us);
+    assert!(link.server.take_datagrams().is_empty());
   }
 }

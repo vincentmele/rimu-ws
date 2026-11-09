@@ -248,6 +248,7 @@ pub(crate) const fn integrity_limit(suite: CipherSuite) -> u64 {
 /// The packets that one key of 1-RTT packets of `suite` seals before an update starts:
 /// `configured`, at most half the confidentiality limit of the suite (2^23 packets for AES-GCM,
 /// RFC 9001 section 6.6), which leaves time for the acknowledgment that an update waits for.
+#[cfg(test)]
 pub(crate) const fn key_update_threshold(suite: CipherSuite, configured: u64) -> u64 {
   threshold_for(confidentiality_limit(suite), configured)
 }

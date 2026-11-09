@@ -43,12 +43,14 @@ use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 use core::hint::cold_path;
 pub(crate) use recv::OooBlock;
 use recv::{Held, RecvPart, RxPools, RxState};
+use reject::{MAX_REJECTED, Rejected};
 use send::{Ready, SendPart};
 pub(crate) use send::{Seg, Source};
 pub(crate) use table::StreamSlots;
 use table::{IMPLICIT, NO_SLOT, Table};
 
 mod recv;
+mod reject;
 mod send;
 mod table;
 
@@ -71,6 +73,8 @@ const OWED_MAX_STREAMS_UNI: u8 = 1 << 3;
 const OWED_MAX_DATA_LOST: u8 = 1 << 4;
 const OWED_MAX_STREAMS_BIDI_LOST: u8 = 1 << 5;
 const OWED_MAX_STREAMS_UNI_LOST: u8 = 1 << 6;
+// RESET_STREAM or STOP_SENDING frames of refused streams
+const OWED_REJECTS: u8 = 1 << 7;
 // Segments of the send queue of a slot reserved when the slot is made: headers, a body, trailers
 pub(super) const RESERVED_SEGMENTS: usize = 4;
 // The window of our unidirectional streams (HTTP/3 opens three)
@@ -85,6 +89,7 @@ pub(crate) struct StreamId(pub u64);
 impl StreamId {
   /// If a client opened the stream and it is bidirectional: a request of HTTP/3.
   #[inline]
+  #[allow(dead_code, reason = "the application interface, which the HTTP/3 layer of task 13 uses")]
   pub(crate) const fn is_client_bidi(self) -> bool {
     self.0 & 0b11 == 0
   }
@@ -209,12 +214,14 @@ impl<const N: usize> RangeSet<N> {
 
   /// If no range is held.
   #[inline]
+  #[cfg(test)]
   pub(crate) const fn is_empty(&self) -> bool {
     self.len == 0
   }
 
   /// If the ranges are in a block of the pools.
   #[inline]
+  #[cfg(test)]
   pub(crate) const fn is_spilled(&self) -> bool {
     self.spill.is_some()
   }
@@ -493,6 +500,8 @@ pub(crate) struct StreamsCold {
   // unidirectional ones
   peer_bidi_credit: u64,
   peer_uni_credit: u64,
+  // Streams of the peer refused for want of a slot (ruling T10-c)
+  rejects: [Option<Rejected>; MAX_REJECTED],
   // Ranges of stream data sent again although they were acknowledged: none, unless a stream had
   // more separate acknowledged ranges than it can remember
   resent_acked: u64,
@@ -519,6 +528,7 @@ impl StreamsCold {
       held: Held { blocks: 0, streams: 0 },
       peer_bidi_credit: 0,
       peer_uni_credit: 0,
+      rejects: [None; MAX_REJECTED],
       resent_acked: 0,
       resets: RateBudget::default(),
       retransmitted: 0,
@@ -628,12 +638,14 @@ impl Streams {
 
   /// STREAM frames sent again, and ranges sent again although they were acknowledged.
   #[inline]
+  #[cfg(test)]
   pub(crate) fn retransmissions(&self) -> (u64, u64) {
     self.cold.as_ref().map_or((0, 0), |el| (el.retransmitted, el.resent_acked))
   }
 
   /// Receive blocks held by the streams.
   #[inline]
+  #[cfg(test)]
   pub(crate) fn held_blocks(&self) -> u32 {
     self.cold.as_ref().map_or(0, |el| el.held.blocks)
   }
@@ -684,7 +696,7 @@ impl Streams {
       .into_iter()
       .flat_map(|el| el.uni_local.slots.iter().chain(el.uni_remote.slots.iter()));
     for slot in self.bidi.slots.iter().chain(uni).copied() {
-      if slot == NO_SLOT || slot == IMPLICIT {
+      if slot == NO_SLOT || slot == IMPLICIT || slot == table::REJECTED {
         continue;
       }
       if let Some(stream) = stream_slots.get_mut(slot) {
@@ -1624,5 +1636,67 @@ mod tests {
     assert_eq!(ids, [StreamId(7), StreamId(11)]);
     link.run();
     assert_eq!(link.client.app.streams[&11].data, b"more");
+  }
+
+  // Ruling T10-c: a stream of the client that finds no slot left on the worker is refused with
+  // RESET_STREAM and STOP_SENDING of H3_REQUEST_REJECTED, not the connection; its data counts
+  // towards the connection credit, which comes back, until its end; past eight refused streams at
+  // once, the connection closes as before.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn exhausted_slots_reject_the_stream_not_the_connection() {
+    let rejected = crate::quic::QuicLimits::default().stream_rejected_app_code;
+    let mut link = settled(&LinkOpts::new(None));
+    link.server.parts.pools.stream_slots.set_cap(2);
+    let now_us = link.now_us;
+    let ids: Vec<StreamId> = (0..3)
+      .map(|_| {
+        link.client.with_ctx(now_us, |cx| {
+          let id = cx.open_bidi()?;
+          cx.write(id, &[b'x'; 100], false)?;
+          Ok::<_, crate::Error>(id)
+        })
+      })
+      .collect::<crate::Result<_>>()
+      .unwrap();
+    link.run();
+    assert_eq!(link.server.conn.state(), ConnState::Confirmed);
+    // The first two are served, the third refused
+    assert_eq!(link.server.app.streams.len(), 2);
+    assert_eq!(link.client.app.stops, [(ids[2], rejected)]);
+    assert_eq!(link.client.app.resets, [(ids[2], rejected)]);
+    // The data of the refused stream was counted and its credit given back, and the client's
+    // reset, which answers the STOP_SENDING, ended it
+    let (_, consumed, _) = link.server.conn.streams().conn_credit();
+    assert_eq!(consumed, 300);
+    assert_eq!(link.server.conn.streams().rejected(), 0);
+    // A stream after it is served once a slot is free: the first two end
+    for id in &ids[..2] {
+      link.client.with_ctx(now_us, |cx| cx.write(*id, b"", true)).unwrap();
+      let id = *id;
+      link.server.with_ctx(now_us, |cx| cx.write(id, b"bye", true)).unwrap();
+    }
+    link.run();
+    let next = link
+      .client
+      .with_ctx(now_us, |cx| {
+        let id = cx.open_bidi()?;
+        cx.write(id, b"again", true)?;
+        Ok::<_, crate::Error>(id)
+      })
+      .unwrap();
+    link.run();
+    assert_eq!(link.server.app.streams[&next.0].data, b"again");
+    // Past eight refused streams at once: INTERNAL_ERROR (the three free slots go first)
+    link.server.parts.pools.stream_slots.set_cap(0);
+    for _ in 0..12 {
+      let _ = link.client.with_ctx(now_us, |cx| {
+        let id = cx.open_bidi()?;
+        cx.write(id, b"x", false)
+      });
+    }
+    let _ = link.client.flush(link.now_us);
+    let _ = link.deliver_to_server();
+    assert_eq!(server_close(&link), Some((false, TransportErrorCode::InternalError.code())));
   }
 }

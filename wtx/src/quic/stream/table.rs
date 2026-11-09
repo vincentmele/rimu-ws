@@ -6,7 +6,7 @@ use crate::quic::{
   pools::QuicPools,
   stream::{
     OWED_MAX_STREAMS_BIDI, OWED_MAX_STREAMS_UNI, Stream, StreamId, Streams, closed, exhausted,
-    stream_limit_error, stream_state_error,
+    reject, stream_limit_error, stream_state_error,
   },
 };
 use alloc::vec::Vec;
@@ -14,6 +14,8 @@ use core::hint::cold_path;
 
 // A stream that a later one opened (RFC 9000 section 3.2), which takes a slot once it is used
 pub(super) const IMPLICIT: u32 = u32::MAX - 1;
+// A stream of the peer that was refused for want of a slot (ruling T10-c)
+pub(super) const REJECTED: u32 = u32::MAX - 2;
 
 // Slots of a worker at most
 pub(super) const MAX_SLOTS: usize = 1 << 14;
@@ -26,6 +28,8 @@ pub(super) const NO_SLOT: u32 = u32::MAX;
 /// in its slot.
 #[derive(Debug)]
 pub(crate) struct StreamSlots {
+  // Slots at most
+  cap: usize,
   pub(super) entries: Vec<SlotEntry>,
   // The first free slot, the others linked from it
   free: u32,
@@ -39,17 +43,25 @@ impl StreamSlots {
   /// No slots.
   #[inline]
   pub(crate) const fn new() -> Self {
-    Self { entries: Vec::new(), free: NO_SLOT, generation_floor: 0, live: 0 }
+    Self { cap: MAX_SLOTS, entries: Vec::new(), free: NO_SLOT, generation_floor: 0, live: 0 }
+  }
+
+  /// Lowers the slots of the worker to at most `cap`, for tests that run out of them.
+  #[cfg(test)]
+  pub(crate) const fn set_cap(&mut self, cap: usize) {
+    self.cap = cap;
   }
 
   /// The number of slots that hold a stream.
   #[inline]
+  #[allow(dead_code, reason = "the idle trim of the worker, which the server of task 14 runs")]
   pub(crate) const fn live(&self) -> usize {
     self.live
   }
 
   /// Frees all but `keep` slots if none holds a stream.
   #[inline]
+  #[allow(dead_code, reason = "the idle trim of the worker, which the server of task 14 runs")]
   pub(crate) fn trim_idle(&mut self, keep: usize) {
     if self.live != 0 {
       return;
@@ -68,7 +80,7 @@ impl StreamSlots {
 
   pub(super) fn alloc(&mut self) -> crate::Result<u32> {
     let idx = if self.free == NO_SLOT {
-      if self.entries.len() >= MAX_SLOTS {
+      if self.entries.len() >= self.cap {
         return Err(exhausted());
       }
       let idx = u32::try_from(self.entries.len()).map_err(|_err| exhausted())?;
@@ -156,6 +168,7 @@ pub(super) enum Entry {
   Implicit,
   NotOpened,
   Open(u32),
+  Rejected,
 }
 
 // The streams of a type of a connection: an index array over the window, from the lowest stream
@@ -241,6 +254,7 @@ impl TableRef<'_> {
     match self.slots.get(pos(self.slots.len(), index)).copied() {
       None | Some(NO_SLOT) => Entry::Closed,
       Some(IMPLICIT) => Entry::Implicit,
+      Some(REJECTED) => Entry::Rejected,
       Some(slot) => Entry::Open(slot),
     }
   }
@@ -311,7 +325,7 @@ impl Streams {
   pub(super) fn app_slot(&self, id: StreamId) -> Option<u32> {
     match self.table(self.kind(id)?)?.entry(id.index()) {
       Entry::Open(slot) => Some(slot),
-      Entry::Closed | Entry::Implicit | Entry::NotOpened => None,
+      Entry::Closed | Entry::Implicit | Entry::NotOpened | Entry::Rejected => None,
     }
   }
 
@@ -375,9 +389,10 @@ impl Streams {
       return Ok(None);
     };
     match table.entry(index) {
-      Entry::Closed => Ok(None),
+      // The data of a refused stream is counted by the caller
+      Entry::Closed | Entry::Rejected => Ok(None),
       Entry::Open(slot) => Ok(Some(slot)),
-      Entry::Implicit => self.create(pools, params, kind, index).map(Some),
+      Entry::Implicit => self.create_or_reject(pools, params, kind, index),
       Entry::NotOpened => {
         if self.is_local(kind) {
           return Err(stream_state_error());
@@ -393,10 +408,26 @@ impl Streams {
           }
           table.meta.next = index.wrapping_add(1);
         }
-        let slot = self.create(pools, params, kind, index)?;
+        let slot = self.create_or_reject(pools, params, kind, index)?;
         self.check_max_streams(kind);
-        Ok(Some(slot))
+        Ok(slot)
       }
+    }
+  }
+
+  // Makes the stream of the peer of `index` in `kind`, or refuses it if the slots of the worker
+  // ran out (ruling T10-c)
+  fn create_or_reject(
+    &mut self,
+    pools: &mut QuicPools,
+    params: &ConnParams,
+    kind: Kind,
+    index: u64,
+  ) -> crate::Result<Option<u32>> {
+    match self.create(pools, params, kind, index) {
+      Ok(slot) => Ok(Some(slot)),
+      Err(err) if reject::refuses(&err) => self.reject(kind, index, err).map(|()| None),
+      Err(err) => Err(err),
     }
   }
 

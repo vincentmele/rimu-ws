@@ -28,6 +28,14 @@ pub enum QuicError {
   /// A connection ID has more bytes than QUIC version 1 allows (20) or than the wire format can
   /// express (255).
   CidTooLong,
+  /// The peer gave more connection IDs than the `active_connection_id_limit` that it was given,
+  /// or retired more of ours than are tracked (with
+  /// [`TransportErrorCode::ConnectionIdLimitError`], RFC 9000 section 5.1.2).
+  ConnectionIdLimit,
+  /// A NEW_CONNECTION_ID or RETIRE_CONNECTION_ID frame that the connection IDs of the connection
+  /// do not allow (with [`TransportErrorCode::ProtocolViolation`], RFC 9000 sections 19.15 and
+  /// 19.16).
+  ConnectionIdInvalid,
   /// A connection ID of the transport parameters of the peer is missing or differs from the one
   /// that its packets carry (RFC 9000 section 7.3).
   ConnectionIdMismatch,

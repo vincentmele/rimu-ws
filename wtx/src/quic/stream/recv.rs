@@ -2,8 +2,9 @@
 //! and the delivery to the application.
 
 use crate::quic::{
-  ConnCtx, ConnParams, QuicApp, QuicError, QuicLimits, TransportErrorCode,
+  ConnCtx, ConnParams, QuicApp, QuicError, TransportErrorCode,
   flow::{flow_control_error, top_up},
+  limits::ConnLimits,
   pools::{FreeList, QuicPools, RX_BLOCK_LEN, RxBlock},
   stream::{
     INLINE_LEN, OWED_MAX_DATA, RangeBlock, RangeSet, StreamId, Streams, closed, excessive_load,
@@ -133,7 +134,7 @@ impl RecvPart {
     bytes: &[u8],
     blocks: &mut FreeList<Box<RxBlock>>,
     held: &mut Held,
-    limits: &QuicLimits,
+    limits: &ConnLimits,
   ) -> crate::Result<()> {
     let len = bytes.len();
     if len > INLINE_LEN {
@@ -165,7 +166,7 @@ impl Held {
   // first and last blocks may hold little of it, the bytes that it retains in a block of their
   // own and the block that the ranges of its waiting data spill into (ruling T9-d). A peer within
   // its credit never goes past it (ruling T8-g).
-  pub(super) fn charge(&mut self, own: &mut u32, limits: &QuicLimits) -> crate::Result<()> {
+  pub(super) fn charge(&mut self, own: &mut u32, limits: &ConnLimits) -> crate::Result<()> {
     let streams = u64::from(self.streams).wrapping_add(u64::from(*own == 0));
     let max = u64::from(limits.max_out_of_order_bytes_per_conn)
       .div_ceil(RX_BLOCK)
@@ -206,7 +207,7 @@ impl Held {
     &mut self,
     blocks: &mut FreeList<Box<RxBlock>>,
     own: &mut u32,
-    limits: &QuicLimits,
+    limits: &ConnLimits,
   ) -> crate::Result<Box<RxBlock>> {
     self.charge(own, limits)?;
     Ok(blocks.take().unwrap_or_else(|| Box::new([0; RX_BLOCK_LEN])))
@@ -249,7 +250,7 @@ pub(super) fn append_to_keep(
   next: usize,
   blocks: &mut FreeList<Box<RxBlock>>,
   held: &mut Held,
-  limits: &QuicLimits,
+  limits: &ConnLimits,
 ) -> crate::Result<usize> {
   let RecvPart { blocks: own, inline, keep, keep_block, ooo_blocks, read, .. } = rx;
   if keep_block.is_none() && keep.wrapping_add(next) > INLINE_LEN {
@@ -325,7 +326,8 @@ impl Streams {
   {
     let id = StreamId(id);
     let Some(slot) = self.frame_slot(pools, params, id, true)? else {
-      return Ok(());
+      // A refused stream answers our STOP_SENDING: it takes no use of the budget
+      return self.on_rejected_data(params, id, final_size, false, true);
     };
     let QuicPools { ooo_indexes, range_blocks, stream_slots, rx_blocks, .. } = &mut *pools;
     let Some(stream) = stream_slots.get_mut(slot) else {
@@ -380,14 +382,14 @@ impl Streams {
   where
     A: QuicApp,
   {
+    let end = offset.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
     let Some(slot) = self.frame_slot(pools, params, StreamId(id), true)? else {
-      return Ok(());
+      return self.on_rejected_data(params, StreamId(id), end, fin, false);
     };
     let Some(stream) = pools.stream_slots.get_mut(slot) else {
       return Ok(());
     };
     let rx = &mut stream.rx;
-    let end = offset.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
     // RFC 9000 section 4.5
     if let Some(size) = rx.final_size
       && (end > size || (fin && end != size))
@@ -676,7 +678,7 @@ impl Streams {
     self.owe_max_data_if_due(params);
   }
 
-  fn owe_max_data_if_due(&mut self, params: &ConnParams) {
+  pub(super) fn owe_max_data_if_due(&mut self, params: &ConnParams) {
     if self.flow.max_data_due(params.conn_credit()).is_some() {
       self.owed |= OWED_MAX_DATA;
     }

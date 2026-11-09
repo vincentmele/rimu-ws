@@ -8,11 +8,15 @@
 //! With an [`Impairment`], the link is a lossy network instead: datagrams take time to arrive and
 //! some are dropped, delivered out of order or twice ([`Link::step_impaired`]), and the clock moves
 //! to the next arrival or timer when nothing else happens ([`Link::advance_to_next_event`]).
+//!
+//! A [`Net`] joins many clients to the endpoints of the workers of a server instead, the kernel's
+//! choice of worker played by [`NetRoute`].
 
 use crate::{
   quic::{
-    BodyRef, Cid, ConnCtx, ConnParams, DatagramMeta, FlushOutcome, Frame, FrameWriter, QuicApp,
-    QuicConn, QuicError, StreamId, TransportErrorCode, TransportParams, TxArena, pools::QuicPools,
+    BodyRef, Cid, ConnCtx, ConnParams, DatagramMeta, Endpoint, EndpointKeys, FlushOutcome, Frame,
+    FrameWriter, QuicApp, QuicConn, QuicError, QuicParams, RecvOutcome, StreamId,
+    TransportErrorCode, TransportParams, TxArena, WorkerLoads, pools::QuicPools,
   },
   rng::{ChaCha20, Rng as _},
   sync::{Arc, AtomicU64},
@@ -720,12 +724,31 @@ pub(crate) fn client_conn(
   pools: &mut QuicPools,
   change_tp: fn(&mut TransportParams),
 ) -> ClientConn {
+  client_conn_padded(params, (local_cid, original_dcid), rng, now_us, pools, change_tp, 0)
+}
+
+/// [`client_conn`] whose transport parameters end with an unknown one of `padding` bytes, which
+/// makes its ClientHello longer.
+pub(crate) fn client_conn_padded(
+  params: &ConnParams,
+  (local_cid, original_dcid): (Cid, Cid),
+  rng: &mut ChaCha20,
+  now_us: u64,
+  pools: &mut QuicPools,
+  change_tp: fn(&mut TransportParams),
+  padding: usize,
+) -> ClientConn {
   let mut tp = [0; 256];
   let mut params_tp = params.transport_params(local_cid, None);
   change_tp(&mut params_tp);
   let len = params_tp.encode(&mut tp).unwrap();
-  let tls =
-    QuicTls::new_client("localhost", b"h3", &tp[..len], ChaCha20::from_key(seed(rng))).unwrap();
+  let mut bytes = tp[..len].to_vec();
+  if padding > 0 {
+    bytes.push(GREASE_PARAM);
+    bytes.extend_from_slice(&(0x4000 | u16::try_from(padding).unwrap()).to_be_bytes());
+    bytes.resize(bytes.len() + padding, 0x5a);
+  }
+  let tls = QuicTls::new_client("localhost", b"h3", &bytes, ChaCha20::from_key(seed(rng))).unwrap();
   QuicConn::new_client(params, local_cid, original_dcid, SERVER_ADDR, tls, now_us, pools).unwrap()
 }
 
@@ -773,8 +796,17 @@ fn server_conn(
     QuicTls::new(&opts.server_config, &padded, rng).unwrap()
   };
   let meta = DatagramMeta { peer: CLIENT_ADDR, local: None, segment_size: None };
-  QuicConn::new_server(&opts.server, local_cid, original_dcid.as_slice(), meta, tls, now_us, pools)
-    .unwrap()
+  QuicConn::new_server(
+    &opts.server,
+    local_cid,
+    original_dcid.as_slice(),
+    meta,
+    tls,
+    now_us,
+    pools,
+    false,
+  )
+  .unwrap()
 }
 
 // Moves the trains of `from` into `to`, one datagram at a time.
@@ -907,4 +939,449 @@ pub(crate) fn encode_frames(frames: &[Frame<'_>]) -> Vec<u8> {
   let len = writer.len();
   buffer.truncate(len);
   buffer
+}
+
+/// The endpoint of a worker of the server of a [`Net`].
+pub(crate) type TestEndpoint = Endpoint<TestApp, ChaCha20, SkCtx>;
+
+/// The TLS configuration of the test certificate, by value.
+pub(crate) fn server_tls_config() -> TlsConfig<SkCtx> {
+  TlsConfig::from_keys_pem(_PUBLIC_KEY, _SECRET_KEY).unwrap()
+}
+
+/// How a [`Net`] picks the worker that a datagram of a client reaches, as the kernel would.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NetRoute {
+  /// By the first byte of the destination CID, modulo the workers, as the steering program does.
+  Steer,
+  /// Always this worker, as a hash of the addresses would for one client.
+  Worker(u8),
+}
+
+/// A worker of the server of a [`Net`].
+#[derive(Debug)]
+pub(crate) struct NetServer {
+  /// The application of the worker.
+  pub(crate) app: TestApp,
+  /// The endpoint.
+  pub(crate) endpoint: TestEndpoint,
+  /// The arena of the worker.
+  pub(crate) tx: TxArena,
+}
+
+/// A client of a [`Net`].
+#[derive(Debug)]
+pub(crate) struct NetClient {
+  /// Its address.
+  pub(crate) addr: SocketAddr,
+  /// The application.
+  pub(crate) app: TestApp,
+  /// The connection.
+  pub(crate) conn: ClientConn,
+  /// The datagrams of the server to it are lost.
+  pub(crate) deaf: bool,
+  /// What it sends is lost.
+  pub(crate) mute: bool,
+}
+
+/// Clients and the workers of a server, a fake network between them and a fake clock. See the
+/// [module documentation](self).
+#[derive(Debug)]
+pub(crate) struct Net {
+  /// The clients, whose ports are 50,000 plus their index.
+  pub(crate) clients: Vec<NetClient>,
+  /// The parameters of the clients.
+  pub(crate) client_params: ConnParams,
+  client_parts: Parts,
+  /// Changes the transport parameters that the clients send.
+  pub(crate) client_tp: fn(&mut TransportParams),
+  counters: Option<(&'static AtomicU64, &'static AtomicU64)>,
+  /// The keys of the stateless packets of the server.
+  pub(crate) keys: Arc<EndpointKeys>,
+  /// The loads of the workers.
+  pub(crate) loads: Arc<WorkerLoads>,
+  /// The time of the fake clock.
+  pub(crate) now_us: u64,
+  rng: ChaCha20,
+  /// How datagrams of the clients reach the workers.
+  pub(crate) route: NetRoute,
+  scratch: Vec<u8>,
+  /// The workers.
+  pub(crate) servers: Vec<NetServer>,
+}
+
+impl Net {
+  /// A server of `workers` workers with `params`, whose applications are `server_app`, and no
+  /// client.
+  pub(crate) fn new(workers: u8, params: QuicParams, server_app: &TestApp) -> Self {
+    let mut rng = ChaCha20::from_key([7; 32]);
+    let keys = Arc::new(EndpointKeys::new(&mut rng));
+    let loads = Arc::new(WorkerLoads::new(workers));
+    let now_us = 1_000_000;
+    let servers = (0..workers)
+      .map(|worker| {
+        let seed = ChaCha20::from_key([worker.wrapping_add(11); 32]);
+        let endpoint = Endpoint::new(
+          params,
+          worker,
+          workers,
+          server_tls_config(),
+          seed,
+          Some(Arc::clone(&loads)),
+          Arc::clone(&keys),
+        )
+        .unwrap();
+        let app = TestApp { is_server: true, ..server_app.clone() };
+        NetServer { app, endpoint, tx: TxArena::new(TxArena::DEFAULT_BYTES).unwrap() }
+      })
+      .collect();
+    Self {
+      clients: Vec::new(),
+      client_params: ConnParams::default(),
+      client_parts: Parts::new(),
+      client_tp: |_| {},
+      counters: None,
+      keys,
+      loads,
+      now_us,
+      rng,
+      route: NetRoute::Steer,
+      scratch: Vec::with_capacity(1 << 17),
+      servers,
+    }
+  }
+
+  /// Counts the allocations of the calls into the endpoints in the first counter, and the others
+  /// in the second one.
+  pub(crate) fn count(&mut self, counters: (&'static AtomicU64, &'static AtomicU64)) {
+    self.counters = Some(counters);
+    _count_allocations_in(counters.1);
+  }
+
+  /// A new client, whose first flight leaves with the next step. Returns its index.
+  pub(crate) fn add_client(&mut self) -> usize {
+    self.add_split_client(0)
+  }
+
+  /// [`Self::add_client`] whose transport parameters have `padding` bytes more, so that its
+  /// ClientHello can span two Initial packets.
+  pub(crate) fn add_split_client(&mut self, padding: usize) -> usize {
+    let idx = self.clients.len();
+    let mut client_cid = [0; 8];
+    let mut original_dcid = [0; 8];
+    self.rng.fill_slice(&mut client_cid);
+    self.rng.fill_slice(&mut original_dcid);
+    let cids = (Cid::new(&client_cid).unwrap(), Cid::new(&original_dcid).unwrap());
+    let conn = client_conn_padded(
+      &self.client_params,
+      cids,
+      &mut self.rng,
+      self.now_us,
+      &mut self.client_parts.pools,
+      self.client_tp,
+      padding,
+    );
+    let port = 50_000u16.wrapping_add(u16::try_from(idx).unwrap());
+    self.clients.push(NetClient {
+      addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
+      app: TestApp::default(),
+      conn,
+      deaf: false,
+      mute: false,
+    });
+    idx
+  }
+
+  /// Moves the clock forward by `us` and runs the timers that are due.
+  pub(crate) fn advance(&mut self, us: u64) {
+    self.now_us = self.now_us.wrapping_add(us);
+    self.run_timers();
+  }
+
+  /// Moves the clock to the next timer of a client or of a worker and runs the timers that are
+  /// due. Returns `false` if there is none.
+  pub(crate) fn advance_to_next_event(&mut self) -> bool {
+    let clients = self.clients.iter().filter_map(|el| el.conn.next_deadline());
+    let servers = self.servers.iter().filter_map(|el| el.endpoint.next_deadline());
+    let Some(next) = clients.chain(servers).min() else {
+      return false;
+    };
+    self.now_us = self.now_us.max(next);
+    self.run_timers();
+    true
+  }
+
+  /// Aborts the connections of the clients that are not closed.
+  pub(crate) fn abort_clients(&mut self) {
+    for client in &mut self.clients {
+      client.conn.abort(&mut client.app, &mut self.client_parts.pools);
+    }
+  }
+
+  /// Gives `datagram`, from client `client`, to the worker that the route picks, and to the one
+  /// that it forwards it to, if it does. Returns what the first one did.
+  pub(crate) fn deliver_to_server(&mut self, client: usize, datagram: &mut [u8]) -> RecvOutcome {
+    let peer = self.clients[client].addr;
+    let meta = DatagramMeta { peer, local: None, segment_size: None };
+    self.deliver_meta(datagram, meta)
+  }
+
+  /// [`Self::deliver_to_server`] with `meta`.
+  pub(crate) fn deliver_meta(&mut self, datagram: &mut [u8], meta: DatagramMeta) -> RecvOutcome {
+    let workers = self.servers.len();
+    let worker = match self.route {
+      NetRoute::Steer => {
+        let byte = if datagram.first().is_some_and(|el| el & 0x80 != 0) { 6 } else { 1 };
+        datagram.get(byte).map_or(0, |el| usize::from(*el) % workers)
+      }
+      NetRoute::Worker(elem) => usize::from(elem),
+    };
+    let now_us = self.now_us;
+    self.enter();
+    let server = &mut self.servers[worker];
+    let rslt = server.endpoint.recv(now_us, datagram, meta, &mut server.app);
+    if let RecvOutcome::Forward { worker } = rslt {
+      let target = &mut self.servers[usize::from(worker)];
+      target.endpoint.recv_forwarded(now_us, datagram, meta, &mut target.app);
+    }
+    self.leave();
+    rslt
+  }
+
+  /// Flushes client `client` and returns its datagrams, which do not leave.
+  pub(crate) fn client_datagrams(&mut self, client: usize) -> Vec<Vec<u8>> {
+    let now_us = self.now_us;
+    let NetClient { app, conn, .. } = &mut self.clients[client];
+    let _ = conn.flush(now_us, &mut self.client_parts.tx, app, &mut self.client_parts.pools);
+    let mut rslt = Vec::new();
+    loop {
+      let next = self
+        .client_parts
+        .tx
+        .pending()
+        .next()
+        .map(|el| (el.id, el.bytes.to_vec(), usize::from(el.segment_size)));
+      let Some((id, bytes, segment)) = next else {
+        break;
+      };
+      self.client_parts.tx.mark_submitted(id);
+      self.client_parts.tx.release(id);
+      rslt.extend(bytes.chunks(segment).map(<[u8]>::to_vec));
+    }
+    rslt
+  }
+
+  /// Gives `datagram`, from the server, to client `client`.
+  pub(crate) fn deliver_to_client(&mut self, client: usize, datagram: &mut [u8]) {
+    let now_us = self.now_us;
+    let NetClient { app, conn, .. } = &mut self.clients[client];
+    let meta = DatagramMeta { peer: SERVER_ADDR, local: None, segment_size: None };
+    let _ = conn.recv_datagram(now_us, datagram, meta, app, &mut self.client_parts.pools);
+  }
+
+  /// Flushes worker `worker` and returns its datagrams with their peers, which do not leave.
+  pub(crate) fn server_datagrams(&mut self, worker: usize) -> Vec<(SocketAddr, Vec<u8>)> {
+    let now_us = self.now_us;
+    self.enter();
+    let server = &mut self.servers[worker];
+    let _ = server.endpoint.flush(now_us, &mut server.tx, &mut server.app);
+    self.leave();
+    let mut rslt = Vec::new();
+    let tx = &mut self.servers[worker].tx;
+    loop {
+      let next = tx
+        .pending()
+        .next()
+        .map(|el| (el.id, el.peer, el.bytes.to_vec(), usize::from(el.segment_size)));
+      let Some((id, peer, bytes, segment)) = next else {
+        break;
+      };
+      tx.mark_submitted(id);
+      tx.release(id);
+      rslt.extend(bytes.chunks(segment).map(|el| (peer, el.to_vec())));
+    }
+    rslt
+  }
+
+  /// Steps until nothing moves anymore, at most `max_steps` times.
+  pub(crate) fn run_for(&mut self, max_steps: usize) {
+    for _ in 0..max_steps {
+      if !self.step() {
+        return;
+      }
+    }
+    panic!("the net did not settle");
+  }
+
+  /// [`Self::run_for`] with 256 steps.
+  pub(crate) fn run(&mut self) {
+    self.run_for(256);
+  }
+
+  /// Sends `per_client` requests from every client, at most `concurrent` at once on each, each
+  /// with its FIN, until every response has its FIN. Returns the responses, which are dropped.
+  pub(crate) fn run_requests(
+    &mut self,
+    per_client: usize,
+    concurrent: usize,
+    request: &[u8],
+  ) -> u64 {
+    self.run_requests_from(0, per_client, concurrent, request)
+  }
+
+  /// [`Self::run_requests`] from the clients from index `first` on.
+  pub(crate) fn run_requests_from(
+    &mut self,
+    first: usize,
+    per_client: usize,
+    concurrent: usize,
+    request: &[u8],
+  ) -> u64 {
+    let clients = self.clients.len().saturating_sub(first);
+    let mut opened = vec![0usize; clients];
+    let mut pending: Vec<Vec<StreamId>> = vec![Vec::new(); clients];
+    let total = (per_client * clients) as u64;
+    let mut done = 0u64;
+    let mut idle_rounds = 0;
+    while done < total {
+      for (idx, client) in self.clients.iter_mut().skip(first).enumerate() {
+        let list = &mut pending[idx];
+        let before = list.len();
+        list.retain(|id| match client.app.streams.get(&id.0) {
+          Some(log) if log.fin => {
+            let _ = client.app.streams.remove(&id.0);
+            false
+          }
+          _ => true,
+        });
+        done += (before - list.len()) as u64;
+        while list.len() < concurrent && opened[idx] < per_client {
+          let rslt = client.conn.with_ctx(self.now_us, &mut self.client_parts.pools, |cx| {
+            let id = cx.open_bidi()?;
+            cx.write(id, request, true)?;
+            Ok::<_, crate::Error>(id)
+          });
+          match rslt {
+            Ok(id) => {
+              list.push(id);
+              opened[idx] += 1;
+            }
+            Err(crate::Error::Quic(QuicError::StreamsBlocked)) => break,
+            Err(err) => panic!("client {idx}, request {}: {err:?}", opened[idx]),
+          }
+        }
+      }
+      if done >= total {
+        break;
+      }
+      if self.step() {
+        idle_rounds = 0;
+      } else {
+        idle_rounds += 1;
+        assert!(idle_rounds < 64 && self.advance_to_next_event(), "{done} of {total} done");
+      }
+    }
+    done
+  }
+
+  /// Flushes every client and delivers what it sent, then flushes every worker and delivers what
+  /// it sent. Returns `false` if nothing was sent.
+  pub(crate) fn step(&mut self) -> bool {
+    let now_us = self.now_us;
+    let mut moved = false;
+    for idx in 0..self.clients.len() {
+      let NetClient { app, conn, mute, .. } = &mut self.clients[idx];
+      let _ = conn.flush(now_us, &mut self.client_parts.tx, app, &mut self.client_parts.pools);
+      let mute = *mute;
+      loop {
+        let next = self.client_parts.tx.pending().next().map(|train| {
+          self.scratch.clear();
+          self.scratch.extend_from_slice(train.bytes);
+          (train.id, usize::from(train.segment_size))
+        });
+        let Some((id, segment)) = next else {
+          break;
+        };
+        self.client_parts.tx.mark_submitted(id);
+        self.client_parts.tx.release(id);
+        moved = true;
+        if mute {
+          continue;
+        }
+        let mut scratch = core::mem::take(&mut self.scratch);
+        for datagram in scratch.chunks_mut(segment) {
+          let _ = self.deliver_to_server(idx, datagram);
+        }
+        self.scratch = scratch;
+      }
+    }
+    for worker in 0..self.servers.len() {
+      self.enter();
+      let server = &mut self.servers[worker];
+      let _ = server.endpoint.flush(now_us, &mut server.tx, &mut server.app);
+      self.leave();
+      loop {
+        let tx = &mut self.servers[worker].tx;
+        let next = tx.pending().next().map(|train| {
+          self.scratch.clear();
+          self.scratch.extend_from_slice(train.bytes);
+          (train.id, train.peer, usize::from(train.segment_size))
+        });
+        let Some((id, peer, segment)) = next else {
+          break;
+        };
+        tx.mark_submitted(id);
+        tx.release(id);
+        moved = true;
+        let idx = usize::from(peer.port().wrapping_sub(50_000));
+        let Some(client) = self.clients.get_mut(idx).filter(|el| !el.deaf) else {
+          continue;
+        };
+        let meta = DatagramMeta { peer: SERVER_ADDR, local: None, segment_size: None };
+        for datagram in self.scratch.chunks_mut(segment) {
+          let _ = client.conn.recv_datagram(
+            now_us,
+            datagram,
+            meta,
+            &mut client.app,
+            &mut self.client_parts.pools,
+          );
+        }
+      }
+    }
+    moved
+  }
+
+  fn enter(&self) {
+    if let Some((own, _)) = self.counters {
+      _count_allocations_in(own);
+    }
+  }
+
+  fn leave(&self) {
+    if let Some((_, others)) = self.counters {
+      _count_allocations_in(others);
+    }
+  }
+
+  fn run_timers(&mut self) {
+    let now_us = self.now_us;
+    for client in &mut self.clients {
+      client.conn.on_timeout(now_us, &mut client.app, &mut self.client_parts.pools);
+    }
+    self.enter();
+    for server in &mut self.servers {
+      server.endpoint.on_timeout(now_us, &mut server.app);
+    }
+    self.leave();
+  }
+}
+
+impl Drop for Net {
+  fn drop(&mut self) {
+    self.abort_clients();
+    for server in &mut self.servers {
+      server.endpoint.abort_all(&mut server.app);
+    }
+  }
 }

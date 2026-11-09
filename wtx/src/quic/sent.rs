@@ -60,6 +60,19 @@ pub(crate) enum FrameRef {
     /// The limit that the frame gave.
     max: u64,
   },
+  /// RESET_STREAM (`stop` false) or STOP_SENDING (`stop` true) of a stream of the peer that was
+  /// refused for want of a slot.
+  RejectedStream {
+    /// The stream.
+    id: u64,
+    /// If the frame was STOP_SENDING.
+    stop: bool,
+  },
+  /// RETIRE_CONNECTION_ID of a connection ID of the peer.
+  RetireConnectionId {
+    /// The sequence number of the connection ID.
+    seq: u64,
+  },
   /// RESET_STREAM of a stream (see [`Self::MaxStreamData`] for the fields).
   ResetStream {
     /// The slot of the stream.
@@ -215,6 +228,7 @@ impl SentRing {
 
   /// The number of packets whose record is held.
   #[inline]
+  #[cfg(test)]
   pub(crate) fn len(&self) -> usize {
     self.slots.iter().filter(|el| el.is_some()).count()
   }

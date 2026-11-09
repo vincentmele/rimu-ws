@@ -349,7 +349,7 @@ pub(crate) const fn char_slice(buffer: &mut [u8; 4], ch: char) -> &mut str {
   ch.encode_utf8(buffer)
 }
 
-#[cfg(all(feature = "foldhash", any(feature = "http2", feature = "postgres")))]
+#[cfg(all(feature = "foldhash", any(feature = "http2", feature = "postgres", feature = "quic")))]
 pub(crate) fn random_state<RNG>(rng: &mut RNG) -> foldhash::fast::FixedState
 where
   RNG: crate::rng::Rng,

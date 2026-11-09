@@ -462,6 +462,7 @@ impl<'a> FrameWriter<'a> {
 
   /// The bytes written so far.
   #[inline]
+  #[cfg(any(test, feature = "_fuzz"))]
   pub(crate) fn written(&self) -> &[u8] {
     self.inner.written()
   }
@@ -710,6 +711,7 @@ impl<'a> FrameWriter<'a> {
   /// Writes a NEW_CONNECTION_ID frame. `cid` has between 1 and 20 bytes and `retire_prior_to`
   /// can not be above `seq`.
   #[inline]
+  #[cfg(test)]
   pub(crate) fn write_new_connection_id(
     &mut self,
     seq: u64,
@@ -722,6 +724,7 @@ impl<'a> FrameWriter<'a> {
 
   /// Writes `len` PADDING bytes.
   #[inline]
+  #[cfg(test)]
   pub(crate) fn write_padding(&mut self, len: usize) -> bool {
     self.write_frame(&Frame::Padding(len))
   }

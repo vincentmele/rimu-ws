@@ -442,10 +442,15 @@ impl Streams {
         }
         return Ok(());
       }
+      FrameRef::RejectedStream { id, stop } => {
+        self.on_rejected_frame(id, stop, true);
+        return Ok(());
+      }
       FrameRef::Ack { .. }
       | FrameRef::Crypto { .. }
       | FrameRef::DataBlocked { .. }
       | FrameRef::HandshakeDone
+      | FrameRef::RetireConnectionId { .. }
       | FrameRef::StopSending { .. }
       | FrameRef::StreamDataBlocked { .. } => return Ok(()),
     };
@@ -535,7 +540,11 @@ impl Streams {
           self.owe_data_blocked();
         }
       }
-      FrameRef::Ack { .. } | FrameRef::Crypto { .. } | FrameRef::HandshakeDone => {}
+      FrameRef::RejectedStream { id, stop } => self.on_rejected_frame(id, stop, false),
+      FrameRef::Ack { .. }
+      | FrameRef::Crypto { .. }
+      | FrameRef::HandshakeDone
+      | FrameRef::RetireConnectionId { .. } => {}
     }
     Ok(())
   }
@@ -670,6 +679,7 @@ impl Streams {
   ) -> crate::Result<bool> {
     let mut wrote = false;
     if self.write_conn_control(fw, frames, pools, params, &mut wrote)?
+      && self.write_rejects(fw, frames, pools, params, &mut wrote)?
       && self.write_stream_control(fw, frames, pools, params, &mut wrote)?
       && self.write_lost(fw, frames, pools, &mut wrote)?
     {

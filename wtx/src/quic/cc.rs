@@ -84,6 +84,7 @@ impl NewReno {
 
   /// The slow start threshold.
   #[inline]
+  #[cfg(test)]
   pub(crate) const fn ssthresh(&self) -> usize {
     self.ssthresh
   }

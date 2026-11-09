@@ -116,6 +116,7 @@ impl<'out> Writer<'out> {
 
   /// What was written so far.
   #[inline]
+  #[cfg(any(test, feature = "_fuzz"))]
   pub(crate) fn written(&self) -> &[u8] {
     self.out.get(..self.pos).unwrap_or_default()
   }

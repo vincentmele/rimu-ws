@@ -37,8 +37,11 @@ const MAX_CHUNKS: usize = 1 << 15;
 // Entries of a free list at most
 const MAX_FREE: usize = 1024;
 // Entries kept by an idle pool
+#[allow(dead_code, reason = "the idle trim of the worker, which the server of task 14 runs")]
 const IDLE_KEEP: usize = 4;
+#[allow(dead_code, reason = "the idle trim of the worker, which the server of task 14 runs")]
 const IDLE_KEEP_CHUNKS: usize = 64;
+#[allow(dead_code, reason = "the idle trim of the worker, which the server of task 14 runs")]
 const IDLE_KEEP_SLOTS: usize = 64;
 const NO_CHUNK: u32 = u32::MAX;
 
@@ -102,6 +105,7 @@ impl QuicPools {
   /// Frees all but a few entries of every pool, for a worker that has no connection: the frame
   /// reference pool and the stream slots only if none is in use.
   #[inline]
+  #[allow(dead_code, reason = "the idle trim of the worker, which the server of task 14 runs")]
   pub(crate) fn trim_idle(&mut self) {
     self.conn_cold.trim(IDLE_KEEP);
     self.crypto_buffers.trim(IDLE_KEEP);
@@ -175,6 +179,7 @@ impl<T> FreeList<T> {
 
   /// The number of entries kept.
   #[inline]
+  #[cfg(test)]
   pub(crate) fn len(&self) -> usize {
     self.items.len()
   }
@@ -193,6 +198,7 @@ impl<T> FreeList<T> {
     (largest > than).then(|| self.items.swap_remove(idx))
   }
 
+  #[allow(dead_code, reason = "the idle trim of the worker, which the server of task 14 runs")]
   fn trim(&mut self, keep: usize) {
     let excess = self.items.len().saturating_sub(keep);
     let _ = self.items.drain(..excess);
@@ -242,6 +248,7 @@ impl FrameRefPool {
 
   /// The references of `range`, in the order in which they were pushed.
   #[inline]
+  #[cfg(test)]
   pub(crate) fn iter(&self, range: FrameRefRange) -> impl Iterator<Item = FrameRef> + '_ {
     let mut idx = range.head;
     let mut chunk: Option<&Chunk> = None;
@@ -259,6 +266,7 @@ impl FrameRefPool {
 
   /// The number of chunks that hold references in use.
   #[inline]
+  #[cfg(test)]
   pub(crate) const fn live_chunks(&self) -> usize {
     self.live
   }
@@ -282,6 +290,7 @@ impl FrameRefPool {
 
   /// The references that wait in `queue`, from the front.
   #[inline]
+  #[cfg(test)]
   pub(crate) fn queue_iter(&self, queue: &FrameRefQueue) -> impl Iterator<Item = FrameRef> + '_ {
     self.iter(queue.range).skip(usize::from(queue.skip))
   }
@@ -383,6 +392,7 @@ impl FrameRefPool {
     self.chunks.get_mut(usize::try_from(idx).ok()?)
   }
 
+  #[allow(dead_code, reason = "the idle trim of the worker, which the server of task 14 runs")]
   fn trim_idle(&mut self, keep: usize) {
     if self.live != 0 {
       return;
