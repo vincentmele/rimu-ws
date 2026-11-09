@@ -1041,13 +1041,12 @@ impl TableRef<'_> {
   }
 }
 
-/// The state of a connection that is seldom used, reached through its streams: the
-/// unidirectional streams, the credit that the peer gives new streams, the receive blocks held,
-/// the budgets of the frames of the peer that a flood would abuse and the close that the
-/// application asked for. It comes from the pools of the worker and goes back once the connection
-/// is over, which keeps the connection small (spec section 5.4, ruling T8-c).
+/// The state of the streams of a connection that is seldom used: the unidirectional streams, the
+/// credit that the peer gives new streams, the receive blocks held, the reset budget and the close
+/// that the application asked for. It comes from the pools of the worker and goes back once the
+/// connection is over, which keeps the connection small (spec section 5.4, ruling T8-c).
 #[derive(Debug)]
-pub(crate) struct ConnCold {
+pub(crate) struct StreamsCold {
   /// DATA_BLOCKED and STREAM_DATA_BLOCKED frames sent.
   #[cfg(test)]
   blocked_sent: u32,
@@ -1055,12 +1054,10 @@ pub(crate) struct ConnCold {
   close_reason_len: u8,
   close_request: Option<u64>,
   held: Held,
-  path_challenges: RateBudget,
   // The credit of a stream that the peer gives: client-initiated bidirectional ones and our
   // unidirectional ones
   peer_bidi_credit: u64,
   peer_uni_credit: u64,
-  pings: RateBudget,
   resets: RateBudget,
   /// If DATA_BLOCKED and STREAM_DATA_BLOCKED are sent, which tests turn off.
   #[cfg(test)]
@@ -1069,7 +1066,7 @@ pub(crate) struct ConnCold {
   uni_remote: Table<UNI_REMOTE_WINDOW>,
 }
 
-impl ConnCold {
+impl StreamsCold {
   // From the pool, or new, for a connection with `params`
   fn take(params: &ConnParams, pools: &mut QuicPools) -> Box<Self> {
     let uni_window = params.max_streams_uni.min(UNI_REMOTE_WINDOW as u64);
@@ -1080,17 +1077,15 @@ impl ConnCold {
       close_reason_len: 0,
       close_request: None,
       held: Held { blocks: 0, streams: 0 },
-      path_challenges: RateBudget::default(),
       peer_bidi_credit: 0,
       peer_uni_credit: 0,
-      pings: RateBudget::default(),
       resets: RateBudget::default(),
       #[cfg(test)]
       send_blocked_frames: true,
       uni_local: Table::new(0, UNI_LOCAL_WINDOW as u64),
       uni_remote: Table::new(uni_window, uni_window),
     };
-    match pools.conn_cold.take() {
+    match pools.streams_cold.take() {
       Some(mut elem) => {
         *elem = fresh;
         elem
@@ -1120,7 +1115,7 @@ pub(crate) struct Streams {
   // The connection is closing: nothing more can be written
   closed: bool,
   // From the pools until the connection is over
-  cold: Option<Box<ConnCold>>,
+  cold: Option<Box<StreamsCold>>,
   ctrl: List,
   fin_only: u32,
   flow: ConnFlow,
@@ -1144,7 +1139,7 @@ impl Streams {
     Self {
       bidi,
       closed: false,
-      cold: Some(ConnCold::take(params, pools)),
+      cold: Some(StreamsCold::take(params, pools)),
       ctrl: List::EMPTY,
       fin_only: 0,
       flow: ConnFlow::new(params.conn_credit()),
@@ -1200,18 +1195,6 @@ impl Streams {
   #[inline]
   pub(crate) fn held_blocks(&self) -> u32 {
     self.cold.as_ref().map_or(0, |el| el.held.blocks)
-  }
-
-  /// Takes a use of the budget of PATH_CHALLENGE frames: `false` if it is spent.
-  #[inline]
-  pub(crate) fn take_path_challenge_budget(&mut self, budget: u32, now_us: u64) -> bool {
-    self.cold.as_deref_mut().is_some_and(|el| el.path_challenges.take(budget, now_us))
-  }
-
-  /// Takes a use of the budget of PING frames: `false` if it is spent.
-  #[inline]
-  pub(crate) fn take_ping_budget(&mut self, budget: u32, now_us: u64) -> bool {
-    self.cold.as_deref_mut().is_some_and(|el| el.pings.take(budget, now_us))
   }
 
   /// The connection is closing: writes fail from now on.
@@ -1551,7 +1534,7 @@ impl Streams {
   #[inline]
   pub(crate) fn release(&mut self, pools: &mut QuicPools) {
     let cold = self.cold.take();
-    let QuicPools { conn_cold, rx_blocks, stream_slots, tx_blocks, .. } = pools;
+    let QuicPools { rx_blocks, stream_slots, streams_cold, tx_blocks, .. } = pools;
     let uni = cold
       .as_deref()
       .into_iter()
@@ -1567,7 +1550,7 @@ impl Streams {
       stream_slots.free(slot);
     }
     if let Some(elem) = cold {
-      conn_cold.give(elem);
+      streams_cold.give(elem);
     }
     self.bidi.slots = [NO_SLOT; BIDI_WINDOW];
     self.closed = true;

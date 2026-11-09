@@ -7,9 +7,9 @@
 
 use crate::quic::{
   QuicError, TransportErrorCode,
-  conn::HandshakeSpaces,
+  conn::{ConnCold, HandshakeSpaces},
   sent::{FrameRef, FrameRefRange, SentPacket},
-  stream::{ConnCold, StreamSlots},
+  stream::{StreamSlots, StreamsCold},
   wipe,
 };
 use alloc::{boxed::Box, vec::Vec};
@@ -57,6 +57,8 @@ pub(crate) struct QuicPools {
   pub(crate) sent_rings: FreeList<Vec<Option<SentPacket>>>,
   /// The streams of every connection.
   pub(crate) stream_slots: StreamSlots,
+  /// The seldom used state of the streams of a connection.
+  pub(crate) streams_cold: FreeList<Box<StreamsCold>>,
   /// Stream data to send that does not fit in a stream slot.
   pub(crate) tx_blocks: FreeList<Box<TxBlock>>,
 }
@@ -72,6 +74,7 @@ impl QuicPools {
       rx_blocks: FreeList::new(),
       sent_rings: FreeList::new(),
       stream_slots: StreamSlots::new(),
+      streams_cold: FreeList::new(),
       tx_blocks: FreeList::new(),
     }
   }
@@ -87,6 +90,7 @@ impl QuicPools {
     self.rx_blocks.trim(IDLE_KEEP);
     self.sent_rings.trim(IDLE_KEEP);
     self.stream_slots.trim_idle(IDLE_KEEP_SLOTS);
+    self.streams_cold.trim(IDLE_KEEP);
     self.tx_blocks.trim(IDLE_KEEP);
   }
 }

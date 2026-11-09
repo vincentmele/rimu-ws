@@ -30,7 +30,7 @@ use crate::{
     AckFrame, Cid, ConnCtx, DatagramMeta, Frame, FrameReader, FrameWriter, PacketKeys, PacketTy,
     QUIC_V1, QuicApp, QuicError, Space, TransportErrorCode, TransportParams, TxArena, initial_keys,
     keys_from_secret,
-    limits::QuicLimits,
+    limits::{QuicLimits, RateBudget},
     open_payload, parse_header, pn_len_for,
     pools::{CRYPTO_BUFFER_LEN, CryptoBuffer, FrameRefPool, QuicPools},
     protect,
@@ -232,6 +232,8 @@ where
   bytes_sent: u64,
   close: CloseFrame,
   close_deadline_us: u64,
+  // From the worker's pool until the connection is closed
+  cold: Option<Box<ConnCold>>,
   close_owed: bool,
   // In the closing state: datagrams received since the last CONNECTION_CLOSE, and how many make
   // the next one, which doubles each time
@@ -896,13 +898,14 @@ where
           ack_eliciting = true;
           self.path_response = Some(data);
           let budget = self.params.limits.path_challenge_budget;
-          if !self.streams.take_path_challenge_budget(budget, now_us) {
+          if !self.cold.as_deref_mut().is_none_or(|el| el.path_challenges.take(budget, now_us)) {
             return Err(self.excessive_load(now_us));
           }
         }
         Frame::Ping => {
           ack_eliciting = true;
-          if !self.streams.take_ping_budget(self.params.limits.ping_budget, now_us) {
+          let budget = self.params.limits.ping_budget;
+          if !self.cold.as_deref_mut().is_none_or(|el| el.pings.take(budget, now_us)) {
             return Err(self.excessive_load(now_us));
           }
         }
@@ -1104,6 +1107,9 @@ where
     self.release_handshake(pools);
     self.data.clear(pools);
     self.streams.release(pools);
+    if let Some(elem) = self.cold.take() {
+      pools.conn_cold.give(elem);
+    }
     self.close_owed = false;
     self.handshake_done_owed = false;
     self.path_response = None;
@@ -1137,6 +1143,7 @@ where
       bytes_sent: 0,
       close: CloseFrame { app: false, code: 0, requested: false },
       close_deadline_us: 0,
+      cold: Some(ConnCold::take(pools)),
       close_owed: false,
       closing_datagrams: 0,
       closing_threshold: 1,
@@ -1440,6 +1447,30 @@ where
       .field("state", &self.state)
       .field("stats", &self.stats)
       .finish_non_exhaustive()
+  }
+}
+
+/// The state of a connection that is seldom used: the budgets of the frames of the peer that a
+/// flood would abuse. It comes from the pools of the worker and goes back once the connection is
+/// closed, which keeps the connection small (spec section 5.4, ruling T8-c). Without it, once the
+/// connection is closed, no frame is processed and no budget is spent.
+#[derive(Debug)]
+pub(crate) struct ConnCold {
+  path_challenges: RateBudget,
+  pings: RateBudget,
+}
+
+impl ConnCold {
+  // From the pool, or new
+  fn take(pools: &mut QuicPools) -> Box<Self> {
+    let fresh = Self { path_challenges: RateBudget::default(), pings: RateBudget::default() };
+    match pools.conn_cold.take() {
+      Some(mut elem) => {
+        *elem = fresh;
+        elem
+      }
+      None => Box::new(fresh),
+    }
   }
 }
 
@@ -2256,7 +2287,7 @@ mod tests {
         pools.handshake_spaces.len(),
         pools.sent_rings.len(),
         pools.crypto_buffers.len(),
-        pools.conn_cold.len(),
+        pools.conn_cold.len() + pools.streams_cold.len(),
       )
     }
     let opts = LinkOpts::new(None);
