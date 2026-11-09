@@ -195,3 +195,37 @@ fn static_misses_do_not_evict_files() {
   assert_eq!(get(&files, "/static/app.js", None).body, b"app");
   assert_eq!(opens(), opened, "the file was read again");
 }
+
+// Task 20 fix 1: the recheck of an entry whose last check is older than `RECHECK` asks the disk
+// again and allocates nothing (the path it asks about is kept), and an entry sees what the disk
+// has now.
+#[test]
+fn recheck_allocates_nothing_and_sees_the_disk() {
+  use super::{Cache, Encoding, RECHECK};
+  use crate::{sync::AtomicU64, tests::_count_allocations_in};
+  use core::sync::atomic::Ordering;
+  use std::time::Instant;
+  static ALLOCS: AtomicU64 = AtomicU64::new(0);
+  let (_, root) = dirs("recheck");
+  fs::write(root.join("a.txt"), b"one").unwrap();
+  let files = StaticFiles::new(&root).unwrap();
+  let mut caches = Vec::new();
+  let cache = Cache::of(&mut caches, &files);
+  cache.path.push_str("a.txt");
+  let begin = Instant::now();
+  // The first look makes the entry (and the kept path)
+  let first = cache.entry(&root, Encoding::Identity, begin).unwrap().file;
+  assert!(first.is_some());
+  // Not due: the entry is the one it was
+  let again = cache.entry(&root, Encoding::Identity, begin).unwrap().file;
+  assert_eq!(first, again);
+  fs::write(root.join("a.txt"), b"longer contents").unwrap();
+  assert_eq!(cache.entry(&root, Encoding::Identity, begin).unwrap().file, first, "not due");
+  _count_allocations_in(&ALLOCS);
+  let later = begin + RECHECK;
+  let rechecked = cache.entry(&root, Encoding::Identity, later).map(|el| el.file);
+  _count_allocations_in(&crate::tests::_ALLOCATIONS);
+  assert_eq!(ALLOCS.load(Ordering::Relaxed), 0);
+  let rechecked = rechecked.unwrap();
+  assert!(rechecked.is_some() && rechecked != first, "the entry did not see the new file");
+}
