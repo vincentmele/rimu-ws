@@ -586,6 +586,19 @@ where
     self.idle_trims = self.idle_trims.wrapping_add(1);
   }
 
+  // The bytes of the pools of the worker (the memory budget of spec section 5.4): the QUIC pools,
+  // the HTTP/3 boxes, the request buffers and slots of the handler and the TLS states of the thread.
+  #[cfg(all(feature = "_h3-loopback-client", feature = "http3-server-framework"))]
+  fn pool_bytes(&self) -> u64 {
+    let bytes = self
+      .endpoint
+      .pool_bytes()
+      .saturating_add(self.app.bytes())
+      .saturating_add(self.app.handler.bytes())
+      .saturating_add(crate::tls::pooled_state_bytes());
+    u64::try_from(bytes).unwrap_or(u64::MAX)
+  }
+
   // The sizes of the pools that an idle trim frees down.
   #[cfg(test)]
   fn pool_sizes(&self) -> PoolSizes {
@@ -670,6 +683,13 @@ where
     let handler = self.app.handler.counters();
     let qpack = self.app.qpack_counters();
     let udp = self.socket.stats();
+    #[cfg(all(feature = "_h3-loopback-client", feature = "http3-server-framework"))]
+    let (pool_bytes, pool_bytes_peak) = {
+      let bytes = self.pool_bytes();
+      (bytes, bytes.max(cell.0.load().pool_bytes_peak))
+    };
+    #[cfg(not(all(feature = "_h3-loopback-client", feature = "http3-server-framework")))]
+    let (pool_bytes, pool_bytes_peak) = (0, 0);
     cell.0.store(&Http3WorkerStats {
       ack_only_out: endpoint.ack_only_out,
       bytes_out: endpoint.bytes_out,
@@ -693,6 +713,8 @@ where
       packets_out: endpoint.packets_out,
       parked: u64::try_from(self.app.handler.parked()).unwrap_or(u64::MAX),
       park_refused: handler.park_refused,
+      pool_bytes,
+      pool_bytes_peak,
       pto_probes: endpoint.pto_probes,
       qpack_memo_hits: qpack.memo_hits,
       qpack_sections: qpack.sections,

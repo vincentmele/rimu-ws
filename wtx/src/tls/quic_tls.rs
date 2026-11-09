@@ -91,6 +91,18 @@ pub(crate) fn pooled_states() -> usize {
   STATE_POOL.with(|pool| pool.borrow().len())
 }
 
+/// The bytes that the state boxes of this thread's pool take, for the memory budget of a worker.
+#[cfg(all(feature = "_h3-loopback-client", feature = "http3-server-framework", feature = "std"))]
+pub(crate) fn pooled_state_bytes() -> usize {
+  STATE_POOL.with(|pool| {
+    let pool = pool.borrow();
+    pool
+      .capacity()
+      .saturating_mul(size_of::<usize>())
+      .saturating_add(pool.len().saturating_mul(size_of::<QuicTlsState>()))
+  })
+}
+
 /// Frees the oldest state boxes of this thread's pool until a few are left: with the other TLS
 /// pools ([`crate::tls::tls_pool`]), once the thread has no connection open.
 #[cfg(all(feature = "std", feature = "io-uring", target_os = "linux"))]
@@ -205,7 +217,7 @@ where
   }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "_h3-loopback-client"))]
 impl<RNG> QuicTls<true, RNG, crate::tls::UnverifiedCtx>
 where
   RNG: CryptoRng + CryptoSeedableRng,
@@ -433,9 +445,9 @@ where
     match self.state.stage {
       Stage::ClientHello => self.server_client_hello(start, excess),
       Stage::ClientFinished => self.server_client_finished(start, excess),
-      #[cfg(test)]
+      #[cfg(any(test, feature = "_h3-loopback-client"))]
       Stage::ServerHello(_) => self.client_server_hello(start, excess),
-      #[cfg(test)]
+      #[cfg(any(test, feature = "_h3-loopback-client"))]
       Stage::ServerFlight(_) => self.client_server_flight(start, excess),
       Stage::Complete | Stage::Failed => {
         Err(alert(AlertDescription::UnexpectedMessage, QuicError::CryptoDataAtWrongLevel))
@@ -550,7 +562,7 @@ where
   }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "_h3-loopback-client"))]
 impl<const IS_CLIENT: bool, RNG, TCX> QuicTls<IS_CLIENT, RNG, TCX>
 where
   RNG: CryptoRng + CryptoSeedableRng,
@@ -757,7 +769,7 @@ enum Stage {
   /// A server waits for the Finished of the client, in Handshake.
   ClientFinished,
   /// A client waits for the ServerHello, in Initial, with its key shares.
-  #[cfg(test)]
+  #[cfg(any(test, feature = "_h3-loopback-client"))]
   ServerHello(
     crate::collections::ArrayVectorU8<
       crate::tls::protocol::named_group::NamedGroupAgreement,
@@ -765,7 +777,7 @@ enum Stage {
     >,
   ),
   /// A client waits for the rest of the flight of the server, in Handshake.
-  #[cfg(test)]
+  #[cfg(any(test, feature = "_h3-loopback-client"))]
   ServerFlight(crate::tls::ManageRemainingServerRecordsInput),
   /// The handshake is over.
   Complete,
@@ -777,7 +789,7 @@ impl Stage {
   /// If the messages that arrive are kept while the stage lasts: those of the flight of a server,
   /// as with records, since a CertificateVerify refers to the Certificate before it.
   const fn keeps_messages(&self) -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "_h3-loopback-client"))]
     if let Self::ServerFlight(_) = self {
       return true;
     }
@@ -788,10 +800,10 @@ impl Stage {
   const fn reading_level(&self) -> Option<u8> {
     match self {
       Self::ClientHello => Some(INITIAL_LEVEL),
-      #[cfg(test)]
+      #[cfg(any(test, feature = "_h3-loopback-client"))]
       Self::ServerHello(_) => Some(INITIAL_LEVEL),
       Self::ClientFinished => Some(HANDSHAKE_LEVEL),
-      #[cfg(test)]
+      #[cfg(any(test, feature = "_h3-loopback-client"))]
       Self::ServerFlight(_) => Some(HANDSHAKE_LEVEL),
       Self::Complete => Some(DATA_LEVEL),
       Self::Failed => None,
@@ -853,7 +865,7 @@ const fn level(space: Space) -> u8 {
   }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "_h3-loopback-client"))]
 fn missing_transport_params() -> crate::Error {
   crate::Error::TlsErrorReply(
     TlsError::MissingQuicTransportParameters,

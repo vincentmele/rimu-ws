@@ -94,7 +94,7 @@ impl<'qtp, G, TCG> ClientHello<'qtp, G, TCG> {
   /// The ClientHello of a QUIC client: with its transport parameters and without a
   /// `legacy_session_id`, which is only there for the middlebox compatibility mode of TLS over
   /// TCP (RFC 9001 section 8.4).
-  #[cfg(all(feature = "quic", test))]
+  #[cfg(all(feature = "quic", any(test, feature = "_h3-loopback-client")))]
   pub(crate) fn into_quic(mut self, transport_parameters: &'qtp [u8]) -> Self {
     self.legacy_session_id.clear();
     self.quic_transport_parameters = Some(transport_parameters);

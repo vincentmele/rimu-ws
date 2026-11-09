@@ -21,6 +21,9 @@ mod h3_app;
 )]
 mod h3_conn_state;
 mod http3_error;
+#[cfg(feature = "_h3-loopback-client")]
+#[doc(hidden)]
+pub mod loopback_client;
 #[cfg_attr(
   not(feature = "http3-server-framework"),
   allow(dead_code, reason = "only the HTTP/3 server framework runs the connection layer")

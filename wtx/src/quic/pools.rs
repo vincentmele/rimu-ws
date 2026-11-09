@@ -115,6 +115,32 @@ impl QuicPools {
     }
   }
 
+  /// The bytes that the pools take, free entries and the frame references and stream slots
+  /// included: the arrays at their capacity, the boxes at the size of what they hold. It is an
+  /// estimate (a stream slot's own heap is not followed), for the memory budget of a worker.
+  #[cfg(all(feature = "_h3-loopback-client", feature = "http3-server-framework"))]
+  pub(crate) fn bytes(&self) -> usize {
+    [
+      self.conn_cold.boxed_bytes(),
+      self.crypto_buffers.boxed_bytes(),
+      self.frame_refs.chunks.capacity().saturating_mul(size_of::<Chunk>()),
+      self.handshake_spaces.boxed_bytes(),
+      self.key_slots.boxed_bytes(),
+      self.ooo_indexes.bytes(|el| el.capacity().saturating_mul(size_of::<OooBlock>())),
+      self.range_blocks.boxed_bytes(),
+      self.recv_spills.boxed_bytes(),
+      self.rx_blocks.boxed_bytes(),
+      self.seg_queues.bytes(|el| el.capacity().saturating_mul(size_of::<Seg>())),
+      self.sent_rings.bytes(|el| el.capacity().saturating_mul(size_of::<Option<SentPacket>>())),
+      self.stream_slots.bytes(),
+      self.streams_cold.boxed_bytes(),
+      self.tx_blocks.boxed_bytes(),
+      size_of::<HpBatch>(),
+    ]
+    .into_iter()
+    .fold(0, usize::saturating_add)
+  }
+
   /// Frees all but a few entries of every pool, for a worker that has no connection: the frame
   /// reference pool and the stream slots only if none is in use.
   #[inline]
@@ -214,6 +240,13 @@ impl<T> FreeList<T> {
     (largest > than).then(|| self.items.swap_remove(idx))
   }
 
+  /// The bytes that the list takes: its array and, by `item`, the heap of each entry.
+  #[cfg(all(feature = "_h3-loopback-client", feature = "http3-server-framework"))]
+  pub(crate) fn bytes(&self, item: impl Fn(&T) -> usize) -> usize {
+    let own = self.items.capacity().saturating_mul(size_of::<T>());
+    self.items.iter().fold(own, |acc, el| acc.saturating_add(item(el)))
+  }
+
   #[cfg_attr(
     not(feature = "http3-server-framework"),
     allow(dead_code, reason = "only the HTTP/3 server framework trims idle workers")
@@ -222,6 +255,14 @@ impl<T> FreeList<T> {
     let excess = self.items.len().saturating_sub(keep);
     let _ = self.items.drain(..excess);
     self.items.shrink_to(keep);
+  }
+}
+
+impl<T> FreeList<Box<T>> {
+  /// The bytes that the list and its boxes take.
+  #[cfg(all(feature = "_h3-loopback-client", feature = "http3-server-framework"))]
+  pub(crate) fn boxed_bytes(&self) -> usize {
+    self.bytes(|_| size_of::<T>())
   }
 }
 

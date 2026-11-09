@@ -66,6 +66,8 @@ pub use limits::{QuicLimits, QuicParams};
 pub(crate) use packet::{
   PacketTy, QUIC_V1, decode_pn, parse_header, pn_len_for, write_retry, write_version_negotiation,
 };
+#[cfg(feature = "_h3-loopback-client")]
+pub(crate) use pools::QuicPools;
 pub use quic_error::{QuicError, TransportErrorCode};
 #[cfg(all(feature = "libc", target_os = "linux"))]
 pub use steer::{STEERING_PROGRAM_LEN, SteeringProgram, steering_cbpf};

@@ -97,6 +97,12 @@ pub struct Http3WorkerStats {
   pub park_refused: u64,
   /// Requests parked now: their handlers wait.
   pub parked: u64,
+  /// The bytes that the pools of the worker take now (QUIC pools, HTTP/3 boxes, request buffers
+  /// and slots, TLS states), as the worker measured them when it stored its counters; always 0
+  /// unless the feature `_h3-loopback-client` (test-only) is on.
+  pub pool_bytes: u64,
+  /// The most [`Self::pool_bytes`] ever measured.
+  pub pool_bytes_peak: u64,
   /// Probe timeouts that fired.
   pub pto_probes: u64,
   /// Of [`Self::qpack_sections`], those that the decode memo replayed: the memo's hit rate is
@@ -190,7 +196,7 @@ impl Default for StatsCell {
 }
 
 impl StatsCell {
-  const LEN: usize = 36;
+  const LEN: usize = 38;
 
   fn load(&self) -> Http3WorkerStats {
     let mut values = [0u64; Self::LEN];
@@ -219,6 +225,8 @@ impl StatsCell {
       packets_out,
       park_refused,
       parked,
+      pool_bytes,
+      pool_bytes_peak,
       pto_probes,
       qpack_memo_hits,
       qpack_sections,
@@ -258,6 +266,8 @@ impl StatsCell {
       packets_out,
       park_refused,
       parked,
+      pool_bytes,
+      pool_bytes_peak,
       pto_probes,
       qpack_memo_hits,
       qpack_sections,
@@ -300,6 +310,8 @@ impl StatsCell {
       stats.packets_out,
       stats.park_refused,
       stats.parked,
+      stats.pool_bytes,
+      stats.pool_bytes_peak,
       stats.pto_probes,
       stats.qpack_memo_hits,
       stats.qpack_sections,

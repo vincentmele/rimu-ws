@@ -1536,6 +1536,8 @@ fn worker_stats_round_trip_through_their_cell() {
     packets_out: 15,
     park_refused: 16,
     parked: 17,
+    pool_bytes: 37,
+    pool_bytes_peak: 38,
     pto_probes: 18,
     qpack_memo_hits: 19,
     qpack_sections: 20,

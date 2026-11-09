@@ -65,6 +65,8 @@ pub use protocol::{
 pub use public_keys::{PublicKeyRef, PublicKeys, PublicKeysIter};
 #[cfg(feature = "quic")]
 pub(crate) use quic_tls::QuicTls;
+#[cfg(all(feature = "_h3-loopback-client", feature = "http3-server-framework", feature = "std"))]
+pub(crate) use quic_tls::pooled_state_bytes;
 #[cfg(all(test, feature = "quic", feature = "std"))]
 pub(crate) use quic_tls::pooled_states;
 pub use read_record_info::ReadRecordInfo;

@@ -246,7 +246,7 @@ impl<'c, S> ConnCtx<'c, S> {
   }
 
   /// Opens a bidirectional stream, as the client of tests does.
-  #[cfg(test)]
+  #[cfg(any(test, feature = "_h3-loopback-client"))]
   pub(crate) fn open_bidi(&mut self) -> crate::Result<StreamId> {
     self.streams.open_bidi(self.pools, self.params)
   }

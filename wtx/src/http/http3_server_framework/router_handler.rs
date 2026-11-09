@@ -60,8 +60,11 @@ use core::{
 /// and their bodies fit in [`KEEP_BODY`]: past that, the request buffers of the requests above the
 /// bound are freed when they end and made again by the next burst (Task 20 measures it).
 pub(crate) const MAX_PARKED: usize = 1024;
-/// The combinations of the fields of a response that are kept encoded.
-const MAX_BLOCKS: usize = 16;
+/// The combinations of the fields of a response that are kept encoded: past them, the least
+/// recently used is encoded again for the next one, which allocates when it is longer than the
+/// room that block had. A workload with at most this many (HttpArena's static files are 7 types in
+/// 3 encodings, Task 20 measured 16 to be too few) allocates nothing in the steady state.
+const MAX_BLOCKS: usize = 64;
 /// The bytes of the values of a combination past which it is encoded per response.
 const MAX_BLOCK_KEY: usize = 512;
 /// The request buffers that a worker keeps for the next requests: fewer than [`MAX_PARKED`], see
@@ -233,6 +236,20 @@ where
   /// Moves the slots woken since the last call into `out`.
   pub(crate) fn take_woken(&self, out: &mut VectorUsize<u32>) -> crate::Result<()> {
     self.slots.take_woken(out)
+  }
+
+  /// The bytes that the request buffers, the clones of the data and the slots of futures take, for
+  /// the memory budget of a worker.
+  #[cfg(all(feature = "_h3-loopback-client", feature = "http3-server-framework"))]
+  pub(crate) fn bytes(&self) -> usize {
+    let datas = self.datas.capacity().saturating_mul(size_of::<D::Data>());
+    let msgs = self
+      .msgs
+      .iter()
+      .fold(self.msgs.capacity().saturating_mul(size_of::<MsgBufferString>()), |acc, el| {
+        acc.saturating_add(el.body.capacity())
+      });
+    datas.saturating_add(msgs).saturating_add(self.slots.bytes())
   }
 
   /// Frees all but a few request buffers and, if no request waits, all but a few slots: for a
@@ -842,6 +859,17 @@ where
     }
   }
 
+  // The bytes that the slots and the lists of free and woken ones take.
+  #[cfg(all(feature = "_h3-loopback-client", feature = "http3-server-framework"))]
+  fn bytes(&self) -> usize {
+    let slot = size_of::<Slot<F>>().saturating_add(size_of::<Option<F>>());
+    self
+      .slots
+      .capacity()
+      .saturating_mul(slot)
+      .saturating_add(self.free.capacity().saturating_mul(size_of::<u32>()))
+  }
+
   // The slot of the request of `stream` of `conn`, if a future waits for it.
   fn find(&self, conn: ConnHandle, stream: StreamId) -> Option<u32> {
     if self.len == 0 {
@@ -1157,5 +1185,38 @@ mod tests {
         assert_eq!(section, expected.as_slice(), "round {round} {content_type:.10}");
       }
     }
+  }
+
+  // Task 20: the combinations of a workload that has fewer than `MAX_BLOCKS` of them stay encoded,
+  // so a round of them allocates nothing once the first has: HttpArena's static files are 7 types
+  // in 3 encodings.
+  #[test]
+  fn combinations_up_to_the_cap_are_encoded_without_allocating() {
+    static ALLOCS: crate::sync::AtomicU64 = crate::sync::AtomicU64::new(0);
+    let types: Vec<alloc::string::String> = (0..16).map(|el| alloc::format!("text/t{el:02}")).collect();
+    let all: Vec<Headers> = types
+      .iter()
+      .flat_map(|ty| {
+        ["", "br", "gzip"].map(|enc| {
+          let mut fields = vec![("content-type", ty.as_str())];
+          if !enc.is_empty() {
+            fields.extend_from_slice(&[("content-encoding", enc), ("vary", "accept-encoding")]);
+          }
+          headers(&fields)
+        })
+      })
+      .collect();
+    let mut head = ResponseHead::new();
+    for fields in &all {
+      let _ = head.encode(StatusCode::Ok, fields, None, None).unwrap();
+    }
+    // Every combination has its block: none is replaced, whatever the order of the rounds
+    assert_eq!(head.blocks.len(), all.len());
+    crate::tests::_count_allocations_in(&ALLOCS);
+    for fields in all.iter().chain(all.iter().rev()) {
+      let _ = head.encode(StatusCode::Ok, fields, None, None).unwrap();
+    }
+    crate::tests::_count_allocations_in(&crate::tests::_ALLOCATIONS);
+    assert_eq!(ALLOCS.load(core::sync::atomic::Ordering::Relaxed), 0);
   }
 }

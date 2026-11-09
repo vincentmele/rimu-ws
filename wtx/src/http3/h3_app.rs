@@ -389,6 +389,12 @@ where
     self.pool_bytes
   }
 
+  /// The bytes that the pool and the response buffers take, for the memory budget of a worker.
+  #[cfg(all(feature = "_h3-loopback-client", feature = "http3-server-framework"))]
+  pub(crate) fn bytes(&self) -> usize {
+    self.pool_bytes.saturating_add(self.fields.capacity()).saturating_add(self.frame.capacity())
+  }
+
   /// If no box of the pool holds state of a connection.
   #[cfg(test)]
   pub(crate) fn pool_is_clear(&self) -> bool {

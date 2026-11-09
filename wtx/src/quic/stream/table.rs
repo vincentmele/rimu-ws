@@ -59,6 +59,12 @@ impl StreamSlots {
     self.live
   }
 
+  /// The bytes that the slots take at their capacity.
+#[cfg(all(feature = "_h3-loopback-client", feature = "http3-server-framework"))]
+  pub(crate) fn bytes(&self) -> usize {
+    self.entries.capacity().saturating_mul(size_of::<SlotEntry>())
+  }
+
   /// Frees all but `keep` slots if none holds a stream.
   #[inline]
   #[cfg_attr(
@@ -302,7 +308,7 @@ impl Streams {
   }
 
   /// Opens a bidirectional stream of ours, as only the client of tests does.
-  #[cfg(test)]
+  #[cfg(any(test, feature = "_h3-loopback-client"))]
   pub(crate) fn open_bidi(
     &mut self,
     pools: &mut QuicPools,

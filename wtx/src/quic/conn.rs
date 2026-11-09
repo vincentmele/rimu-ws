@@ -486,7 +486,7 @@ where
   }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "_h3-loopback-client"))]
 impl<A, RNG, TCX> QuicConn<A, RNG, TCX, true>
 where
   A: QuicApp,

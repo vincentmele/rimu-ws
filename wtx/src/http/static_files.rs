@@ -342,6 +342,9 @@ struct Cache {
   misses: usize,
   /// The path of the current request, decoded.
   path: String,
+  /// The path under the root that [`stat`] asks the disk about: kept, so that the recheck of an
+  /// entry, once a [`RECHECK`], allocates nothing after the first.
+  scratch: PathBuf,
   used: usize,
   uses: u64,
 }
@@ -358,6 +361,7 @@ impl Cache {
         key: String::new(),
         misses: 0,
         path: String::new(),
+        scratch: PathBuf::new(),
         used: 0,
         uses: 0,
       });
@@ -422,11 +426,11 @@ impl Cache {
     self.key.push(encoding.tag());
     self.key.push_str(&self.path);
     self.key.push_str(encoding.suffix());
-    let Self { entries, key, misses, used, uses, .. } = self;
+    let Self { entries, key, misses, scratch, used, uses, .. } = self;
     if let Some(entry) = entries.get_mut(key.as_str()) {
       entry.last_use = *uses;
       if now.saturating_duration_since(entry.checked) >= RECHECK {
-        let file = stat(root, key);
+        let file = stat(root, key, scratch);
         if file != entry.file {
           if let Some(body) = entry.body.take() {
             *used = used.saturating_sub(body.len());
@@ -443,7 +447,7 @@ impl Cache {
       // Reborrowed: returning `entry` from inside the `if let` would hold `entries` borrowed.
       return entries.get_mut(key.as_str());
     }
-    let file = stat(root, key);
+    let file = stat(root, key, scratch);
     if file.is_none() {
       if *misses >= MAX_MISSES {
         entries.retain(|_, el| el.file.is_some());
@@ -479,8 +483,12 @@ impl Cache {
 }
 
 /// The file of `key` (its encoding tag, then its path under `root`), if a regular one.
-fn stat(root: &Path, key: &str) -> Option<FileId> {
-  fs::metadata(root.join(key.get(1..).unwrap_or_default())).ok().and_then(|el| FileId::of(&el))
+/// `scratch` holds the path while the disk is asked, and keeps its room for the next call.
+fn stat(root: &Path, key: &str, scratch: &mut PathBuf) -> Option<FileId> {
+  scratch.clear();
+  scratch.push(root);
+  scratch.push(key.get(1..).unwrap_or_default());
+  fs::metadata(&*scratch).ok().and_then(|el| FileId::of(&el))
 }
 
 /// The contents of `path` and what it was when read.

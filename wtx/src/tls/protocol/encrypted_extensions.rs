@@ -48,7 +48,7 @@ impl<'qtp> EncryptedExtensions<'qtp> {
   }
 
   /// The data of the `quic_transport_parameters` extension (RFC 9001 section 8.2), if present.
-  #[cfg(all(feature = "quic", test))]
+  #[cfg(all(feature = "quic", any(test, feature = "_h3-loopback-client")))]
   pub(crate) const fn quic_transport_parameters(&self) -> Option<&'qtp [u8]> {
     self.quic_transport_parameters
   }

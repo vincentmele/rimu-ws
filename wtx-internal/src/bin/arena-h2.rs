@@ -66,21 +66,21 @@ use rimu_ws::{
 };
 
 macro_rules! paths {
-  () => {
+  ($static_root:expr) => {
     rimu_ws::paths!(
       ("/baseline2", get(endpoint_baseline2)),
       ("/json/{count}", get(endpoint_json)),
-      ("/static/{*file}", Get(StaticFiles::new(static_dir())?))
+      ("/static/{*file}", Get(StaticFiles::new($static_root)?))
     )
   };
 }
 
 macro_rules! router {
-  () => {
-    HttpRouter::new(paths!(), ServerHeader)
+  ($static_root:expr) => {
+    HttpRouter::new(paths!($static_root), ServerHeader)
   };
-  (no_middleware) => {
-    HttpRouter::paths(paths!())
+  ($static_root:expr, no_middleware) => {
+    HttpRouter::paths(paths!($static_root))
   };
 }
 
@@ -113,7 +113,7 @@ fn main() -> rimu_ws::Result<()> {
       .set_error_cb(error_cb)
       .set_http_recv_params(recv_params())
       .set_local_runtime_cb(runtime)
-      .run_in_threads("0.0.0.0:8443", router!()?)
+      .run_in_threads("0.0.0.0:8443", router!(static_dir())?)
     });
     (Some(tls), Some(h3))
   } else {
@@ -129,7 +129,7 @@ fn main() -> rimu_ws::Result<()> {
   .set_error_cb(error_cb)
   .set_http_recv_params(recv_params())
   .set_local_runtime_cb(runtime)
-  .run_in_threads("0.0.0.0:8082", router!()?)?;
+  .run_in_threads("0.0.0.0:8082", router!(static_dir())?)?;
   if let Some(elem) = tls {
     elem.join().map_err(|_| std::io::Error::other("TLS thread panicked"))??;
   }
@@ -149,8 +149,44 @@ fn spawn_h3(
   let knobs = knobs::H3Knobs::from_vars(|name| std::env::var(name).ok())
     .map_err(|err| rimu_ws::Error::from(std::io::Error::other(err)))?;
   eprintln!("arena-h2: h3 knobs {}", knobs.line());
+  let run = H3Run {
+    addr: "[::]:8443".into(),
+    knobs,
+    local_runtimes: None,
+    shutdown: None,
+    static_root: static_dir(),
+  };
+  spawn_h3_with(cert, key, data, run, runtime)
+}
+
+/// What the h3 server runs with, which the program takes from the environment and tests choose.
+struct H3Run {
+  /// Where the workers bind.
+  addr: String,
+  /// The `ARENA_H3_*` switches.
+  knobs: knobs::H3Knobs,
+  /// The workers; one per CPU if `None`.
+  local_runtimes: Option<core::num::NonZeroUsize>,
+  /// The signal that ends the server and the time it lets connections drain, if any.
+  shutdown: Option<(rimu_ws::http::ShutdownSignal, core::time::Duration)>,
+  /// The directory of `/static`.
+  static_root: String,
+}
+
+/// [`spawn_h3`] with the choices of `run`, and the runtime of each worker built by `rc`.
+fn spawn_h3_with<RC>(
+  cert: &[u8],
+  key: Vec<u8>,
+  data: ConnAux,
+  run: H3Run,
+  rc: RC,
+) -> rimu_ws::Result<(Http3Stats, std::thread::JoinHandle<rimu_ws::Result<()>>)>
+where
+  RC: Clone + Fn() -> rimu_ws::Result<UringRuntime> + Send + 'static,
+{
+  let H3Run { addr, knobs, local_runtimes, shutdown, static_root } = run;
   let min_headers = knobs.headers == knobs::Headers::Min;
-  let framework = Http3ServerFramework::<(), fn(rimu_ws::Error), UringExecutor, _, _, _>::new(
+  let mut framework = Http3ServerFramework::<(), fn(rimu_ws::Error), UringExecutor, _, _, _>::new(
     UringExecutor::default(),
     ChaCha20::from_std_random()?,
     TlsConfig::from_keys_pem(cert, key.as_slice())?,
@@ -158,17 +194,21 @@ fn spawn_h3(
   .set_data(data)
   .set_error_cb(error_cb)
   .set_reuse_data(knobs.data == knobs::Data::Reuse)
-  .set_local_runtime_cb(runtime)
+  .set_local_runtime_cb(rc)
+  .set_local_runtimes(local_runtimes)
   .set_h3_params(knobs.h3)
   .set_pin_workers(knobs.pin_workers)
   .set_quic_params(knobs.quic)
   .set_udp_params(knobs.udp);
+  if let Some((signal, drain)) = shutdown {
+    framework = framework.set_shutdown(signal, drain);
+  }
   let stats = framework.stats();
   let handle = std::thread::spawn(move || -> rimu_ws::Result<()> {
     let rslt = if min_headers {
-      framework.run_in_threads("[::]:8443", router!(no_middleware)?)
+      framework.run_in_threads(&addr, router!(static_root.as_str(), no_middleware)?)
     } else {
-      framework.set_rfc9110_headers(true).run_in_threads("[::]:8443", router!()?)
+      framework.set_rfc9110_headers(true).run_in_threads(&addr, router!(static_root.as_str())?)
     };
     if let Err(err) = &rslt {
       eprintln!("arena-h2: the h3 server ended: {err}");
@@ -677,6 +717,10 @@ struct Rating {
   score: i64,
   count: i64,
 }
+
+#[cfg(test)]
+#[path = "arena_h2/alloc_tests_h3.rs"]
+mod alloc_tests_h3;
 
 #[cfg(test)]
 mod knob_tests {

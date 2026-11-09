@@ -526,6 +526,12 @@ where
     EndpointStats { conns: self.live, half_open: self.half_open, ..self.stats }
   }
 
+  /// The bytes that the pools of the worker take (see [`QuicPools::bytes`]).
+  #[cfg(all(feature = "_h3-loopback-client", feature = "http3-server-framework"))]
+  pub(crate) fn pool_bytes(&self) -> usize {
+    self.pools.bytes()
+  }
+
   /// Frees all but a few entries of the pools of the worker, if it has no connection: for a worker
   /// that has been idle a while (spec section 5.4).
   #[inline]

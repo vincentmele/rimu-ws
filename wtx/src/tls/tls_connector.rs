@@ -61,7 +61,7 @@ pub struct ManageRemainingServerRecordsInput {
 
 impl ManageRemainingServerRecordsInput {
   /// If the server asked for a certificate of the client.
-  #[cfg(all(feature = "quic", test))]
+  #[cfg(all(feature = "quic", any(test, feature = "_h3-loopback-client")))]
   pub(crate) const fn client_cert_requested(&self) -> bool {
     self.client_cert_requested
   }
