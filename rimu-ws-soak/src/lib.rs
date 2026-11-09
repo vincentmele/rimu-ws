@@ -7,6 +7,7 @@
 pub mod burst;
 pub mod codec;
 pub mod conn;
+pub mod cpus;
 pub mod cycle;
 pub mod fdflood;
 pub mod monitor;

@@ -113,6 +113,8 @@ pub struct Extended {
   pub cgroup: Option<std::path::PathBuf>,
   /// The server claims io_uring: a run that never sees an io_uring descriptor is invalid.
   pub expect_io_uring: bool,
+  /// CPUs for the probe thread alone (`cpus::load_runtime` keeps the load off them).
+  pub probe_cpus: Vec<usize>,
   /// Cycle `i` runs profile `i % len`; empty runs `RunConfig::weights` every cycle.
   pub rotation: Vec<(String, Weights)>,
   pub records: RecordMode,
@@ -409,7 +411,9 @@ pub async fn run(cfg: CycleConfig, out: &mut dyn Write) -> Summary {
   }
   let deadline = cfg.ext.max_time.map(|el| started + el);
   let probes =
-    (cfg.probes > 0).then(|| Probes::spawn(cfg.run.ctx.clone(), cfg.probes, cfg.probe_rate));
+    (cfg.probes > 0).then(|| {
+      Probes::spawn(cfg.run.ctx.clone(), cfg.probes, cfg.probe_rate, cfg.ext.probe_cpus.clone())
+    });
   let mut first_base: Option<Baseline> = None;
   let mut first_drained: Option<Baseline> = None;
   for cycle in 0..cfg.cycles {

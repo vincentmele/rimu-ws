@@ -143,7 +143,7 @@ async fn slow_echoes_are_latency_not_saturation() {
   let faults = Faults { echo_delay: Some(Duration::from_millis(25)), ..Faults::default() };
   let addr = spawn_fake(faults).await;
   let ctx = cfg(addr, 0).run.ctx;
-  let probes = Probes::spawn(ctx, 2, 100);
+  let probes = Probes::spawn(ctx, 2, 100, Vec::new());
   tokio::time::sleep(Duration::from_secs(2)).await;
   let stats = probes.snapshot();
   probes.stop();

@@ -17,6 +17,7 @@
 # Environment:
 #   FD_NOFILE=N   the container's descriptor limit (default 1048576; the flood job uses 1024)
 #   HTTPARENA     the HttpArena checkout (default ~/src/HttpArena), read at commit fdb4aae
+#   SOAK_MALLOC=0 leaves out MALLOC_MMAP_THRESHOLD_, for diagnosis only: a comparison uses the default
 #
 # A server that never listens on 8080 within 60 s gets a summary line {"invalid":"did not start"}
 # in the harness's --out file, and exit code 4.
@@ -106,11 +107,13 @@ cleanup() {
 
 # Starts the container; false if it never listens on 8080.
 start() {
+	local malloc_env=(-e MALLOC_MMAP_THRESHOLD_=262144)
+	[[ ${SOAK_MALLOC:-1} == 0 ]] && malloc_env=()
 	check_idle
 	trap cleanup EXIT
 	docker run -d --name "$container" --network host --security-opt seccomp=unconfined \
 		--ulimit memlock=-1:-1 --ulimit "nofile=$nofile:$nofile" --cpuset-cpus 0-5,12-17 \
-		--memory 3g --user "$(id -u):$(id -g)" -e MALLOC_MMAP_THRESHOLD_=262144 \
+		--memory 3g --user "$(id -u):$(id -g)" "${malloc_env[@]}" \
 		-v "$httparena/data/dataset.json:/data/dataset.json:ro" -v "$httparena/data/static:/data/static:ro" \
 		"$container" >/dev/null
 	for _ in $(seq 300); do
@@ -157,8 +160,11 @@ harness_run() {
 	local uring=()
 	[[ ${IO_URING:-0} == 1 ]] && uring=(--expect-io-uring)
 	local code=0
+	# One physical core (CPUs 11 and 23) for the probes alone: sharing the load's CPUs, they waited
+	# for one at a burst's start, which read as server latency.
 	taskset -c 6-11,18-23 "$harness" run --url "ws://127.0.0.1:8080$URL_PATH" \
-		--cgroup "$(cgroup_dir)" --label "$name" --rss-ceiling 2048 "${uring[@]}" "$@" || code=$?
+		--cgroup "$(cgroup_dir)" --label "$name" --rss-ceiling 2048 --probe-cpus 11,23 \
+		"${uring[@]}" "$@" || code=$?
 	return "$code"
 }
 

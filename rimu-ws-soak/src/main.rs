@@ -147,6 +147,11 @@ struct RunArgs {
   /// The server's name in the summary, for the report card.
   #[arg(long)]
   label: Option<String>,
+  /// CPUs for the latency probes alone, as `a-b` ranges or a comma list; the load runs on the
+  /// rest of the process's CPUs. Without it the probes share the load's CPUs, and at a burst they
+  /// wait for one, which reads as server latency.
+  #[arg(long)]
+  probe_cpus: Option<String>,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -251,9 +256,29 @@ fn raise_nofile() {
 fn main() -> ExitCode {
   let cli = Cli::parse();
   raise_nofile();
-  let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
+  // The probes' CPUs, which the load runtime must leave to them.
+  let probe_cpus = match &cli.cmd {
+    Cmd::Run(args) => match args.probe_cpus.as_deref().map(parse_cpus).transpose() {
+      Ok(el) => el.unwrap_or_default(),
+      Err(err) => {
+        eprintln!("error: {err}");
+        return ExitCode::from(3);
+      }
+    },
+    _ => Vec::new(),
+  };
+  let load_cpus = if probe_cpus.is_empty() {
+    Vec::new()
+  } else {
+    rimu_ws_soak::cpus::without(&rimu_ws_soak::cpus::current_cpus(), &probe_cpus)
+  };
+  if !probe_cpus.is_empty() && load_cpus.is_empty() {
+    eprintln!("error: --probe-cpus leaves no CPU for the load");
+    return ExitCode::from(3);
+  }
+  let runtime = rimu_ws_soak::cpus::load_runtime(load_cpus);
   let rslt = match cli.cmd {
-    Cmd::Run(args) => runtime.block_on(run(args)),
+    Cmd::Run(args) => runtime.block_on(run(args, probe_cpus)),
     Cmd::Replay(args) => runtime.block_on(replay_one(args)),
     Cmd::Report(args) => report(args),
   };
@@ -263,7 +288,23 @@ fn main() -> ExitCode {
   })
 }
 
-async fn run(args: RunArgs) -> Result<ExitCode, String> {
+/// `5,7-9` as CPU numbers.
+fn parse_cpus(s: &str) -> Result<Vec<usize>, String> {
+  let mut cpus = Vec::new();
+  for part in s.split(',').map(str::trim).filter(|el| !el.is_empty()) {
+    let bad = || format!("bad CPU list `{s}`");
+    match part.split_once('-') {
+      Some((a, b)) => {
+        let (a, b): (usize, usize) = (a.parse().map_err(|_| bad())?, b.parse().map_err(|_| bad())?);
+        cpus.extend(a..=b);
+      }
+      None => cpus.push(part.parse().map_err(|_| bad())?),
+    }
+  }
+  Ok(cpus)
+}
+
+async fn run(args: RunArgs, probe_cpus: Vec<usize>) -> Result<ExitCode, String> {
   let (ctx, weights, rotation) = ctx(&args.common)?;
   let source_ips = args.source_ips.as_deref().map(parse_ips).transpose()?.unwrap_or_default();
   let out_path = args
@@ -297,6 +338,7 @@ async fn run(args: RunArgs) -> Result<ExitCode, String> {
       label: args.label,
       cgroup: args.cgroup,
       expect_io_uring: args.expect_io_uring,
+      probe_cpus,
       rotation,
       records: match args.records {
         Records::All => RecordMode::All,

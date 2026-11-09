@@ -70,6 +70,8 @@ fn histogram() -> Histogram<u64> {
 
 /// Running probes.
 pub struct Probes {
+  // The CPUs the probe thread found itself on
+  cpus: Arc<Mutex<Vec<usize>>>,
   hists: Arc<Mutex<Hists>>,
   stop: Arc<AtomicBool>,
   thread: Option<JoinHandle<()>>,
@@ -83,8 +85,9 @@ impl std::fmt::Debug for Probes {
 
 impl Probes {
   /// `connections` connections, each echoing a 32-byte text `rate_hz` times a second, their
-  /// schedules spread evenly over the period.
-  pub fn spawn(ctx: Ctx, connections: u32, rate_hz: u32) -> Probes {
+  /// schedules spread evenly over the period, on a thread pinned to `cpus` (none: unpinned), which
+  /// the load must not use (`cpus::load_runtime`).
+  pub fn spawn(ctx: Ctx, connections: u32, rate_hz: u32, cpus: Vec<usize>) -> Probes {
     let hists = Arc::new(Mutex::new(Hists {
       failures: 0,
       lag: histogram(),
@@ -94,7 +97,15 @@ impl Probes {
     }));
     let stop = Arc::new(AtomicBool::new(false));
     let (thread_hists, thread_stop) = (hists.clone(), stop.clone());
+    let found = Arc::new(Mutex::new(Vec::new()));
+    let thread_found = found.clone();
     let thread = std::thread::spawn(move || {
+      if let Err(err) = crate::cpus::pin_current(&cpus) {
+        eprintln!("warning: pinning the probes to {cpus:?}: {err}");
+      }
+      if let Ok(mut el) = thread_found.lock() {
+        *el = crate::cpus::current_cpus();
+      }
       let runtime =
         tokio::runtime::Builder::new_current_thread().enable_all().build().expect("probe runtime");
       runtime.block_on(async move {
@@ -111,7 +122,12 @@ impl Probes {
         }
       });
     });
-    Probes { hists, stop, thread: Some(thread) }
+    Probes { cpus: found, hists, stop, thread: Some(thread) }
+  }
+
+  /// The CPUs the probe thread runs on.
+  pub fn cpus(&self) -> Vec<usize> {
+    self.cpus.lock().map(|el| el.clone()).unwrap_or_default()
   }
 
   /// The results since the last snapshot.
