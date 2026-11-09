@@ -279,6 +279,12 @@ impl FrameRefPool {
     chunk.refs.get(usize::from(queue.skip)).copied()
   }
 
+  /// The references that wait in `queue`, from the front.
+  #[inline]
+  pub(crate) fn queue_iter(&self, queue: &FrameRefQueue) -> impl Iterator<Item = FrameRef> + '_ {
+    self.iter(queue.range).skip(usize::from(queue.skip))
+  }
+
   /// Takes the reference at the front of `queue` out of it, giving back its chunk once every
   /// reference of the chunk was taken.
   #[inline]

@@ -81,6 +81,8 @@ const CHACHA20_INTEGRITY_LIMIT: u64 = 1 << 36;
 const AMPLIFICATION_FACTOR: u64 = 3;
 // The datagram size until path MTU discovery finds a larger one
 const INITIAL_MAX_DATAGRAM: usize = 1200;
+// PTOs between the acknowledgment of a key update and the next one that this endpoint starts
+const KEY_UPDATE_WAIT_PTOS: u64 = 4;
 // The bit of the first byte of a short header that carries the key phase
 const KEY_PHASE_BIT: u8 = 0x04;
 // The Length field of a long header always takes two bytes, so that it can be written last
@@ -152,6 +154,12 @@ pub(crate) struct ConnParams {
   /// The packets sealed with one key of 1-RTT packets after which a key update starts, if it is
   /// below the threshold of the cipher suite.
   pub(crate) key_update_threshold: u64,
+  /// Lowers the confidentiality limit of the cipher suite, for tests (ruling T9-g).
+  #[cfg(test)]
+  pub(crate) test_confidentiality_limit: u32,
+  /// Lowers the integrity limit of the cipher suite, for tests (ruling T9-g).
+  #[cfg(test)]
+  pub(crate) test_integrity_limit: u32,
   /// Abuse limits.
   pub(crate) limits: QuicLimits,
 }
@@ -202,6 +210,24 @@ impl ConnParams {
   }
 }
 
+impl ConnParams {
+  // The packets that one key of `suite` seals at most, which tests can lower (ruling T9-g).
+  fn confidentiality_limit(&self, suite: CipherSuite) -> u64 {
+    #[cfg(test)]
+    return confidentiality_limit(suite).min(u64::from(self.test_confidentiality_limit));
+    #[cfg(not(test))]
+    confidentiality_limit(suite)
+  }
+
+  // The packets that may fail to open over a connection of `suite`, which tests can lower.
+  fn integrity_limit(&self, suite: CipherSuite) -> u64 {
+    #[cfg(test)]
+    return integrity_limit(suite).min(u64::from(self.test_integrity_limit));
+    #[cfg(not(test))]
+    integrity_limit(suite)
+  }
+}
+
 impl Default for ConnParams {
   /// The library defaults of the spec.
   #[inline]
@@ -218,6 +244,10 @@ impl Default for ConnParams {
       pacing: true,
       max_in_flight: 256 << 10,
       key_update_threshold: u64::MAX,
+      #[cfg(test)]
+      test_confidentiality_limit: u32::MAX,
+      #[cfg(test)]
+      test_integrity_limit: u32::MAX,
       limits: QuicLimits::default(),
     }
   }
@@ -698,7 +728,7 @@ where
   // Declares lost the packets of `space` that are (RFC 9002 appendix A.10): their frames are
   // queued again, and the window shrinks, to the minimum for persistent congestion.
   fn detect_lost(&mut self, space: Space, now_us: u64, pools: &mut QuicPools) -> crate::Result<()> {
-    let max_ack_delay = if space == Space::Data { self.peer_max_ack_delay_us() } else { 0 };
+    let persistent_us = self.persistent_congestion_us();
     let Self {
       cold,
       data,
@@ -717,8 +747,7 @@ where
       return Ok(());
     };
     let rtt = recovery.rtt;
-    let persistent =
-      rtt.first_sample_us.map(|first| (first, rtt.persistent_congestion_us(max_ack_delay)));
+    let persistent = rtt.first_sample_us.map(|first| (first, persistent_us));
     let PacketSpace { ack_eliciting_in_flight, crypto_lost, loss_time_us, sent, .. } = sp;
     let mut lost_count = 0u64;
     let mut rslt = Ok(());
@@ -751,6 +780,7 @@ where
     }
     if losses.persistent {
       recovery.cc.on_persistent_congestion();
+      recovery.rtt.on_persistent_congestion();
     }
     let persistent = u64::from(losses.persistent);
     if lost_count > 0 {
@@ -762,6 +792,12 @@ where
         elem.stats.persistent_congestions.wrapping_add(persistent);
     }
     rslt
+  }
+
+  // How long losses must span to be persistent congestion, with the max_ack_delay of the peer in
+  // every packet number space (RFC 9002 section 7.6.1, review J5).
+  fn persistent_congestion_us(&self) -> u64 {
+    self.recovery.rtt.persistent_congestion_us(self.peer_max_ack_delay_us())
   }
 
   // The earliest time of the packet number spaces at which a packet becomes lost by the time
@@ -835,7 +871,7 @@ where
       return Ok(());
     };
     cold.open_failures = cold.open_failures.wrapping_add(1);
-    if cold.open_failures >= integrity_limit(suite) {
+    if cold.open_failures >= self.params.integrity_limit(suite) {
       cold_path();
       return Err(crate::Error::QuicClose(
         TransportErrorCode::AeadLimitReached,
@@ -1030,12 +1066,17 @@ where
   }
 
   // Records the processing of a packet of `space`.
-  fn after_packet(&mut self, now_us: u64, space: Space, pools: &mut QuicPools) {
+  fn after_packet(
+    &mut self,
+    now_us: u64,
+    space: Space,
+    pools: &mut QuicPools,
+  ) -> crate::Result<()> {
     self.count(|el| el.packets_in = el.packets_in.wrapping_add(1));
     self.last_activity_us = now_us;
     self.idle_restart_on_send = true;
     if !matches!(self.state, ConnState::Handshake | ConnState::Confirmed) {
-      return;
+      return Ok(());
     }
     if !IS_CLIENT && space == Space::Handshake {
       // A Handshake packet proves that the client got the Initial packets (RFC 9000 section
@@ -1047,8 +1088,9 @@ where
     }
     if !IS_CLIENT && self.handshake_complete && self.state == ConnState::Handshake {
       // A server confirms the handshake once it is complete (RFC 9001 section 4.1.2)
-      self.confirm(pools);
+      self.confirm(pools)?;
     }
+    Ok(())
   }
 
   // The application asked for a close: an application CONNECTION_CLOSE. Returns whether the
@@ -1092,9 +1134,16 @@ where
     self.enter_closing(now_us, CloseFrame { app: false, code: code.code(), requested: false });
   }
 
-  fn confirm(&mut self, pools: &mut QuicPools) {
+  // The handshake is confirmed: what only it needed goes back, and the keys of the next key phase
+  // that open packets are made now, never while a packet is processed (RFC 9001 section 9.5,
+  // review J12).
+  fn confirm(&mut self, pools: &mut QuicPools) -> crate::Result<()> {
     self.state = ConnState::Confirmed;
     self.release_handshake(pools);
+    match self.data.keys.as_mut() {
+      Some(keys) => self.key.prepare_next(keys, pools),
+      None => Ok(()),
+    }
   }
 
   // The Initial and Handshake spaces, wiped, and the TLS state go back to their pools; their
@@ -1208,7 +1257,17 @@ where
   ) -> crate::Result<()> {
     let max_ranges = self.params.limits.max_ack_ranges;
     let max_in_flight = self.params.max_in_flight;
-    let Self { data, handshake, key, max_datagram, pmtud, recovery, streams, .. } = self;
+    let Self {
+      data,
+      handshake,
+      handshake_done_owed,
+      key,
+      max_datagram,
+      pmtud,
+      recovery,
+      streams,
+      ..
+    } = self;
     let Some(sp) = space_mut(data, handshake, space) else {
       return Ok(());
     };
@@ -1239,7 +1298,7 @@ where
           largest_sent_us = Some(packet.time_us);
         }
         match packet.kind {
-          SentKind::InFlight | SentKind::MtuProbe => {
+          SentKind::InFlight | SentKind::MtuProbe | SentKind::Probed => {
             recovery.on_acked(&packet);
             if packet.counts_for_congestion() {
               let size = usize::from(packet.size);
@@ -1260,8 +1319,9 @@ where
           SentKind::Lost => late = late.wrapping_add(1),
           SentKind::NotInFlight => {}
         }
-        if space == Space::Data && pn >= key.local_first_pn {
+        if space == Space::Data && pn >= key.local_first_pn && !key.local_acked {
           key.local_acked = true;
+          key.local_acked_us = now_us;
         }
         let mut cursor = FrameRefPool::cursor(packet.frames);
         while let Some(frame) = cursor.next(&pools.frame_refs) {
@@ -1272,7 +1332,8 @@ where
                 rslt = trim_acked_crypto(crypto_lost, offset, len, &mut pools.frame_refs);
               }
             }
-            FrameRef::HandshakeDone => {}
+            // Also late, before a copy owed for its loss went (review J8)
+            FrameRef::HandshakeDone => *handshake_done_owed = false,
             _ => {
               if rslt.is_ok() {
                 rslt = streams.on_frame_acked(frame, pools);
@@ -1468,7 +1529,7 @@ where
           }
           // A client confirms the handshake when the server says so (RFC 9001 section 4.1.2)
           if self.state == ConnState::Handshake {
-            self.confirm(pools);
+            self.confirm(pools)?;
           }
         }
         Frame::NewToken(_) => {
@@ -1614,9 +1675,6 @@ where
     } else {
       Generation::Current
     };
-    if generation == Generation::Next {
-      self.key.prepare_next(keys, pools)?;
-    }
     let header_len = pn_offset.wrapping_add(pn_len);
     let suite = keys.remote.suite();
     let opened = self
@@ -1650,7 +1708,7 @@ where
     if let Some(sp) = space_mut(&mut self.data, &mut self.handshake, space) {
       let _is_new = sp.recv.on_packet(pn, ack_eliciting, now_us, pools);
     }
-    self.after_packet(now_us, space, pools);
+    self.after_packet(now_us, space, pools)?;
     Ok(())
   }
 
@@ -1916,6 +1974,8 @@ where
     let (dcid, scid) = (self.peer_cid, self.local_cid);
     let confirmed = self.state == ConnState::Confirmed;
     let key_update_after = self.params.key_update_threshold;
+    let pto_us = self.pto_us();
+    let params = self.params;
     let Some(sp) = space_mut(&mut self.data, &mut self.handshake, space) else {
       return Ok(None);
     };
@@ -1930,7 +1990,8 @@ where
       && let Some(keys) = sp.keys.as_mut()
     {
       let suite = keys.local.suite();
-      if !closing && keys.local.packets_sealed() >= confidentiality_limit(suite).saturating_sub(1) {
+      let limit = params.confidentiality_limit(suite);
+      if !closing && keys.local.packets_sealed() >= limit.saturating_sub(1) {
         // No update could come in time (RFC 9001 section 6.6)
         cold_path();
         return Err(crate::Error::QuicClose(
@@ -1939,8 +2000,8 @@ where
         ));
       }
       if !closing && confirmed {
-        let threshold = key_update_threshold(suite, key_update_after);
-        if self.key.maybe_initiate(keys, threshold, pn)?
+        let threshold = threshold_for(limit, key_update_after);
+        if self.key.maybe_initiate(keys, threshold, pn, now_us, pto_us)?
           && let Some(cold) = self.cold.as_deref_mut()
         {
           cold.stats.key_updates = cold.stats.key_updates.wrapping_add(1);
@@ -2077,6 +2138,16 @@ where
     }
   }
 
+  /// Forgets the 1-RTT packets that were sent, as if they were acknowledged, for a test that sends
+  /// more than the ring holds.
+  pub(crate) fn forget_sent_packets(&mut self, pools: &mut QuicPools) {
+    for packet in self.data.sent.records() {
+      self.recovery.on_gone(packet);
+    }
+    self.data.sent.release(pools);
+    self.data.ack_eliciting_in_flight = 0;
+  }
+
   /// Declares lost every 1-RTT packet in flight, as loss detection would.
   pub(crate) fn declare_in_flight_lost(&mut self, pools: &mut QuicPools) {
     let Self { data, handshake_done_owed, max_datagram, pmtud, recovery, streams, .. } = self;
@@ -2109,6 +2180,11 @@ where
   pub(crate) fn cwnd(&self) -> usize {
     use crate::quic::cc::CongestionControl as _;
     self.recovery.cc.window()
+  }
+
+  /// The smallest RTT sample that counts.
+  pub(crate) const fn min_rtt_us(&self) -> u64 {
+    self.recovery.rtt.min_us
   }
 
   /// The slow start threshold.
@@ -2265,8 +2341,10 @@ enum OtherKeys {
 struct KeyPhase {
   // If the current keys that open packets are in `slot`, not in the slot of the space
   current_in_slot: bool,
-  // A packet sealed with the current keys was acknowledged: a new update can start
+  // A packet sealed with the current keys was acknowledged: a new update can start, three PTOs
+  // after `local_acked_us` if the keys were updated before
   local_acked: bool,
+  local_acked_us: u64,
   // The first packet number sealed with the current keys
   local_first_pn: u64,
   // The key phase of the packets that are sent
@@ -2285,6 +2363,7 @@ impl KeyPhase {
     Self {
       current_in_slot: false,
       local_acked: false,
+      local_acked_us: 0,
       local_first_pn: 0,
       local_phase: false,
       other: OtherKeys::None,
@@ -2298,7 +2377,8 @@ impl KeyPhase {
   // The generation that opens a packet of key phase `phase` and number `pn`, before it is
   // decrypted (RFC 9001 section 6.3, ruling T9-a): the current one for its phase; for the other
   // phase, the previous one below the first packet number of the current phase, if it is still
-  // kept, and the next one above the largest packet number received. Anything else is dropped.
+  // kept, and the next one above the largest packet number received, if it is made: while the
+  // previous keys are kept it is not (review J12). Anything else is dropped.
   fn choose(&self, phase: bool, pn: u64, largest: Option<u64>) -> Option<Generation> {
     if phase == self.remote_phase {
       return Some(Generation::Current);
@@ -2306,7 +2386,8 @@ impl KeyPhase {
     if pn < self.remote_first_pn {
       return (self.other == OtherKeys::Previous).then_some(Generation::Previous);
     }
-    largest.is_none_or(|elem| pn > elem).then_some(Generation::Next)
+    let next = self.other == OtherKeys::Next && largest.is_none_or(|elem| pn > elem);
+    next.then_some(Generation::Next)
   }
 
   // When the previous keys that open packets go, if they are kept.
@@ -2328,15 +2409,24 @@ impl KeyPhase {
   }
 
   // Updates the keys that seal packets if `keys` sealed `threshold` packets, the peer follows
-  // the current phase and a packet sealed with the current keys was acknowledged (RFC 9001
-  // sections 6.1 and 6.5): the next packet, `next_pn`, has the new phase. Returns whether it did.
+  // the current phase and a packet sealed with the current keys was acknowledged, four PTOs of
+  // `pto_us` before `now_us` if the keys were updated before (RFC 9001 sections 6.1 and 6.5,
+  // review J7): the next packet, `next_pn`, has the new phase. Returns whether it did. The peer
+  // keeps its previous keys three of its own PTOs, and makes its next ones only then (review
+  // J12): the fourth one leaves room for its PTO to be longer than ours, so that the packets of
+  // the update are not dropped.
   fn maybe_initiate(
     &mut self,
     keys: &mut PacketKeys,
     threshold: u64,
     next_pn: u64,
+    now_us: u64,
+    pto_us: u64,
   ) -> crate::Result<bool> {
+    let waited = self.local_first_pn == 0
+      || now_us >= self.local_acked_us.saturating_add(pto_us.saturating_mul(KEY_UPDATE_WAIT_PTOS));
     if !self.local_acked
+      || !waited
       || self.local_phase != self.remote_phase
       || keys.local.packets_sealed() < threshold
     {
@@ -2451,6 +2541,8 @@ impl LostCtx<'_> {
     while let Some(frame) = cursor.next(&pools.frame_refs) {
       let requeued = match frame {
         FrameRef::Ack { .. } => Ok(()),
+        // A probe sent it again already
+        FrameRef::Crypto { .. } if packet.kind == SentKind::Probed => Ok(()),
         FrameRef::Crypto { .. } => pools.frame_refs.queue_push(self.crypto_lost, frame),
         FrameRef::HandshakeDone => {
           *self.handshake_done_owed = true;
@@ -2764,17 +2856,28 @@ const fn integrity_limit(suite: CipherSuite) -> u64 {
 /// `configured`, at most half the confidentiality limit of the suite (2^23 packets for AES-GCM,
 /// RFC 9001 section 6.6), which leaves time for the acknowledgment that an update waits for.
 pub(crate) const fn key_update_threshold(suite: CipherSuite, configured: u64) -> u64 {
-  let half = confidentiality_limit(suite);
-  let half = if half == u64::MAX { half } else { half / 2 };
+  threshold_for(confidentiality_limit(suite), configured)
+}
+
+// `configured`, at most half of the confidentiality limit `limit`.
+const fn threshold_for(limit: u64, configured: u64) -> u64 {
+  let half = if limit == u64::MAX { limit } else { limit / 2 };
   if configured < half { configured } else { half }
 }
 
-// The CRYPTO data of the packets of `sp` in flight goes again, unless lost data waits already.
+// The CRYPTO data of the packets of `sp` in flight goes again, unless lost data waits already, and
+// they are marked so that their loss does not queue it once more.
 fn requeue_crypto_in_flight(sp: &mut PacketSpace, pools: &mut QuicPools) -> crate::Result<()> {
   if sp.keys.is_none() || !sp.crypto_lost.is_empty() {
     return Ok(());
   }
-  for packet in sp.sent.records().filter(|el| el.in_flight()) {
+  let (base, next) = (sp.sent.base(), sp.sent.next_pn());
+  for pn in base..next {
+    let Some(packet) = sp.sent.get_mut(pn).filter(|el| el.kind == SentKind::InFlight) else {
+      continue;
+    };
+    // Its CRYPTO data is not queued once more if it is lost (review J9)
+    packet.kind = SentKind::Probed;
     let mut cursor = FrameRefPool::cursor(packet.frames);
     while let Some(frame) = cursor.next(&pools.frame_refs) {
       if let FrameRef::Crypto { .. } = frame {
@@ -3009,6 +3112,7 @@ mod tests {
       parse_header,
       pools::{CRYPTO_BUFFER_LEN, QuicPools, RX_BLOCK_LEN, TX_BLOCK_LEN},
       protect,
+      sent::FrameRef,
       testing::{
         Behavior, CLIENT_ADDR, Impairment, Link, LinkOpts, Parts, SERVER_ADDR, TestApp,
         encode_frames, run_lossy_requests,
@@ -3531,6 +3635,65 @@ mod tests {
     assert_eq!(pools.stream_slots.live(), 0);
     assert_eq!((pools.rx_blocks.len(), pools.tx_blocks.len()), (4, 4));
     assert_eq!(Rc::strong_count(&body), 1);
+    // In the middle of spills (review J13): the keys of the next phase, the block of spilled
+    // ranges, the spill of received packet numbers, the index of waiting data and a send queue that
+    // grew go back too. The same connection twice: the second one finds the pools warm
+    fn new_counts(parts: &Parts) -> [usize; 5] {
+      let pools = &parts.pools;
+      [
+        pools.key_slots.len(),
+        pools.range_blocks.len(),
+        pools.recv_spills.len(),
+        pools.ooo_indexes.len(),
+        pools.seg_queues.len(),
+      ]
+    }
+    let (mut client_parts, mut server_parts) = link.into_parts();
+    let mut opts = LinkOpts::new(None);
+    opts.server_app = TestApp::new(Behavior::Echo);
+    opts.server.limits.ping_budget = 3000;
+    let mut warm: Option<([usize; 5], (usize, usize, usize, usize, usize))> = None;
+    for _ in 0..2 {
+      let mut link = Link::with_parts(&opts, client_parts, server_parts);
+      link.run();
+      // 40 separate ranges of waiting data on stream 0
+      let pieces: Vec<Frame<'_>> = (0..40u64)
+        .map(|el| Frame::Stream { id: 0, offset: 2 * el + 1, data: b"x", fin: false })
+        .collect();
+      link.client.conn.queue_test_frames(&encode_frames(&pieces));
+      let _ = link.client.flush(link.now_us);
+      assert_eq!(link.deliver_to_server(), 1);
+      // 25,000 bytes in order on stream 4, which the server echoes into a send queue of 7 blocks
+      let data = [3u8; 1000];
+      for nth in 0..25u64 {
+        let frame = Frame::Stream { id: 4, offset: nth * 1000, data: &data, fin: false };
+        link.client.conn.queue_test_frames(&encode_frames(&[frame]));
+        let _ = link.client.flush(link.now_us);
+        assert_eq!(link.deliver_to_server(), 1);
+      }
+      // 1,100 packets before the server flushes: more than the window of received packet numbers
+      for nth in 0..1100 {
+        if nth % 200 == 0 {
+          link.client.conn.forget_sent_packets(&mut link.client.parts.pools);
+        }
+        link.client.conn.queue_test_frames(&PING);
+        let _ = link.client.flush(link.now_us);
+        assert_eq!(link.deliver_to_server(), 1);
+      }
+      let during = new_counts(&link.server.parts);
+      link.server.abort();
+      let after = new_counts(&link.server.parts);
+      for (idx, (held, back)) in during.iter().zip(after).enumerate() {
+        assert!(*held < back, "{idx}: {during:?} then {after:?}");
+      }
+      let old = counts(&link.server.parts);
+      assert_eq!(old.0, 0);
+      if let Some(elem) = warm {
+        assert_eq!((after, old), elem);
+      }
+      warm = Some((after, old));
+      (client_parts, server_parts) = link.into_parts();
+    }
   }
 
   // What a connection holds of the pools goes back only if it is closed or aborted, so dropping it
@@ -3995,6 +4158,229 @@ mod tests {
     ));
   }
 
+  // Ruling T9-g: packets that fail to open close the connection with AEAD_LIMIT_REACHED once
+  // they reach the integrity limit; so does a key that sealed as many packets as the
+  // confidentiality limit allows when no update can start, here as the peer acknowledges nothing.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn aead_limits_close_the_connection() {
+    let code = Some(TransportErrorCode::AeadLimitReached.code());
+    let mut opts = LinkOpts::new(None);
+    opts.server.test_integrity_limit = 3;
+    let mut link = settled(&opts);
+    for nth in 0..3 {
+      assert_eq!(link.server.conn.state(), ConnState::Confirmed, "{nth}");
+      link.client.conn.queue_test_frames(&PING);
+      let _ = link.client.flush(link.now_us);
+      let mut datagrams = link.client.take_datagrams();
+      let last = datagrams[0].len() - 1;
+      datagrams[0][last] ^= 1;
+      link.server.recv(link.now_us, &mut datagrams[0], CLIENT_ADDR);
+    }
+    assert_eq!(server_close_code(&link), code);
+    let mut opts = LinkOpts::new(None);
+    opts.server.test_confidentiality_limit = 40;
+    let mut link = settled(&opts);
+    let sealed = |link: &Link| link.server.conn.data.keys.as_ref().unwrap().local.packets_sealed();
+    let mut most = 0;
+    for _ in 0..100 {
+      if link.server.conn.state() != ConnState::Confirmed {
+        break;
+      }
+      most = most.max(sealed(&link));
+      link.server.conn.queue_test_frames(&PING);
+      let _ = link.server.flush(link.now_us);
+      let _ = link.server.take_datagrams();
+    }
+    assert_eq!(server_close_code(&link), code);
+    // One update at half the limit, which the peer never acknowledged, then the limit
+    assert_eq!(link.server.conn.stats().key_updates, 1);
+    assert!(most < 40 && sealed(&link) <= 40, "{most} {}", sealed(&link));
+  }
+
+  // Review J5, RFC 9002 section 7.6.1: the duration of persistent congestion includes the
+  // max_ack_delay of the peer whatever the packet number space.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn persistent_congestion_counts_max_ack_delay_in_every_space() {
+    let link = Link::new(&LinkOpts::new(None));
+    let conn = &link.server.conn;
+    // `detect_lost` takes it for every space
+    let expected = 3 * (conn.recovery.rtt.pto_base_us() + 25_000);
+    assert_eq!(conn.persistent_congestion_us(), expected);
+  }
+
+  // Review J7, RFC 9001 section 6.5: an update waits at least three PTOs (four, see
+  // `maybe_initiate`) from the acknowledgment that confirmed the previous one, whatever the
+  // threshold.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn key_updates_wait_three_ptos_after_the_previous_one() {
+    let mut opts = LinkOpts::new(None);
+    opts.server.key_update_threshold = 1;
+    opts.server.limits.ping_budget = 100_000;
+    opts.client.limits.ping_budget = 100_000;
+    let mut link = Link::new(&opts);
+    link.impair(Impairment::delay(5_000));
+    while link.server.conn.state() != ConnState::Confirmed {
+      if !link.step_impaired() {
+        assert!(link.advance_to_next_event());
+      }
+    }
+    let (mut phase, mut flips) = (link.server.conn.key_phases().0, Vec::new());
+    for _ in 0..200 {
+      link.server.conn.queue_test_frames(&PING);
+      link.client.conn.queue_test_frames(&PING);
+      for _ in 0..4 {
+        if !link.step_impaired() {
+          assert!(link.advance_to_next_event());
+        }
+        if link.server.conn.key_phases().0 != phase {
+          phase = !phase;
+          flips.push(link.now_us);
+        }
+      }
+    }
+    let pto = link.server.conn.current_pto_us();
+    assert!(flips.len() >= 2, "{flips:?}");
+    for pair in flips.windows(2) {
+      assert!(pair[1] - pair[0] >= 3 * pto, "{flips:?}, PTO {pto}");
+    }
+  }
+
+  // Review J8: a lost control frame whose packet is acknowledged late, before it went again, is
+  // owed no more: HANDSHAKE_DONE, MAX_DATA and MAX_STREAM_DATA with the current limits.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn late_ack_of_a_lost_control_frame_owes_nothing() {
+    // No path MTU probes, whose PINGs would be acknowledged
+    let mut opts = LinkOpts::new(None);
+    opts.client.max_udp_payload_size = 1200;
+    opts.server.max_udp_payload_size = 1200;
+    let mut link = Link::new(&opts);
+    while link.server.conn.state() != ConnState::Confirmed {
+      let _ = link.server.flush(link.now_us);
+      let _ = link.deliver_to_client();
+      let _ = link.client.flush(link.now_us);
+      assert!(link.deliver_to_server() > 0);
+    }
+    let _ = link.server.flush(link.now_us);
+    assert!(link.deliver_to_client() > 0);
+    assert_eq!(link.client.conn.state(), ConnState::Confirmed);
+    let _ = link.client.flush(link.now_us);
+    let mut acks = link.client.take_datagrams();
+    link.server.conn.declare_in_flight_lost(&mut link.server.parts.pools);
+    assert!(link.server.conn.handshake_done_owed);
+    for datagram in &mut acks {
+      link.server.recv(link.now_us, datagram, CLIENT_ADDR);
+    }
+    assert!(!link.server.conn.handshake_done_owed);
+    let _ = link.server.flush(link.now_us);
+    assert!(link.server.take_datagrams().is_empty());
+    // MAX_DATA and MAX_STREAM_DATA
+    let mut opts = LinkOpts::new(None);
+    opts.server.stream_window = 4096;
+    opts.server.conn_window = 8192;
+    let mut link = settled(&opts);
+    let now_us = link.now_us;
+    let _ = link.client.with_ctx(now_us, |cx| {
+      let id = cx.open_bidi()?;
+      cx.write(id, &[1; 4096], false)
+    });
+    let _ = link.client.flush(link.now_us);
+    assert!(link.deliver_to_server() > 0);
+    let _ = link.server.flush(link.now_us);
+    assert!(link.deliver_to_client() > 0);
+    let _ = link.client.flush(link.now_us);
+    let mut acks = link.client.take_datagrams();
+    assert!(!acks.is_empty());
+    link.server.conn.declare_in_flight_lost(&mut link.server.parts.pools);
+    assert!(link.server.conn.streams().wants_send());
+    for datagram in &mut acks {
+      link.server.recv(link.now_us, datagram, CLIENT_ADDR);
+    }
+    let _ = link.server.flush(link.now_us);
+    assert!(link.server.take_datagrams().is_empty());
+  }
+
+  // Review J9: CRYPTO data that a probe sent again is not queued once more when the packets that
+  // carried it first are declared lost: a server whose first flight of two datagrams is lost, and
+  // whose probe carries part of it, has no more CRYPTO queued than its flight has, and then
+  // completes the handshake.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn crypto_sent_again_by_a_probe_is_queued_once() {
+    let mut opts = LinkOpts::new(None);
+    opts.server_tp_padding = 1400;
+    let mut link = Link::new(&opts);
+    let _ = link.server.flush(link.now_us);
+    assert_eq!(link.server.take_datagrams().len(), 2);
+    let deadline = link.server.conn.next_deadline().unwrap();
+    link.advance(deadline - link.now_us);
+    // The probe, which the amplification limit cuts short of the flight
+    let _ = link.server.flush(link.now_us);
+    assert!(link.deliver_to_client() > 0);
+    assert!(!link.client.conn.handshake_complete);
+    let _ = link.client.flush(link.now_us);
+    assert!(link.deliver_to_server() > 0);
+    let conn = &link.server.conn;
+    assert!(conn.stats().packets_lost > 0);
+    let hs = conn.handshake.as_deref().unwrap();
+    let pools = &link.server.parts.pools;
+    for (space, sp) in [(Space::Initial, &hs.initial), (Space::Handshake, &hs.handshake)] {
+      let queued: u64 = pools
+        .frame_refs
+        .queue_iter(&sp.crypto_lost)
+        .map(|el| if let FrameRef::Crypto { len, .. } = el { u64::from(len) } else { 0 })
+        .sum();
+      let output = conn.tls.as_ref().unwrap().output(space).len() as u64;
+      assert!(queued <= output, "{space:?}: {queued} queued of {output}");
+    }
+    link.run();
+    assert_eq!(link.server.conn.state(), ConnState::Confirmed);
+  }
+
+  // Reviews J11 and J12, RFC 9001 sections 6.3, 6.5 and 9.5: the next keys that open packets are
+  // made once the handshake is confirmed and once the previous ones go, never for a packet. A
+  // packet of the previous phase that arrives late opens with the previous keys; a flip of the
+  // peer while they are kept does not overwrite them: its packets are dropped until they go.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn previous_keys_open_late_packets_and_stay_until_their_time() {
+    let mut link = settled(&LinkOpts::new(None));
+    assert_eq!(link.server.conn.key.other, super::OtherKeys::Next);
+    // A packet of the client before its update, held back
+    link.client.conn.queue_test_frames(&PING);
+    let _ = link.client.flush(link.now_us);
+    let mut late = link.client.take_datagrams();
+    link.client.conn.force_key_update();
+    link.client.conn.queue_test_frames(&PING);
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
+    assert_eq!(link.server.conn.key_phases(), (true, true));
+    assert!(link.server.conn.keeps_previous_keys());
+    let before = *link.server.conn.stats();
+    link.server.recv(link.now_us, &mut late[0], CLIENT_ADDR);
+    let after = *link.server.conn.stats();
+    assert_eq!((after.packets_in, after.packets_dropped), (before.packets_in + 1, 0));
+    // Another update of the client within the three PTOs
+    link.client.conn.force_key_update();
+    link.client.conn.queue_test_frames(&PING);
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
+    assert_eq!(link.server.conn.stats().packets_dropped, 1);
+    assert_eq!(link.server.conn.key_phases(), (true, true));
+    assert!(link.server.conn.keeps_previous_keys());
+    // Once the previous keys go, the next ones are made and the packets of the client open
+    let pto = link.server.conn.current_pto_us();
+    link.advance(3 * pto + 1);
+    assert_eq!(link.server.conn.key.other, super::OtherKeys::Next);
+    link.client.conn.queue_test_frames(&PING);
+    link.run();
+    assert_eq!(link.server.conn.key_phases(), (false, false));
+    assert_eq!(link.server.conn.state(), ConnState::Confirmed);
+  }
+
   // Requests of 3000 bytes that the server echoes, over a link with 5 ms of delay that reorders
   // `reorder` of the datagrams
   fn echo_run(opts: &mut LinkOpts, reorder: f32, count: usize) -> Link {
@@ -4063,6 +4449,8 @@ mod tests {
     // A threshold of one packet: an update as soon as the rules allow, once per round trip
     let mut opts = LinkOpts::new(None);
     opts.server.key_update_threshold = 1;
+    opts.server.limits.ping_budget = 100_000;
+    opts.client.limits.ping_budget = 100_000;
     let mut link = Link::new(&opts);
     link.impair(Impairment::delay(5_000));
     while link.server.conn.state() != ConnState::Confirmed {
@@ -4072,7 +4460,7 @@ mod tests {
       }
     }
     let start = link.now_us;
-    for _ in 0..50 {
+    for _ in 0..200 {
       link.server.conn.queue_test_frames(&PING);
       link.client.conn.queue_test_frames(&PING);
       for _ in 0..4 {
@@ -4087,7 +4475,7 @@ mod tests {
     // A threshold of 64 packets, with traffic
     let mut opts = LinkOpts::new(None);
     opts.server.key_update_threshold = 64;
-    let link = echo_run(&mut opts, 0.0, 100);
+    let link = echo_run(&mut opts, 0.0, 600);
     let (client, server) = (*link.client.conn.stats(), *link.server.conn.stats());
     assert!(server.key_updates >= 3, "{server:?}");
     assert!(server.key_updates <= server.packets_out / 64, "{server:?}");

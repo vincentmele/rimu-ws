@@ -77,6 +77,13 @@ impl RttEstimator {
     self.smoothed_us.saturating_add(variance)
   }
 
+  /// Persistent congestion is established: the smallest RTT is the newest sample from now on
+  /// (RFC 9002 section 5.2, review J6).
+  #[inline]
+  pub(crate) const fn on_persistent_congestion(&mut self) {
+    self.min_us = self.latest_us;
+  }
+
   /// Takes the sample `latest_us`, at `now_us`, of a packet that the peer acknowledged after
   /// `ack_delay_us`, which counts up to `max_ack_delay_us` once the handshake is `confirmed`
   /// (RFC 9002 section 5.3).
@@ -623,6 +630,38 @@ mod tests {
         assert!(link.advance_to_next_event());
       }
     }
+  }
+
+  // Review J6, RFC 9002 section 5.2: once persistent congestion is established, the smallest RTT
+  // is the newest sample, so that a path that got slower is not judged by its old minimum.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn persistent_congestion_resets_min_rtt() {
+    let (mut link, id) = responding(400_000, |_| {});
+    link.impair(Impairment::delay(5_000));
+    while link.client.app.streams.get(&id.0).is_none_or(|el| el.data.len() < 100_000) {
+      if !link.step_impaired() {
+        assert!(link.advance_to_next_event());
+      }
+    }
+    assert!(link.server.conn.min_rtt_us() < 15_000);
+    link.filter = Some(|to_server, _| !to_server);
+    let blackout = link.now_us;
+    while link.now_us - blackout < 3_000_000 {
+      if !link.step_impaired() {
+        assert!(link.advance_to_next_event());
+      }
+    }
+    // The path comes back slower
+    link.filter = None;
+    link.impair(Impairment::delay(20_000));
+    while !link.client.app.streams.get(&id.0).is_some_and(|el| el.fin) {
+      if !link.step_impaired() {
+        assert!(link.advance_to_next_event());
+      }
+    }
+    assert_eq!(link.server.conn.stats().persistent_congestions, 1);
+    assert!(link.server.conn.min_rtt_us() >= 35_000, "{}", link.server.conn.min_rtt_us());
   }
 
   // A connection that serves a lossy profile, with key updates, on pools that served the same

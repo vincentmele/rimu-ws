@@ -224,10 +224,9 @@ mod tests {
       assert_eq!(link.server.conn.max_datagram(), expected, "{expected}");
       assert_eq!(link.server.conn.stats().mtu_probes, probes, "{expected}");
       assert_eq!(LARGEST.load(Ordering::Relaxed), expected as u64);
-      // No loss of a probe was a congestion event: the window only grew
-      if expected == MIN_MTU {
-        assert!(link.server.conn.cwnd() >= cwnd);
-      }
+      // No loss of a probe was a congestion event (review J10)
+      assert_eq!(link.server.conn.ssthresh(), usize::MAX, "{expected}");
+      assert!(link.server.conn.cwnd() >= cwnd);
       // The client probed the other way, where nothing is dropped
       assert_eq!(link.client.conn.max_datagram(), 1472);
     }

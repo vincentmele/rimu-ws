@@ -28,6 +28,12 @@ pub struct QuicLimits {
   /// top of this, each stream that holds blocks may take four more, the blocks at the edges of its
   /// data, one for retained bytes and one that the ranges of its waiting data spill into.
   ///
+  /// Outside of this cap, each stream with waiting data also holds an index of its blocks with
+  /// room for all that it can hold: 16 bytes per 4 KiB of
+  /// [`Self::max_out_of_order_bytes_per_stream`] (about 4.1 KiB at the default), for as long as
+  /// data waits. The blocks and indexes go back to pools of the worker, whose free lists keep at
+  /// most 1,024 entries each, the high-water ones, until the worker is idle.
+  ///
   /// Defaults to 16 MiB, the connection window.
   pub max_out_of_order_bytes_per_conn: u32,
   /// How far, in bytes, the received data of a stream can reach past the first byte that the

@@ -415,13 +415,37 @@ impl Streams {
         stream.tx.reset_acked = true;
         (slot, generation, true)
       }
+      // A limit acknowledged, late or not, while it is still the current one: a copy owed for
+      // its loss is not needed (review J8)
+      FrameRef::MaxData { max } => {
+        if max == self.flow.rx_max {
+          self.owed &= !OWED_MAX_DATA_LOST;
+        }
+        return Ok(());
+      }
+      FrameRef::MaxStreams { bidi, max } => {
+        let (kind, flag) = if bidi {
+          (Kind::Bidi, OWED_MAX_STREAMS_BIDI_LOST)
+        } else {
+          (Kind::UniRemote, OWED_MAX_STREAMS_UNI_LOST)
+        };
+        if self.table(kind).is_some_and(|el| el.meta.limit == max) {
+          self.owed &= !flag;
+        }
+        return Ok(());
+      }
+      FrameRef::MaxStreamData { slot, generation, max } => {
+        if let Some(stream) = pools.stream_slots.get_live(slot, generation)
+          && stream.rx.max == max
+        {
+          stream.rx.max_lost = false;
+        }
+        return Ok(());
+      }
       FrameRef::Ack { .. }
       | FrameRef::Crypto { .. }
       | FrameRef::DataBlocked { .. }
       | FrameRef::HandshakeDone
-      | FrameRef::MaxData { .. }
-      | FrameRef::MaxStreamData { .. }
-      | FrameRef::MaxStreams { .. }
       | FrameRef::StopSending { .. }
       | FrameRef::StreamDataBlocked { .. } => return Ok(()),
     };
@@ -467,10 +491,12 @@ impl Streams {
           self.ctrl_add(stream_slots, slot);
         }
       }
-      FrameRef::MaxStreamData { slot, generation } => {
+      FrameRef::MaxStreamData { slot, generation, max } => {
+        // Only the frame of the current limit: a later one went
         if let Some(stream) = stream_slots.get_live(slot, generation)
           && stream.rx.state == RxState::Recv
           && stream.rx.final_size.is_none()
+          && stream.rx.max == max
         {
           stream.rx.max_owed = true;
           stream.rx.max_lost = true;
@@ -921,7 +947,7 @@ impl Streams {
           if !fw.write_max_stream_data(id, max) {
             return Ok(false);
           }
-          frame_refs.push(frames, FrameRef::MaxStreamData { slot, generation })?;
+          frame_refs.push(frames, FrameRef::MaxStreamData { slot, generation, max })?;
           rx.max = max;
           *wrote = true;
         }

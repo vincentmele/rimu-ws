@@ -50,6 +50,8 @@ pub(crate) enum FrameRef {
     slot: u32,
     /// The generation of the slot when the frame was sent.
     generation: u32,
+    /// The limit that the frame gave.
+    max: u64,
   },
   /// MAX_STREAMS, of bidirectional or unidirectional streams.
   MaxStreams {
@@ -124,6 +126,9 @@ pub(crate) enum SentKind {
   NotInFlight,
   /// In flight: ack-eliciting or padded, and counted by congestion control.
   InFlight,
+  /// In flight, and its CRYPTO data queued again for a probe: its loss does not queue it once
+  /// more (review J9).
+  Probed,
   /// A probe of path MTU discovery: in flight until it is acknowledged or lost, but not counted
   /// by congestion control, whose loss is no congestion signal (ruling T9-e).
   MtuProbe,
@@ -150,13 +155,13 @@ impl SentPacket {
   /// If it counts towards the bytes in flight of congestion control.
   #[inline]
   pub(crate) fn counts_for_congestion(&self) -> bool {
-    self.kind == SentKind::InFlight
+    matches!(self.kind, SentKind::InFlight | SentKind::Probed)
   }
 
   /// If its fate is still unknown: in flight, a probe included.
   #[inline]
   pub(crate) fn in_flight(&self) -> bool {
-    matches!(self.kind, SentKind::InFlight | SentKind::MtuProbe)
+    matches!(self.kind, SentKind::InFlight | SentKind::MtuProbe | SentKind::Probed)
   }
 }
 
