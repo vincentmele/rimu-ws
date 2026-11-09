@@ -1,12 +1,14 @@
 use crate::{
   quic::{
-    Cid, ConnState, DatagramMeta, Frame, PacketTy, QuicLimits, QuicParams, RecvOutcome,
+    Cid, ConnState, DatagramMeta, EndpointKeys, Frame, PacketTy, QuicLimits, QuicParams,
+    RecvOutcome, TxArena,
     cid_table::FORWARDED_TTL_US,
     parse_header,
-    testing::{Behavior, Net, NetRoute, TestApp, encode_frames},
+    testing::{Behavior, Net, NetRoute, TestApp, TestEndpoint, encode_frames, server_tls_config},
     token::RETRY_TOKEN_LIFETIME_US,
   },
-  sync::AtomicU64,
+  rng::ChaCha20,
+  sync::{Arc, AtomicU64},
 };
 use alloc::{vec, vec::Vec};
 use core::{
@@ -154,9 +156,9 @@ fn unknown_short_cid_gets_stateless_reset_rate_limited() {
     assert_eq!(&reset[reset.len() - 16..], &token);
     resets.push(reset);
   }
-  // Random bytes: two resets of the same size differ but for the token
-  let random = resets[1].len() - 16;
-  assert_ne!(resets[1][1..random], resets[2][1..random]);
+  // Random bytes: two resets differ but for the token (lengths differ too, review L9: the bytes
+  // after the first one that every reset has, at least 21 bytes long, are compared)
+  assert_ne!(resets[1][1..5], resets[2][1..5]);
   assert_eq!(net.servers[0].endpoint.stats().resets, 3);
   // The budget of the second is spent after one more
   for _ in 0..3 {
@@ -474,14 +476,12 @@ fn endpoint_steady_state_allocates_nothing_after_warmup() {
   net.count((&SERVER, &OTHERS));
   let round = |net: &mut Net| {
     let first = net.clients.len();
-    // The clients share the thread, and so the pools of TLS states, of the server: in batches of
-    // 32, the handshakes of both sides hold at most the 64 that a thread keeps
-    for _ in 0..2 {
-      for _ in 0..CLIENTS / 2 {
-        let _ = net.add_client();
-      }
-      net.run();
+    // All at once, as the benchmark does: the clients share the thread, and so the TLS pools, of
+    // the server, which keep as many as 256 handshakes (ruling T10-l)
+    for _ in 0..CLIENTS {
+      let _ = net.add_client();
     }
+    net.run();
     assert!((first..first + CLIENTS).all(|el| confirmed(net, el)));
     let done = net.run_requests_from(first, REQUESTS, 256, b"GET /");
     assert_eq!(done, (CLIENTS * REQUESTS) as u64);
@@ -695,4 +695,312 @@ fn initials_dropped_at_the_connection_cap() {
   let _ = net.deliver_to_server(late, &mut first[0].clone());
   net.run();
   assert!(confirmed(&net, late));
+}
+
+// An Initial packet of version 1 to `dcid`, of `len` bytes, that nothing opens.
+fn garbage_initial(dcid: &[u8; 8], len: usize) -> Vec<u8> {
+  let mut datagram = vec![0x5au8; len];
+  datagram[..6].copy_from_slice(&[0xc3, 0, 0, 0, 1, 8]);
+  datagram[6..14].copy_from_slice(dcid);
+  datagram[14] = 8;
+  datagram[15..23].copy_from_slice(&[7; 8]);
+  // No token, then a Length that covers the rest
+  datagram[23] = 0;
+  let length = u16::try_from(len - 26).unwrap() | 0x4000;
+  datagram[24..26].copy_from_slice(&length.to_be_bytes());
+  datagram
+}
+
+// The datagrams that an endpoint of a test flushed, taken out of `tx`.
+fn flushed(endpoint: &mut TestEndpoint, app: &mut TestApp, now_us: u64) -> Vec<Vec<u8>> {
+  let mut tx = TxArena::new(TxArena::DEFAULT_BYTES).unwrap();
+  let _ = endpoint.flush(now_us, &mut tx, app);
+  let mut rslt = Vec::new();
+  loop {
+    let next =
+      tx.pending().next().map(|el| (el.id, el.bytes.to_vec(), usize::from(el.segment_size)));
+    let Some((id, bytes, segment)) = next else {
+      break;
+    };
+    tx.mark_submitted(id);
+    tx.release(id);
+    rslt.extend(bytes.chunks(segment).map(<[u8]>::to_vec));
+  }
+  rslt
+}
+
+// Ruling T10-l: a burst of 128 handshakes at once, then another one, allocates nothing in the
+// endpoint the second time but what ring takes for an RSA signature (the test certificate is
+// ECDSA: none). The clients share the thread, and so its TLS pools: 256 handshakes at once.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn handshake_bursts_allocate_nothing_after_warmup() {
+  static OTHERS: AtomicU64 = AtomicU64::new(0);
+  static SERVER: AtomicU64 = AtomicU64::new(0);
+  const BURST: usize = 128;
+  let mut net = net(1, limits(|el| el.retry_above_half_open = 256));
+  net.count((&SERVER, &OTHERS));
+  let burst = |net: &mut Net| {
+    let first = net.clients.len();
+    for _ in 0..BURST {
+      let _ = net.add_client();
+    }
+    net.run();
+    assert!((first..first + BURST).all(|el| confirmed(net, el)));
+    assert_eq!(net.servers[0].endpoint.stats().retries, 0);
+    for idx in first..first + BURST {
+      let now_us = net.now_us;
+      net.clients[idx].conn.close_app(now_us, 0);
+    }
+    net.run();
+    net.advance(CLOSING_US);
+    assert_eq!(net.servers[0].endpoint.stats().conns, 0);
+  };
+  burst(&mut net);
+  let before = SERVER.load(Ordering::Relaxed);
+  burst(&mut net);
+  let allocations = SERVER.load(Ordering::Relaxed) - before;
+  assert!(allocations <= 9 * BURST as u64, "{allocations}");
+  assert_eq!(allocations, 0, "{allocations} allocations in {BURST} handshakes");
+}
+
+// Ruling T10-m: 64 first Initial packets that reach one worker of four in one batch, before any
+// other worker processed what it got, spread over the four: the load of a worker counts the
+// connections placed on it, not only those that it opened.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn first_initials_in_one_batch_spread_over_the_workers() {
+  let mut net = net(4, QuicParams::default());
+  let clients: Vec<usize> = (0..64).map(|_| net.add_client()).collect();
+  let mut forwards = Vec::new();
+  for &idx in &clients {
+    let mut datagram = net.client_datagrams(idx).remove(0);
+    let meta = DatagramMeta { peer: net.clients[idx].addr, local: None, segment_size: None };
+    let now_us = net.now_us;
+    let server = &mut net.servers[0];
+    if let RecvOutcome::Forward { worker } =
+      server.endpoint.recv(now_us, &mut datagram, meta, &mut server.app)
+    {
+      forwards.push((worker, datagram, meta));
+    }
+  }
+  for (worker, mut datagram, meta) in forwards {
+    let now_us = net.now_us;
+    let server = &mut net.servers[usize::from(worker)];
+    server.endpoint.recv_forwarded(now_us, &mut datagram, meta, &mut server.app);
+  }
+  net.run();
+  assert!(clients.iter().all(|el| confirmed(&net, *el)));
+  for worker in 0..4u8 {
+    let conns = net.servers[usize::from(worker)].endpoint.stats().conns;
+    assert!((15..=17).contains(&conns), "worker {worker}: {conns}");
+    assert_eq!(net.loads.load(worker), conns);
+  }
+}
+
+// Ruling T10-m: every way in which a placement opens no connection gives it back: a forwarded
+// datagram that the caller could not hand over, a target that shuts down, answers with a Retry,
+// has no room for a handshake or a connection, or opens nothing in the datagram; and the same on
+// the worker that received it.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn placements_that_open_nothing_are_given_back() {
+  // A net whose worker 0 is the busier one: the first Initial packets that reach it go to worker 1
+  let busy = |params: QuicParams| {
+    let mut net = net(2, params);
+    net.route = NetRoute::Worker(0);
+    net.loads.placed(0);
+    net
+  };
+  let first_initial = |net: &mut Net| {
+    let client = net.add_client();
+    let datagram = net.client_datagrams(client).remove(0);
+    let meta = DatagramMeta { peer: net.clients[client].addr, local: None, segment_size: None };
+    (datagram, meta)
+  };
+  let forward = |net: &mut Net, datagram: &mut Vec<u8>, meta: DatagramMeta| {
+    let now_us = net.now_us;
+    let server = &mut net.servers[0];
+    assert_eq!(
+      server.endpoint.recv(now_us, datagram, meta, &mut server.app),
+      RecvOutcome::Forward { worker: 1 }
+    );
+    assert_eq!((net.loads.load(0), net.loads.load(1)), (1, 1), "placed on worker 1");
+  };
+  let deliver = |net: &mut Net, datagram: &mut Vec<u8>, meta: DatagramMeta| {
+    let now_us = net.now_us;
+    let server = &mut net.servers[1];
+    server.endpoint.recv_forwarded(now_us, datagram, meta, &mut server.app);
+  };
+  // The inbox of the target was full
+  let mut net = busy(QuicParams::default());
+  let (mut datagram, meta) = first_initial(&mut net);
+  forward(&mut net, &mut datagram, meta);
+  net.servers[0].endpoint.forward_dropped(&datagram, 1);
+  assert_eq!((net.loads.load(0), net.loads.load(1)), (1, 0), "inbox full");
+  // The target refuses, in each of its ways
+  let refusals: [(&str, QuicParams); 4] = [
+    ("Retry", limits(|el| el.retry_above_half_open = 0)),
+    ("half-open cap", limits(|el| el.max_half_open_per_worker = 0)),
+    ("connection cap", QuicParams::default().set_max_conns_per_worker(0)),
+    ("shutdown", QuicParams::default()),
+  ];
+  for (name, params) in refusals {
+    let mut net = busy(params);
+    if name == "shutdown" {
+      let now_us = net.now_us;
+      let target = &mut net.servers[1];
+      target.endpoint.begin_shutdown(now_us, &mut target.app);
+    }
+    let (mut datagram, meta) = first_initial(&mut net);
+    forward(&mut net, &mut datagram, meta);
+    deliver(&mut net, &mut datagram, meta);
+    assert_eq!((net.loads.load(0), net.loads.load(1)), (1, 0), "{name}");
+    assert_eq!(net.servers[1].endpoint.stats().conns, 0, "{name}");
+  }
+  // A first datagram that opens nothing on the target
+  let mut net = busy(QuicParams::default());
+  let mut garbage = garbage_initial(&[9; 8], 1200);
+  let meta = stranger(7);
+  forward(&mut net, &mut garbage, meta);
+  deliver(&mut net, &mut garbage, meta);
+  assert_eq!((net.loads.load(0), net.loads.load(1)), (1, 0), "undecryptable");
+  // On the worker that received them: Retry, half-open cap, shutdown, nothing that opens
+  for case in 0..4 {
+    let params = match case {
+      0 => limits(|el| el.retry_above_half_open = 0),
+      1 => limits(|el| el.max_half_open_per_worker = 0),
+      _ => QuicParams::default(),
+    };
+    let mut net = self::net(1, params);
+    if case == 2 {
+      let now_us = net.now_us;
+      let server = &mut net.servers[0];
+      server.endpoint.begin_shutdown(now_us, &mut server.app);
+    }
+    let (mut datagram, meta) = if case == 3 {
+      (garbage_initial(&[9; 8], 1200), stranger(7))
+    } else {
+      first_initial(&mut net)
+    };
+    let _ = net.deliver_meta(&mut datagram, meta);
+    assert_eq!(net.loads.load(0), 0, "case {case}");
+    assert_eq!(net.servers[0].endpoint.stats().conns, 0, "case {case}");
+  }
+}
+
+// Ruling T10-o: two endpoints whose generators come from one generator of the process draw
+// other numbers: other CIDs and other nonces of their Retry tokens for the same Initial packet.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn endpoints_from_one_parent_draw_different_numbers() {
+  let mut parent = ChaCha20::from_key([1; 32]);
+  let keys = Arc::new(EndpointKeys::new(&mut parent));
+  let params = limits(|el| el.retry_above_half_open = 0);
+  let mut make = || {
+    TestEndpoint::new(params, 0, 1, server_tls_config(), &mut parent, None, Arc::clone(&keys))
+      .unwrap()
+  };
+  let (mut first, mut second) = (make(), make());
+  let mut net = net(1, QuicParams::default());
+  let client = net.add_client();
+  let datagram = net.client_datagrams(client).remove(0);
+  let meta = DatagramMeta { peer: net.clients[client].addr, local: None, segment_size: None };
+  let mut retries = Vec::new();
+  for endpoint in [&mut first, &mut second] {
+    let mut app = TestApp::default();
+    let _ = endpoint.recv(net.now_us, &mut datagram.clone(), meta, &mut app);
+    let out = flushed(endpoint, &mut app, net.now_us);
+    assert_eq!(out.len(), 1);
+    let header = parse_header(&out[0], 8).unwrap();
+    assert_eq!(header.ty, PacketTy::Retry);
+    retries.push((header.scid.to_vec(), header.token[..12].to_vec()));
+  }
+  assert_ne!(retries[0].0, retries[1].0, "the CIDs");
+  assert_ne!(retries[0].1, retries[1].1, "the nonces of the tokens");
+}
+
+// Review L6: a slot whose connection was owed a flush, then ended, and which a new connection
+// took again in the same turn, is flushed once.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_slot_taken_again_in_one_turn_is_flushed_once() {
+  let mut net = net(1, QuicParams::default().set_max_conns_per_worker(1));
+  let first = net.add_client();
+  net.run();
+  let cid = server_cid(&net, first);
+  let now_us = net.now_us;
+  net.clients[first].conn.close_app(now_us, 0);
+  net.run();
+  assert_eq!(net.servers[0].endpoint.conn(&cid).unwrap().state(), ConnState::Draining);
+  // A late datagram: owed a flush, which does not come before the end of the draining period
+  let _ = net.deliver_to_server(first, &mut short_packet(&cid, 60));
+  assert_eq!(net.servers[0].endpoint.dirty_len(), 1);
+  net.advance(CLOSING_US);
+  assert_eq!(net.servers[0].endpoint.stats().conns, 0);
+  let second = net.add_client();
+  let mut initial = net.client_datagrams(second).remove(0);
+  let _ = net.deliver_to_server(second, &mut initial);
+  assert_eq!(net.servers[0].endpoint.stats().conns, 1);
+  assert_eq!(net.servers[0].endpoint.dirty_len(), 1);
+  net.run();
+  assert!(confirmed(&net, second));
+}
+
+// Review L7: a first Initial packet in which nothing opens leaves no connection and makes no
+// call of the application, which never saw it.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn undecryptable_first_initials_make_no_app_callback() {
+  let mut net = net(1, QuicParams::default());
+  for idx in 0..8u8 {
+    let _ = net.deliver_meta(&mut garbage_initial(&[idx; 8], 1200), stranger(9));
+  }
+  let server = &net.servers[0];
+  assert_eq!((server.app.closed, server.app.established), (0, 0));
+  assert_eq!((server.endpoint.stats().conns, server.endpoint.stats().half_open), (0, 0));
+  assert!(net.server_datagrams(0).is_empty());
+}
+
+// Review L9: the length of a stateless reset is unpredictable, from 21 bytes up to one byte less
+// than what it answers and at most 40; one byte less than an answered datagram of up to 43 bytes,
+// as RFC 9000 section 10.3 asks, as far as the cap of 40 lets it.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn stateless_reset_lengths_are_unpredictable_within_bounds() {
+  let mut net = net(1, limits(|el| el.stateless_reset_per_sec = 100_000));
+  let cid = [0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7];
+  for len in [41, 42, 43, 44, 60, 100, 1200] {
+    let mut lengths = Vec::new();
+    for _ in 0..64 {
+      let _ = net.deliver_meta(&mut short_packet(&cid, len), stranger(1));
+      let out = net.server_datagrams(0);
+      assert_eq!(out.len(), 1);
+      lengths.push(out[0].1.len());
+    }
+    let max = (len - 1).min(40);
+    assert!(lengths.iter().all(|el| (21..=max).contains(el)), "{len}: {lengths:?}");
+    if len <= 43 {
+      assert!(lengths.iter().all(|el| *el == max), "{len}: {lengths:?}");
+    } else {
+      lengths.sort_unstable();
+      lengths.dedup();
+      assert!(lengths.len() > 4, "{len}: {lengths:?}");
+    }
+  }
+}
+
+// Review L10: a datagram that goes to another worker counts there, once, and as forwarded here.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn forwarded_datagrams_count_once() {
+  let mut net = net(2, QuicParams::default());
+  net.route = NetRoute::Worker(0);
+  net.loads.placed(0);
+  let client = net.add_client();
+  let mut initial = net.client_datagrams(client).remove(0);
+  assert_eq!(net.deliver_to_server(client, &mut initial), RecvOutcome::Forward { worker: 1 });
+  let (here, there) = (net.servers[0].endpoint.stats(), net.servers[1].endpoint.stats());
+  assert_eq!((here.datagrams_in, here.forwarded), (0, 1));
+  assert_eq!((there.datagrams_in, there.conns), (1, 1));
 }

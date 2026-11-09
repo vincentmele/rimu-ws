@@ -27,8 +27,8 @@ const KS_POOL_MAX: usize = 64;
 const KS_POOL_IDLE_KEEP: usize = 4;
 /// Buffer pairs a thread keeps, of at most `BUF_POOL_BYTES` in all; buffers larger than
 /// `BUF_MAX` are freed. With no connection open: the most recent `BUF_POOL_IDLE_KEEP` within
-/// `BUF_POOL_IDLE_BYTES`.
-const BUF_POOL_MAX: usize = 64;
+/// `BUF_POOL_IDLE_BYTES`. As many as a QUIC worker has handshakes under way (ruling T10-l).
+const BUF_POOL_MAX: usize = 256;
 const BUF_POOL_BYTES: usize = 8 << 20;
 const BUF_MAX: usize = 1 << 20;
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
@@ -83,6 +83,8 @@ pub(crate) fn trim_idle_pools() {
         elem.bytes = total;
       }
     });
+    #[cfg(feature = "quic")]
+    crate::tls::quic_tls::trim_idle_states();
   }
 }
 

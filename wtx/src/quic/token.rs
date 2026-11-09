@@ -128,6 +128,18 @@ impl EndpointKeys {
   }
 }
 
+/// If `a` and `b` are the same token, compared in a time that does not depend on where they
+/// differ: the comparison of a received datagram with a stateless reset token must not leak the
+/// token (RFC 9000 section 10.3.1, review L1).
+#[inline]
+pub(crate) fn tokens_match(a: &[u8; RESET_TOKEN_LEN], b: &[u8; RESET_TOKEN_LEN]) -> bool {
+  let mut diff = 0u8;
+  for (left, right) in a.iter().zip(b) {
+    diff |= left ^ right;
+  }
+  core::hint::black_box(diff) == 0
+}
+
 impl Debug for EndpointKeys {
   #[inline]
   fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
@@ -176,7 +188,9 @@ mod tests {
   use crate::{
     quic::{
       Cid,
-      token::{EndpointKeys, RETRY_TOKEN_LEN, RETRY_TOKEN_LIFETIME_US},
+      token::{
+        EndpointKeys, RESET_TOKEN_LEN, RETRY_TOKEN_LEN, RETRY_TOKEN_LIFETIME_US, tokens_match,
+      },
     },
     rng::ChaCha20,
   };
@@ -196,6 +210,22 @@ mod tests {
     assert_eq!(one.reset_token(&cid).unwrap(), one.reset_token(&cid).unwrap());
     assert_ne!(one.reset_token(&cid).unwrap(), other.reset_token(&cid).unwrap());
     assert_ne!(one.reset_token(&cid).unwrap(), one.reset_token(&[0, 1, 2, 3, 4, 5, 6, 8]).unwrap());
+  }
+
+  // Review L1: tokens match only when every byte does, whichever byte differs.
+  #[test]
+  fn tokens_match_only_when_every_byte_does() {
+    let token: [u8; RESET_TOKEN_LEN] = core::array::from_fn(|idx| u8::try_from(idx).unwrap());
+    assert!(tokens_match(&token, &token));
+    assert!(tokens_match(&[0; RESET_TOKEN_LEN], &[0; RESET_TOKEN_LEN]));
+    for idx in 0..RESET_TOKEN_LEN {
+      for bit in 0..8 {
+        let mut other = token;
+        other[idx] ^= 1 << bit;
+        assert!(!tokens_match(&token, &other), "{idx} {bit}");
+        assert!(!tokens_match(&other, &token), "{idx} {bit}");
+      }
+    }
   }
 
   // A Retry token opens for the peer, the Retry and the time that it was made for: not for

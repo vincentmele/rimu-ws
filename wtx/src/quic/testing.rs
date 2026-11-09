@@ -748,7 +748,7 @@ pub(crate) fn client_conn_padded(
     bytes.extend_from_slice(&(0x4000 | u16::try_from(padding).unwrap()).to_be_bytes());
     bytes.resize(bytes.len() + padding, 0x5a);
   }
-  let tls = QuicTls::new_client("localhost", b"h3", &bytes, ChaCha20::from_key(seed(rng))).unwrap();
+  let tls = QuicTls::new_client("localhost", b"h3", &bytes, rng).unwrap();
   QuicConn::new_client(params, local_cid, original_dcid, SERVER_ADDR, tls, now_us, pools).unwrap()
 }
 
@@ -761,12 +761,6 @@ pub(crate) fn server_config(suite: Option<CipherSuite>) -> Arc<TlsConfig<SkCtx>>
     suites.push(elem).unwrap();
   }
   Arc::new(config)
-}
-
-fn seed(rng: &mut ChaCha20) -> [u8; 32] {
-  let mut rslt = [0; 32];
-  rng.fill_slice(&mut rslt);
-  rslt
 }
 
 // The connection that the endpoint makes for the first Initial packet of a client.
@@ -784,16 +778,16 @@ fn server_conn(
   let len = params_tp.encode(&mut tp).unwrap();
   let mut key = [0; 32];
   key[..4].copy_from_slice(&seed.to_le_bytes());
-  let rng = ChaCha20::from_key(key);
+  let mut rng = ChaCha20::from_key(key);
   let tls = if opts.server_tp_padding == 0 {
-    QuicTls::new(&opts.server_config, &tp[..len], rng).unwrap()
+    QuicTls::new(&opts.server_config, &tp[..len], &mut rng).unwrap()
   } else {
     let mut padded = tp[..len].to_vec();
     let padding = u16::try_from(opts.server_tp_padding).unwrap();
     padded.push(GREASE_PARAM);
     padded.extend_from_slice(&(0x4000 | padding).to_be_bytes());
     padded.resize(padded.len() + opts.server_tp_padding, 0x5a);
-    QuicTls::new(&opts.server_config, &padded, rng).unwrap()
+    QuicTls::new(&opts.server_config, &padded, &mut rng).unwrap()
   };
   let meta = DatagramMeta { peer: CLIENT_ADDR, local: None, segment_size: None };
   QuicConn::new_server(
@@ -1018,15 +1012,16 @@ impl Net {
     let keys = Arc::new(EndpointKeys::new(&mut rng));
     let loads = Arc::new(WorkerLoads::new(workers));
     let now_us = 1_000_000;
+    // The generator of the process, which each endpoint derives its own from
+    let mut parent = ChaCha20::from_key([11; 32]);
     let servers = (0..workers)
       .map(|worker| {
-        let seed = ChaCha20::from_key([worker.wrapping_add(11); 32]);
         let endpoint = Endpoint::new(
           params,
           worker,
           workers,
           server_tls_config(),
-          seed,
+          &mut parent,
           Some(Arc::clone(&loads)),
           Arc::clone(&keys),
         )

@@ -60,10 +60,11 @@ use crate::{
     remove_header_protection,
     sent::{FrameRef, FrameRefRange, SentKind, SentPacket, SentRing},
     stream::{BIDI_WINDOW, Streams, UNI_REMOTE_WINDOW},
+    token::tokens_match,
     varint::varint_len,
     writer::Writer,
   },
-  rng::CryptoRng,
+  rng::{CryptoRng, CryptoSeedableRng},
   tls::{AlertDescription, CipherSuite, QuicTls, TlsCtxSk},
 };
 use alloc::boxed::Box;
@@ -391,7 +392,7 @@ pub(crate) struct TestClient {
 impl<A, RNG, TCX> QuicConn<A, RNG, TCX, false>
 where
   A: QuicApp,
-  RNG: CryptoRng,
+  RNG: CryptoRng + CryptoSeedableRng,
   TCX: TlsCtxSk,
 {
   /// The connection that an Initial packet of a client opens, which `meta` came with and whose
@@ -429,7 +430,7 @@ where
 impl<A, RNG, TCX> QuicConn<A, RNG, TCX, true>
 where
   A: QuicApp,
-  RNG: CryptoRng,
+  RNG: CryptoRng + CryptoSeedableRng,
   TCX: TlsCtxSk,
 {
   /// The connection of a client, for tests, that sends its first Initial packet to `peer` with
@@ -454,7 +455,7 @@ where
 impl<A, RNG, TCX, const IS_CLIENT: bool> QuicConn<A, RNG, TCX, IS_CLIENT>
 where
   A: QuicApp,
-  RNG: CryptoRng,
+  RNG: CryptoRng + CryptoSeedableRng,
   TCX: TlsCtxSk,
 {
   /// Ends the connection at once, without a CONNECTION_CLOSE, and gives back to `pools` all that
@@ -1007,11 +1008,17 @@ where
   }
 
   // If `tail`, the last bytes of a datagram that could not be processed, is the stateless reset
-  // token of a CID of the peer.
+  // token of a CID of the peer. Every stored token is compared, each in constant time: the
+  // comparison tells nothing of a token (RFC 9000 section 10.3.1, review L1).
   fn is_peer_reset(&self, tail: &[u8; RESET_TOKEN_LEN]) -> bool {
-    self.cold.as_deref().is_some_and(|cold| {
-      cold.peer_cids.iter().flatten().any(|el| el.reset_token.as_ref() == Some(tail))
-    })
+    let Some(cold) = self.cold.as_deref() else {
+      return false;
+    };
+    let mut found = false;
+    for token in cold.peer_cids.iter().flatten().filter_map(|el| el.reset_token.as_ref()) {
+      found |= tokens_match(token, tail);
+    }
+    found
   }
 
   // If the peer completed address validation: always for a server, which the handshake validates
@@ -2533,6 +2540,55 @@ where
   }
 }
 
+// Spec section 5.4: a connection is at most 4 KiB in the build that runs, not only in tests,
+// whose random number generators are smaller (ruling T10-j). The probe application keeps no state
+// of its own: what an application keeps per connection counts on top.
+const _: () = assert!(
+  size_of::<QuicConn<SizeProbeApp, crate::rng::ChaCha20, crate::tls::SkCtx>>() <= 4096,
+  "a QUIC connection of the production build is larger than 4 KiB"
+);
+
+// An application that keeps nothing, for the size of a connection of the production build.
+struct SizeProbeApp;
+
+impl QuicApp for SizeProbeApp {
+  type ConnState = ();
+
+  fn on_established(&mut self, _: &mut ConnCtx<'_, ()>) -> crate::Result<()> {
+    Ok(())
+  }
+
+  fn on_stream_data(
+    &mut self,
+    _: &mut ConnCtx<'_, ()>,
+    _: crate::quic::StreamId,
+    _: &[u8],
+    _: bool,
+  ) -> crate::Result<()> {
+    Ok(())
+  }
+
+  fn on_stream_reset(
+    &mut self,
+    _: &mut ConnCtx<'_, ()>,
+    _: crate::quic::StreamId,
+    _: u64,
+  ) -> crate::Result<()> {
+    Ok(())
+  }
+
+  fn on_stop_sending(
+    &mut self,
+    _: &mut ConnCtx<'_, ()>,
+    _: crate::quic::StreamId,
+    _: u64,
+  ) -> crate::Result<()> {
+    Ok(())
+  }
+
+  fn on_closed(&mut self, _: &mut ()) {}
+}
+
 /// The state of a connection that is seldom used: the budgets of the frames of the peer that a
 /// flood would abuse, the packets that failed to open and the counters. It comes from the pools of
 /// the worker and goes back once the connection is closed, which keeps the connection small (spec
@@ -2899,7 +2955,7 @@ fn feed<const IS_CLIENT: bool, RNG, TCX>(
   data_keys: &mut Option<PacketKeys>,
 ) -> crate::Result<()>
 where
-  RNG: CryptoRng,
+  RNG: CryptoRng + CryptoSeedableRng,
   TCX: TlsCtxSk,
 {
   tls.feed(space, data)?;

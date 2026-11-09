@@ -15,10 +15,16 @@
 //!
 //! # Memory
 //!
-//! Besides the shared configuration and the random number generator, the whole state of a
-//! handshake (key schedule, transcript, buffers) lives in a box that this thread pools, and the two
+//! Besides the shared configuration, the whole state of a handshake (key schedule, transcript,
+//! buffers, the seed of its random numbers) lives in a box that this thread pools, and the two
 //! buffers come from this thread's TLS pools ([`TlsBuffer`]): both go back zeroed when this is
-//! dropped, which a connection does once the handshake is confirmed.
+//! dropped, which a connection does once the handshake is confirmed. The handle that a connection
+//! keeps inline is two pointers (ruling T10-j).
+//!
+//! The random numbers of a handshake come from a generator made, when they are needed, from a
+//! seed of the pooled state, which the generator replaces with the first bytes that it gives. The
+//! seed is drawn from the generator of the caller each time a state is taken: a state that came
+//! back zeroed never gives the next handshake the numbers of the previous one.
 //!
 //! The reader buffer holds the transport parameters that are kept (the local ones of a server
 //! until its EncryptedExtensions is written, then those of the peer), followed by the handshake
@@ -28,9 +34,9 @@
 use crate::{
   collections::ArrayVectorCopy,
   crypto::MAX_HASH_LEN,
-  misc::zero_volatile,
+  misc::{LeaseMut, zero_volatile},
   quic::{QuicError, Space, TransportErrorCode},
-  rng::CryptoRng,
+  rng::{CryptoRng, CryptoSeedableRng},
   sync::Arc,
   tls::{
     AlertDescription, CipherSuite, DLFT_MAX_FRAGMENT_LENGTH, HandshakeTy, NamedGroup,
@@ -48,6 +54,7 @@ use alloc::boxed::Box;
 use core::{
   fmt::{Debug, Formatter},
   hint::cold_path,
+  marker::PhantomData,
   mem::{ManuallyDrop, MaybeUninit},
   ops::{Deref, DerefMut, Range},
   ptr,
@@ -57,19 +64,38 @@ use core::{
 /// `CRYPTO_BUFFER_EXCEEDED`.
 pub(crate) const MAX_HANDSHAKE_MESSAGE: usize = 16 * 1024;
 
+// The bytes of the seed of the random numbers of a handshake: at least the seed of its generator
+const RNG_SEED_LEN: usize = 32;
+
 const INITIAL_LEVEL: u8 = 0;
 const HANDSHAKE_LEVEL: u8 = 1;
 const DATA_LEVEL: u8 = 2;
 const SECRET_LEN: usize = MAX_HASH_LEN;
-// State boxes that a thread keeps
+// State boxes that a thread keeps: as many as a QUIC worker has handshakes under way, so that
+// bursts of them allocate nothing once warm (ruling T10-l); trimmed when the thread is idle
 #[cfg(feature = "std")]
-const STATE_POOL_MAX: usize = 64;
+const STATE_POOL_MAX: usize = 256;
+#[cfg(all(feature = "std", feature = "io-uring", target_os = "linux"))]
+const STATE_POOL_IDLE_KEEP: usize = 4;
 
 #[cfg(feature = "std")]
 std::thread_local! {
   #[allow(clippy::vec_box, reason = "the boxes are what is pooled")]
   static STATE_POOL: core::cell::RefCell<alloc::vec::Vec<Box<MaybeUninit<QuicTlsState>>>> =
     const { core::cell::RefCell::new(alloc::vec::Vec::new()) };
+}
+
+/// Frees the oldest state boxes of this thread's pool until a few are left: with the other TLS
+/// pools ([`crate::tls::tls_pool`]), once the thread has no connection open.
+#[cfg(all(feature = "std", feature = "io-uring", target_os = "linux"))]
+#[inline]
+pub(crate) fn trim_idle_states() {
+  let _rslt = STATE_POOL.try_with(|pool| {
+    if let Ok(mut elem) = pool.try_borrow_mut() {
+      let excess = elem.len().saturating_sub(STATE_POOL_IDLE_KEEP);
+      let _ = elem.drain(..excess);
+    }
+  });
 }
 
 /// The traffic secrets of one encryption level, from which the connection derives its packet
@@ -117,7 +143,8 @@ impl Drop for QuicTlsSecrets {
 /// server negotiates `h3` and nothing else.
 pub(crate) struct QuicTls<const IS_CLIENT: bool, RNG, TCX> {
   config: Arc<TlsConfig<TCX>>,
-  rng: RNG,
+  // The generator of the random numbers, made from the seed of the state when they are needed
+  rng: PhantomData<fn() -> RNG>,
   // Everything else, in a box that this thread pools
   state: StateBox,
 }
@@ -134,6 +161,8 @@ struct QuicTlsState {
   // What is sent in Initial and in Handshake: ranges of the writer buffer
   output_handshake: Range<usize>,
   output_initial: Range<usize>,
+  // What the next generator of random numbers is made from (see the module documentation)
+  rng_seed: [u8; RNG_SEED_LEN],
   // The levels whose secrets TLS has (Handshake, then Data), and how many of them were taken
   secrets_ready: u8,
   secrets_taken: u8,
@@ -146,18 +175,20 @@ struct QuicTlsState {
 
 impl<RNG, TCX> QuicTls<false, RNG, TCX>
 where
-  RNG: CryptoRng,
+  RNG: CryptoRng + CryptoSeedableRng,
   TCX: TlsCtxSk,
 {
   /// The handshake of a server, which sends `local_transport_params` (encoded) in its
-  /// EncryptedExtensions.
-  #[allow(dead_code, reason = "called by the endpoint, which opens connections")]
+  /// EncryptedExtensions, and whose random numbers come from a seed drawn from `rng`.
   #[inline]
-  pub(crate) fn new(
+  pub(crate) fn new<R>(
     config: &Arc<TlsConfig<TCX>>,
     local_transport_params: &[u8],
-    rng: RNG,
-  ) -> crate::Result<Self> {
+    rng: &mut R,
+  ) -> crate::Result<Self>
+  where
+    R: CryptoRng,
+  {
     let mut this = Self::with_parts(Arc::clone(config), rng, Stage::ClientHello);
     let state = &mut *this.state;
     state.signature_algorithms = filter_signature_algorithms(config);
@@ -171,17 +202,20 @@ where
 #[cfg(test)]
 impl<RNG> QuicTls<true, RNG, crate::tls::UnverifiedCtx>
 where
-  RNG: CryptoRng,
+  RNG: CryptoRng + CryptoSeedableRng,
 {
   /// The handshake of a client, for tests: it offers `alpn` and sends `local_transport_params`
   /// (encoded) in its ClientHello, which [`Self::output`] already holds. The certificate of the
   /// server is not verified, its CertificateVerify is.
-  pub(crate) fn new_client(
+  pub(crate) fn new_client<R>(
     server_name: &str,
     alpn: &[u8],
     local_transport_params: &[u8],
-    mut rng: RNG,
-  ) -> crate::Result<Self> {
+    seed_rng: &mut R,
+  ) -> crate::Result<Self>
+  where
+    R: CryptoRng,
+  {
     use crate::{
       codec::Encode as _,
       collections::ArrayVectorU8,
@@ -197,12 +231,13 @@ where
     let mut server_names = ServerNameList::default();
     server_names.server_name_list.push(ServerName::from_name(server_name.try_into()?))?;
     *config.server_name_mut() = Some(server_names);
+    let mut this = Self::with_parts(Arc::new(config), seed_rng, Stage::Failed);
+    let mut rng = next_rng::<RNG>(&mut this.state.rng_seed)?;
     let mut secrets = ArrayVectorU8::new();
-    for named_group in &config.supported_groups().named_group_list {
+    for named_group in &this.config.supported_groups().named_group_list {
       secrets.push(named_group.agreement(&mut rng)?)?;
     }
-    let mut this = Self::with_parts(Arc::new(config), rng, Stage::Failed);
-    let client_hello = ClientHello::new(&secrets, &mut this.rng, &*this.config);
+    let client_hello = ClientHello::new(&secrets, &mut rng, &*this.config);
     let state = &mut *this.state;
     Handshake::new(HandshakeTy::ClientHello, client_hello.into_quic(local_transport_params))
       .encode(&mut TlsEncodeWrapper::from_buffer(&mut state.buffer.writer_buffer))?;
@@ -214,7 +249,7 @@ where
 
 impl<const IS_CLIENT: bool, RNG, TCX> QuicTls<IS_CLIENT, RNG, TCX>
 where
-  RNG: CryptoRng,
+  RNG: CryptoRng + CryptoSeedableRng,
   TCX: TlsCtxSk,
 {
   /// The negotiated application protocol (`h3`), empty until it is known.
@@ -419,6 +454,7 @@ where
     let (mut max_fragment_length, mut max_fragment_length_send) =
       (DLFT_MAX_FRAGMENT_LENGTH, DLFT_MAX_FRAGMENT_LENGTH);
     let initial_begin = writer_buffer.len();
+    let mut rng = next_rng::<RNG>(&mut state.rng_seed)?;
     let negotiation = negotiate_client_hello::<_, _, true>(
       client_hello,
       &self.config,
@@ -426,7 +462,7 @@ where
       (&mut max_fragment_length, &mut max_fragment_length_send),
       &mut state.named_group,
       writer_buffer,
-      &mut self.rng,
+      &mut rng,
       &state.signature_algorithms,
       &mut state.transcript_hash,
     )?;
@@ -442,7 +478,7 @@ where
       negotiation,
       writer_buffer,
       Some(local_transport_params),
-      &mut self.rng,
+      &mut rng,
       &mut state.transcript_hash,
     )?;
     state.output_initial = initial_begin..handshake_begin;
@@ -468,7 +504,10 @@ where
     self.enter_data_level()
   }
 
-  fn with_parts(config: Arc<TlsConfig<TCX>>, rng: RNG, stage: Stage) -> Self {
+  fn with_parts<R>(config: Arc<TlsConfig<TCX>>, rng: &mut R, stage: Stage) -> Self
+  where
+    R: CryptoRng,
+  {
     let key_schedule = KeySchedule::default();
     let transcript_hash = key_schedule.cipher_suite().hash_new();
     let named_group =
@@ -482,6 +521,8 @@ where
       named_group,
       output_handshake: 0..0,
       output_initial: 0..0,
+      // From the caller at every take of a state, which comes back zeroed (ruling T10-j)
+      rng_seed: rng.u8_32(),
       secrets_ready: 0,
       secrets_taken: 0,
       signature_algorithms: ArrayVectorCopy::new(),
@@ -489,7 +530,7 @@ where
       stored_len: 0,
       transcript_hash,
     });
-    Self { config, rng, state }
+    Self { config, rng: PhantomData, state }
   }
 
   /// Where the pooled state and buffers are.
@@ -506,7 +547,7 @@ where
 #[cfg(test)]
 impl<const IS_CLIENT: bool, RNG, TCX> QuicTls<IS_CLIENT, RNG, TCX>
 where
-  RNG: CryptoRng,
+  RNG: CryptoRng + CryptoSeedableRng,
   TCX: TlsCtxSk,
 {
   // The ServerHello, after which the secrets of Handshake can be taken.
@@ -752,6 +793,24 @@ impl Stage {
   }
 }
 
+// A generator made from `seed`, which takes as the next seed the first bytes that the generator
+// gives: no two generators give the same numbers.
+fn next_rng<RNG>(seed: &mut [u8; RNG_SEED_LEN]) -> crate::Result<RNG>
+where
+  RNG: CryptoRng + CryptoSeedableRng,
+{
+  let mut rng_seed = RNG::Seed::default();
+  let dst = rng_seed.lease_mut();
+  let Some(src) = seed.get(..dst.len()) else {
+    cold_path();
+    return Err(crate::Error::ProgrammingError);
+  };
+  dst.copy_from_slice(src);
+  let mut rng = RNG::from_seed(rng_seed)?;
+  rng.fill_slice(seed);
+  Ok(rng)
+}
+
 fn alert(description: AlertDescription, err: QuicError) -> crate::Error {
   crate::Error::QuicClose(TransportErrorCode::Crypto(description.into()), err)
 }
@@ -853,12 +912,13 @@ mod tests {
   const UNKNOWN_EXTENSION: u16 = 0xfa0a;
 
   fn client(alpn: &[u8]) -> Client {
-    QuicTls::new_client("localhost", alpn, CLIENT_TP, ChaCha20::from_std_random().unwrap()).unwrap()
+    QuicTls::new_client("localhost", alpn, CLIENT_TP, &mut ChaCha20::from_std_random().unwrap())
+      .unwrap()
   }
 
   fn server() -> Server {
     let config = Arc::new(TlsConfig::from_keys_pem(_PUBLIC_KEY, _SECRET_KEY).unwrap());
-    QuicTls::new(&config, SERVER_TP, ChaCha20::from_std_random().unwrap()).unwrap()
+    QuicTls::new(&config, SERVER_TP, &mut ChaCha20::from_std_random().unwrap()).unwrap()
   }
 
   // What the client has to send in `space`, taken out of it.
@@ -1217,6 +1277,35 @@ mod tests {
     assert_eq!(again.pooled_addrs(), addrs);
   }
 
+  // Ruling T10-j: the random numbers of a handshake come from a seed of its pooled state, drawn
+  // from the generator of the caller each time the state is taken: two handshakes in turn on the
+  // same state box, from one generator, answer the same ClientHello with other randoms and key
+  // shares, although the box came back zeroed in between.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn reused_states_draw_new_random_numbers() {
+    tls_pool::clear_thread_pools();
+    STATE_POOL.with(|el| el.borrow_mut().clear());
+    let config = Arc::new(TlsConfig::from_keys_pem(_PUBLIC_KEY, _SECRET_KEY).unwrap());
+    let mut parent = ChaCha20::from_key([3; 32]);
+    let client_hello = client_out(&mut client(b"h3"), Space::Initial);
+    let mut answers = Vec::new();
+    let mut boxes = Vec::new();
+    for _ in 0..2 {
+      let mut server = Server::new(&config, SERVER_TP, &mut parent).unwrap();
+      boxes.push(server.pooled_addrs()[0]);
+      server.feed(Space::Initial, &client_hello).unwrap();
+      let _secrets = secrets_of(&mut server);
+      answers.push(server_out(&mut server, Space::Initial));
+    }
+    assert_eq!(boxes[0], boxes[1], "the same pooled state");
+    // Handshake type, length, legacy version, then the random
+    let (first, second) = (&answers[0], &answers[1]);
+    assert_eq!(first.len(), second.len());
+    assert_ne!(first[6..38], second[6..38], "the ServerHello randoms");
+    assert_ne!(first[38..], second[38..], "the key shares");
+  }
+
   // The last state box that this thread pooled, with whether every byte of it is zero.
   fn last_pooled_state() -> Option<(usize, bool)> {
     STATE_POOL.with(|pool| {
@@ -1241,6 +1330,7 @@ mod tests {
       named_group: NamedGroup::default(),
       output_handshake: 5..9,
       output_initial: 1..5,
+      rng_seed: [0x5a; 32],
       secrets_ready: 2,
       secrets_taken: 1,
       signature_algorithms: ArrayVectorCopy::new(),

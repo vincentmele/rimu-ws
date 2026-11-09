@@ -11,10 +11,18 @@
 //! - an unknown version gets a Version Negotiation packet, in a datagram of 1200 bytes or more
 //!   (ruling T10-f);
 //! - a connection ID of ours that names another worker goes to that worker
-//!   ([`RecvOutcome::Forward`], ruling T10-e), once: a forwarded datagram is never forwarded again;
+//!   ([`RecvOutcome::Forward`], ruling T10-e), once: a forwarded datagram is never forwarded again.
+//!   That is a short header, a long header other than Initial, or an Initial packet with a token,
+//!   whose destination is a CID of ours; an Initial packet without a token is sent by a client to
+//!   a CID that it chose at random, which could look like one of another worker: it is taken for a
+//!   first Initial packet (with CID steering on, a later Initial packet to our CID reaches the
+//!   worker that it names);
 //! - the first Initial packet of a client goes, while CID steering is on, to the worker with the
 //!   fewest connections if that one has fewer than this one (spec section 5.11), which is
-//!   remembered for two seconds so that the Initial packets that follow go there too; or it is
+//!   remembered for two seconds so that the Initial packets that follow go there too. The worker
+//!   that decides counts the connection on the other one at once, so that a burst spreads; the
+//!   other one gives it back if the datagram opens nothing there (ruling T10-m), and so does
+//!   [`Endpoint::forward_dropped`] for a datagram that could not be handed over. Or it is
 //!   dropped if the worker has as many connections as it can, or as many handshakes under way as
 //!   [`QuicLimits::max_half_open_per_worker`], or gets a Retry if it has as many as
 //!   [`QuicLimits::retry_above_half_open`], or opens a connection, which the endpoint drops at
@@ -71,6 +79,8 @@ const MIN_RESET_LEN: usize = 5 + RESET_TOKEN_LEN;
 // Our stateless resets have at most 40 bytes and answer datagrams of at least 41: never one of
 // ours (ruling T10-g)
 const MAX_RESET_LEN: usize = 40;
+// A stateless reset that answers a datagram of at most this is one byte shorter than it
+const SHORT_TRIGGER_LEN: usize = 43;
 const NO_SLOT: u32 = u32::MAX;
 // Room for a Retry while its integrity tag is computed: a 20-byte original destination CID and
 // its length, the first byte, the version, two CIDs of 20 bytes and their lengths, the token
@@ -157,11 +167,17 @@ impl WorkerLoads {
     self.workers
   }
 
-  // A connection of `worker` closed
+  // A connection placed on `worker` closed, or did not open
   fn closed(&self, worker: u8) {
     if let Some(elem) = self.counts.get(usize::from(worker)) {
-      let _ = elem.fetch_sub(1, Ordering::Relaxed);
+      let _rslt = elem.try_update(Ordering::Relaxed, Ordering::Relaxed, |el| el.checked_sub(1));
     }
+  }
+
+  /// One more connection placed on `worker`.
+  #[inline]
+  pub(crate) fn placed(&self, worker: u8) {
+    self.opened(worker);
   }
 
   // A connection of `worker` opened
@@ -193,6 +209,9 @@ where
   live: u32,
   loads: Option<Arc<WorkerLoads>>,
   params: QuicParams,
+  // The datagram that is processed carries a place that the worker that forwarded it counted on
+  // this one (ruling T10-m)
+  placement: bool,
   pools: QuicPools,
   reset_budget: RateBudget,
   rng: RNG,
@@ -214,19 +233,26 @@ where
   RNG: CryptoRng + CryptoSeedableRng,
   TCX: TlsCtxSk,
 {
-  /// The endpoint of worker `worker` of `workers`, which serves with `tls` and draws its CIDs
-  /// and TLS randomness from `rng`. The keys of its stateless packets are those of the process
-  /// (ruling T10-a), and so are the loads of the workers, if new connections are balanced.
+  /// The endpoint of worker `worker` of `workers`, which serves with `tls`. Its CIDs, tokens and
+  /// the random numbers of its handshakes come from a generator of its own, seeded from `rng`, the
+  /// generator of the process (ruling T10-o): two endpoints that copied one generator would make
+  /// the same CIDs and, under the keys of the process, the same nonces of Retry tokens. The keys
+  /// of its stateless packets are those of the process (ruling T10-a), and so are the loads of
+  /// the workers, if new connections are balanced.
   #[inline]
-  pub(crate) fn new(
+  pub(crate) fn new<R>(
     params: QuicParams,
     worker: u8,
     workers: u8,
     tls: TlsConfig<TCX>,
-    mut rng: RNG,
+    rng: &mut R,
     loads: Option<Arc<WorkerLoads>>,
     keys: Arc<EndpointKeys>,
-  ) -> crate::Result<Self> {
+  ) -> crate::Result<Self>
+  where
+    R: CryptoRng,
+  {
+    let mut rng = RNG::from_crypto_rng(rng)?;
     if worker >= workers {
       return Err(crate::Error::ProgrammingError);
     }
@@ -243,6 +269,7 @@ where
       live: 0,
       loads,
       params,
+      placement: false,
       pools: QuicPools::new(),
       reset_budget: RateBudget::default(),
       rng,
@@ -407,6 +434,19 @@ where
     let _outcome = self.recv_segments(now_us, datagram, meta, app, false);
   }
 
+  /// The caller could not hand `datagram`, which [`Self::recv`] returned
+  /// [`RecvOutcome::Forward`] for, to `worker` (its inbox was full): the place that the datagram
+  /// took on that worker, if it was the first Initial packet of a client, is given back (ruling
+  /// T10-m).
+  #[inline]
+  pub(crate) fn forward_dropped(&mut self, datagram: &[u8], worker: u8) {
+    if carries_placement(datagram)
+      && let Some(loads) = &self.loads
+    {
+      loads.closed(worker);
+    }
+  }
+
   /// The counters of the endpoint.
   #[inline]
   pub(crate) fn stats(&self) -> EndpointStats {
@@ -482,7 +522,9 @@ where
     };
     let _rslt = conn.recv_datagram(now_us, chunk, meta, app, pools);
     if fresh && conn.stats().packets_in == 0 {
-      self.remove(idx, app);
+      // The application never saw it (review L7)
+      conn.discard(pools);
+      self.release_slot(idx);
       return;
     }
     self.after_event(idx, app);
@@ -500,9 +542,16 @@ where
     if self.shutdown || len < MIN_INITIAL_DATAGRAM || dcid.len() < MIN_FIRST_DCID_LEN {
       return Route::Done;
     }
-    // An Initial packet that follows one that went elsewhere goes there too
+    // An Initial packet that follows one that went elsewhere goes there too, with a place that
+    // the connection that it opens takes, or that the worker gives back
     if let Some(worker) = self.cids.get_forwarded(dcid, now_us) {
-      return if may_forward { Route::Forward(worker) } else { Route::Done };
+      if !may_forward {
+        return Route::Done;
+      }
+      if let Some(loads) = &self.loads {
+        loads.placed(worker);
+      }
+      return Route::Forward(worker);
     }
     // Without steering, the packets of the client that follow would come back here by the hash
     // of their addresses: they stay (spec section 5.11)
@@ -519,6 +568,8 @@ where
         if let Ok(elem) = Cid::new(dcid) {
           self.cids.insert_forwarded(elem, target, now_us);
         }
+        // Counted now, so that the first Initial packets that follow spread (ruling T10-m)
+        loads.placed(target);
         return Route::Forward(target);
       }
     }
@@ -634,7 +685,8 @@ where
     let timeout_us = self.params.handshake_timeout_ms().saturating_mul(1_000);
     *slot = Slot {
       conn: Some(conn),
-      dirty: false,
+      // A slot that waits in the dirty list stays there once (review L6)
+      dirty: slot.dirty,
       generation: slot.generation,
       handshake_deadline_us: Some(now_us.saturating_add(timeout_us)),
       local_cid: local,
@@ -644,7 +696,11 @@ where
     };
     self.half_open = self.half_open.wrapping_add(1);
     self.live = self.live.wrapping_add(1);
-    if let Some(loads) = &self.loads {
+    // A connection that a forwarded first Initial packet opens was counted by the worker that
+    // forwarded it
+    if !core::mem::take(&mut self.placement)
+      && let Some(loads) = &self.loads
+    {
       loads.opened(self.worker);
     }
     // The client sends its Initial packets to the CID that it chose until it learns ours
@@ -681,8 +737,7 @@ where
     tp.retry_source_connection_id = retry_scid;
     let mut buffer = [0; TP_LEN];
     let len = tp.encode(&mut buffer)?;
-    let rng = RNG::from_crypto_rng(&mut self.rng)?;
-    let tls = QuicTls::new(&self.tls, buffer.get(..len).unwrap_or_default(), rng)?;
+    let tls = QuicTls::new(&self.tls, buffer.get(..len).unwrap_or_default(), &mut self.rng)?;
     let validated = retry_scid.is_some();
     let params = &self.conn_params;
     QuicConn::new_server(
@@ -720,10 +775,19 @@ where
 
   // A stateless reset for our CID `dcid`, in answer to a datagram of `len` bytes.
   fn queue_reset(&mut self, now_us: u64, len: usize, dcid: &[u8], meta: DatagramMeta) {
-    let reset_len = len.wrapping_sub(1).min(MAX_RESET_LEN);
-    if len <= MAX_RESET_LEN || reset_len < MIN_RESET_LEN {
+    if len <= MAX_RESET_LEN {
       return;
     }
+    // One byte less than a datagram of up to 43 bytes (RFC 9000 section 10.3), as far as the cap
+    // lets it; else a length that does not tell a reset of ours (review L9)
+    let reset_len = if len <= SHORT_TRIGGER_LEN {
+      len.wrapping_sub(1).min(MAX_RESET_LEN)
+    } else {
+      let span =
+        u32::try_from(MAX_RESET_LEN.wrapping_sub(MIN_RESET_LEN).wrapping_add(1)).unwrap_or(1);
+      let pick = u32::from_be_bytes(self.rng.u8_4()) % span;
+      MIN_RESET_LEN.wrapping_add(usize::try_from(pick).unwrap_or(0))
+    };
     if !self.reset_budget.take(self.params.limits().stateless_reset_per_sec, now_us) {
       return;
     }
@@ -778,18 +842,28 @@ where
     may_forward: bool,
   ) -> RecvOutcome {
     let segment = meta.segment_size.map_or(datagram.len(), usize::from).max(1);
-    let segments = u64::try_from(datagram.len().div_ceil(segment)).unwrap_or(u64::MAX);
-    self.stats.datagrams_in = self.stats.datagrams_in.wrapping_add(segments);
+    // The worker that forwarded the first Initial packet of a client counted a connection here
+    // (ruling T10-m): the connection that the datagram opens takes it, or it is given back
+    self.placement = !may_forward && carries_placement(datagram);
     let meta = DatagramMeta { segment_size: None, ..meta };
     for (nth, chunk) in datagram.chunks_mut(segment).enumerate() {
       match self.route(now_us, chunk, meta, may_forward && nth == 0) {
-        Route::Conn { idx, fresh } => self.deliver(now_us, idx, chunk, meta, fresh, app),
+        Route::Conn { idx, fresh } => {
+          self.stats.datagrams_in = self.stats.datagrams_in.wrapping_add(1);
+          self.deliver(now_us, idx, chunk, meta, fresh, app);
+        }
+        // Counted by the worker that receives it (review L10)
         Route::Forward(worker) => {
           self.stats.forwarded = self.stats.forwarded.wrapping_add(1);
           return RecvOutcome::Forward { worker };
         }
-        Route::Done => {}
+        Route::Done => self.stats.datagrams_in = self.stats.datagrams_in.wrapping_add(1),
       }
+    }
+    if core::mem::take(&mut self.placement)
+      && let Some(loads) = &self.loads
+    {
+      loads.closed(self.worker);
     }
     RecvOutcome::Done
   }
@@ -913,13 +987,25 @@ where
   #[inline]
   fn drop(&mut self) {
     // The connections that `abort_all` did not end go with the pools, without the application
-    let Self { pools, slots, .. } = self;
+    let Self { loads, pools, slots, worker, .. } = self;
     for slot in slots.as_slice_mut() {
       if let Some(conn) = slot.conn.as_mut() {
         conn.discard(pools);
+        if let Some(elem) = loads {
+          elem.closed(*worker);
+        }
       }
     }
   }
+}
+
+// If `datagram`, which went to another worker, is a first Initial packet of a client, for which
+// the worker that forwarded it counted a connection on the other one: a long header Initial packet
+// without a token (the others that are forwarded are sent to CIDs of ours).
+fn carries_placement(datagram: &[u8]) -> bool {
+  datagram.first().is_some_and(|el| el & 0x80 != 0)
+    && parse_header(datagram, CID_LEN)
+      .is_ok_and(|el| el.ty == PacketTy::Initial && el.token.is_empty())
 }
 
 // Where a datagram goes.
@@ -1048,6 +1134,11 @@ where
     let conn = self.cids.get(cid)?;
     let slot = self.slots.get(usize::try_from(conn.slot).ok()?)?;
     slot.conn.as_ref().filter(|_| slot.generation == conn.generation)
+  }
+
+  /// The entries of the list of connections to flush.
+  pub(crate) fn dirty_len(&self) -> usize {
+    self.dirty.len()
   }
 
   /// The keys of the stateless packets.
