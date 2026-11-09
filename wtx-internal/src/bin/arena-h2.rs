@@ -156,7 +156,7 @@ fn spawn_h3(
     shutdown: None,
     static_root: static_dir(),
   };
-  spawn_h3_with(cert, key, data, run, runtime)
+  spawn_h3_with(cert, key, data, run, runtime_h3)
 }
 
 /// What the h3 server runs with, which the program takes from the environment and tests choose.
@@ -234,6 +234,12 @@ fn recv_params() -> HttpRecvParams {
 
 fn runtime() -> rimu_ws::Result<UringRuntime> {
   UringRuntime::with_params(UringParams::default())
+}
+
+/// The runtime of an h3 worker. Its UDP socket has a receive ring of its own, so the ring of TCP
+/// receives that every runtime makes (512 buffers of 4 KiB, 2 MiB) is never used: it is made small.
+fn runtime_h3() -> rimu_ws::Result<UringRuntime> {
+  UringRuntime::with_params(UringParams::default().set_recv_buffers(4, 4096))
 }
 
 /// The `ARENA_H3_*` switches: see the table of the program's documentation.

@@ -69,11 +69,11 @@ baseline-h3 base: 5,788k req/s, 2.10 µs/req (rps spread 0.1 %, CPU spread 1.3 %
 **Library defaults changed: none.** GRO is the only WIN confirmed without a loss on the other profile, and the rule
 would have made `UdpParams::gro` default on (`balance-off` was a baseline-h3 WIN too, held back because static-h3 was
 not run: Task 17). **Ruling T16-h** keeps GRO off. With GRO, 256 receive buffers of 64 KiB make one socket's ring
-256 × 65,536 B = exactly 16 MiB (16.8 MB), which equals spec §5.4's 16 MiB per-worker budget by itself, leaving
-nothing for the other pools (48 workers: 768 MiB), and the win is +0.8 % on one profile. arena-h2, the
+256 × 65,536 B = exactly 16 MiB (16.8 MB), which equals spec §5.4's 16 MiB per-worker budget by itself (the budget counts the whole heap of a worker; the GRO ring is the one thing
+reported apart, ruling T20-e), leaving nothing for the other pools (48 workers: 768 MiB), and the win is +0.8 % on one profile. arena-h2, the
 benchmark path, turns GRO on by default: `ARENA_H3_GRO` is `1` unless set to `0`. The kit's `base` therefore runs
 with GRO. Its old `gro-on` variant becomes `gro-off`, and a `gro-ring64` variant (GRO on with 64 receive buffers,
-about 4 MiB) measures whether a ring within the budget keeps the win, so the library default can be revisited.
+about 4 MiB) measures whether a ring that fits the budget keeps the win, so the library default can be revisited.
 Every other knob keeps its library default.
 
 ## 4. Handed on to later tasks (settled here; do not re-measure)

@@ -374,8 +374,8 @@ fn parse(id: u64, bytes: &[u8]) -> crate::Result<H3Reply> {
           return Err(bad());
         }
         let status = fields.iter().find(|el| el.0 == b":status").ok_or_else(bad)?;
-        reply.status =
-          crate::misc::from_utf8_basic(&status.1).ok().and_then(|el| el.parse().ok()).ok_or_else(bad)?;
+        let text = crate::misc::from_utf8_basic(&status.1).ok();
+        reply.status = text.and_then(|el| el.parse().ok()).ok_or_else(bad)?;
         reply.fields = fields;
       }
       H3FrameTy::Data => reply.body.extend_from_slice(payload),

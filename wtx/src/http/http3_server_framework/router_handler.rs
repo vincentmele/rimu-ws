@@ -58,7 +58,9 @@ use core::{
 ///
 /// The steady state allocates nothing while at most [`MAX_MSGS`] requests are under way at once
 /// and their bodies fit in [`KEEP_BODY`]: past that, the request buffers of the requests above the
-/// bound are freed when they end and made again by the next burst (Task 20 measures it).
+/// bound are freed when they end and made again by the next burst. The arena-h2 endpoints answer
+/// in the turn of the request, so they never wait and the tests of Task 20 do not reach this bound
+/// (the parked-handler path is covered by the library tests of this module).
 pub(crate) const MAX_PARKED: usize = 1024;
 /// The combinations of the fields of a response that are kept encoded: past them, the least
 /// recently used is encoded again for the next one, which allocates when it is longer than the
@@ -1193,7 +1195,8 @@ mod tests {
   #[test]
   fn combinations_up_to_the_cap_are_encoded_without_allocating() {
     static ALLOCS: crate::sync::AtomicU64 = crate::sync::AtomicU64::new(0);
-    let types: Vec<alloc::string::String> = (0..16).map(|el| alloc::format!("text/t{el:02}")).collect();
+    let types: Vec<alloc::string::String> =
+      (0..16).map(|el| alloc::format!("text/t{el:02}")).collect();
     let all: Vec<Headers> = types
       .iter()
       .flat_map(|ty| {

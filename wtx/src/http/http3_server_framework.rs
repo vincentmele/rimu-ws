@@ -100,8 +100,10 @@ pub struct Http3WorkerStats {
   /// The bytes that the pools of the worker take now (QUIC pools, HTTP/3 boxes, request buffers
   /// and slots, TLS states), as the worker measured them when it stored its counters; always 0
   /// unless the feature `_h3-loopback-client` (test-only) is on.
+  #[doc(hidden)]
   pub pool_bytes: u64,
   /// The most [`Self::pool_bytes`] ever measured.
+  #[doc(hidden)]
   pub pool_bytes_peak: u64,
   /// Probe timeouts that fired.
   pub pto_probes: u64,

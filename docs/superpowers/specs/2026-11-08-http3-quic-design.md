@@ -238,7 +238,11 @@ deployment allocate the pools at start.
   existing per-thread TLS pools and returns there, zeroed, at handshake confirmation.
 - **Budget:** at the benchmark (64 connections × 64 streams per process, at worst all on one worker) a
   worker's pools stay under 16 MiB; idle a worker keeps under 2 MiB; caps bound the worst case per worker
-  and are reported with idle and peak figures.
+  and are reported with idle and peak figures. The budget counts everything a worker thread holds on the
+  heap once started, measured as net live bytes (allocated minus freed, by layout, on the worker thread):
+  pools, connection table, stream slots, executor tasks, HTTP/3 boxes, router-handler buffers, the transmit
+  arena and the UDP receive ring. The one exception is the GRO receive ring (256 × 64 KiB = 16 MiB, off by
+  default), reported apart: a deployment that turns GRO on adds it per worker (ruling T20-e).
 - **CID table**: our CIDs are 8 bytes: byte 0 = worker index, bytes 1–7 random (CSPRNG), with a
   stateless-reset token derived from a per-process key (HMAC). While CID steering is on, each connection has
   **exactly one** server CID and we send no NEW_CONNECTION_ID: RFC 9000 §5.1 forbids CIDs of one connection
