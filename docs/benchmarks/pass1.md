@@ -48,7 +48,7 @@ baseline-h3 base: 5,788k req/s, 2.10 µs/req (rps spread 0.1 %, CPU spread 1.3 %
 
 | knob (variant) | baseline-h3 rps / CPU (spreads) | static-h3 rps / CPU (spreads) | decision |
 |---|---|---|---|
-| GRO on, 64 KiB buffers (`gro-on`) | +0.8 % / **−2.8 %** (0.2 % / 0.3 %) | −1.3 % / +3.6 % (2.6 % / 8.9 %) | **default on**: WIN on baseline, no loss outside spread on static |
+| GRO on, 64 KiB buffers (`gro-on`) | +0.8 % / **−2.8 %** (0.2 % / 0.3 %) | −1.3 % / +3.6 % (2.6 % / 8.9 %) | WIN on baseline, no loss outside spread on static — but **library default stays off** (ruling T16-h, memory budget); **on in arena-h2** (the benchmark path) |
 | receive ring 512 (`ring512`) | −0.6 % / +0.2 % | not run | keep 256 |
 | flush in slot order (`flush-slot`) | −0.4 % / +0.7 % | not run | keep arrival order |
 | TX arena ×2, 1.5 MB (`arena-x2`) | not run | −0.3 % / −2.5 % (1.5 % / 24.5 %) | keep 768,000 B (within spread) |
@@ -64,8 +64,13 @@ baseline-h3 base: 5,788k req/s, 2.10 µs/req (rps spread 0.1 %, CPU spread 1.3 %
 | round-robin bodies (`bodies-rr`) | not run | −1.2 % / +4.3 % | keep one body to completion |
 | fresh data per request (`data-fresh`) | −0.9 % / +9.5 % | not run | semantics, not a perf default: fresh stays the library default (T16-e); reuse is opt-in |
 
-**Defaults changed: one.** `UdpParams::gro` is now `true`: 256 receive buffers of 64 KiB, about 16.8 MiB per socket,
-one socket per worker. Every other knob keeps its library default.
+**Library defaults changed: none.** GRO is the only WIN, and the rule would have made `UdpParams::gro` default on.
+**Ruling T16-h** keeps it off. With GRO, 256 receive buffers of 64 KiB make one socket's ring about 16.8 MiB, which
+alone exceeds spec §5.4's 16 MiB pool budget per worker, and the win is +0.8 % on one profile. arena-h2, the
+benchmark path, turns GRO on by default: `ARENA_H3_GRO` is `1` unless set to `0`. The kit's `base` therefore runs
+with GRO. Its old `gro-on` variant becomes `gro-off`, and a `gro-ring64` variant (GRO on with 64 receive buffers,
+about 4 MiB) measures whether a ring within the budget keeps the win, so the library default can be revisited.
+Every other knob keeps its library default.
 
 ## 4. Handed on to later tasks (settled here; do not re-measure)
 - **Task 17 (steering, balance, pinning).** Settled: pinning stays on (neutral). Open:

@@ -89,9 +89,11 @@ pub struct UdpParams {
   pub recv_buffer_len: u32,
   /// Generic receive offload (`UDP_GRO`): the kernel coalesces datagrams of a flow that arrive
   /// together into one and reports their size in [`DatagramMeta::segment_size`]; the receive
-  /// buffers are then 64 KiB each (256 of them: about 16.8 MiB per socket). Defaults to `true`
-  /// (task 16, EC2: HttpArena baseline-h3 2.8 % less server CPU per request at 0.8 % more requests
-  /// per second; static-h3 unchanged within the spread).
+  /// buffers are then 64 KiB each (256 of them: about 16.8 MiB per socket). Defaults to `false`
+  /// (ruling T16-h): on, it measured 2.8 % less server CPU per request at 0.8 % more requests per
+  /// second on HttpArena baseline-h3 (task 16, EC2; static-h3 unchanged within the spread), but its
+  /// ring alone passes the 16 MiB pool budget of a worker (spec section 5.4). Turn it on where the
+  /// memory is there, with fewer [`Self::recv_buffers`] to keep the ring small.
   pub gro: bool,
   /// The `SO_RCVBUF` asked for. The kernel caps it at `net.core.rmem_max`, which is never raised
   /// here; what it granted is in [`UdpStats::rcvbuf`]. Defaults to 4 MiB.
@@ -122,7 +124,7 @@ impl UdpParams {
     Self {
       recv_buffers: 256,
       recv_buffer_len: 2048,
-      gro: true,
+      gro: false,
       rcvbuf: 4 << 20,
       sndbuf: 4 << 20,
       reuseport: true,
@@ -1580,14 +1582,15 @@ mod tests {
     UdpParams { reuseport: false, ..UdpParams::new() }
   }
 
-  // Brief step 3 of task 16 (EC2 variant batch of 9 Nov 2026): generic receive offload is on by
-  // default (baseline-h3 -2.8 % server CPU per request at +0.8 % requests per second, outside the
-  // spread; static-h3 within the spread), with buffers that hold a coalesced datagram; the other
-  // defaults are the measured ones too.
+  // Brief step 3 of task 16 (EC2 variant batch of 9 Nov 2026) and ruling T16-h: generic receive
+  // offload stays off by default, although it won on baseline-h3 (-2.8 % server CPU per request at
+  // +0.8 % requests per second): its 64 KiB receive buffers make one socket's ring about 16.8 MiB,
+  // past the 16 MiB pool budget of a worker (spec section 5.4). The other defaults are the
+  // measured ones too.
   #[test]
   fn defaults_are_the_measured_ones() {
     let params = UdpParams::new();
-    assert!(params.gro);
+    assert!(!params.gro);
     assert_eq!((params.recv_buffers, params.recv_buffer_len), (256, 2048));
     assert_eq!((params.rcvbuf, params.sndbuf), (4 << 20, 4 << 20));
     assert_eq!((params.tx_arena_bytes, params.max_train_segments), (TxArena::DEFAULT_BYTES, 64));

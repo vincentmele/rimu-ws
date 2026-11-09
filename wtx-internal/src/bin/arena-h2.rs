@@ -14,14 +14,14 @@
 //!
 //! Each selects, at start, one setting of the h3 server, so that one build measures the A/Bs of
 //! tasks 16, 17 and 19 (the EC2 variant phase of `/mnt/nvme1tb/claude-tmp/aws-h3`). Unset, each is
-//! the library default. A value outside the table stops the program; the server prints the
+//! the library default, but for `ARENA_H3_GRO`. A value outside the table stops the program; the server prints the
 //! settings it runs with on one line starting with `arena-h2: h3 knobs`.
 //!
 //! | variable | values | default | maps to |
 //! |---|---|---|---|
 //! | `ARENA_H3_HEADERS` | `min`, `full` | `min` | `min`: `content-type` only, no middleware (like cnetmod and zix, not RFC 9110-compliant; decision Q2); `full`: `Http3ServerFramework::set_rfc9110_headers(true)` and the `server` middleware, as on h2 |
 //! | `ARENA_H3_DATA` | `reuse`, `fresh` | `reuse` | `Http3ServerFramework::set_reuse_data` (`reuse`: the opt-in, the library default is `fresh`; the data, an `Arc` of the dataset, is never changed by the handlers) |
-//! | `ARENA_H3_GRO` | `0`, `1` | `1` | `UdpParams::gro` (on: receive buffers of 64 KiB; on by default since task 16) |
+//! | `ARENA_H3_GRO` | `0`, `1` | `1` | `UdpParams::gro` (on: receive buffers of 64 KiB). On here although the library default is off (ruling T16-h: the ring of a socket, about 16.8 MiB, passes a worker's 16 MiB pool budget; the benchmark has the memory) |
 //! | `ARENA_H3_RECV_BUFFERS` | 1 to 32768 | 256 | `UdpParams::recv_buffers` |
 //! | `ARENA_H3_TX_ARENA` | bytes, 65536 or more | 768000 | `UdpParams::tx_arena_bytes` |
 //! | `ARENA_H3_RCVBUF` | bytes | 4194304 | `UdpParams::rcvbuf` (capped by `net.core.rmem_max`) |
@@ -229,9 +229,8 @@ mod knobs {
       let headers = one_of(&var, "ARENA_H3_HEADERS", &headers)?.unwrap_or(Headers::Min);
       let data = [("reuse", Data::Reuse), ("fresh", Data::Fresh)];
       let data = one_of(&var, "ARENA_H3_DATA", &data)?.unwrap_or(Data::Reuse);
-      if let Some(elem) = flag(&var, "ARENA_H3_GRO")? {
-        udp.gro = elem;
-      }
+      // The benchmark path: on unless asked off, unlike the library (ruling T16-h)
+      udp.gro = flag(&var, "ARENA_H3_GRO")?.unwrap_or(true);
       if let Some(elem) = number(&var, "ARENA_H3_RECV_BUFFERS", 1, 32_768)? {
         udp.recv_buffers = u16::try_from(elem).map_err(|err| err.to_string())?;
       }
@@ -631,8 +630,8 @@ mod knob_tests {
     let (quic, udp) = (QuicParams::default(), UdpParams::new());
     assert_eq!(knobs.quic, quic);
     assert_eq!(
-      (knobs.udp.gro, knobs.udp.recv_buffers, knobs.udp.recv_buffer_len, knobs.udp.tx_arena_bytes),
-      (udp.gro, udp.recv_buffers, udp.recv_buffer_len, udp.tx_arena_bytes)
+      (knobs.udp.recv_buffers, knobs.udp.recv_buffer_len, knobs.udp.tx_arena_bytes),
+      (udp.recv_buffers, udp.recv_buffer_len, udp.tx_arena_bytes)
     );
     assert_eq!(
       (knobs.udp.rcvbuf, knobs.udp.sndbuf, knobs.udp.max_train_segments, knobs.udp.reuseport),
@@ -640,6 +639,9 @@ mod knob_tests {
     );
     assert!(knobs.pin_workers);
     assert_eq!((knobs.data, knobs.headers), (Data::Reuse, Headers::Min));
+    // Ruling T16-h: the benchmark path has GRO on, the library default has it off
+    assert!(knobs.udp.gro && !udp.gro);
+    assert!(!parse(&[("ARENA_H3_GRO", "0")]).unwrap().udp.gro);
   }
 
   // Ruling T16-b: each variable sets the field of the table in the program's documentation.
