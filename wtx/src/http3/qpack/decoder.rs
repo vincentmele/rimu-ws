@@ -210,6 +210,17 @@ impl QpackDecoder {
     Ok(())
   }
 
+  /// The bytes that the storage of the decoder takes on the heap.
+  pub(crate) fn heap_bytes(&self) -> usize {
+    let blocked = self.blocked.capacity().saturating_mul(size_of::<(u64, u64)>());
+    let entries = self.entries.capacity().saturating_mul(size_of::<Entry>());
+    blocked
+      .saturating_add(entries)
+      .saturating_add(self.out.capacity())
+      .saturating_add(self.ring.capacity())
+      .saturating_add(self.staging.capacity())
+  }
+
   /// Inserts and duplications so far.
   #[inline]
   pub(crate) const fn insert_count(&self) -> u64 {

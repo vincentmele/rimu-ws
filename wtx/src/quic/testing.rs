@@ -131,6 +131,9 @@ pub(crate) struct TestApp {
   pub(crate) established: u32,
   /// How it fails, if it does.
   pub(crate) fail: Option<Fail>,
+  /// A stream whose data it never consumes: it retains all of it, so that its credit never comes
+  /// back to the peer.
+  pub(crate) hold: Option<u64>,
   /// Calls of [`QuicApp::on_stream_data`].
   pub(crate) calls: u64,
   /// The calls of [`QuicApp::on_stream_data`] that succeed before [`Self::fail`] applies.
@@ -193,6 +196,9 @@ impl QuicApp for TestApp {
           Ok(())
         }
       };
+    }
+    if self.hold == Some(id.0) {
+      return cx.retain(data.len());
     }
     if fin {
       self.fins = self.fins.wrapping_add(1);

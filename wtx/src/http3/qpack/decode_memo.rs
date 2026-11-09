@@ -76,6 +76,20 @@ impl<const N: usize> DecodeMemo<N> {
     }
   }
 
+  /// The bytes that the kept fields take on the heap.
+  pub(crate) fn heap_bytes(&self) -> usize {
+    self.entries.iter().fold(0usize, |acc, el| {
+      let fields = el.fields.capacity().saturating_mul(size_of::<(u32, u32)>());
+      acc.saturating_add(el.bytes.capacity()).saturating_add(fields)
+    })
+  }
+
+  /// The sections that can be replayed.
+  #[cfg(test)]
+  pub(crate) fn kept(&self) -> usize {
+    self.entries.iter().filter(|el| el.section_len != 0).count()
+  }
+
   /// Forgets every kept section; the storage stays for the next ones.
   pub(crate) fn clear(&mut self) {
     for entry in &mut self.entries {

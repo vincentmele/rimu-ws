@@ -36,9 +36,20 @@
 //! # Shutdown
 //!
 //! When the endpoint shuts down ([`QuicApp::on_shutdown`]), the connection sends GOAWAY with the
-//! lowest client stream that it did not accept, refuses requests from it on with
-//! `H3_REQUEST_REJECTED`, lets the others finish and, once their answers left, closes with
-//! `H3_NO_ERROR`. GOAWAY is sent then only.
+//! lowest client stream that QUIC did not open, refuses requests from it on with
+//! `H3_REQUEST_REJECTED`, and lets the others finish. Once no request is under way, the streams
+//! below the GOAWAY that brought no request (opened by a later one, or whose data did not arrive in
+//! order) are refused with `H3_REQUEST_REJECTED`, never dropped, and once every answer and refusal
+//! is acknowledged the connection closes with `H3_NO_ERROR` (ruling T13-h);
+//! [`crate::quic::QuicLimits::shutdown_grace_ms`] bounds the wait. GOAWAY is sent then only.
+//!
+//! # Memory
+//!
+//! The request buffers of a connection hold at most [`H3Params::max_buffered_body_per_conn`]
+//! bytes (ruling T13-g); the decoder-stream output is written while that stream has less than
+//! 4 KiB unsent, so a peer that gives it no credit meets the bound of the decoder (review V3); the
+//! pool keeps boxes within a byte budget, and [`H3App::trim_idle`] frees it down for an idle
+//! worker (review V4).
 
 use crate::{
   collections::{VectorError, VectorUsize},
@@ -46,7 +57,7 @@ use crate::{
   http3::{
     DecodeOutcome, H3ErrorCode, H3FrameTy, H3Settings, Http3Error, decode_frame_header,
     encode_frame_header, encode_static,
-    h3_conn_state::{FrameLeft, H3Conn, H3ConnState, Phase},
+    h3_conn_state::{FrameLeft, H3Conn, H3ConnState, KEEP_SCRATCH, Phase, Req},
     request::{H3Request, check_trailer},
   },
   quic::{
@@ -59,6 +70,9 @@ use core::hint::cold_path;
 /// The bytes that the connection retains for a stream at most (see `ConnCtx::retain`): what is
 /// read in one piece without a buffer of its own.
 const RETAIN_MAX: usize = 4096;
+/// The bytes that the decoder stream may have unsent before more decoder output waits in the
+/// decoder (review V3).
+const DECODER_UNSENT_MAX: usize = 4096;
 /// Boxes of connections that the pool keeps at most.
 const MAX_POOLED: usize = 256;
 // Room for what follows a blocked field section on its stream, on top of the limits of a request
@@ -91,6 +105,12 @@ pub struct H3Params {
   ///
   /// Defaults to 1 MiB.
   pub max_request_body: u32,
+  /// The bytes that the buffers of the requests of a connection (heads, bodies, bytes that wait
+  /// for others) may hold at most, counted by their capacity: a request that would need more is
+  /// answered with 413, and the others go on (ruling T13-g).
+  ///
+  /// Defaults to 16 MiB, the receive window of a connection.
+  pub max_buffered_body_per_conn: u32,
 }
 
 impl Default for H3Params {
@@ -101,6 +121,7 @@ impl Default for H3Params {
       qpack_blocked_streams: 0,
       max_field_section_size: 16 * 1024,
       max_request_body: 1 << 20,
+      max_buffered_body_per_conn: 16 << 20,
     }
   }
 }
@@ -157,7 +178,9 @@ impl H3ReqCtx<'_, '_> {
   #[inline]
   pub(crate) fn respond(&mut self, encoded_headers: &[u8], body: &[u8]) -> crate::Result<()> {
     self.check_once()?;
-    write_response(self.cx, self.frame, self.stream, encoded_headers, body)?;
+    let rslt = write_response(self.cx, self.frame, self.stream, encoded_headers, body);
+    keep_small(self.frame);
+    rslt?;
     self.responded = true;
     Ok(())
   }
@@ -182,6 +205,7 @@ impl H3ReqCtx<'_, '_> {
       self.cx.write(self.stream, frame, false)?;
       self.cx.write_body(self.stream, body, true)?;
     }
+    keep_small(frame);
     self.responded = true;
     Ok(())
   }
@@ -196,7 +220,10 @@ impl H3ReqCtx<'_, '_> {
     self.check_once()?;
     self.fields.clear();
     encode_static(fields, self.fields)?;
-    write_response(self.cx, self.frame, self.stream, self.fields, body)?;
+    let rslt = write_response(self.cx, self.frame, self.stream, self.fields, body);
+    keep_small(self.fields);
+    keep_small(self.frame);
+    rslt?;
     self.responded = true;
     Ok(())
   }
@@ -223,6 +250,8 @@ pub(crate) struct H3App<H> {
   frame: VectorUsize<u8>,
   params: H3Params,
   pool: VectorUsize<Box<H3Conn>>,
+  // The bytes that the boxes of the pool take
+  pool_bytes: usize,
 }
 
 // What reading the bytes of a request stream came to.
@@ -260,6 +289,7 @@ where
       frame: VectorUsize::new(),
       params,
       pool: VectorUsize::new(),
+      pool_bytes: 0,
     }
   }
 
@@ -279,10 +309,51 @@ where
     conclude(cx, rslt)
   }
 
+  /// The bytes that the boxes of the pool take at most (review V4): a box that would pass it is
+  /// dropped instead of pooled.
+  pub(crate) const POOL_BYTES: usize = 4 << 20;
+  /// The boxes that [`Self::trim_idle`] keeps at most.
+  pub(crate) const IDLE_POOLED: usize = 4;
+  /// The bytes that the boxes that [`Self::trim_idle`] keeps take at most.
+  const IDLE_POOL_BYTES: usize = 512 * 1024;
+
+  /// Frees all but a few boxes of the pool, and the response buffers, for a worker that has no
+  /// connection (the idle hook of the server, spec section 5.4).
+  #[inline]
+  pub(crate) fn trim_idle(&mut self) {
+    while self.pool.len() > Self::IDLE_POOLED || self.pool_bytes > Self::IDLE_POOL_BYTES {
+      let Some(conn) = self.pool.pop() else {
+        break;
+      };
+      self.pool_bytes = self.pool_bytes.saturating_sub(conn.heap_bytes());
+    }
+    self.field_refs = Vec::new();
+    self.fields = VectorUsize::new();
+    self.frame = VectorUsize::new();
+  }
+
   /// The boxes that wait in the pool.
   #[cfg(test)]
   pub(crate) fn pooled(&self) -> usize {
     self.pool.len()
+  }
+
+  /// The bytes that the boxes of the pool take.
+  #[cfg(test)]
+  pub(crate) fn pooled_bytes(&self) -> usize {
+    self.pool_bytes
+  }
+
+  /// If no box of the pool holds state of a connection.
+  #[cfg(test)]
+  pub(crate) fn pool_is_clear(&self) -> bool {
+    self.pool.iter().all(|el| el.is_clear())
+  }
+
+  /// The capacity of the response buffers of the worker.
+  #[cfg(test)]
+  pub(crate) fn scratch_bytes(&self) -> usize {
+    self.frame.capacity().saturating_add(self.fields.capacity())
   }
 
   // Calls the handler with request `idx`, complete.
@@ -336,7 +407,7 @@ where
       }
     };
     let stash_max = self.stash_max();
-    let Some(req) = conn.reqs.get_mut(idx) else {
+    let Some(req) = conn.reqs.get(idx) else {
       return Ok(());
     };
     if req.blocked || !req.stash.is_empty() {
@@ -344,6 +415,12 @@ where
       if req.stash.len().saturating_add(data.len()) > stash_max {
         return stream_error(conn, cx, idx, H3ErrorCode::ExcessiveLoad);
       }
+      if !reserve_in(conn, idx, data.len(), |el| (&mut el.stash, None))? {
+        return self.refuse(conn, cx, idx, b"413");
+      }
+      let Some(req) = conn.reqs.get_mut(idx) else {
+        return Ok(());
+      };
       req.stash.extend_from_copyable_slice(data)?;
       req.fin |= fin;
       if req.blocked {
@@ -361,6 +438,9 @@ where
     let rest = data.get(pos..).unwrap_or_default();
     if !blocked && rest.len() < RETAIN_MAX {
       return cx.retain(rest.len());
+    }
+    if !reserve_in(conn, idx, rest.len(), |el| (&mut el.stash, None))? {
+      return self.refuse(conn, cx, idx, b"413");
     }
     let Some(req) = conn.reqs.get_mut(idx) else {
       return Ok(());
@@ -392,6 +472,13 @@ where
       match req.frame {
         FrameLeft::Data(left) => {
           let take = usize::try_from(left).unwrap_or(usize::MAX).min(rest.len());
+          if !reserve_in(conn, idx, take, |el| (&mut el.body, el.head.content_length()))? {
+            self.refuse(conn, cx, idx, b"413")?;
+            return Ok(Parsed::Done);
+          }
+          let Some(req) = conn.reqs.get_mut(idx) else {
+            return Ok(Parsed::Done);
+          };
           req.body.extend_from_copyable_slice(rest.get(..take).unwrap_or_default())?;
           pos = pos.wrapping_add(take);
           let left = left.wrapping_sub(u64::try_from(take).unwrap_or(u64::MAX));
@@ -443,10 +530,16 @@ where
             return Err(unexpected_frame());
           }
           let body_len = u64::try_from(req.body.len()).unwrap_or(u64::MAX);
-          if body_len.saturating_add(len) > max_body {
+          let frame_len = usize::try_from(len).unwrap_or(usize::MAX);
+          if body_len.saturating_add(len) > max_body
+            || !fits_in(conn, idx, frame_len, |el| &mut el.body)
+          {
             self.refuse(conn, cx, idx, b"413")?;
             return Ok(Parsed::Done);
           }
+          let Some(req) = conn.reqs.get_mut(idx) else {
+            return Ok(Parsed::Done);
+          };
           req.frame = if len == 0 { FrameLeft::None } else { FrameLeft::Data(len) };
           pos = pos.wrapping_add(header_len);
         }
@@ -496,10 +589,11 @@ where
       Ok(Parsed::More(pos, _) | Parsed::Blocked(pos)) => drain_front(&mut stash, pos),
       Ok(Parsed::Done) | Err(_) => stash.clear(),
     }
-    // The entry keeps the storage, whether it still holds the request or not
+    // The entry keeps the storage, whether it still holds the request or not; small if not
     if let Some(req) = conn.reqs.get_mut(idx) {
       req.stash = stash;
     }
+    conn.trim_free_stash(idx);
     rslt.map(|_| ())
   }
 
@@ -519,6 +613,7 @@ where
     encode_static(&[(b":status", status)], &mut self.fields)?;
     // A stream that the client stopped can not be answered: the stop is what it gets
     let _rslt = write_response(cx, &mut self.frame, id, &self.fields, &[]);
+    keep_small(&mut self.frame);
     cx.stop_sending(id, H3ErrorCode::NoError.code());
     conn.decoder.on_stream_cancelled(id.0)?;
     conn.free_req(idx);
@@ -580,7 +675,11 @@ where
   ) -> crate::Result<Section> {
     let max_body = u64::from(self.params.max_request_body);
     let max_section = u64::from(self.params.max_field_section_size);
-    let H3Conn { blocked, decoder, memo, reqs, scratch, .. } = &mut *conn;
+    if conn.budget.is_tight() {
+      // What entries without a request keep goes first (ruling T13-g)
+      conn.reclaim();
+    }
+    let H3Conn { blocked, budget, decoder, memo, reqs, scratch, .. } = &mut *conn;
     let Some(req) = reqs.get_mut(idx) else {
       return Ok(Section::Done);
     };
@@ -592,7 +691,7 @@ where
       req.head.clear();
       let head = &mut req.head;
       decoder.decode_with_memo(memo, id.0, section, scratch, &mut |name, value| {
-        head.push(name, value, max_section)
+        head.push(name, value, max_section, budget)
       })
     } else {
       let mut size = 0u64;
@@ -615,6 +714,10 @@ where
         self.refuse(conn, cx, idx, b"431")?;
         return Ok(Section::Done);
       }
+      Err(crate::Error::Http3(Http3Error::BufferedLimit)) => {
+        self.refuse(conn, cx, idx, b"413")?;
+        return Ok(Section::Done);
+      }
       Err(err) => return Err(err),
     }
     if !is_head {
@@ -625,11 +728,15 @@ where
       stream_error(conn, cx, idx, H3ErrorCode::MessageError)?;
       return Ok(Section::Done);
     }
-    if req.head.content_length().is_some_and(|el| el > max_body) {
+    // A body that is announced larger than what is allowed, or than what the buffers of the
+    // connection can take, is refused before it arrives
+    let length = req.head.content_length();
+    req.phase = Phase::Body;
+    let announced = length.map(|el| usize::try_from(el).unwrap_or(usize::MAX)).unwrap_or(0);
+    if length.is_some_and(|el| el > max_body) || !fits_in(conn, idx, announced, |el| &mut el.body) {
       self.refuse(conn, cx, idx, b"413")?;
       return Ok(Section::Done);
     }
-    req.phase = Phase::Body;
     Ok(Section::Read)
   }
 
@@ -643,12 +750,11 @@ where
     usize::try_from(max).unwrap_or(usize::MAX)
   }
 
-  // A box from the pool, reset, or a new one. A box whose reset fails is dropped (ruling T13-a).
+  // A box from the pool, cleared when it was pooled, or a new one.
   fn take_conn(&mut self) -> crate::Result<Box<H3Conn>> {
-    while let Some(mut conn) = self.pool.pop() {
-      if conn.reset(&self.params).is_ok() {
-        return Ok(conn);
-      }
+    if let Some(conn) = self.pool.pop() {
+      self.pool_bytes = self.pool_bytes.saturating_sub(conn.heap_bytes());
+      return Ok(conn);
     }
     H3Conn::new(&self.params)
   }
@@ -809,11 +915,17 @@ where
 
   #[inline]
   fn on_closed(&mut self, state: &mut H3ConnState) {
-    if let Some(mut conn) = state.conn.take() {
-      conn.release();
-      if self.pool.len() < MAX_POOLED {
-        let _rslt = self.pool.push(conn);
-      }
+    // Cleared now, so that the pool holds no state of a connection (review V5); a box whose
+    // release fails is dropped (ruling T13-a)
+    let Some(mut conn) = state.conn.take().filter(|_| self.pool.len() < MAX_POOLED) else {
+      return;
+    };
+    if conn.release(&self.params).is_err() {
+      return;
+    }
+    let bytes = conn.heap_bytes();
+    if self.pool_bytes.saturating_add(bytes) <= Self::POOL_BYTES && self.pool.push(conn).is_ok() {
+      self.pool_bytes = self.pool_bytes.saturating_add(bytes);
     }
   }
 
@@ -842,8 +954,9 @@ where
     if conn.goaway.is_some() {
       return true;
     }
-    // The lowest client stream that was not accepted (RFC 9114 section 5.2)
-    let (control, id) = (conn.control, conn.next_request);
+    // The lowest client stream that QUIC did not open: the streams below it are answered or
+    // refused before the close (RFC 9114 section 5.2, ruling T13-h)
+    let (control, id) = (conn.control, conn.next_request.max(cx.next_peer_bidi().0));
     let mut frame = [0u8; 16];
     let len = u64::try_from(varint_len(id)).unwrap_or(u64::MAX);
     let Some(header_len) = encode_frame_header(H3FrameTy::Goaway, len, &mut frame) else {
@@ -1028,17 +1141,102 @@ fn drain_front(vector: &mut VectorUsize<u8>, n: usize) {
 // Writes the decoder-stream output of the turn in one write, starts the next turn of the decoder
 // and, after a GOAWAY, closes once every accepted request was answered and its answer sent.
 fn flush_conn(conn: &mut H3Conn, cx: &mut ConnCtx<'_, H3ConnState>) -> crate::Result<()> {
+  // While the stream has room: what does not fit waits in the decoder, whose bound then closes a
+  // connection whose peer gives the stream no credit (review V3)
+  let room = DECODER_UNSENT_MAX.saturating_sub(cx.unsent_on(conn.decoder_stream));
   let output = conn.decoder.decoder_stream_output();
-  if !output.is_empty() {
-    let len = output.len();
-    cx.write(conn.decoder_stream, output, false)?;
+  let len = output.len().min(room);
+  if let Some(bytes) = output.get(..len).filter(|el| !el.is_empty()) {
+    cx.write(conn.decoder_stream, bytes, false)?;
     conn.decoder.consume_decoder_output(len);
   }
   conn.decoder.start_turn();
-  if conn.goaway.is_some() && conn.live == 0 && cx.unsent_bytes() == 0 {
+  if let Some(goaway) = conn.goaway
+    && conn.live == 0
+  {
+    drain(conn, cx, StreamId(goaway))?;
+  }
+  Ok(())
+}
+
+// A shutdown with no request under way (ruling T13-h): the streams below the GOAWAY that brought
+// no request are refused (RFC 9114 section 5.2), and once every answer and refusal is
+// acknowledged, and the GOAWAY sent, the connection closes with H3_NO_ERROR.
+fn drain(
+  conn: &mut H3Conn,
+  cx: &mut ConnCtx<'_, H3ConnState>,
+  below: StreamId,
+) -> crate::Result<()> {
+  let mut answered = true;
+  let mut from = StreamId(0);
+  while let Some((id, writable)) = cx.first_unanswered(from, below) {
+    if writable {
+      cx.refuse(id, H3ErrorCode::RequestRejected.code())?;
+      conn.decoder.on_stream_cancelled(id.0)?;
+    }
+    answered = false;
+    from = StreamId(id.0.wrapping_add(4));
+  }
+  if answered && cx.unsent_on(conn.control) == 0 {
     cx.close(H3ErrorCode::NoError.code(), b"");
   }
   Ok(())
+}
+
+// Room for `add` more elements in the buffer of request `idx` that `which` picks, with the length
+// that it will have if known, within the budget of the connection, what entries without a request
+// keep being freed first if needed (ruling T13-g). `false` if the budget does not allow it.
+fn reserve_in(
+  conn: &mut H3Conn,
+  idx: usize,
+  add: usize,
+  which: fn(&mut Req) -> (&mut VectorUsize<u8>, Option<u64>),
+) -> crate::Result<bool> {
+  for reclaim in [false, true] {
+    if reclaim {
+      conn.reclaim();
+    }
+    let H3Conn { budget, reqs, .. } = &mut *conn;
+    let Some(req) = reqs.get_mut(idx) else {
+      return Ok(false);
+    };
+    let (buf, hint) = which(req);
+    let hint = hint.map(|el| usize::try_from(el).unwrap_or(usize::MAX));
+    if budget.grow(buf, add, hint)? {
+      return Ok(true);
+    }
+  }
+  Ok(false)
+}
+
+// If the buffer of request `idx` that `which` picks can take `add` more elements within the budget
+// of the connection, what entries without a request keep being freed first if needed.
+fn fits_in(
+  conn: &mut H3Conn,
+  idx: usize,
+  add: usize,
+  which: fn(&mut Req) -> &mut VectorUsize<u8>,
+) -> bool {
+  for reclaim in [false, true] {
+    if reclaim {
+      conn.reclaim();
+    }
+    let H3Conn { budget, reqs, .. } = &mut *conn;
+    let Some(req) = reqs.get_mut(idx) else {
+      return false;
+    };
+    if budget.fits(which(req), add) {
+      return true;
+    }
+  }
+  false
+}
+
+// Frees a response buffer of the worker that a large response made grow (review V4).
+fn keep_small(buf: &mut VectorUsize<u8>) {
+  if buf.capacity() > KEEP_SCRATCH {
+    *buf = VectorUsize::new();
+  }
 }
 
 // Opens our control stream, with the SETTINGS of `params`, and our QPACK streams.

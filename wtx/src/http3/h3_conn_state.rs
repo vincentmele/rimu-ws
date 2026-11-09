@@ -5,9 +5,19 @@
 //! closed. The box, [`H3Conn`], holds the stream identifiers of both sides, the settings of the
 //! peer, the QPACK decoder and its memo, the state of the requests being read (indexed by stream
 //! index modulo the window of client streams, which two open streams never share) and the GOAWAY
-//! that was sent. A box that comes back is reset before it is used again: a new epoch for the
-//! decoder table, so that the memo of the previous connection replays nothing, and the memo
-//! cleared, so that its decoded bytes do not stay.
+//! that was sent.
+//!
+//! A box is cleared when it goes back to the pool, so that a pooled box holds no state of a
+//! request (ruling T13-a, review V5): a new epoch for the decoder table, so that the memo of the
+//! previous connection replays nothing, the memo cleared, so that its decoded bytes do not stay,
+//! and the requests forgotten.
+//!
+//! # Memory
+//!
+//! The buffers of the requests (heads, bodies, bytes that wait) take at most
+//! [`H3Params::max_buffered_body_per_conn`] bytes of capacity per connection ([`Budget`], ruling
+//! T13-g): a request that would take more is answered as one whose body is too large. An entry
+//! keeps small buffers only once its request is done, and so does a pooled box (review V4).
 
 use crate::{
   collections::VectorUsize,
@@ -19,11 +29,20 @@ use crate::{
 };
 use alloc::boxed::Box;
 
+/// The capacity of a head buffer, or of the bytes that wait for a request, that an entry keeps once
+/// its request is done; larger ones are freed (review V4).
+pub(crate) const KEEP_HEAD: usize = 4 * 1024;
+/// The capacity of a body buffer that an entry keeps once its request is done.
+pub(crate) const KEEP_BODY: usize = 16 * 1024;
+/// The capacity of the other buffers of a connection (the decoder scratch, the part of an
+/// encoder-stream instruction that waits) that a pooled box keeps.
+const KEEP_OTHER: usize = 4 * 1024;
+/// The capacity that a response buffer of the worker keeps after a write (review V4).
+pub(crate) const KEEP_SCRATCH: usize = 16 * 1024;
+/// The smallest capacity, in bytes, that a request buffer grows to.
+const MIN_GROWTH: usize = 256;
 /// Requests read at once at most: the window of client-initiated bidirectional streams.
 const REQ_WINDOW: usize = 256;
-/// Buffers of a request or of the encoder stream that grew past this are freed when their
-/// connection is pooled.
-const KEEP_CAPACITY: usize = 64 * 1024;
 
 // Ruling T13-a: what the connection keeps inline for HTTP/3 is at most 160 bytes, and so a
 // connection of the production build with its HTTP/3 state is at most 4 KiB (spec section 5.4).
@@ -46,6 +65,11 @@ pub(crate) struct H3ConnState {
 
 #[cfg(test)]
 impl H3ConnState {
+  /// The capacity that the request buffers hold, in bytes.
+  pub(crate) fn buffered(&self) -> usize {
+    self.conn.as_ref().map_or(0, |el| el.budget.held)
+  }
+
   /// Requests read, answered later or not answered yet.
   pub(crate) fn live_requests(&self) -> u32 {
     self.conn.as_ref().map_or(0, |el| el.live)
@@ -59,6 +83,74 @@ impl H3ConnState {
   /// The settings of the peer, once its SETTINGS frame arrived.
   pub(crate) fn peer_settings(&self) -> Option<H3Settings> {
     self.conn.as_ref().and_then(|el| el.settings)
+  }
+}
+
+/// The capacity that the request buffers of a connection hold, in bytes, and the most that they
+/// may hold (ruling T13-g). It is counted where the buffers grow and where they are freed.
+#[derive(Debug)]
+pub(crate) struct Budget {
+  held: usize,
+  max: usize,
+}
+
+impl Budget {
+  const fn new(max: usize) -> Self {
+    Self { held: 0, max }
+  }
+
+  /// If `buf` can take `add` more elements without the budget being passed.
+  pub(crate) fn fits<T>(&self, buf: &VectorUsize<T>, add: usize) -> bool {
+    let need = buf.len().saturating_add(add);
+    need <= buf.capacity() || need.saturating_mul(size_of::<T>()) <= self.room_for(buf)
+  }
+
+  /// Makes room in `buf` for `add` more elements: by doubling while the budget allows, and never
+  /// past `hint` (the length that it will have, if known), else as much as is needed. Returns
+  /// `false`, and grows nothing, if that is more than the budget allows.
+  pub(crate) fn grow<T>(
+    &mut self,
+    buf: &mut VectorUsize<T>,
+    add: usize,
+    hint: Option<usize>,
+  ) -> crate::Result<bool> {
+    let need = buf.len().saturating_add(add);
+    let capacity = buf.capacity();
+    if need <= capacity {
+      return Ok(true);
+    }
+    let size = size_of::<T>().max(1);
+    let room = self.room_for(buf) / size;
+    if need > room {
+      return Ok(false);
+    }
+    let min = MIN_GROWTH / size;
+    let target =
+      capacity.saturating_mul(2).max(min).min(room).min(hint.unwrap_or(usize::MAX)).max(need);
+    let others = self.held.saturating_sub(bytes(buf));
+    buf.reserve_exact(target.wrapping_sub(buf.len()))?;
+    self.held = others.saturating_add(bytes(buf));
+    Ok(true)
+  }
+
+  /// Frees `buf` if its capacity is more than `keep` bytes.
+  pub(crate) fn trim<T>(&mut self, buf: &mut VectorUsize<T>, keep: usize) {
+    let held = bytes(buf);
+    if held > keep {
+      self.held = self.held.saturating_sub(held);
+      *buf = VectorUsize::new();
+    }
+  }
+
+  /// If more than half of the budget is held: what entries without a request keep is freed
+  /// before a new head is decoded.
+  pub(crate) const fn is_tight(&self) -> bool {
+    self.held > self.max / 2
+  }
+
+  // The bytes that `buf` may hold at most: what the others leave
+  fn room_for<T>(&self, buf: &VectorUsize<T>) -> usize {
+    self.max.saturating_sub(self.held.saturating_sub(bytes(buf)))
   }
 }
 
@@ -140,8 +232,9 @@ impl Req {
     }
   }
 
-  // Forgets the request; the storage stays, unless it grew large.
-  fn clear(&mut self, forget_large: bool) {
+  // Forgets the request; the buffers stay if they are small, up to `head`, `body` and `stash`
+  // bytes.
+  fn clear(&mut self, budget: &mut Budget, head: usize, body: usize, stash: usize) {
     self.body.clear();
     self.blocked = false;
     self.fin = false;
@@ -149,15 +242,9 @@ impl Req {
     self.head.clear();
     self.phase = Phase::Free;
     self.stash.clear();
-    if forget_large {
-      self.head.forget_large();
-      if self.body.capacity() > KEEP_CAPACITY {
-        self.body = VectorUsize::new();
-      }
-      if self.stash.capacity() > KEEP_CAPACITY {
-        self.stash = VectorUsize::new();
-      }
-    }
+    self.head.trim(budget, head);
+    budget.trim(&mut self.body, body);
+    budget.trim(&mut self.stash, stash);
   }
 }
 
@@ -167,6 +254,8 @@ impl Req {
 pub(crate) struct H3Conn {
   /// Field sections that wait for QPACK inserts: their stream and Required Insert Count.
   pub(crate) blocked: VectorUsize<(StreamId, u64)>,
+  /// The capacity that the request buffers hold, and the most that they may hold.
+  pub(crate) budget: Budget,
   /// Our control stream.
   pub(crate) control: StreamId,
   /// Bytes of an unknown frame of the control stream of the peer that are still to skip.
@@ -189,7 +278,7 @@ pub(crate) struct H3Conn {
   pub(crate) max_push_id: Option<u64>,
   /// Field sections decoded lately.
   pub(crate) memo: DecodeMemo<8>,
-  /// The lowest stream identifier of a request that did not arrive: what a GOAWAY carries.
+  /// The lowest stream identifier of a request that did not arrive.
   pub(crate) next_request: u64,
   /// The control stream of the peer.
   pub(crate) peer_control: Option<StreamId>,
@@ -215,8 +304,10 @@ pub(crate) struct H3Conn {
 impl H3Conn {
   /// A box for a connection with `params`.
   pub(crate) fn new(params: &H3Params) -> crate::Result<Box<Self>> {
+    let max = usize::try_from(params.max_buffered_body_per_conn).unwrap_or(usize::MAX);
     Ok(Box::new(Self {
       blocked: VectorUsize::new(),
+      budget: Budget::new(max),
       control: StreamId(0),
       control_skip: 0,
       decoder: QpackDecoder::new(params.qpack_max_table_capacity, params.qpack_blocked_streams)?,
@@ -240,44 +331,67 @@ impl H3Conn {
     }))
   }
 
-  /// Makes a pooled box the one of a new connection with `params`. A box whose reset fails must
-  /// not be used again.
-  pub(crate) fn reset(&mut self, params: &H3Params) -> crate::Result<()> {
-    self.decoder.reset(params.qpack_max_table_capacity, params.qpack_blocked_streams)?;
+  /// Frees the buffers that entries without a request keep, for a request that needs the room.
+  pub(crate) fn reclaim(&mut self) {
+    let Self { budget, reqs, .. } = self;
+    for req in reqs.iter_mut().filter(|el| el.phase == Phase::Free) {
+      req.clear(budget, 0, 0, 0);
+    }
+  }
+
+  /// The bytes that the box takes, on the heap included.
+  pub(crate) fn heap_bytes(&self) -> usize {
+    let reqs = self.reqs.capacity().saturating_mul(size_of::<Req>());
+    let free = self.reqs_free.capacity().saturating_mul(size_of::<u16>());
+    let blocked = self.blocked.capacity().saturating_mul(size_of::<(StreamId, u64)>());
+    size_of::<Self>()
+      .saturating_add(self.decoder.heap_bytes())
+      .saturating_add(self.memo.heap_bytes())
+      .saturating_add(reqs)
+      .saturating_add(free)
+      .saturating_add(blocked)
+      .saturating_add(self.budget.held)
+      .saturating_add(self.encoder_rx.capacity())
+      .saturating_add(self.scratch.capacity())
+  }
+
+  /// Makes the box the one of no connection, for the pool: every request forgotten, small buffers
+  /// kept, a new decoder table and an empty memo (ruling T13-a, review V5). A box whose release
+  /// fails must not be used again.
+  pub(crate) fn release(&mut self, params: &H3Params) -> crate::Result<()> {
     self.memo.clear();
-    self.release();
+    self.decoder.reset(params.qpack_max_table_capacity, params.qpack_blocked_streams)?;
+    self.blocked.clear();
     self.control = StreamId(0);
+    self.control_skip = 0;
     self.decoder_stream = StreamId(0);
+    self.encoder_rx.clear();
     self.encoder_stream = StreamId(0);
     self.goaway = None;
+    self.live = 0;
     self.max_push_id = None;
     self.next_request = 0;
     self.peer_control = None;
     self.peer_decoder = None;
     self.peer_encoder = None;
     self.peer_goaway = None;
-    self.settings = None;
-    Ok(())
-  }
-
-  /// Forgets every request, for a box that goes back to the pool; storage that grew large is
-  /// freed.
-  pub(crate) fn release(&mut self) {
-    self.blocked.clear();
-    self.control_skip = 0;
-    self.encoder_rx.clear();
-    if self.encoder_rx.capacity() > KEEP_CAPACITY {
-      self.encoder_rx = VectorUsize::new();
-    }
-    self.reqs_free.clear();
-    for (idx, req) in self.reqs.iter_mut().enumerate().rev() {
-      req.clear(true);
-      // Room for every entry is reserved when the entry is made
-      let _rslt = self.reqs_free.push(u16::try_from(idx).unwrap_or(u16::MAX));
-    }
     self.req_of = [0; REQ_WINDOW];
-    self.live = 0;
+    self.reqs_free.clear();
     self.scratch.clear();
+    self.settings = None;
+    let Self { budget, encoder_rx, reqs, reqs_free, scratch, .. } = self;
+    for (idx, req) in reqs.iter_mut().enumerate().rev() {
+      req.clear(budget, KEEP_HEAD, KEEP_BODY, KEEP_HEAD);
+      // Room for every entry is reserved when the entry is made
+      let _rslt = reqs_free.push(u16::try_from(idx).unwrap_or(u16::MAX));
+    }
+    if encoder_rx.capacity() > KEEP_OTHER {
+      *encoder_rx = VectorUsize::new();
+    }
+    if scratch.capacity() > KEEP_OTHER {
+      *scratch = VectorUsize::new();
+    }
+    Ok(())
   }
 
   /// The entry of the request of stream `id`, if it has one.
@@ -315,24 +429,40 @@ impl H3Conn {
     Ok(idx)
   }
 
-  /// Gives back the entry `idx`: its request is answered, refused or abandoned.
+  /// Gives back the entry `idx`: its request is answered, refused or abandoned. It keeps small
+  /// buffers only (review V4).
   pub(crate) fn free_req(&mut self, idx: usize) {
-    let Some(req) = self.reqs.get_mut(idx).filter(|el| el.phase != Phase::Free) else {
+    let Self { blocked, budget, live, req_of, reqs, reqs_free, .. } = self;
+    let Some(req) = reqs.get_mut(idx).filter(|el| el.phase != Phase::Free) else {
       return;
     };
     let id = req.id;
-    req.clear(false);
-    if let Some(elem) = self.req_of.get_mut(window_pos(id))
+    req.clear(budget, KEEP_HEAD, KEEP_BODY, KEEP_HEAD);
+    if let Some(elem) = req_of.get_mut(window_pos(id))
       && usize::from(*elem) == idx.wrapping_add(1)
     {
       *elem = 0;
     }
-    if let Some(pos) = self.blocked.iter().position(|el| el.0 == id) {
-      let _ = self.blocked.swap_remove(pos);
+    if let Some(pos) = blocked.iter().position(|el| el.0 == id) {
+      let _ = blocked.swap_remove(pos);
     }
-    let _rslt = self.reqs_free.push(u16::try_from(idx).unwrap_or(u16::MAX));
-    self.live = self.live.saturating_sub(1);
+    let _rslt = reqs_free.push(u16::try_from(idx).unwrap_or(u16::MAX));
+    *live = live.saturating_sub(1);
   }
+
+  /// Frees the stash of entry `idx` if it holds no request and the stash is large: for a stash that
+  /// was out while its request was given back.
+  pub(crate) fn trim_free_stash(&mut self, idx: usize) {
+    let Self { budget, reqs, .. } = self;
+    if let Some(req) = reqs.get_mut(idx).filter(|el| el.phase == Phase::Free) {
+      budget.trim(&mut req.stash, KEEP_HEAD);
+    }
+  }
+}
+
+// The capacity of `buf` in bytes.
+fn bytes<T>(buf: &VectorUsize<T>) -> usize {
+  buf.capacity().saturating_mul(size_of::<T>())
 }
 
 // The entry of stream `id` in the window of client streams.
@@ -358,5 +488,26 @@ impl crate::http3::H3Handler for SizeProbeHandler {
     _: StreamId,
   ) -> crate::Result<crate::http3::ReqOutcome> {
     Ok(crate::http3::ReqOutcome::Responded)
+  }
+}
+
+#[cfg(test)]
+impl H3Conn {
+  /// If the box holds no state of a connection: no dynamic table entry, no kept section and no
+  /// request (review V5).
+  pub(crate) fn is_clear(&self) -> bool {
+    self.decoder.insert_count() == 0
+      && self.memo.kept() == 0
+      && self.live == 0
+      && self.blocked.is_empty()
+      && self.encoder_rx.is_empty()
+      && self.settings.is_none()
+      && self.reqs.iter().all(|el| {
+        el.phase == Phase::Free
+          && el.body.is_empty()
+          && el.stash.is_empty()
+          && el.head.fields_len() == 0
+          && el.head.method().is_empty()
+      })
   }
 }

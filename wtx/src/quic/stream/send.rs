@@ -12,7 +12,7 @@ use crate::quic::{
     OWED_MAX_STREAMS_UNI_LOST, RESERVED_SEGMENTS, RangeBlock, RangeSet, StreamId, Streams, closed,
     excessive_load, exhausted,
     recv::RxState,
-    table::{Kind, StreamSlots},
+    table::{Entry, Kind, StreamSlots},
   },
   varint::varint_len,
 };
@@ -617,6 +617,79 @@ impl Streams {
     if let Some(slot) = self.app_slot(id) {
       self.reset_send(pools, slot, code);
     }
+  }
+
+  /// For a server that shuts down (ruling T13-h): the first client-initiated bidirectional stream
+  /// from the index of `from` on and below the index of `below` whose sending part is not done
+  /// (what was written to it, its FIN or its reset, is not all acknowledged), with `true` if it
+  /// still takes writes: the application never answered it, as for a stream that a later one
+  /// opened or whose data did not reach the application yet.
+  #[inline]
+  pub(crate) fn first_unanswered(
+    &self,
+    pools: &QuicPools,
+    from: StreamId,
+    below: StreamId,
+  ) -> Option<(StreamId, bool)> {
+    if self.is_client {
+      return None;
+    }
+    let table = self.bidi.view_ref();
+    let end = below.index().min(table.meta.next);
+    let mut index = from.index().max(table.meta.base);
+    while index < end {
+      match table.entry(index) {
+        Entry::Implicit => return Some((StreamId::of(index, true, false), true)),
+        Entry::Open(slot) => {
+          if let Some(stream) = pools.stream_slots.get(slot)
+            && !stream.tx.is_done()
+          {
+            let tx = &stream.tx;
+            return Some((stream.id, tx.exists && !tx.fin && tx.reset.is_none()));
+          }
+        }
+        Entry::Closed | Entry::NotOpened | Entry::Rejected => {}
+      }
+      index = index.wrapping_add(1);
+    }
+    None
+  }
+
+  /// The lowest client-initiated bidirectional stream that is not open: those below it were
+  /// opened, with data or by a later one (RFC 9000 section 3.2).
+  #[inline]
+  pub(crate) fn next_peer_bidi(&self) -> StreamId {
+    StreamId::of(self.bidi.meta.next, true, false)
+  }
+
+  /// Refuses client stream `id`, which the application never answered: its sending part is reset
+  /// and the peer asked to stop, with `code`. A stream that a later one opened takes a slot for it.
+  #[inline]
+  pub(crate) fn refuse(
+    &mut self,
+    pools: &mut QuicPools,
+    params: &ConnParams,
+    id: StreamId,
+    code: u64,
+  ) -> crate::Result<()> {
+    if self.is_client || !id.is_client_bidi() || id.index() >= self.bidi.meta.next {
+      return Ok(());
+    }
+    let Some(slot) = self.frame_slot(pools, params, id, true)? else {
+      return Ok(());
+    };
+    self.reset_send(pools, slot, code);
+    self.stop_sending(pools, params, id, code);
+    Ok(())
+  }
+
+  /// The bytes written to stream `id` that were not sent yet.
+  #[inline]
+  pub(crate) fn unsent_on(&self, pools: &QuicPools, id: StreamId) -> u64 {
+    self
+      .app_slot(id)
+      .and_then(|slot| pools.stream_slots.get(slot))
+      .map_or(0, |el| el.tx.end.saturating_sub(el.tx.sent))
   }
 
   /// If stream `id` takes no more writes of the application: its FIN was written, it was reset or

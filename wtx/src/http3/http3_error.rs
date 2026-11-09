@@ -18,6 +18,9 @@ pub enum Http3Error {
   AlreadyResponded,
   /// An output buffer is too small for what should be written to it.
   BufferTooSmall,
+  /// The buffers of the requests of a connection would hold more than
+  /// [`crate::http3::H3Params::max_buffered_body_per_conn`]: the request is answered with 413.
+  BufferedLimit,
   /// A Set Dynamic Table Capacity instruction asks for more than the advertised
   /// `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (with [`H3ErrorCode::QpackEncoderStreamError`], RFC 9204
   /// section 4.3.1).

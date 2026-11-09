@@ -6,7 +6,11 @@
 //! reset with `H3_MESSAGE_ERROR`. A field section that decodes to more than the advertised
 //! `SETTINGS_MAX_FIELD_SECTION_SIZE` ([`Http3Error::FieldSectionTooLarge`]) is answered with 431.
 
-use crate::{collections::VectorUsize, http3::Http3Error, quic::StreamId};
+use crate::{
+  collections::VectorUsize,
+  http3::{Http3Error, h3_conn_state::Budget},
+  quic::StreamId,
+};
 use core::hint::cold_path;
 
 /// The bytes that RFC 9114 section 4.2.2 counts for each field on top of its name and value.
@@ -19,8 +23,6 @@ const SCHEME: usize = 1;
 const AUTHORITY: usize = 2;
 /// The index of `:path`.
 const PATH: usize = 3;
-/// Buffers of a head that grew past this are freed when their connection is pooled.
-const KEEP_CAPACITY: usize = 64 * 1024;
 
 /// A complete request: its head, checked (RFC 9114 section 4.3), and its body, the payloads of its
 /// DATA frames. Pseudo-header fields that the request does not have are empty (`:scheme` and
@@ -106,10 +108,6 @@ impl RequestHead {
         (Some(lhs), Some(rhs)) if lhs != rhs || lhs.is_empty() => return Err(malformed()),
         _ => {}
       }
-      // No userinfo (RFC 9114 section 4.3.1)
-      if authority.is_some_and(|el| el.contains(&b'@')) {
-        return Err(malformed());
-      }
     }
     Ok(())
   }
@@ -143,14 +141,10 @@ impl RequestHead {
     self.fields.len()
   }
 
-  /// Frees the storage if a large request made it grow past what is worth keeping.
-  pub(crate) fn forget_large(&mut self) {
-    if self.bytes.capacity() > KEEP_CAPACITY {
-      self.bytes = VectorUsize::new();
-    }
-    if self.fields.capacity() > KEEP_CAPACITY / 12 {
-      self.fields = VectorUsize::new();
-    }
+  /// Frees each buffer whose capacity is more than `keep` bytes, out of `budget`.
+  pub(crate) fn trim(&mut self, budget: &mut Budget, keep: usize) {
+    budget.trim(&mut self.bytes, keep);
+    budget.trim(&mut self.fields, keep);
   }
 
   /// `:method`.
@@ -164,22 +158,30 @@ impl RequestHead {
   }
 
   /// Takes the next field of the head, decoded, whose section may decode to `max_size` bytes as
-  /// RFC 9114 section 4.2.2 counts them.
-  pub(crate) fn push(&mut self, name: &[u8], value: &[u8], max_size: u64) -> crate::Result<()> {
+  /// RFC 9114 section 4.2.2 counts them, into buffers that grow within `budget`
+  /// ([`Http3Error::BufferedLimit`] if they can not).
+  pub(crate) fn push(
+    &mut self,
+    name: &[u8],
+    value: &[u8],
+    max_size: u64,
+    budget: &mut Budget,
+  ) -> crate::Result<()> {
     count_field(&mut self.size, name, value, max_size)?;
     if let Some(pseudo) = name.strip_prefix(b":") {
-      // Pseudo-header fields come first, once each, and only those of requests (section 4.3)
+      // Pseudo-header fields come first, once each, and only those of requests (section 4.3); no
+      // userinfo in the authority (section 4.3.1)
       let idx = match pseudo {
         b"method" if is_token(value) => METHOD,
         b"scheme" if is_scheme(value) => SCHEME,
-        b"authority" if is_visible(value) => AUTHORITY,
+        b"authority" if is_visible(value) && !value.contains(&b'@') => AUTHORITY,
         b"path" if is_visible(value) => PATH,
         _ => return Err(malformed()),
       };
       if self.regular || self.has(idx) {
         return Err(malformed());
       }
-      let range = self.store(value)?;
+      let range = self.store(value, budget)?;
       if let Some(elem) = self.pseudo.get_mut(idx) {
         *elem = Some(range);
       }
@@ -189,6 +191,8 @@ impl RequestHead {
     check_field(name, value)?;
     let start = u32::try_from(self.bytes.len()).map_err(|_err| malformed())?;
     let (name_len, value_len) = (len_u32(name)?, len_u32(value)?);
+    reserve(budget, &mut self.bytes, name.len().wrapping_add(value.len()))?;
+    reserve(budget, &mut self.fields, 1)?;
     let _ = self.bytes.extend_from_copyable_slices([name, value])?;
     let value_range = (start.wrapping_add(name_len), value_len);
     match name {
@@ -200,7 +204,8 @@ impl RequestHead {
         self.content_length = Some(length);
       }
       b"host" => {
-        if self.host.is_some() {
+        // Once, and without userinfo (RFC 9110 section 7.2)
+        if self.host.is_some() || value.contains(&b'@') {
           return Err(malformed());
         }
         self.host = Some(value_range);
@@ -230,8 +235,9 @@ impl RequestHead {
     self.bytes.get(start..).and_then(|el| el.get(..len)).unwrap_or_default()
   }
 
-  fn store(&mut self, bytes: &[u8]) -> crate::Result<(u32, u32)> {
+  fn store(&mut self, bytes: &[u8], budget: &mut Budget) -> crate::Result<(u32, u32)> {
     let start = u32::try_from(self.bytes.len()).map_err(|_err| malformed())?;
+    reserve(budget, &mut self.bytes, bytes.len())?;
     self.bytes.extend_from_copyable_slice(bytes)?;
     Ok((start, len_u32(bytes)?))
   }
@@ -326,6 +332,15 @@ fn is_visible(value: &[u8]) -> bool {
 
 fn len_u32(bytes: &[u8]) -> crate::Result<u32> {
   u32::try_from(bytes.len()).map_err(|_err| malformed())
+}
+
+// Room in `buf` for `add` more elements within `budget`.
+fn reserve<T>(budget: &mut Budget, buf: &mut VectorUsize<T>, add: usize) -> crate::Result<()> {
+  if budget.grow(buf, add, None)? {
+    return Ok(());
+  }
+  cold_path();
+  Err(crate::Error::Http3(Http3Error::BufferedLimit))
 }
 
 #[cold]

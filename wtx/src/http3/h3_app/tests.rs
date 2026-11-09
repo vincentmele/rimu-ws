@@ -9,7 +9,10 @@ use crate::{
       varint, write,
     },
   },
-  quic::{ConnState, Frame, QuicConn, QuicLimits, QuicParams, StreamId, testing::encode_frames},
+  quic::{
+    ConnState, Frame, PacketTy, QuicConn, QuicLimits, QuicParams, StreamId, parse_header,
+    testing::encode_frames,
+  },
   rng::ChaCha20,
   sync::AtomicU64,
   tls::SkCtx,
@@ -487,10 +490,7 @@ fn h3_steady_state_allocates_nothing_after_warmup() {
 fn pooled_state_is_reset_between_connections() {
   let inline = size_of::<H3ConnState>();
   let conn = size_of::<QuicConn<H3App<TestHandler>, ChaCha20, SkCtx>>();
-  std::eprintln!(
-    "size_of::<H3ConnState>() = {inline}, size_of::<QuicConn<H3App<_>, ChaCha20, SkCtx>>() = {conn}"
-  );
-  assert!(inline <= 160 && conn <= 4096);
+  assert!(inline <= 160 && conn <= 4096, "{inline} {conn}");
   let mut net = h3_net(QuicParams::default(), dynamic_params(), &TestHandler::new(OK));
   let conn_with = |net: &mut H3Net, value: &[u8]| {
     let client = net.add_client();
@@ -857,4 +857,355 @@ fn unknown_and_ignored_elements() {
   net.run();
   assert_eq!(status(&net, client, id).as_deref(), Some(&b"200"[..]));
   assert_eq!(server_close(&net, client), None);
+}
+
+// A POST of `path` that announces `len` bytes of body, with `body`.
+fn post(path: &[u8], len: usize, body: &[u8]) -> Vec<u8> {
+  let len = format!("{len}");
+  let mut request =
+    headers_frame(&request_fields(b"POST", path, &[(b"content-length", len.as_bytes())]));
+  if !body.is_empty() {
+    request.extend_from_slice(&data_frame(body));
+  }
+  request
+}
+
+fn buffered(net: &H3Net, client: usize) -> usize {
+  server_state(net, client, H3ConnState::buffered)
+}
+
+// Fix V1 (ruling T13-g): the request buffers of a connection hold at most
+// `max_buffered_body_per_conn`: a request that would take more is answered with 413, the others go
+// on.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn buffered_requests_are_capped_per_connection() {
+  const CAP: usize = 1_000_000;
+  let params = H3Params {
+    max_buffered_body_per_conn: CAP as u32,
+    max_request_body: 600_000,
+    ..H3Params::default()
+  };
+  let (mut net, client) = connected(params, &TestHandler::new(OK));
+  let body: Vec<u8> = (0..400_000u32).map(|el| (el % 249) as u8).collect();
+  let first = send(&mut net, client, &post(b"/a", body.len(), &body), false);
+  net.run_for(1024);
+  assert!(buffered(&net, client) <= CAP);
+  let second = send(&mut net, client, &post(b"/b", body.len(), &body), false);
+  net.run_for(1024);
+  assert!(buffered(&net, client) <= CAP, "{}", buffered(&net, client));
+  let third = send(&mut net, client, &post(b"/c", body.len(), &body), false);
+  net.run_for(1024);
+  assert!(buffered(&net, client) <= CAP, "{}", buffered(&net, client));
+  assert_eq!(status(&net, client, third).as_deref(), Some(&b"413"[..]));
+  assert!(response(&net, client, first).is_none() && response(&net, client, second).is_none());
+  for id in [first, second] {
+    write(&mut net, client, id, b"", true);
+  }
+  net.run();
+  assert_eq!(status(&net, client, first).as_deref(), Some(&b"200"[..]));
+  assert_eq!(status(&net, client, second).as_deref(), Some(&b"200"[..]));
+  assert!(handler(&net).seen.iter().all(|el| el.body == body));
+  assert_eq!(handler(&net).count, 2);
+  // What they held is given back: only small buffers stay
+  assert!(buffered(&net, client) <= 64 * 1024, "{}", buffered(&net, client));
+  let id = send(&mut net, client, &headers_frame(&GET), true);
+  net.run();
+  assert_eq!(status(&net, client, id).as_deref(), Some(&b"200"[..]));
+  assert_eq!(server_close(&net, client), None);
+}
+
+// Fix V1: requests that never finish and the buffers that finished requests leave can not make the
+// connection hold more than the cap; what finished requests leave is freed for a large request.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn unfinished_and_finished_requests_cannot_pin_more_than_the_cap() {
+  const CAP: usize = 1_000_000;
+  let params = H3Params {
+    max_buffered_body_per_conn: CAP as u32,
+    max_request_body: 600_000,
+    ..H3Params::default()
+  };
+  let (mut net, client) = connected(params, &TestHandler::new(OK));
+  let large: Vec<u8> = vec![7; 300_000];
+  for _ in 0..2 {
+    let id = send(&mut net, client, &post(b"/done", large.len(), &large), true);
+    net.run_for(1024);
+    assert_eq!(status(&net, client, id).as_deref(), Some(&b"200"[..]));
+  }
+  // Fifty requests that never finish (no FIN), with 15,000 bytes of body each
+  let small = vec![3; 15_000];
+  let pending: Vec<StreamId> =
+    (0..50).map(|_| send(&mut net, client, &post(b"/slow", small.len(), &small), false)).collect();
+  net.run_for(1024);
+  assert!(buffered(&net, client) <= CAP, "{}", buffered(&net, client));
+  assert!(pending.iter().all(|id| response(&net, client, *id).is_none()));
+  let id = send(&mut net, client, &post(b"/big", large.len(), &large), true);
+  net.run_for(1024);
+  assert_eq!(status(&net, client, id).as_deref(), Some(&b"413"[..]));
+  assert!(buffered(&net, client) <= CAP);
+  // Once they are abandoned, what they leave makes room again
+  for id in &pending {
+    reset(&mut net, client, *id, 0x10c);
+  }
+  net.run();
+  assert_eq!(server_state(&net, client, H3ConnState::live_requests), 0);
+  let id = send(&mut net, client, &post(b"/big", large.len(), &large), true);
+  net.run_for(1024);
+  assert_eq!(status(&net, client, id).as_deref(), Some(&b"200"[..]));
+  assert!(buffered(&net, client) <= CAP);
+  assert_eq!(server_close(&net, client), None);
+}
+
+// Fix V2 (ruling T13-h): a graceful close waits until the last response is acknowledged: lost, it
+// is sent again first.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn graceful_close_waits_for_the_last_response_to_be_acknowledged() {
+  let (mut net, client) = connected(H3Params::default(), &TestHandler::new(OK));
+  let parked = send(&mut net, client, &headers_frame(&request_fields(b"GET", b"/park", &[])), true);
+  net.run();
+  let now_us = net.now_us;
+  let server = &mut net.servers[0];
+  server.endpoint.begin_shutdown(now_us, &mut server.app);
+  net.run();
+  resume(&mut net, client, parked);
+  // The datagram with the response is lost
+  net.clients[client].deaf = true;
+  let _ = net.step();
+  net.clients[client].deaf = false;
+  assert!(response(&net, client, parked).is_none());
+  for _ in 0..32 {
+    if server_close(&net, client).is_some() {
+      break;
+    }
+    assert!(net.advance_to_next_event());
+    net.run();
+  }
+  let rsp = response(&net, client, parked).unwrap();
+  assert_eq!((rsp.fin, rsp.body.as_slice()), (true, &b"resumed"[..]));
+  assert_eq!(server_close(&net, client), Some((true, 0x100)));
+}
+
+// Fix V2 (ruling T13-h): the GOAWAY covers the streams that QUIC opened, and those that brought no
+// request by the time the others are answered are refused with H3_REQUEST_REJECTED before the
+// close, never dropped: one opened by a later one, one whose data waits for its start.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn graceful_close_refuses_the_streams_it_never_read() {
+  let (mut net, client) = connected(H3Params::default(), &TestHandler::new(OK));
+  let now_us = net.now_us;
+  let (implicit, answered, waiting) = net
+    .client_ctx(client, now_us, |cx| {
+      let implicit = cx.open_bidi()?;
+      let answered = cx.open_bidi()?;
+      cx.write(answered, &headers_frame(&GET), true)?;
+      let waiting = cx.open_bidi()?;
+      Ok::<_, crate::Error>((implicit, answered, waiting))
+    })
+    .unwrap();
+  net.run();
+  // The start of the third request is lost; what follows arrives and waits for it
+  let request = headers_frame(&GET);
+  write(&mut net, client, waiting, &request[..5], false);
+  let _lost = net.client_datagrams(client);
+  write(&mut net, client, waiting, &request[5..], false);
+  net.run();
+  assert!(response(&net, client, waiting).is_none());
+  assert_eq!(status(&net, client, answered).as_deref(), Some(&b"200"[..]));
+  let now_us = net.now_us;
+  let server = &mut net.servers[0];
+  server.endpoint.begin_shutdown(now_us, &mut server.app);
+  net.run();
+  let goaways: Vec<_> =
+    server_control_frames(&net, client).into_iter().filter(|el| el.0 == 0x07).collect();
+  assert_eq!(goaways, [(0x07, varint(waiting.0 + 4))]);
+  let resets = resets(&net, client);
+  assert!(resets.contains(&(implicit.0, 0x10b)), "{resets:?}");
+  assert!(resets.contains(&(waiting.0, 0x10b)), "{resets:?}");
+  assert_eq!(server_close(&net, client), Some((true, 0x100)));
+}
+
+// Fix V3: decoder-stream output is written while the stream has little unsent, so a client that
+// never gives credit on our decoder stream meets the bound of the decoder (H3_EXCESSIVE_LOAD)
+// instead of growing the memory of the server.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn decoder_stream_output_without_credit_is_bounded() {
+  let mut net = h3_net(QuicParams::default(), dynamic_params(), &TestHandler::new(OK));
+  net.client_params.stream_window = 256;
+  let client = net.add_client();
+  // The server's decoder stream: its third unidirectional stream
+  net.clients[client].app.hold = Some(11);
+  net.run();
+  let mut encoder = encoder_stream(4096);
+  wire::insert_name_ref(&mut encoder, true, AUTHORITY, b"localhost", false);
+  let _ = open_uni(&mut net, client, &encoder);
+  net.run();
+  let request = dynamic_request(1, b"/", &[]);
+  let mut sent = 0;
+  while server_close(&net, client).is_none() && sent < 12_000 {
+    for _ in 0..64 {
+      let _ = send(&mut net, client, &request, true);
+      sent += 1;
+    }
+    net.run();
+    let logs = &mut net.clients[client].app.streams;
+    logs.retain(|id, log| !(log.fin && *id & 0b11 == 0));
+  }
+  assert_eq!(server_close(&net, client), Some((true, 0x107)), "{sent} requests");
+}
+
+// Fix V4: an entry keeps small buffers only once its request is done, a pooled box too, the pool
+// has a byte budget, an idle trim frees it down, and the response buffer stays small.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn request_buffers_and_the_pool_stay_small() {
+  let params = H3Params { max_request_body: 2 << 20, ..H3Params::default() };
+  let mut net = h3_net(QuicParams::default(), params, &TestHandler::new(&[9; 100_000]));
+  let mut clients = Vec::new();
+  for _ in 0..6 {
+    let client = net.add_client();
+    net.run();
+    let body = vec![5; 500_000];
+    let id = send(&mut net, client, &post(b"/up", body.len(), &body), true);
+    net.run_for(1024);
+    assert_eq!(status(&net, client, id).as_deref(), Some(&b"200"[..]));
+    let long = vec![b'v'; 10_000];
+    let request = headers_frame(&request_fields(b"GET", b"/", &[(b"x-long", &long)]));
+    let id = send(&mut net, client, &request, true);
+    net.run_for(1024);
+    assert_eq!(status(&net, client, id).as_deref(), Some(&b"200"[..]));
+    assert!(buffered(&net, client) <= 32 * 1024, "{}", buffered(&net, client));
+    clients.push(client);
+  }
+  // The responses of 100,000 bytes went through the response buffer, which stays small
+  assert!(net.servers[0].app.scratch_bytes() <= 32 * 1024);
+  for client in clients {
+    let now_us = net.now_us;
+    net.clients[client].conn.close_app(now_us, 0x100);
+  }
+  net.run();
+  net.advance(CLOSING_US);
+  let app = &net.servers[0].app;
+  assert_eq!(app.pooled(), 6);
+  assert!(app.pooled_bytes() <= 6 * 64 * 1024, "{}", app.pooled_bytes());
+  assert!(app.pooled_bytes() <= H3App::<TestHandler>::POOL_BYTES);
+  net.servers[0].app.trim_idle();
+  let app = &net.servers[0].app;
+  assert!(app.pooled() <= H3App::<TestHandler>::IDLE_POOLED, "{}", app.pooled());
+  assert!(app.pooled_bytes() <= 2 << 20);
+  assert!(app.scratch_bytes() == 0);
+}
+
+// Fix V5: a box that goes back to the pool holds no state of its connection: no dynamic table
+// entry, no kept section, no request.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn pooled_box_holds_no_request_state() {
+  let (mut net, client) = connected(dynamic_params(), &TestHandler::new(OK));
+  let mut encoder = encoder_stream(4096);
+  wire::insert_name_ref(&mut encoder, true, AUTHORITY, b"localhost", false);
+  let _ = open_uni(&mut net, client, &encoder);
+  net.run();
+  let id = send(&mut net, client, &dynamic_request(1, b"/", &[]), true);
+  let _parked =
+    send(&mut net, client, &headers_frame(&request_fields(b"GET", b"/park", &[])), true);
+  let _unfinished = send(&mut net, client, &post(b"/slow", 100, &[1; 10]), false);
+  net.run();
+  assert_eq!(status(&net, client, id).as_deref(), Some(&b"200"[..]));
+  assert_eq!(server_state(&net, client, H3ConnState::live_requests), 2);
+  let now_us = net.now_us;
+  net.clients[client].conn.close_app(now_us, 0x100);
+  net.run();
+  net.advance(CLOSING_US);
+  assert_eq!(net.servers[0].app.pooled(), 1);
+  assert!(net.servers[0].app.pool_is_clear());
+}
+
+// Fix V6: RFC 9114 sections 4.2 and 4.3.1: fields of a connection, `content-length` that
+// disagrees with itself, `host` twice or against `:authority`, userinfo in `host` or
+// `:authority`: all stream errors H3_MESSAGE_ERROR.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn authority_host_and_connection_fields_are_message_errors() {
+  let (mut net, client) = connected(H3Params::default(), &TestHandler::new(OK));
+  let get = |extra: &[(&[u8], &[u8])]| headers_frame(&request_fields(b"GET", b"/", extra));
+  let cases: Vec<Vec<u8>> = vec![
+    get(&[(b"keep-alive", b"timeout=5")]),
+    get(&[(b"proxy-connection", b"keep-alive")]),
+    get(&[(b"upgrade", b"websocket")]),
+    get(&[(b"content-length", b"5"), (b"content-length", b"6")]),
+    get(&[(b"host", b"localhost"), (b"host", b"localhost")]),
+    get(&[(b"host", b"other")]),
+    get(&[(b"host", b"user@localhost")]),
+    headers_frame(&[
+      (b":method", b"GET"),
+      (b":scheme", b"http"),
+      (b":path", b"/"),
+      (b"host", b"u@h"),
+    ]),
+    headers_frame(&[(b":method", b"CONNECT"), (b":authority", b"user@localhost:443")]),
+  ];
+  for (nth, case) in cases.iter().enumerate() {
+    let id = send(&mut net, client, case, true);
+    net.run();
+    assert!(resets(&net, client).contains(&(id.0, 0x10e)), "case {nth}");
+  }
+  assert_eq!(handler(&net).count, 0);
+  // The same fields well formed are answered
+  let id =
+    send(&mut net, client, &get(&[(b"host", b"localhost"), (b"content-length", b"0")]), true);
+  net.run();
+  assert_eq!(status(&net, client, id).as_deref(), Some(&b"200"[..]));
+  assert_eq!(server_close(&net, client), None);
+}
+
+// The packet types of the packets of a datagram to the server.
+fn packet_types(datagram: &[u8]) -> Vec<PacketTy> {
+  let mut rslt = Vec::new();
+  let mut rest = datagram;
+  while let Ok(header) = parse_header(rest, 8) {
+    rslt.push(header.ty);
+    rest = &rest[header.packet_end..];
+    if rest.is_empty() {
+      break;
+    }
+  }
+  rslt
+}
+
+// Fix V7 (review focus 1): the client's Finished and its first request, coalesced in one
+// datagram, are served in that turn: the handler runs on that datagram and the next flush of the
+// server carries the response.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn first_request_coalesced_with_finished_is_answered_in_that_turn() {
+  let mut net = h3_net(QuicParams::default(), H3Params::default(), &TestHandler::new(OK));
+  let client = net.add_client();
+  for mut datagram in net.client_datagrams(client) {
+    let _ = net.deliver_to_server(client, &mut datagram);
+  }
+  for (_, mut datagram) in net.server_datagrams(0) {
+    net.deliver_to_client(client, &mut datagram);
+  }
+  let id = send(&mut net, client, &headers_frame(&GET), true);
+  let mut datagrams = net.client_datagrams(client);
+  let idx = datagrams
+    .iter()
+    .position(|el| {
+      let types = packet_types(el);
+      types.contains(&PacketTy::Handshake) && types.last() == Some(&PacketTy::OneRtt)
+    })
+    .unwrap();
+  for datagram in &mut datagrams[..=idx] {
+    assert_eq!(handler(&net).count, 0);
+    let _ = net.deliver_to_server(client, datagram);
+  }
+  assert_eq!(handler(&net).count, 1);
+  for (_, mut datagram) in net.server_datagrams(0) {
+    net.deliver_to_client(client, &mut datagram);
+  }
+  let rsp = response(&net, client, id).unwrap();
+  assert_eq!((rsp.field(b":status"), rsp.fin), (Some(&b"200"[..]), true));
 }

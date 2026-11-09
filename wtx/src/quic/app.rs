@@ -175,6 +175,40 @@ impl<'c, S> ConnCtx<'c, S> {
     usize::try_from(self.streams.unsent()).unwrap_or(usize::MAX)
   }
 
+  /// For a server that shuts down: the first client-initiated bidirectional stream from `from` on
+  /// and below `below` whose sending part is not done (what was written to it, its FIN or its
+  /// reset, is not all acknowledged), with `true` if it still takes writes: the application never
+  /// answered it, as for a stream that a later one opened or whose data did not arrive in order
+  /// yet.
+  #[inline]
+  pub(crate) fn first_unanswered(
+    &self,
+    from: StreamId,
+    below: StreamId,
+  ) -> Option<(StreamId, bool)> {
+    self.streams.first_unanswered(self.pools, from, below)
+  }
+
+  /// The lowest client-initiated bidirectional stream that is not open: those below it were
+  /// opened, with data or by a later one (RFC 9000 section 3.2).
+  #[inline]
+  pub(crate) fn next_peer_bidi(&self) -> StreamId {
+    self.streams.next_peer_bidi()
+  }
+
+  /// Refuses client stream `id`, which the application never answered: RESET_STREAM and
+  /// STOP_SENDING with `code`. A stream that a later one opened takes a slot for it.
+  #[inline]
+  pub(crate) fn refuse(&mut self, id: StreamId, code: u64) -> crate::Result<()> {
+    self.streams.refuse(self.pools, self.params, id, code)
+  }
+
+  /// The bytes written to stream `id` that were not sent yet.
+  #[inline]
+  pub(crate) fn unsent_on(&self, id: StreamId) -> usize {
+    usize::try_from(self.streams.unsent_on(self.pools, id)).unwrap_or(usize::MAX)
+  }
+
   /// If stream `id` takes no more writes: its FIN was written, it was reset or it is not open for
   /// sending.
   #[inline]
