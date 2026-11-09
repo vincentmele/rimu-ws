@@ -21,7 +21,7 @@
 //! |---|---|---|---|
 //! | `ARENA_H3_HEADERS` | `min`, `full` | `min` | `min`: `content-type` only, no middleware (like cnetmod and zix, not RFC 9110-compliant; decision Q2); `full`: `Http3ServerFramework::set_rfc9110_headers(true)` and the `server` middleware, as on h2 |
 //! | `ARENA_H3_DATA` | `reuse`, `fresh` | `reuse` | `Http3ServerFramework::set_reuse_data` (`reuse`: the opt-in, the library default is `fresh`; the data, an `Arc` of the dataset, is never changed by the handlers) |
-//! | `ARENA_H3_GRO` | `0`, `1` | `0` | `UdpParams::gro` (on: receive buffers of 64 KiB) |
+//! | `ARENA_H3_GRO` | `0`, `1` | `1` | `UdpParams::gro` (on: receive buffers of 64 KiB; on by default since task 16) |
 //! | `ARENA_H3_RECV_BUFFERS` | 1 to 32768 | 256 | `UdpParams::recv_buffers` |
 //! | `ARENA_H3_TX_ARENA` | bytes, 65536 or more | 768000 | `UdpParams::tx_arena_bytes` |
 //! | `ARENA_H3_RCVBUF` | bytes | 4194304 | `UdpParams::rcvbuf` (capped by `net.core.rmem_max`) |

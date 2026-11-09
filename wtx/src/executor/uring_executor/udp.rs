@@ -88,8 +88,10 @@ pub struct UdpParams {
   /// within 512 MiB. Defaults to 2048.
   pub recv_buffer_len: u32,
   /// Generic receive offload (`UDP_GRO`): the kernel coalesces datagrams of a flow that arrive
-  /// together into one and reports their size in [`DatagramMeta::segment_size`]. Defaults to
-  /// `false`.
+  /// together into one and reports their size in [`DatagramMeta::segment_size`]; the receive
+  /// buffers are then 64 KiB each (256 of them: about 16.8 MiB per socket). Defaults to `true`
+  /// (task 16, EC2: HttpArena baseline-h3 2.8 % less server CPU per request at 0.8 % more requests
+  /// per second; static-h3 unchanged within the spread).
   pub gro: bool,
   /// The `SO_RCVBUF` asked for. The kernel caps it at `net.core.rmem_max`, which is never raised
   /// here; what it granted is in [`UdpStats::rcvbuf`]. Defaults to 4 MiB.
@@ -120,7 +122,7 @@ impl UdpParams {
     Self {
       recv_buffers: 256,
       recv_buffer_len: 2048,
-      gro: false,
+      gro: true,
       rcvbuf: 4 << 20,
       sndbuf: 4 << 20,
       reuseport: true,
@@ -1554,7 +1556,7 @@ mod tests {
       uring_executor::udp::{UdpInbox, UdpParams, UringUdpSocket},
     },
     futures::Sleep,
-    quic::{DatagramMeta, steering_cbpf},
+    quic::{DatagramMeta, TxArena, steering_cbpf},
   };
   use alloc::vec::Vec;
   use core::{
@@ -1576,6 +1578,20 @@ mod tests {
   // `UdpParams::reuseport`). Only `cbpf_steers_by_dcid_byte` makes a group, on purpose.
   fn params() -> UdpParams {
     UdpParams { reuseport: false, ..UdpParams::new() }
+  }
+
+  // Brief step 3 of task 16 (EC2 variant batch of 9 Nov 2026): generic receive offload is on by
+  // default (baseline-h3 -2.8 % server CPU per request at +0.8 % requests per second, outside the
+  // spread; static-h3 within the spread), with buffers that hold a coalesced datagram; the other
+  // defaults are the measured ones too.
+  #[test]
+  fn defaults_are_the_measured_ones() {
+    let params = UdpParams::new();
+    assert!(params.gro);
+    assert_eq!((params.recv_buffers, params.recv_buffer_len), (256, 2048));
+    assert_eq!((params.rcvbuf, params.sndbuf), (4 << 20, 4 << 20));
+    assert_eq!((params.tx_arena_bytes, params.max_train_segments), (TxArena::DEFAULT_BYTES, 64));
+    assert!(params.reuseport);
   }
 
   // One datagram written into the arena; it joins the newest train if it can.
