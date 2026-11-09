@@ -237,14 +237,17 @@ where
 
 // ---- the server
 
+// `content_length`, `date` and `rfc9110`: what the test asks of the framework, if anything; `None`
+// leaves the default of the framework.
 struct Opts {
-  content_length: bool,
+  content_length: Option<bool>,
   count: Option<&'static AtomicU64>,
-  date: bool,
+  date: Option<bool>,
   drain: Duration,
   h3: H3Params,
   hooks: TestHooks,
   record: bool,
+  rfc9110: Option<bool>,
   root: PathBuf,
   workers: usize,
 }
@@ -252,13 +255,14 @@ struct Opts {
 impl Opts {
   fn new(name: &str) -> Self {
     Self {
-      content_length: true,
+      content_length: None,
       count: None,
-      date: true,
+      date: None,
       drain: Duration::from_secs(1),
       h3: H3Params::default(),
       hooks: TestHooks::default(),
       record: false,
+      rfc9110: None,
       root: static_dir(name),
       workers: 1,
     }
@@ -329,8 +333,6 @@ fn serve(opts: Opts) -> Served {
   )
   .unwrap()
   .set_error_cb(error_cb)
-  .set_content_length(opts.content_length)
-  .set_date(opts.date)
   .set_h3_params(opts.h3)
   .set_local_runtimes(NonZeroUsize::new(opts.workers))
   .set_pin_workers(false)
@@ -342,6 +344,15 @@ fn serve(opts: Opts) -> Served {
     }
     UringRuntime::new()
   });
+  if let Some(value) = opts.rfc9110 {
+    fw = fw.set_rfc9110_headers(value);
+  }
+  if let Some(value) = opts.content_length {
+    fw = fw.set_content_length(value);
+  }
+  if let Some(value) = opts.date {
+    fw = fw.set_date(value);
+  }
   fw.test = TestHooks { bound: Some(bound_tx), ..opts.hooks };
   let stats = fw.stats();
   let addr =
@@ -579,11 +590,14 @@ fn status(rsp: &Response) -> &[u8] {
 // ---- tests
 
 // Brief step 1: `/baseline2?a=1&b=1` of the router is answered `2` over HTTP/3, with the fields of
-// the endpoint, `content-length` and `date`; a path with no route gets 404.
+// the endpoint, `content-length` and `date`; a path with no route gets 404. Decision Q2: the
+// default leaves `content-length` and `date` out, so this test asks for the RFC 9110 fields.
 #[cfg_attr(miri, ignore)]
 #[test]
 fn baseline2_route_answers_2() {
-  let served = serve(Opts::new("baseline2"));
+  let mut opts = Opts::new("baseline2");
+  opts.rfc9110 = Some(true);
+  let served = serve(opts);
   let mut client = Client::connect(served.addr);
   let rsp = client.get("/baseline2?a=1&b=1", &[]);
   assert_eq!((status(&rsp), rsp.body.as_slice()), (&b"200"[..], &b"2"[..]));
@@ -612,6 +626,8 @@ fn baseline2_route_answers_2() {
 #[test]
 fn static_file_br_twin_served_by_reference() {
   let mut opts = Opts::new("brtwin");
+  // The test checks the `content-length` of the `.br` twin, which only the RFC 9110 fields carry
+  opts.rfc9110 = Some(true);
   let css: Vec<u8> = (0..20_000u32).map(|el| (el % 251) as u8).collect();
   let br: Vec<u8> = (0..9_000u32).map(|el| (el % 241) as u8).collect();
   std::fs::write(opts.root.join("a.css"), &css).unwrap();
@@ -742,12 +758,14 @@ fn abandoned_and_orphaned_parked_requests_are_dropped() {
   assert!(served.errors().is_empty(), "{:?}", served.errors());
 }
 
-// Brief step 1: `date` is sent by default (RFC 9110 section 6.6.1), as an IMF-fixdate, and not
-// with `set_date(false)`.
+// Brief step 1: `set_date(true)` sends `date` (RFC 9110 section 6.6.1) as an IMF-fixdate, and
+// `set_date(false)` does not (decision Q2: the default does not either).
 #[cfg_attr(miri, ignore)]
 #[test]
 fn date_header_toggles() {
-  let served = serve(Opts::new("date-on"));
+  let mut opts = Opts::new("date-on");
+  opts.date = Some(true);
+  let served = serve(opts);
   let mut client = Client::connect(served.addr);
   let rsp = client.get("/baseline2?a=1&b=1", &[]);
   let date = rsp.field(b"date").unwrap();
@@ -755,7 +773,7 @@ fn date_header_toggles() {
   assert!(date.ends_with(b" GMT") && date[3] == b',', "{date:?}");
   drop((client, served));
   let mut opts = Opts::new("date-off");
-  opts.date = false;
+  opts.date = Some(false);
   let served = serve(opts);
   let mut client = Client::connect(served.addr);
   let rsp = client.get("/baseline2?a=1&b=1", &[]);
@@ -953,6 +971,9 @@ fn idle_worker_trims_its_pools() {
 fn framework_steady_state_allocates_nothing_after_warmup() {
   static WORKER: AtomicU64 = AtomicU64::new(0);
   let mut opts = Opts::new("alloc");
+  // The most the framework does per response: the RFC 9110 fields (`date`, `content-length`) are
+  // encoded too
+  opts.rfc9110 = Some(true);
   std::fs::write(opts.root.join("a.css"), vec![b'c'; 5_000]).unwrap();
   std::fs::write(opts.root.join("a.css.br"), vec![b'b'; 3_000]).unwrap();
   opts.count = Some(&WORKER);
@@ -1153,11 +1174,14 @@ fn every_parked_slot_wakes_at_once_without_allocating() {
 
 // Ruling T14-i (RFC 9110 sections 9.3.2, 8.6, 15.3.5 and 15.4.5): a response to HEAD has the fields
 // that GET gets, `content-length` included, and no content; 204 has neither content nor
-// `content-length`; 304 has no content.
+// `content-length`; 304 has no content. The GET asserts `content-length`, which the default
+// leaves out (decision Q2), so the test asks for the RFC 9110 fields.
 #[cfg_attr(miri, ignore)]
 #[test]
 fn head_204_and_304_carry_no_content() {
-  let served = serve(Opts::new("no-content"));
+  let mut opts = Opts::new("no-content");
+  opts.rfc9110 = Some(true);
+  let served = serve(opts);
   let mut client = Client::connect(served.addr);
   let get = client.get("/hello", &[]);
   assert_eq!((get.field(b"content-length"), get.body.as_slice()), (Some(&b"5"[..]), &b"hello"[..]));
@@ -1181,16 +1205,19 @@ fn head_204_and_304_carry_no_content() {
 }
 
 // Ruling T14-j: `set_content_length(false)` leaves `content-length` out of responses with content
-// (HTTP/3 frames the body), and a response to HEAD keeps it.
+// (HTTP/3 frames the body), and a response to HEAD keeps it; `set_content_length(true)` puts it
+// in (decision Q2: the default leaves it out).
 #[cfg_attr(miri, ignore)]
 #[test]
 fn content_length_toggles() {
-  let served = serve(Opts::new("length-on"));
+  let mut opts = Opts::new("length-on");
+  opts.content_length = Some(true);
+  let served = serve(opts);
   let mut client = Client::connect(served.addr);
   assert_eq!(client.get("/baseline2?a=1&b=1", &[]).field(b"content-length"), Some(&b"1"[..]));
   drop((client, served));
   let mut opts = Opts::new("length-off");
-  opts.content_length = false;
+  opts.content_length = Some(false);
   let served = serve(opts);
   let mut client = Client::connect(served.addr);
   let rsp = client.get("/baseline2?a=1&b=1", &[]);
@@ -1198,6 +1225,52 @@ fn content_length_toggles() {
   let id = client.request(b"HEAD", "/hello", &[]);
   let head = client.wait(id);
   assert_eq!((head.field(b"content-length"), head.body.as_slice()), (Some(&b"5"[..]), &b""[..]));
+}
+
+// Decision Q2: by default a response carries `:status` and `content-type` only, like the HttpArena
+// HTTP/3 leaders (cnetmod, zix): no `date`, no `content-length` (the 404 and the 200 both), and a
+// response to HEAD keeps `content-length` (ruling T14-i).
+#[cfg_attr(miri, ignore)]
+#[test]
+fn default_headers_are_status_and_content_type_only() {
+  let served = serve(Opts::new("lean-default"));
+  let mut client = Client::connect(served.addr);
+  let rsp = client.get("/baseline2?a=1&b=1", &[]);
+  assert_eq!((status(&rsp), rsp.body.as_slice()), (&b"200"[..], &b"2"[..]));
+  assert_eq!(rsp.field(b"content-type"), Some(&b"text/plain"[..]));
+  assert_eq!((rsp.field(b"date"), rsp.field(b"content-length")), (None, None));
+  let mut names: Vec<&[u8]> = rsp.fields.iter().map(|el| el.0.as_slice()).collect();
+  names.sort_unstable();
+  assert_eq!(names, [&b":status"[..], b"content-type", b"server"], "{names:?}");
+  let rsp = client.get("/nothing-here", &[]);
+  assert_eq!(
+    (status(&rsp), rsp.field(b"date"), rsp.field(b"content-length")),
+    (&b"404"[..], None, None)
+  );
+  let id = client.request(b"HEAD", "/hello", &[]);
+  let head = client.wait(id);
+  assert_eq!((head.field(b"date"), head.field(b"content-length")), (None, Some(&b"5"[..])));
+  assert!(served.errors().is_empty(), "{:?}", served.errors());
+}
+
+// Decision Q2: `set_rfc9110_headers(true)` turns on `date` (RFC 9110 section 6.6.1) and
+// `content-length` (section 8.6) together.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn rfc9110_flag_adds_date_and_content_length() {
+  let mut opts = Opts::new("rfc-flag");
+  opts.rfc9110 = Some(true);
+  let served = serve(opts);
+  let mut client = Client::connect(served.addr);
+  let rsp = client.get("/baseline2?a=1&b=1", &[]);
+  assert_eq!((status(&rsp), rsp.body.as_slice()), (&b"200"[..], &b"2"[..]));
+  assert_eq!(rsp.field(b"content-length"), Some(&b"1"[..]));
+  let date = rsp.field(b"date").unwrap();
+  assert!(date.len() == 29 && date.ends_with(b" GMT"), "{date:?}");
+  assert_eq!(rsp.field(b"content-type"), Some(&b"text/plain"[..]));
+  let id = client.request(b"HEAD", "/hello", &[]);
+  assert_eq!(client.wait(id).field(b"content-length"), Some(&b"5"[..]));
+  assert!(served.errors().is_empty(), "{:?}", served.errors());
 }
 
 // Fix X6: a manual-mode route answers 500 on HTTP/3, with OperationModeMismatch to the error

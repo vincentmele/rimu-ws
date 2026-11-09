@@ -179,6 +179,11 @@ impl StatsCell {
 }
 
 /// HTTP/3 Server Framework: see the [module documentation](self).
+///
+/// The responses carry `:status` and `content-type` only by default (plus `content-encoding` and
+/// `vary` where static files need them), like the HttpArena HTTP/3 leaders (cnetmod, zix). That
+/// is not RFC 9110-compliant: `date` (section 6.6.1) and `content-length` (section 8.6) are left
+/// out, and [`Http3ServerFramework::set_rfc9110_headers`] turns both on.
 #[derive(Debug)]
 pub struct Http3ServerFramework<DA, EC, EX, RC, RNG, TCX> {
   content_length: bool,
@@ -220,9 +225,9 @@ where
     let error_cb: fn(_) = |_| {};
     let local_runtime_cb: fn() -> _ = || Ok(EX::LocalRuntime::new()?);
     Ok(Self {
-      content_length: true,
+      content_length: false,
       data: (),
-      date: true,
+      date: false,
       error_cb,
       executor,
       h3_params: H3Params::default(),
@@ -275,7 +280,8 @@ impl<DA, EC, EX, RC, RNG, TCX> Http3ServerFramework<DA, EC, EX, RC, RNG, TCX> {
 
   /// If responses with content carry `content-length` (RFC 9110 section 8.6: a SHOULD when the size
   /// is known; HTTP/3 frames the content without it). A response to `HEAD` carries it either way.
-  /// Defaults to `true`.
+  /// Defaults to `false`, which matches the lean style of the HttpArena HTTP/3 leaders (cnetmod,
+  /// zix) and is not RFC 9110-compliant: see [`Self::set_rfc9110_headers`].
   #[inline]
   #[must_use = must_use_itself_doc!()]
   pub const fn set_content_length(mut self, value: bool) -> Self {
@@ -284,7 +290,9 @@ impl<DA, EC, EX, RC, RNG, TCX> Http3ServerFramework<DA, EC, EX, RC, RNG, TCX> {
   }
 
   /// If responses carry a `date` header (RFC 9110 section 6.6.1: an origin server with a clock
-  /// must send one), formatted once a second. Defaults to `true`.
+  /// must send one), formatted once a second. Defaults to `false`, which matches the lean style
+  /// of the HttpArena HTTP/3 leaders (cnetmod, zix) and is not RFC 9110-compliant: see
+  /// [`Self::set_rfc9110_headers`].
   #[inline]
   #[must_use = must_use_itself_doc!()]
   pub const fn set_date(mut self, value: bool) -> Self {
@@ -388,6 +396,22 @@ impl<DA, EC, EX, RC, RNG, TCX> Http3ServerFramework<DA, EC, EX, RC, RNG, TCX> {
   #[must_use = must_use_itself_doc!()]
   pub const fn set_quic_params(mut self, value: QuicParams) -> Self {
     self.quic_params = value;
+    self
+  }
+
+  /// Turns on both response fields that RFC 9110 asks of an origin server and the default leaves
+  /// out: `date` (section 6.6.1, a MUST for a server with a clock) and `content-length` (section
+  /// 8.6, a SHOULD when the size is known). Shorthand for [`Self::set_date`] and
+  /// [`Self::set_content_length`] with the same value. Defaults to `false`: responses carry
+  /// `:status` and `content-type` only (plus `content-encoding` and `vary` where static files
+  /// need them), like the HttpArena HTTP/3 leaders (cnetmod, zix); that is not RFC
+  /// 9110-compliant, so call this with `true` where compliance matters. A response to `HEAD`
+  /// carries `content-length` either way.
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub const fn set_rfc9110_headers(mut self, value: bool) -> Self {
+    self.content_length = value;
+    self.date = value;
     self
   }
 

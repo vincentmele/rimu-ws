@@ -20,7 +20,9 @@
 //! RFC 9110 (ruling T14-i): a response to `HEAD` has the fields that `GET` would get,
 //! `content-length` included, and no content (section 9.3.2); 1xx and 204 have neither content
 //! nor `content-length` (section 8.6), 304 no content and no `content-length` (section 15.4.5).
-//! `content-length` of the other responses can be left out (ruling T14-j).
+//! `content-length` of the other responses can be left out (ruling T14-j), and by default it is,
+//! like `date`: the lean default is not RFC 9110-compliant, see
+//! [`Http3ServerFramework::set_rfc9110_headers`](super::Http3ServerFramework::set_rfc9110_headers).
 
 use crate::{
   collections::{ArrayVectorCopy, VectorUsize},

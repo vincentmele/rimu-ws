@@ -6,9 +6,12 @@
 //! Environment: `CERT_DIR` (default `/certs`, with `server.crt` and `server.key`; without them
 //! only h2c is served), `DATASET_PATH` (default `/data/dataset.json`), `STATIC_DIR` (default
 //! `/data/static`), `ARENA_PARAMS` (`permissive` for `HttpRecvParams::with_permissive_params`, as
-//! upstream's wtx-http2 entry does; otherwise the library defaults), `ARENA_H3_HEADERS` (`full`, the
-//! default: `content-length`, `date` and the `server` middleware on h3 responses, as on h2; or
-//! `min`: no `date`, no `content-length`, no middleware, which is the A/B of the user's decision Q2).
+//! upstream's wtx-http2 entry does; otherwise the library defaults), `ARENA_H3_HEADERS` (`min`, the
+//! default: h3 responses carry `content-type` only, no `date`, no `content-length`, no middleware,
+//! like the HttpArena h3 leaders cnetmod and zix and not RFC 9110-compliant; or `full`:
+//! `set_rfc9110_headers(true)` and the `server` middleware, as on h2; the user's decision Q2). The
+//! h3 limits are the defaults of `H3Params`, as in the HttpArena entry; `ARENA_PARAMS` is for h1
+//! and h2 only.
 //!
 //! With TLS on, SIGUSR1 prints the sums of the counters of the h3 workers on one line starting with
 //! `h3-stats` (what `h3-bench.sh` reads), and SIGINT or SIGTERM prints them with one line per
@@ -115,8 +118,8 @@ fn spawn_h3(
   data: ConnAux,
 ) -> rimu_ws::Result<(Http3Stats, std::thread::JoinHandle<rimu_ws::Result<()>>)> {
   let min_headers = match std::env::var("ARENA_H3_HEADERS").as_deref() {
-    Ok("min") => true,
-    Ok("full") | Err(_) => false,
+    Ok("min") | Err(_) => true,
+    Ok("full") => false,
     Ok(other) => {
       let msg = format!("ARENA_H3_HEADERS must be `min` or `full`, not `{other}`");
       return Err(std::io::Error::other(msg).into());
@@ -129,17 +132,13 @@ fn spawn_h3(
   )?
   .set_data(data)
   .set_error_cb(error_cb)
-  .set_http_recv_params(recv_params())
   .set_local_runtime_cb(runtime);
   let stats = framework.stats();
   let handle = std::thread::spawn(move || -> rimu_ws::Result<()> {
     let rslt = if min_headers {
-      framework
-        .set_content_length(false)
-        .set_date(false)
-        .run_in_threads("[::]:8443", router!(no_middleware)?)
+      framework.run_in_threads("[::]:8443", router!(no_middleware)?)
     } else {
-      framework.run_in_threads("[::]:8443", router!()?)
+      framework.set_rfc9110_headers(true).run_in_threads("[::]:8443", router!()?)
     };
     if let Err(err) = &rslt {
       eprintln!("arena-h2: the h3 server ended: {err}");
@@ -188,7 +187,10 @@ mod stats_signals {
       for sig in REPORTED {
         libc::sigaddset(&mut set, sig);
       }
-      libc::pthread_sigmask(libc::SIG_BLOCK, &set, core::ptr::null_mut());
+      // `pthread_sigmask` returns the error number, not -1 with `errno`; a mask that was not set
+      // would leave the signals to their default action (SIGUSR1 kills the process)
+      let rslt = libc::pthread_sigmask(libc::SIG_BLOCK, &set, core::ptr::null_mut());
+      assert_eq!(rslt, 0, "arena-h2: pthread_sigmask failed with error {rslt}");
       Blocked(set)
     }
   }
@@ -197,7 +199,10 @@ mod stats_signals {
     let _jh = std::thread::spawn(move || {
       loop {
         let mut sig: libc::c_int = 0;
-        // SAFETY: `blocked.0` was initialized by `sigemptyset` and `sig` is a valid `c_int`.
+        // SAFETY: `blocked.0` was initialized by `sigemptyset`; `sig` is a valid `c_int`. The
+        // set is blocked in this thread, which inherited the mask of `block` (called before the
+        // first thread started): `sigwait` requires its signals to be blocked, or a signal could
+        // run its action instead of being taken here.
         let rslt = unsafe { libc::sigwait(&blocked.0, &mut sig) };
         if rslt != 0 {
           continue;

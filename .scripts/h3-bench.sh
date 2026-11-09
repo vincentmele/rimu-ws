@@ -44,7 +44,8 @@
 #                 (default /mnt/nvme1tb/claude-tmp/arena-main)
 #   ARENA_BIN     the arena-h2 binary (default $CARGO_TARGET_DIR/release/arena-h2; the HttpArena entry
 #                 builds with -C target-cpu=native, so the default target dir is the one built so)
-#   ARENA_H3_HEADERS  min or full, passed on to arena-h2 (the response headers A/B); recorded in
+#   ARENA_H3_HEADERS  min (arena-h2's default: content-type only, like cnetmod and zix) or full
+#                 (RFC 9110 fields and the server middleware), passed on to arena-h2; recorded in
 #                 the output line when set
 #   RUNS          runs per server start (default 3)
 #   DURATION      h2load -D (default 5s)
@@ -71,7 +72,6 @@ work=${TMPDIR:-/mnt/nvme1tb/claude-tmp}/h3bench
 mkdir -p "$work"
 # Shared with the generator container: it creates ready, the script go, the container done.
 sync_dir=$work/sync-$$
-mkdir -p "$sync_dir"
 
 # Mounted over the generator's /etc/hosts (the host network shares the host's own otherwise).
 gen_hosts=()
@@ -160,6 +160,8 @@ cleanup() {
 	done
 }
 trap cleanup EXIT
+# After the trap: a script that dies here still removes it.
+mkdir -p "$sync_dir"
 
 # As HttpArena does: thousands of connections need more than the default 1024 descriptors.
 ulimit -n "$(ulimit -Hn)"
@@ -206,9 +208,11 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 		exit 5
 	fi
 	# A server that does not answer leaves h2load waiting for its 30 s idle timeout: give it 10 s
-	# (less, if the deadline comes sooner).
+	# (less, if the deadline comes sooner, but at least 1 s: `timeout 0` has no limit).
 	left=$((deadline - SECONDS))
-	answer=$(timeout $((left < 10 ? left : 10)) docker run --rm --name "$gen_name" --network host --cpuset-cpus $load_cpus \
+	probe_timeout=$((left < 10 ? left : 10))
+	[ "$probe_timeout" -ge 1 ] || probe_timeout=1
+	answer=$(timeout "$probe_timeout" docker run --rm --name "$gen_name" --network host --cpuset-cpus $load_cpus \
 		"${gen_hosts[@]}" "$generator" --alpn-list=h3 -n 1 -c 1 -t 1 "$probe_url" 2>/dev/null || true)
 	docker rm -f "$gen_name" >/dev/null 2>&1 || true
 	if [[ $answer == *" 1 2xx"* ]]; then
