@@ -95,7 +95,8 @@ pub(crate) struct Budget {
 }
 
 impl Budget {
-  const fn new(max: usize) -> Self {
+  /// Nothing held, at most `max` bytes.
+  pub(crate) const fn new(max: usize) -> Self {
     Self { held: 0, max }
   }
 

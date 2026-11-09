@@ -40,7 +40,7 @@ use crate::{
     },
     http3_server_framework::Http3ManualStream,
   },
-  http3::{H3Handler, H3ReqCtx, H3Request, ReqOutcome, encode_static_line, encode_static_prefix},
+  http3::{H3Handler, H3ReqCtx, H3Request, ReqOutcome, encode_static_line},
   misc::{SharedBytes, from_utf8_basic},
   quic::{BodyRef, ConnHandle, StreamId},
   sync::{Arc, AtomicU64, AtomicWaker, SyncMutex},
@@ -77,6 +77,9 @@ const MSG_URI: usize = 256;
 const KEEP_BODY: usize = 64 * 1024;
 /// What [`RouterHandler::trim_idle`] keeps of the request buffers and of the slots.
 const IDLE_KEEP: usize = 4;
+/// The prefix of a field section that references no entry of the dynamic table, as
+/// `encode_static` writes it: a Required Insert Count of 0 and a Base of 0.
+const SECTION_PREFIX: [u8; 2] = [0, 0];
 
 /// The routes of an endpoint found for a path, handed back to the endpoints.
 pub(crate) type Matches = ArrayVectorCopy<RouteMatch, 4>;
@@ -266,10 +269,10 @@ where
     };
     let date = self.date.as_ref().map(DateLine::line);
     let rslt = match self.head.encode(status, &msg.headers, length, date) {
-      Ok(section) if head || without_length => cx.respond(section, &[]),
+      Ok(section) if head || without_length => cx.respond(&section, &[]),
       Ok(section) => match shared {
-        Some(body) => BodyRef::try_from(body).and_then(|el| cx.respond_body(section, el)),
-        None => cx.respond(section, msg.body.as_slice()),
+        Some(body) => BodyRef::try_from(body).and_then(|el| cx.respond_body(&section, el)),
+        None => cx.respond(&section, msg.body.as_slice()),
       },
       Err(err) => Err(err),
     };
@@ -387,6 +390,10 @@ where
       Some(elem) => elem,
       None => self.data.clone(),
     };
+    // Every handler, whatever its route, gets its request through the `AutoStream` (a `State`
+    // borrows it), and the router picks the endpoint of the route by its matches: neither can be
+    // left out with the same effect for the handler (ruling T16-a; building it moves pooled
+    // buffers, it allocates nothing)
     let auto_stream = AutoStream::new(data, cx.peer(), None, Request::new(method, msg));
     let fut = self.dispatch.call(auto_stream, matches);
     let idx = self.slots.insert(fut, cx.conn(), req.stream)?;
@@ -448,12 +455,24 @@ fn fill_request(msg: &mut MsgBufferString, req: &H3Request<'_>) -> Result<Method
     return Err(StatusCode::BadRequest);
   };
   msg.uri.set_from_parts(scheme, authority, path);
-  for (name, value) in req.fields.iter() {
-    let (Ok(name), Ok(value)) = (from_utf8_basic(name), from_utf8_basic(value)) else {
-      return Err(StatusCode::BadRequest);
-    };
-    if msg.headers.push_from_iter(Header::new(false, false, name, [value])).is_err() {
-      return Err(StatusCode::BadRequest);
+  // Checked once, when they were decoded, if they are ASCII (ruling T16-a); else here
+  match req.fields.ascii() {
+    Some(fields) => {
+      for (name, value) in fields {
+        if msg.headers.push_from_iter(Header::new(false, false, name, [value])).is_err() {
+          return Err(StatusCode::BadRequest);
+        }
+      }
+    }
+    None => {
+      for (name, value) in req.fields.iter() {
+        let (Ok(name), Ok(value)) = (from_utf8_basic(name), from_utf8_basic(value)) else {
+          return Err(StatusCode::BadRequest);
+        };
+        if msg.headers.push_from_iter(Header::new(false, false, name, [value])).is_err() {
+          return Err(StatusCode::BadRequest);
+        }
+      }
     }
   }
   if msg.body.extend_from_copyable_slice(req.body).is_err() {
@@ -511,7 +530,10 @@ struct ResponseHead {
   // The block used last
   last: Option<usize>,
   lower: VectorUsize<u8>,
+  // The lines of a combination too long to keep encoded
   section: VectorUsize<u8>,
+  // The lines encoded per response: `content-length` and the other fields
+  tail: VectorUsize<u8>,
   uses: u64,
 }
 
@@ -523,19 +545,22 @@ impl ResponseHead {
       last: None,
       lower: VectorUsize::new(),
       section: VectorUsize::new(),
+      tail: VectorUsize::new(),
       uses: 0,
     }
   }
 
   // The field section of a response of `status`, `headers`, `content-length` if `length` and the
-  // `date` line if any.
-  fn encode(
-    &mut self,
+  // `date` line if any, in pieces that joined are the section: the prefix, the lines of the block
+  // (kept encoded, or encoded now), the `date` line and the lines encoded per response. Each goes
+  // to the stream with one copy (ruling T16-a).
+  fn encode<'this>(
+    &'this mut self,
     status: StatusCode,
     headers: &Headers,
     length: Option<usize>,
-    date: Option<&[u8]>,
-  ) -> crate::Result<&[u8]> {
+    date: Option<&'this [u8]>,
+  ) -> crate::Result<[&'this [u8]; 4]> {
     let [mut content_type, mut content_encoding, mut vary] = [None; 3];
     // If a field is left for the second pass below
     let mut others = false;
@@ -556,24 +581,31 @@ impl ResponseHead {
         others = true;
       }
     }
-    self.section.clear();
-    encode_static_prefix(&mut self.section)?;
     let fields = [content_type, content_encoding, vary];
     let idx = self.block(u16::from(status), fields)?;
-    match idx.and_then(|el| self.blocks.get(el)) {
-      Some(block) => self.section.extend_from_copyable_slice(block.lines.as_slice())?,
-      None => write_block(u16::from(status), fields, &mut self.section)?,
+    if idx.is_none() {
+      self.section.clear();
+      write_block(u16::from(status), fields, &mut self.section)?;
     }
-    if let Some(elem) = date {
-      self.section.extend_from_copyable_slice(elem)?;
-    }
+    self.tail.clear();
     if let Some(elem) = length {
       let mut digits = [0u8; 20];
-      encode_static_line(b"content-length", decimal(elem, &mut digits), &mut self.section)?;
+      encode_static_line(b"content-length", decimal(elem, &mut digits), &mut self.tail)?;
     }
-    if !others {
-      return Ok(self.section.as_slice());
+    if others {
+      self.encode_others(headers, date.is_some())?;
     }
+    let lines = match idx.and_then(|el| self.blocks.get(el)) {
+      Some(block) => block.lines.as_slice(),
+      None => self.section.as_slice(),
+    };
+    Ok([&SECTION_PREFIX, lines, date.unwrap_or_default(), self.tail.as_slice()])
+  }
+
+  // The fields of `headers` that the block does not have, into the tail: those after the first of
+  // each kind of the block and the others, but `content-length`, the fields specific to a
+  // connection and, with `date`, `date`.
+  fn encode_others(&mut self, headers: &Headers, date: bool) -> crate::Result<()> {
     let mut firsts = [true; 3];
     for header in headers.iter() {
       let name = header.name.as_bytes();
@@ -583,7 +615,7 @@ impl ResponseHead {
         Some(Known::Vary) => firsts.get_mut(2),
         // Written above, or not sent over HTTP/3 (RFC 9114 section 4.2)
         Some(Known::ContentLength | Known::ConnectionSpecific) => continue,
-        Some(Known::Date) if date.is_some() => continue,
+        Some(Known::Date) if date => continue,
         Some(Known::Date) | None => None,
       };
       if let Some(elem) = first
@@ -599,9 +631,9 @@ impl ResponseHead {
       } else {
         name
       };
-      encode_static_line(name, header.value.as_bytes(), &mut self.section)?;
+      encode_static_line(name, header.value.as_bytes(), &mut self.tail)?;
     }
-    Ok(self.section.as_slice())
+    Ok(())
   }
 
   // The index of the block of `status` and `fields`, encoded now if it was not; `None` for values
@@ -978,7 +1010,7 @@ mod tests {
     },
     http3::encode_static,
   };
-  use alloc::vec::Vec;
+  use alloc::{vec, vec::Vec};
 
   // The fields of the encoder as one comparison after the other found them before ruling T16-a.
   fn known_one_by_one(name: &[u8]) -> Option<Known> {
@@ -1106,8 +1138,44 @@ mod tests {
       let (status, fields, lines) = cases[idx];
       expected.clear();
       encode_static(lines, &mut expected).unwrap();
-      let section = head.encode(status, &headers(fields), None, None).unwrap();
+      let section = head.encode(status, &headers(fields), None, None).unwrap().concat();
       assert_eq!(section, expected.as_slice(), "case {idx}");
+    }
+  }
+
+  // Ruling T16-a (single-copy responses): the pieces of a section, the block kept encoded (or
+  // encoded now, for values too long to keep), the `date` line and the lines encoded per response,
+  // joined, are the static encoding of the fields in that order.
+  #[test]
+  fn section_pieces_join_to_the_static_encoding() {
+    let mut prefix = VectorUsize::new();
+    encode_static(&[], &mut prefix).unwrap();
+    assert_eq!(prefix.as_slice(), super::SECTION_PREFIX);
+    let long = "x".repeat(600);
+    let mut date = VectorUsize::new();
+    crate::http3::encode_static_line(b"date", b"Mon, 09 Nov 2026 12:00:00 GMT", &mut date).unwrap();
+    let mut head = ResponseHead::new();
+    for round in 0..3 {
+      for (content_type, length, with_date) in
+        [("text/plain", Some(17), true), (long.as_str(), Some(5), false), ("a/b", None, true)]
+      {
+        let fields = headers(&[("content-type", content_type), ("server", "rimu")]);
+        let date_line = with_date.then_some(date.as_slice());
+        let pieces = head.encode(StatusCode::Ok, &fields, length, date_line).unwrap();
+        let mut expected = VectorUsize::new();
+        let length_text = length.map(|el: usize| alloc::format!("{el}"));
+        let mut lines: Vec<(&[u8], &[u8])> =
+          vec![(b":status", b"200"), (b"content-type", content_type.as_bytes())];
+        if with_date {
+          lines.push((b"date", b"Mon, 09 Nov 2026 12:00:00 GMT"));
+        }
+        if let Some(elem) = &length_text {
+          lines.push((b"content-length", elem.as_bytes()));
+        }
+        lines.push((b"server", b"rimu"));
+        encode_static(&lines, &mut expected).unwrap();
+        assert_eq!(pieces.concat(), expected.as_slice(), "round {round} {content_type:.10}");
+      }
     }
   }
 }

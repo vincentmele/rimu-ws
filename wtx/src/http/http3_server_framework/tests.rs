@@ -1528,3 +1528,19 @@ fn data_changes_stay_with_their_request_unless_reused() {
   let reused: Vec<Vec<u8>> = (1..=4).map(|el: u8| vec![b'0' + el]).collect();
   assert_eq!(visits_seen(Some(true)), reused);
 }
+
+// Ruling T16-a (fields validated once): a request whose fields are ASCII reaches its handler
+// without a second check; one with obs-text that is UTF-8 too, after the check; one whose obs-text
+// is not UTF-8 is answered with 400, as before.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn field_values_beyond_ascii_are_checked_once_more() {
+  let served = serve(Opts::new("obs-text"));
+  let mut client = Client::connect(served.addr);
+  let ascii = client.get("/baseline2?a=1&b=1", &[(&b"x-a"[..], &b"plain"[..])]);
+  assert_eq!((status(&ascii), ascii.body.as_slice()), (&b"200"[..], &b"2"[..]));
+  let utf8 = client.get("/baseline2?a=1&b=1", &[(&b"x-a"[..], "café".as_bytes())]);
+  assert_eq!((status(&utf8), utf8.body.as_slice()), (&b"200"[..], &b"2"[..]));
+  let bad = client.get("/baseline2?a=1&b=1", &[(&b"x-a"[..], &b"caf\xe9"[..])]);
+  assert_eq!(status(&bad), b"400");
+}

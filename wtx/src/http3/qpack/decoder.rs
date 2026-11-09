@@ -25,7 +25,7 @@ use crate::{
   },
   http3::{
     H3ErrorCode, Http3Error,
-    qpack::{DecodeMemo, static_table::STATIC_TABLE},
+    qpack::{DecodeMemo, StaticRef, static_table::STATIC_TABLE},
   },
   misc::{Lease, Usize},
   sync::AtomicU64,
@@ -268,7 +268,8 @@ impl QpackDecoder {
       return self.block(stream, prefix.ric);
     }
     self.unblock(stream);
-    let _lowest = self.decode_lines(prefix, section, scratch, sink)?;
+    let _lowest =
+      self.decode_lines(prefix, section, scratch, &mut |name, value, _| sink(name, value))?;
     self.finish(stream, prefix.ric)
   }
 
@@ -276,6 +277,7 @@ impl QpackDecoder {
   /// once it is decoded. A replay has the effects of a decode: a stream that would block blocks,
   /// and the Section Acknowledgment is queued. `memo` is this decoder's: it replays only what was
   /// decoded against the table of this decoder since its last `new` or `reset`.
+  #[cfg_attr(not(test), allow(dead_code, reason = "connections take the static references too"))]
   pub(crate) fn decode_with_memo<const N: usize>(
     &mut self,
     memo: &mut DecodeMemo<N>,
@@ -284,23 +286,38 @@ impl QpackDecoder {
     scratch: &mut VectorUsize<u8>,
     sink: &mut dyn FnMut(&[u8], &[u8]) -> crate::Result<()>,
   ) -> crate::Result<DecodeOutcome> {
+    self
+      .decode_with_memo_ref(memo, stream, section, scratch, &mut |name, value, _| sink(name, value))
+  }
+
+  /// [`Self::decode_with_memo`] whose sink gets with each field the static table entry that gave
+  /// its name, if one did ([`StaticRef`], ruling T16-a): the request head classifies known fields
+  /// by it.
+  pub(crate) fn decode_with_memo_ref<const N: usize>(
+    &mut self,
+    memo: &mut DecodeMemo<N>,
+    stream: u64,
+    section: &[u8],
+    scratch: &mut VectorUsize<u8>,
+    sink: &mut dyn FnMut(&[u8], &[u8], Option<StaticRef>) -> crate::Result<()>,
+  ) -> crate::Result<DecodeOutcome> {
     let prefix = self.prefix(section)?;
     if prefix.ric > self.insert_count {
       return self.block(stream, prefix.ric);
     }
     self.unblock(stream);
     if let Some(fields) = memo.lookup(self.epoch, prefix.ric, section, self.oldest_live()) {
-      for (name, value) in fields {
-        sink(name, value)?;
+      for (name, value, sref) in fields {
+        sink(name, value, sref)?;
       }
       return self.finish(stream, prefix.ric);
     }
     let mut recorder = memo.insert(self.epoch, prefix.ric, section);
-    let lowest = self.decode_lines(prefix, section, scratch, &mut |name, value| {
+    let lowest = self.decode_lines(prefix, section, scratch, &mut |name, value, sref| {
       if let Some(elem) = &mut recorder {
-        elem.push(name, value);
+        elem.push(name, value, sref);
       }
-      sink(name, value)
+      sink(name, value, sref)
     })?;
     if let Some(elem) = recorder {
       elem.seal(lowest);
@@ -422,7 +439,7 @@ impl QpackDecoder {
     prefix: Prefix,
     section: &'this [u8],
     scratch: &mut VectorUsize<u8>,
-    sink: &mut dyn FnMut(&[u8], &[u8]) -> crate::Result<()>,
+    sink: &mut dyn FnMut(&[u8], &[u8], Option<StaticRef>) -> crate::Result<()>,
   ) -> crate::Result<u64> {
     let mut lowest = u64::MAX;
     let mut highest = None;
@@ -434,11 +451,13 @@ impl QpackDecoder {
         lowest = lowest.min(abs);
         highest = highest.max(Some(abs));
       };
+      let mut sref = None;
       let (name, value, len) = if first & 0b1000_0000 != 0 {
         // Indexed Field Line (RFC 9204 section 4.5.2)
         let (idx, len) = section_int(rest, 6)?;
         if first & 0b0100_0000 != 0 {
           let (name, value) = static_entry(idx)?;
+          sref = static_ref(idx, true);
           (Part::Borrowed(name), Part::Borrowed(value), len)
         } else {
           let (abs, entry) = self.section_entry(prefix, relative(prefix.base, idx))?;
@@ -450,6 +469,7 @@ impl QpackDecoder {
         // Literal Field Line with Name Reference (section 4.5.4)
         let (idx, idx_len) = section_int(rest, 4)?;
         let name = if first & 0b0001_0000 != 0 {
+          sref = static_ref(idx, false);
           Part::Borrowed(static_entry(idx)?.0)
         } else {
           let (abs, entry) = self.section_entry(prefix, relative(prefix.base, idx))?;
@@ -484,7 +504,7 @@ impl QpackDecoder {
         (name, value, idx_len.wrapping_add(value_len))
       };
       let bytes = scratch.as_slice();
-      sink(name.get(bytes), value.get(bytes))?;
+      sink(name.get(bytes), value.get(bytes), sref)?;
       rest = rest.get(len..).unwrap_or_default();
     }
     // The Required Insert Count must be the one that the references need (section 2.2.1)
@@ -1001,6 +1021,14 @@ fn static_entry(idx: u64) -> crate::Result<(&'static [u8], &'static [u8])> {
   }
   cold_path();
   Err(decompression_failed(Http3Error::InvalidStaticIndex))
+}
+
+// The reference to static entry `idx`, which `static_entry` checked or checks next.
+fn static_ref(idx: u64, with_value: bool) -> Option<StaticRef> {
+  u8::try_from(idx)
+    .ok()
+    .filter(|el| usize::from(*el) < STATIC_TABLE.len())
+    .map(|idx| StaticRef { idx, with_value })
 }
 
 fn static_name(idx: u64) -> crate::Result<&'static [u8]> {
@@ -1524,6 +1552,50 @@ mod tests {
     });
     assert!(matches!(rslt, Err(Error::Http3(Http3Error::BufferTooSmall))));
     assert_eq!(calls, 1);
+  }
+
+  // Ruling T16-a: each field comes with the static entry that gave its name (and its value, for an
+  // Indexed Field Line), and with none for a literal name or a name of the dynamic table; a replay
+  // of the memo gives the same references.
+  #[test]
+  fn fields_carry_their_static_reference() {
+    use crate::http3::qpack::StaticRef;
+    let mut decoder = after_b2();
+    let mut section = Vec::new();
+    wire::prefix(&mut section, 2, 2, 8);
+    wire::indexed(&mut section, true, 17); // :method GET
+    wire::name_ref(&mut section, true, false, 1, b"/index", false); // :path, a literal value
+    wire::name_ref(&mut section, true, false, 31, b"br", true); // accept-encoding, Huffman value
+    wire::literal(&mut section, false, b"x-y", b"z", false);
+    wire::indexed(&mut section, false, 0); // dynamic: :path /sample/path
+    wire::name_ref(&mut section, false, false, 1, b"x", false); // dynamic name: :authority
+    let expected = [
+      (&b":method"[..], &b"GET"[..], Some(StaticRef { idx: 17, with_value: true })),
+      (b":path", b"/index", Some(StaticRef { idx: 1, with_value: false })),
+      (b"accept-encoding", b"br", Some(StaticRef { idx: 31, with_value: false })),
+      (b"x-y", b"z", None),
+      (b":path", b"/sample/path", None),
+      (b":authority", b"x", None),
+    ];
+    let mut memo = DecodeMemo::<4>::new();
+    let mut scratch = VectorUsize::new();
+    for (round, stream) in [(0, 8u64), (1, 12)] {
+      let mut got = Vec::new();
+      let outcome = decoder.decode_with_memo_ref(
+        &mut memo,
+        stream,
+        &section,
+        &mut scratch,
+        &mut |name, value, sref| {
+          got.push((name.to_vec(), value.to_vec(), sref));
+          Ok(())
+        },
+      );
+      assert_eq!(outcome.unwrap(), DONE_DYNAMIC, "round {round}");
+      let want: Vec<_> = expected.iter().map(|(n, v, r)| (n.to_vec(), v.to_vec(), *r)).collect();
+      assert_eq!(got, want, "round {round}");
+    }
+    assert_eq!(memo.hits, 1);
   }
 
   #[test]

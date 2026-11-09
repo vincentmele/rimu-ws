@@ -238,6 +238,17 @@ impl<'c, S> ConnCtx<'c, S> {
     self.streams.write(self.pools, id, Source::Bytes(bytes), fin)
   }
 
+  /// [`Self::write`] of the bytes of `pieces` joined, each copied once, straight into the stream.
+  #[inline]
+  pub(crate) fn write_gather(
+    &mut self,
+    id: StreamId,
+    pieces: &[&[u8]],
+    fin: bool,
+  ) -> crate::Result<()> {
+    self.streams.write(self.pools, id, Source::Gather(pieces), fin)
+  }
+
   /// [`Self::write`] of `body`, which is not copied: the stream holds it until every frame that
   /// carries it is acknowledged, or the stream is reset.
   #[inline]

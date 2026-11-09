@@ -10,7 +10,7 @@
 //! One memo goes with one decoder. The decoder replays a kept section with the same effects as a
 //! decode: the blocked check before and the Section Acknowledgment after.
 
-use crate::collections::VectorUsize;
+use crate::{collections::VectorUsize, http3::qpack::StaticRef};
 
 /// Longer field sections are not kept: they are rarely repeated and costly to compare.
 pub(crate) const MAX_SECTION_LEN: usize = 128;
@@ -24,8 +24,8 @@ struct Entry {
   bytes: VectorUsize<u8>,
   /// The decoder table that the section was decoded against.
   epoch: u64,
-  /// Name and value lengths of each field, in order.
-  fields: VectorUsize<(u32, u32)>,
+  /// Name and value lengths of each field, and its static reference (`StaticRef::code`), in order.
+  fields: VectorUsize<(u32, u32, u8)>,
   last_use: u64,
   lowest_dynamic: u64,
   ric: u64,
@@ -79,7 +79,7 @@ impl<const N: usize> DecodeMemo<N> {
   /// The bytes that the kept fields take on the heap.
   pub(crate) fn heap_bytes(&self) -> usize {
     self.entries.iter().fold(0usize, |acc, el| {
-      let fields = el.fields.capacity().saturating_mul(size_of::<(u32, u32)>());
+      let fields = el.fields.capacity().saturating_mul(size_of::<(u32, u32, u8)>());
       acc.saturating_add(el.bytes.capacity()).saturating_add(fields)
     })
   }
@@ -158,23 +158,23 @@ impl<const N: usize> DecodeMemo<N> {
   }
 }
 
-/// The fields of a kept section: name and value.
+/// The fields of a kept section: name, value and static reference.
 #[derive(Debug)]
 pub(crate) struct MemoFields<'memo> {
   bytes: &'memo [u8],
-  fields: core::slice::Iter<'memo, (u32, u32)>,
+  fields: core::slice::Iter<'memo, (u32, u32, u8)>,
 }
 
 impl<'memo> Iterator for MemoFields<'memo> {
-  type Item = (&'memo [u8], &'memo [u8]);
+  type Item = (&'memo [u8], &'memo [u8], Option<StaticRef>);
 
   #[inline]
   fn next(&mut self) -> Option<Self::Item> {
-    let (name_len, value_len) = self.fields.next()?;
+    let (name_len, value_len, sref) = self.fields.next()?;
     let (name, rest) = self.bytes.split_at_checked(usize::try_from(*name_len).ok()?)?;
     let (value, rest) = rest.split_at_checked(usize::try_from(*value_len).ok()?)?;
     self.bytes = rest;
-    Some((name, value))
+    Some((name, value, StaticRef::from_code(*sref)))
   }
 }
 
@@ -190,7 +190,7 @@ pub(crate) struct MemoRecorder<'memo> {
 impl MemoRecorder<'_> {
   /// Keeps a decoded field. A section that decodes to more than [`MAX_DECODED_LEN`] bytes, or
   /// whose fields can not be stored, is not kept.
-  pub(crate) fn push(&mut self, name: &[u8], value: &[u8]) {
+  pub(crate) fn push(&mut self, name: &[u8], value: &[u8], sref: Option<StaticRef>) {
     let fits =
       self.entry.bytes.len().wrapping_add(name.len()).wrapping_add(value.len()) <= MAX_DECODED_LEN;
     let (Ok(name_len), Ok(value_len)) = (u32::try_from(name.len()), u32::try_from(value.len()))
@@ -201,7 +201,7 @@ impl MemoRecorder<'_> {
     self.valid = self.valid
       && fits
       && self.entry.bytes.extend_from_copyable_slices([name, value]).is_ok()
-      && self.entry.fields.push((name_len, value_len)).is_ok();
+      && self.entry.fields.push((name_len, value_len, StaticRef::code(sref))).is_ok();
   }
 
   /// Keeps the section, which referenced no dynamic table entry below `lowest_dynamic`

@@ -103,6 +103,36 @@ pub(crate) static STATIC_TABLE: [(&[u8], &[u8]); 99] = [
   (b"x-frame-options", b"sameorigin"),
 ];
 
+/// The static table entry that a decoded field came from (ruling T16-a): its name, and its value
+/// too for an Indexed Field Line. A field with a literal name, or a name of the dynamic table, has
+/// none.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StaticRef {
+  /// The index of the entry, below 99.
+  pub(crate) idx: u8,
+  /// If the value is the entry's too.
+  pub(crate) with_value: bool,
+}
+
+impl StaticRef {
+  // The reference as one byte for the decode memo, `NONE_CODE` for none
+  pub(crate) const NONE_CODE: u8 = u8::MAX;
+
+  pub(crate) const fn code(this: Option<Self>) -> u8 {
+    match this {
+      Some(elem) => elem.idx | if elem.with_value { 0x80 } else { 0 },
+      None => Self::NONE_CODE,
+    }
+  }
+
+  pub(crate) const fn from_code(code: u8) -> Option<Self> {
+    if code == Self::NONE_CODE {
+      return None;
+    }
+    Some(Self { idx: code & 0x7f, with_value: code & 0x80 != 0 })
+  }
+}
+
 /// The index of the entry with `name` and `value`, if there is one.
 pub(crate) fn find_exact(name: &[u8], value: &[u8]) -> Option<u8> {
   let idx =

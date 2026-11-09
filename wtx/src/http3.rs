@@ -64,7 +64,7 @@ pub use http3_error::{H3ErrorCode, Http3Error};
   allow(unused_imports, reason = "only the HTTP/3 server framework encodes field lines")
 )]
 pub(crate) use qpack::{
-  DecodeMemo, DecodeOutcome, QpackDecoder, encode_static, encode_static_line, encode_static_prefix,
+  DecodeMemo, DecodeOutcome, QpackDecoder, encode_static, encode_static_line,
 };
 #[allow(unused_imports, reason = "the static table, for the checks of tests and fuzzing")]
 pub(crate) use qpack::{STATIC_TABLE, find_exact, find_name};

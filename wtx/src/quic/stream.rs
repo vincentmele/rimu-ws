@@ -1129,6 +1129,47 @@ mod tests {
     assert!(link.server.parts.pools.rx_blocks.len() > 0);
   }
 
+  // Ruling T16-a (single-copy responses): a write of several pieces puts on the stream exactly the
+  // bytes of one write of them joined, whatever their sizes (inline room, blocks, empty pieces).
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn gathered_write_is_one_write_of_the_pieces_joined() {
+    let big: Vec<u8> = (0..9000u32).map(|el| (el % 251) as u8).collect();
+    let pieces: [&[&[u8]]; 4] = [
+      &[b"ab", b"", b"cdef"],
+      &[b"\x01\x05", &[0, 0, 0xd9], b"\x00\x01", b"x"],
+      &[b"head", big.as_slice(), b"tail"],
+      &[&[], &[]],
+    ];
+    let mut link = settled(&LinkOpts::new(None));
+    let mut ids = Vec::new();
+    for parts in pieces {
+      let joined: Vec<u8> = parts.concat();
+      let (gathered, single) = (open_bidi(&mut link).unwrap(), open_bidi(&mut link).unwrap());
+      write(&mut link, gathered, b"GET", true);
+      write(&mut link, single, b"GET", true);
+      ids.push((gathered, single, joined));
+    }
+    link.run();
+    let now_us = link.now_us;
+    for (gathered, single, joined) in &ids {
+      let parts = pieces[ids.iter().position(|el| el.0 == *gathered).unwrap()];
+      link.server.with_ctx(now_us, |cx| {
+        cx.write_gather(*gathered, parts, true).unwrap();
+        cx.write(*single, joined, true).unwrap();
+      });
+    }
+    link.run();
+    for (gathered, single, joined) in ids {
+      let got =
+        |id: StreamId| link.client.app.streams.get(&id.0).map(|el| (el.data.clone(), el.fin));
+      assert_eq!(got(gathered), got(single));
+      if !joined.is_empty() {
+        assert_eq!(got(gathered), Some((joined, true)));
+      }
+    }
+  }
+
   // Ruling T16-c: the 64 responses of one packet count 64 FINs, in one flush that carries the
   // acknowledgment of the requests; BLOCKED frames received are counted by kind.
   #[cfg_attr(miri, ignore)]
