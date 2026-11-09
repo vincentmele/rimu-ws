@@ -1,0 +1,92 @@
+imds instance-type: m6a.24xlarge
+imds placement/availability-zone: sa-east-1b
+uname -r: 7.0.0-1016-aws
+server cpus 0,48,1,49,2,50,3,51,4,52,5,53,6,54,7,55,8,56,9,57,10,58,11,59,12,60,13,61,14,62,15,63,16,64,17,65,18,66,19,67,20,68,21,69,22,70,23,71 | generator cpus 24,72,25,73,26,74,27,75,28,76,29,77,30,78,31,79,32,80,33,81,34,82,35,83,36,84,37,85,38,86,39,87,40,88,41,89,42,90,43,91,44,92,45,93,46,94,47,95 | h2load -t 48
+pmu=yes
+
+## variants (phase V)
+
+### baseline-h3 (median of 3 passes; base 5,809,027 req/s, 2.13 us/req)
+
+| variant | req/s | vs base | srv us/req | vs base | spread | verdict | resp/pkt | ACK-only | flushes w/ ACK | blocked in (streams/data/stream) | lost | PTO | resent | starts |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| base | 5,809,027 | +0.0% | 2.13 | +0.0% | 0.7% | - | 62.1 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 3 |
+| prev | 5,792,231 | -0.3% | 2.08 | -2.2% | 0.9% | WIN (within spread) [prev: read inverted] | 61.7 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 3 |
+| zix | 5,964,284 | +2.7% | 1.40 | -34.2% | 1.2% | - | - | - | - | -/-/- | - | - | - | 3 |
+
+The verdict of `prev` (the build before the one measured) reads inverted: its loss is the newer build's win. "within spread": the change is smaller than the spread of the passes of base or of the variant.
+
+rps by pass (k = 1000; ! = errors):
+
+| variant | pass 1 | pass 2 | pass 3 |
+|---|---|---|---|
+| base | 5824k | 5785k | 5809k |
+| prev | 5792k | 5837k | 5784k |
+| zix | 5951k | 6023k | 5964k |
+
+### static-h3 (median of 3 passes; base 947,625 req/s, 43.17 us/req)
+
+| variant | req/s | vs base | srv us/req | vs base | spread | verdict | resp/pkt | ACK-only | flushes w/ ACK | blocked in (streams/data/stream) | lost | PTO | resent | starts |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| base | 947,625 | +0.0% | 43.17 | +0.0% | 2.9% | - | 0.1 | 0.0% | 81.5% | 0/0/0 | 18064 | 0 | 32729 | 3 |
+| prev | 950,894 | +0.3% | 41.36 | -4.2% | 2.2% | WIN (within spread) [prev: read inverted] | 0.1 | 0.0% | 78.8% | 0/0/0 | 23097 | 0 | 38380 | 3 |
+| zix | 578,918 | -38.9% | 52.20 | +20.9% | 7.0% | - | - | - | - | -/-/- | - | - | - | 3 |
+
+The verdict of `prev` (the build before the one measured) reads inverted: its loss is the newer build's win. "within spread": the change is smaller than the spread of the passes of base or of the variant.
+
+rps by pass (k = 1000; ! = errors):
+
+| variant | pass 1 | pass 2 | pass 3 |
+|---|---|---|---|
+| base | 948k | 961k | 934k |
+| prev | 948k | 951k | 970k |
+| zix | 602k | 579k | 562k |
+
+knobs each variant ran with (first start; the server's own line):
+
+- base: headers=min data=reuse gro=0 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete
+- prev: headers=min data=reuse gro=0 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete
+
+## vprofile: software profile windows
+
+| profile | server | req/s | srv us/req | user % | softirq % cores | UDP in/req | UDP out/req | rcvbuf/sndbuf/in err | ctx-sw/req | syscalls/req (top) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| baseline-h3 | v-base | 5,734,049 | 2.30 | 82 | 0.9 | 0.063 | 0.032 | 0/0/0 | 0.028 | io_uring_enter 0.03, read 0.00, write 0.00, epoll_pwait 0.00 |
+| static-h3 | v-base | 933,021 | 44.66 | 44 | 6.7 | 0.524 | 0.524 | 358/0/358 | 0.087 | io_uring_enter 0.19, write 0.00, read 0.00, futex 0.00 |
+
+~ = request rate from the run's h2load rps (rivals); rimu's comes from its own counters over the window.
+UDP counters are host-wide: both the server's and the generator's datagrams on the loopback.
+
+### baseline-h3 v-base  (vprofile/v-base-baseline-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.063/req, io_uring:io_uring_submit_req 0.016/req, io_uring:io_uring_task_add 0.001/req, net:net_dev_xmit 0.016/req, net:netif_receive_skb 0.016/req, net:netif_rx 0.016/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  3.36% <rimu_ws::quic::stream::send::SendPart>::append_bytes (arena-h2)
+  3.29% <rimu_ws::http::http3_server_framework::router_handler::Rout (arena-h2)
+  3.02% <rimu_ws::http3::h3_app::H3App<rimu_ws::http::http3_server_f (arena-h2)
+  2.79% <rimu_ws::http3::request::RequestHead>::push (arena-h2)
+  1.89% <(rimu_ws::http::http2_server_framework::path_params::PathPa (arena-h2)
+  1.61% <rimu_ws::quic::stream::Streams>::create (arena-h2)
+  1.60% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  1.54% <rimu_ws::quic::stream::Streams>::deliver::<rimu_ws::http3:: (arena-h2)
+  1.53% rimu_ws::http::http3_server_framework::router_handler::fill_ (arena-h2)
+  1.53% memcpy (libc.so.6)
+
+### static-h3 v-base  (vprofile/v-base-static-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.740/req, io_uring:io_uring_submit_req 0.609/req, io_uring:io_uring_task_add 0.005/req, net:net_dev_xmit 0.361/req, net:netif_receive_skb 0.361/req, net:netif_rx 0.361/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  31.52% kernel_init_pages ([kernel.kallsyms])
+  6.92% ring_core_0_17_14__aes_gcm_enc_update_vaes_avx2 (arena-h2)
+  2.71% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  2.39% rep_movs_alternative ([kernel.kallsyms])
+  1.96% asm_sysvec_apic_timer_interrupt ([kernel.kallsyms])
+  1.93% ring::aead::aes_gcm::seal (arena-h2)
+  1.60% skb_release_data ([kernel.kallsyms])
+  1.49% <rimu_ws::quic::stream::Streams>::write_stream_frame (arena-h2)
+  1.26% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  0.93% rimu_ws::http::huffman::huffman_decode::<rimu_ws::http3::qpa (arena-h2)
+
+## vprofile: hardware counter windows
+
+| profile | server | req/s | cycles/req | instr/req | IPC | branch-miss % | L1d miss % | LLC miss % | dTLB miss/req | iTLB miss/req |
+|---|---|---|---|---|---|---|---|---|---|---|
+| baseline-h3 | v-base | 5,505,115 | 6,760 | 9,359 | 1.38 | 1.36 | 2.95 | - | 0.63 | 0.44 |
+| static-h3 | v-base | 861,151 | 122,478 | 74,494 | 0.61 | 2.21 | 7.24 | - | 4.67 | 2.98 |
+
