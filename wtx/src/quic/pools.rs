@@ -7,7 +7,8 @@
 
 use crate::quic::{
   QuicError, TransportErrorCode,
-  conn::{ConnCold, HandshakeSpaces, KeySlot},
+  conn::{ConnCold, HandshakeSpaces},
+  key_phase::KeySlot,
   recv_tracker::RecvSpill,
   sent::{FrameRef, FrameRefRange, SentPacket},
   stream::{OooBlock, RangeBlock, Seg, StreamSlots, StreamsCold},

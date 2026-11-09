@@ -20,6 +20,8 @@ mod frame;
 #[cfg(any(test, feature = "_fuzz"))]
 #[doc(hidden)]
 pub mod frame_check;
+#[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
+mod key_phase;
 mod limits;
 #[allow(dead_code, reason = "consumed by the connection and the endpoint of the later QUIC tasks")]
 mod packet;
