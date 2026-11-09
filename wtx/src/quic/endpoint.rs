@@ -46,8 +46,8 @@
 use crate::{
   collections::Vector,
   quic::{
-    Cid, ConnParams, ConnState, DatagramMeta, FlushOutcome, PacketTy, QuicApp, QuicConn,
-    QuicParams, TxArena,
+    Cid, ConnCtx, ConnHandle, ConnParams, ConnState, DatagramMeta, FlushOutcome, PacketTy, QuicApp,
+    QuicConn, QuicParams, TxArena,
     cid_table::{CID_LEN, CidTable, ConnRef},
     limits::RateBudget,
     parse_header,
@@ -254,7 +254,7 @@ where
     params: QuicParams,
     worker: u8,
     workers: u8,
-    tls: TlsConfig<TCX>,
+    tls: Arc<TlsConfig<TCX>>,
     rng: &mut R,
     loads: Option<Arc<WorkerLoads>>,
     keys: Arc<EndpointKeys>,
@@ -289,7 +289,7 @@ where
       stateless: StatelessQueue::new(),
       stats: EndpointStats::default(),
       timers: TimerWheel::new(conns, 0)?,
-      tls: Arc::new(tls),
+      tls,
       vn_budget: RateBudget::default(),
       worker,
       workers,
@@ -480,6 +480,34 @@ where
   #[inline]
   pub(crate) fn stats(&self) -> EndpointStats {
     EndpointStats { conns: self.live, half_open: self.half_open, ..self.stats }
+  }
+
+  /// Frees all but a few entries of the pools of the worker, if it has no connection: for a worker
+  /// that has been idle a while (spec section 5.4).
+  #[inline]
+  pub(crate) fn trim_idle(&mut self) {
+    if self.live == 0 {
+      self.pools.trim_idle();
+    }
+  }
+
+  /// Runs `f` with `app` and the context of the connection of `handle` ([`ConnCtx::handle`]),
+  /// as a handler that answers later does (ruling T14-d), and has the connection flushed with the
+  /// next flush. `None`, and `f` is not run, if the connection is gone: a stale handle is ignored.
+  #[inline]
+  pub(crate) fn with_conn<R>(
+    &mut self,
+    now_us: u64,
+    handle: ConnHandle,
+    app: &mut A,
+    f: impl FnOnce(&mut A, &mut ConnCtx<'_, A::ConnState>) -> R,
+  ) -> Option<R> {
+    let idx = self.lookup(Some(ConnRef { generation: handle.generation, slot: handle.slot }))?;
+    let Self { pools, slots, .. } = self;
+    let conn = slots.get_mut(idx)?.conn.as_mut()?;
+    let rslt = conn.with_ctx(now_us, pools, |cx| f(app, cx));
+    self.after_event(idx, app);
+    Some(rslt)
   }
 
   // A connection received or timed out: the end of its handshake, its end, a flush that is due.
@@ -698,7 +726,7 @@ where
     let Ok(local_cid) = Cid::new(&local) else {
       return Route::Done;
     };
-    let Ok(conn) = self.make_conn(now_us, client_dcid, local_cid, original, retry_scid, meta)
+    let Ok(mut conn) = self.make_conn(now_us, client_dcid, local_cid, original, retry_scid, meta)
     else {
       cold_path();
       return Route::Done;
@@ -713,6 +741,7 @@ where
     };
     let conn_ref =
       ConnRef { generation: slot.generation, slot: u32::try_from(idx).unwrap_or(NO_SLOT) };
+    conn.set_handle(ConnHandle { generation: conn_ref.generation, slot: conn_ref.slot });
     let timeout_us = self.params.handshake_timeout_ms().saturating_mul(1_000);
     *slot = Slot {
       conn: Some(conn),
@@ -1195,22 +1224,27 @@ where
   RNG: CryptoRng + CryptoSeedableRng,
   TCX: TlsCtxSk,
 {
-  /// Runs `f` with `app` and the context of the connection that `cid`, one of ours, leads to, as
-  /// a handler that finished later does, and has the connection flushed with the next flush.
-  pub(crate) fn with_conn<R>(
+  /// [`Self::with_conn`] for the connection that `cid`, one of ours, leads to.
+  pub(crate) fn with_cid<R>(
     &mut self,
     now_us: u64,
     cid: &[u8],
     app: &mut A,
-    f: impl FnOnce(&mut A, &mut crate::quic::ConnCtx<'_, A::ConnState>) -> R,
+    f: impl FnOnce(&mut A, &mut ConnCtx<'_, A::ConnState>) -> R,
   ) -> Option<R> {
     let conn = self.cids.get(cid)?;
-    let idx = usize::try_from(conn.slot).ok()?;
-    let Self { pools, slots, .. } = self;
-    let slot = slots.get_mut(idx).filter(|el| el.generation == conn.generation)?;
-    let rslt = slot.conn.as_mut()?.with_ctx(now_us, pools, |cx| f(app, cx));
-    self.after_event(idx, app);
-    Some(rslt)
+    self.with_conn(now_us, ConnHandle { generation: conn.generation, slot: conn.slot }, app, f)
+  }
+
+  /// The handle of the connection that `cid`, one of ours, leads to.
+  pub(crate) fn handle_of(&self, cid: &[u8]) -> Option<ConnHandle> {
+    let conn = self.cids.get(cid)?;
+    Some(ConnHandle { generation: conn.generation, slot: conn.slot })
+  }
+
+  /// The pools of the worker, for tests that run them out.
+  pub(crate) const fn pools_mut(&mut self) -> &mut QuicPools {
+    &mut self.pools
   }
 }
 

@@ -61,11 +61,12 @@ use crate::{
     request::{H3Request, check_trailer},
   },
   quic::{
-    BodyRef, ConnCtx, QuicApp, QuicError, StreamId, decode_varint, encode_varint, varint_len,
+    BodyRef, ConnCtx, ConnHandle, QuicApp, QuicError, StreamId, decode_varint, encode_varint,
+    varint_len,
   },
 };
 use alloc::{boxed::Box, vec::Vec};
-use core::hint::cold_path;
+use core::{hint::cold_path, net::IpAddr};
 
 /// The bytes that the connection retains for a stream at most (see `ConnCtx::retain`): what is
 /// read in one piece without a buffer of its own.
@@ -153,12 +154,29 @@ pub(crate) trait H3Handler {
   /// The request of `stream`, parked, is resumed: answer it, or park it again. Called also for a
   /// request that the peer abandoned meanwhile, whose answer then fails.
   fn resume(&mut self, cx: &mut H3ReqCtx<'_, '_>, stream: StreamId) -> crate::Result<ReqOutcome>;
+
+  /// The peer abandoned the parked request of `stream` of the connection of `conn` (RESET_STREAM
+  /// or STOP_SENDING): nothing will be answered, and what would answer it can go.
+  #[inline]
+  fn on_abandoned(&mut self, conn: ConnHandle, stream: StreamId) {
+    let _args = (conn, stream);
+  }
+
+  /// The connection of `conn` is over: what would answer its parked requests can go.
+  #[inline]
+  fn on_conn_closed(&mut self, conn: ConnHandle) {
+    let _conn = conn;
+  }
 }
 
 /// What a handler answers a request through.
 #[derive(Debug)]
 pub(crate) struct H3ReqCtx<'c, 'a> {
   cx: &'c mut ConnCtx<'a, H3ConnState>,
+  #[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "the server framework encodes its own sections")
+  )]
   fields: &'c mut VectorUsize<u8>,
   frame: &'c mut VectorUsize<u8>,
   responded: bool,
@@ -166,10 +184,17 @@ pub(crate) struct H3ReqCtx<'c, 'a> {
 }
 
 impl H3ReqCtx<'_, '_> {
-  /// The stream of the request.
+  /// The handle of the connection of the request, which names it from outside of the callbacks
+  /// ([`crate::quic::Endpoint::with_conn`]).
   #[inline]
-  pub(crate) const fn stream(&self) -> StreamId {
-    self.stream
+  pub(crate) const fn conn(&self) -> ConnHandle {
+    self.cx.handle()
+  }
+
+  /// The address of the peer.
+  #[inline]
+  pub(crate) const fn peer(&self) -> IpAddr {
+    self.cx.peer()
   }
 
   /// Answers with the field section `encoded_headers`, encoded with QPACK by the static table,
@@ -212,6 +237,7 @@ impl H3ReqCtx<'_, '_> {
 
   /// [`Self::respond`] with `fields`, which are encoded with the static table of QPACK.
   #[inline]
+  #[cfg_attr(not(test), allow(dead_code, reason = "the server framework encodes its own sections"))]
   pub(crate) fn respond_fields(
     &mut self,
     fields: &[(&[u8], &[u8])],
@@ -856,6 +882,7 @@ where
   #[inline]
   fn on_established(&mut self, cx: &mut ConnCtx<'_, H3ConnState>) -> crate::Result<()> {
     let mut conn = self.take_conn()?;
+    conn.handle = cx.handle();
     let rslt = open_streams(&mut conn, cx, &self.params);
     cx.state.conn = Some(conn);
     conclude(cx, rslt)
@@ -893,7 +920,11 @@ where
     let Some(mut conn) = cx.state.conn.take() else {
       return Ok(());
     };
+    let parked = conn.is_parked(id);
     let rslt = reset_by_peer(&mut conn, cx, id);
+    if parked {
+      self.handler.on_abandoned(conn.handle, id);
+    }
     cx.state.conn = Some(conn);
     conclude(cx, rslt)
   }
@@ -908,18 +939,28 @@ where
     let Some(mut conn) = cx.state.conn.take() else {
       return Ok(());
     };
+    let parked = conn.is_parked(id);
     let rslt = stopped_by_peer(&mut conn, cx, id);
+    if parked {
+      self.handler.on_abandoned(conn.handle, id);
+    }
     cx.state.conn = Some(conn);
     conclude(cx, rslt)
   }
 
   #[inline]
   fn on_closed(&mut self, state: &mut H3ConnState) {
-    // Cleared now, so that the pool holds no state of a connection (review V5); a box whose
-    // release fails is dropped (ruling T13-a)
-    let Some(mut conn) = state.conn.take().filter(|_| self.pool.len() < MAX_POOLED) else {
+    let Some(mut conn) = state.conn.take() else {
       return;
     };
+    if conn.live > 0 {
+      self.handler.on_conn_closed(conn.handle);
+    }
+    // Cleared now, so that the pool holds no state of a connection (review V5); a box whose
+    // release fails is dropped (ruling T13-a)
+    if self.pool.len() >= MAX_POOLED {
+      return;
+    }
     if conn.release(&self.params).is_err() {
       return;
     }
@@ -987,11 +1028,9 @@ fn after_handler(
   match outcome {
     Err(err @ crate::Error::Http3Close(..)) => Err(err),
     Ok(ReqOutcome::Parked) if !responded => {
-      if let Some(req) = conn.reqs.get_mut(idx) {
-        req.body.clear();
-        req.head.clear();
-        req.phase = Phase::Parked;
-      }
+      // What it held is not needed anymore: a parked request keeps small buffers only, which the
+      // budget of the connection counts (fix in passing of task 14)
+      conn.park(idx);
       Ok(())
     }
     _ if responded => {
@@ -1170,8 +1209,10 @@ fn drain(
   let mut answered = true;
   let mut from = StreamId(0);
   while let Some((id, writable)) = cx.first_unanswered(from, below) {
-    if writable {
-      cx.refuse(id, H3ErrorCode::RequestRejected.code())?;
+    // A refusal that finds no room (no stream slot left on the worker and as many refused streams
+    // as a connection keeps) is tried again at the next flush, and the grace period of the
+    // shutdown bounds the wait: the close stays graceful (fix in passing of task 14)
+    if writable && cx.refuse(id, H3ErrorCode::RequestRejected.code()).is_ok() {
       conn.decoder.on_stream_cancelled(id.0)?;
     }
     answered = false;

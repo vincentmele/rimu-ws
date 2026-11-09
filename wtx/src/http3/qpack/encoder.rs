@@ -21,21 +21,39 @@ pub(crate) fn encode_static(
   fields: &[(&[u8], &[u8])],
   out: &mut VectorUsize<u8>,
 ) -> crate::Result<()> {
+  encode_static_prefix(out)?;
+  for (name, value) in fields {
+    encode_static_line(name, value, out)?;
+  }
+  Ok(())
+}
+
+/// Appends to `out` the prefix of a field section that references no entry of the dynamic table:
+/// a Required Insert Count of 0 and a Base of 0, which the lines of [`encode_static_line`] follow.
+pub(crate) fn encode_static_prefix(out: &mut VectorUsize<u8>) -> crate::Result<()> {
   // Required Insert Count 0; Sign 0 and Delta Base 0
   out.extend_from_copyable_slice(&[0, 0])?;
-  for (name, value) in fields {
-    if let Some(idx) = find_exact(name, value) {
-      // Indexed Field Line, T = 1 (RFC 9204 section 4.5.2)
-      push_int(out, idx.into(), 6, 0b1100_0000)?;
-    } else if let Some(idx) = find_name(name) {
-      // Literal Field Line with Name Reference, N = 0, T = 1 (section 4.5.4)
-      push_int(out, idx.into(), 4, 0b0101_0000)?;
-      push_raw_string(out, value, 8, 0)?;
-    } else {
-      // Literal Field Line with Literal Name, N = 0 (section 4.5.6)
-      push_raw_string(out, name, 4, 0b0010_0000)?;
-      push_raw_string(out, value, 8, 0)?;
-    }
+  Ok(())
+}
+
+/// Appends to `out` the field line of `name` and `value`, as [`encode_static`] encodes each field.
+/// `name` must be lowercase (RFC 9114 section 4.2).
+pub(crate) fn encode_static_line(
+  name: &[u8],
+  value: &[u8],
+  out: &mut VectorUsize<u8>,
+) -> crate::Result<()> {
+  if let Some(idx) = find_exact(name, value) {
+    // Indexed Field Line, T = 1 (RFC 9204 section 4.5.2)
+    push_int(out, idx.into(), 6, 0b1100_0000)?;
+  } else if let Some(idx) = find_name(name) {
+    // Literal Field Line with Name Reference, N = 0, T = 1 (section 4.5.4)
+    push_int(out, idx.into(), 4, 0b0101_0000)?;
+    push_raw_string(out, value, 8, 0)?;
+  } else {
+    // Literal Field Line with Literal Name, N = 0 (section 4.5.6)
+    push_raw_string(out, name, 4, 0b0010_0000)?;
+    push_raw_string(out, value, 8, 0)?;
   }
   Ok(())
 }

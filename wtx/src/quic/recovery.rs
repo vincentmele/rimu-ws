@@ -487,7 +487,9 @@ mod tests {
   #[cfg_attr(miri, ignore)]
   #[test]
   fn persistent_congestion_collapses_window() {
-    let body: alloc::rc::Rc<[u8]> = (0..400_000u32).map(|el| el as u8).collect();
+    let body = crate::misc::SharedBytes::from_slice(
+      &(0..400_000u32).map(|el| el as u8).collect::<Vec<u8>>(),
+    );
     let mut opts = LinkOpts::new(None);
     let response = crate::quic::BodyRef::new(body.clone(), 0..400_000).unwrap();
     opts.server_app = TestApp::new(Behavior::RespondBody(b"", response));
@@ -537,12 +539,13 @@ mod tests {
     // at once (appendix B.5, after loss detection as in appendix A.7): at most two more
     assert_eq!(link.server.conn.stats().persistent_congestions, 1);
     assert!((2 * mss..=4 * mss).contains(&lowest), "{lowest}");
-    assert_eq!(link.client.app.streams[&id.0].data, &body[..]);
+    assert_eq!(link.client.app.streams[&id.0].data, body.as_slice());
   }
 
   // A server whose response is in flight, the client having sent its request
   fn responding(body_len: u32, change: fn(&mut LinkOpts)) -> (Link, crate::quic::StreamId) {
-    let body: alloc::rc::Rc<[u8]> = (0..body_len).map(|el| el as u8).collect();
+    let body =
+      crate::misc::SharedBytes::from_slice(&(0..body_len).map(|el| el as u8).collect::<Vec<u8>>());
     let mut opts = LinkOpts::new(None);
     let response = crate::quic::BodyRef::new(body, 0..body_len).unwrap();
     opts.server_app = TestApp::new(Behavior::RespondBody(b"", response));

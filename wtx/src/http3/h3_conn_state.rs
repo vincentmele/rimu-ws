@@ -25,7 +25,7 @@ use crate::{
     DecodeMemo, H3Params, H3Settings, QpackDecoder,
     request::{H3Request, RequestHead},
   },
-  quic::{QuicConn, StreamId},
+  quic::{ConnHandle, QuicConn, StreamId},
 };
 use alloc::boxed::Box;
 
@@ -258,6 +258,8 @@ pub(crate) struct H3Conn {
   pub(crate) budget: Budget,
   /// Our control stream.
   pub(crate) control: StreamId,
+  /// The handle of the connection on the endpoint of its worker.
+  pub(crate) handle: ConnHandle,
   /// Bytes of an unknown frame of the control stream of the peer that are still to skip.
   pub(crate) control_skip: u64,
   /// The decoder of the field sections of the peer.
@@ -310,6 +312,7 @@ impl H3Conn {
       budget: Budget::new(max),
       control: StreamId(0),
       control_skip: 0,
+      handle: ConnHandle { generation: 0, slot: 0 },
       decoder: QpackDecoder::new(params.qpack_max_table_capacity, params.qpack_blocked_streams)?,
       decoder_stream: StreamId(0),
       encoder_rx: VectorUsize::new(),
@@ -364,6 +367,7 @@ impl H3Conn {
     self.blocked.clear();
     self.control = StreamId(0);
     self.control_skip = 0;
+    self.handle = ConnHandle { generation: 0, slot: 0 };
     self.decoder_stream = StreamId(0);
     self.encoder_rx.clear();
     self.encoder_stream = StreamId(0);
@@ -448,6 +452,25 @@ impl H3Conn {
     }
     let _rslt = reqs_free.push(u16::try_from(idx).unwrap_or(u16::MAX));
     *live = live.saturating_sub(1);
+  }
+
+  /// If the request of stream `id` is parked.
+  pub(crate) fn is_parked(&self, id: StreamId) -> bool {
+    self.req_idx(id).and_then(|idx| self.reqs.get(idx)).is_some_and(|el| el.phase == Phase::Parked)
+  }
+
+  /// Parks the request of entry `idx`: its head and body are forgotten, and their buffers kept only
+  /// if small, out of the budget of the connection.
+  pub(crate) fn park(&mut self, idx: usize) {
+    let Self { budget, reqs, .. } = self;
+    if let Some(req) = reqs.get_mut(idx) {
+      req.body.clear();
+      req.head.clear();
+      req.head.trim(budget, KEEP_HEAD);
+      budget.trim(&mut req.body, KEEP_BODY);
+      budget.trim(&mut req.stash, KEEP_HEAD);
+      req.phase = Phase::Parked;
+    }
   }
 
   /// Frees the stash of entry `idx` if it holds no request and the stash is large: for a stash that

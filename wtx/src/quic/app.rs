@@ -2,13 +2,15 @@
 //! callbacks of [`QuicApp`], the [`ConnCtx`] that the application acts through, and
 //! [`BodyRef`], a body that is sent by reference.
 
-use crate::quic::{
-  ConnParams, QuicError,
-  pools::{QuicPools, RX_BLOCK_LEN},
-  stream::{Source, StreamId, Streams},
+use crate::{
+  misc::SharedBytes,
+  quic::{
+    ConnParams, QuicError,
+    pools::{QuicPools, RX_BLOCK_LEN},
+    stream::{Source, StreamId, Streams},
+  },
 };
-use alloc::rc::Rc;
-use core::{hint::cold_path, ops::Range};
+use core::{hint::cold_path, net::IpAddr, ops::Range};
 
 /// What a connection tells the application.
 ///
@@ -126,10 +128,23 @@ impl<'c, S> ConnCtx<'c, S> {
     self.streams.request_close(app_code, reason);
   }
 
+  /// The handle of the connection on the endpoint of its worker, which names it from outside of
+  /// the callbacks ([`crate::quic::Endpoint::with_conn`]): for a handler that answers later.
+  #[inline]
+  pub(crate) const fn handle(&self) -> ConnHandle {
+    self.params.handle
+  }
+
   /// The time of the call that runs.
   #[inline]
   pub(crate) const fn now_us(&self) -> u64 {
     self.now_us
+  }
+
+  /// The address of the peer, as the connection was opened from it.
+  #[inline]
+  pub(crate) const fn peer(&self) -> IpAddr {
+    self.params.peer
   }
 
   /// Opens a unidirectional stream. Fails with [`QuicError::StreamsBlocked`] if the peer allows
@@ -237,56 +252,83 @@ impl<'c, S> ConnCtx<'c, S> {
   }
 }
 
-/// Bytes that a stream sends by reference: a range of bytes shared with the rest of the thread,
-/// such as a cached file, held until the stream does not need them anymore.
+/// A connection of the endpoint of a worker: its slot and the generation of the slot, so that a
+/// handle of a connection that is gone names no connection, not the next one of its slot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ConnHandle {
+  /// The generation of the slot when the connection was put there.
+  pub(crate) generation: u32,
+  /// The slot.
+  pub(crate) slot: u32,
+}
+
+/// Bytes that a stream sends by reference: a range of bytes shared with the rest of the process,
+/// such as a cached file ([`SharedBytes`], ruling T14-a), held until the stream does not need them
+/// anymore.
 #[derive(Clone, Debug)]
 pub(crate) struct BodyRef {
-  bytes: Rc<[u8]>,
-  start: u32,
-  len: u32,
+  bytes: SharedBytes,
 }
 
 impl BodyRef {
   /// The bytes of `range` in `bytes`. Fails with [`QuicError::BodyOutOfBounds`] if they are not
   /// all there.
   #[inline]
-  pub(crate) fn new(bytes: Rc<[u8]>, range: Range<u32>) -> crate::Result<Self> {
+  pub(crate) fn new(bytes: SharedBytes, range: Range<u32>) -> crate::Result<Self> {
     let in_bounds = usize::try_from(range.end).is_ok_and(|end| end <= bytes.len());
     if range.start > range.end || !in_bounds {
       cold_path();
       return Err(crate::Error::Quic(QuicError::BodyOutOfBounds));
     }
-    Ok(Self { bytes, start: range.start, len: range.end.wrapping_sub(range.start) })
+    let start = usize::try_from(range.start).unwrap_or(usize::MAX);
+    let end = usize::try_from(range.end).unwrap_or(usize::MAX);
+    Ok(Self { bytes: bytes.slice(start, end) })
   }
 
   /// The bytes.
   #[inline]
   pub(crate) fn as_slice(&self) -> &[u8] {
-    let start = usize::try_from(self.start).unwrap_or(usize::MAX);
-    let len = usize::try_from(self.len).unwrap_or(0);
-    self.bytes.get(start..).and_then(|el| el.get(..len)).unwrap_or_default()
+    self.bytes.as_slice()
   }
 
   /// If it has no bytes.
   #[inline]
-  pub(crate) const fn is_empty(&self) -> bool {
-    self.len == 0
+  pub(crate) fn is_empty(&self) -> bool {
+    self.bytes.is_empty()
   }
 
   /// The number of bytes.
   #[inline]
-  pub(crate) const fn len(&self) -> u32 {
-    self.len
+  pub(crate) fn len(&self) -> u32 {
+    u32::try_from(self.bytes.len()).unwrap_or(u32::MAX)
+  }
+}
+
+impl TryFrom<SharedBytes> for BodyRef {
+  type Error = crate::Error;
+
+  /// All of `bytes`. Fails with [`QuicError::BodyOutOfBounds`] past 4 GiB.
+  #[inline]
+  fn try_from(bytes: SharedBytes) -> crate::Result<Self> {
+    if u32::try_from(bytes.len()).is_err() {
+      cold_path();
+      return Err(crate::Error::Quic(QuicError::BodyOutOfBounds));
+    }
+    Ok(Self { bytes })
   }
 }
 
 #[cfg(test)]
 mod tests {
-  use crate::quic::{
-    BodyRef, ConnState, Frame, QuicError, TransportErrorCode,
-    testing::{Behavior, Fail, Link, LinkOpts, TestApp, encode_frames},
+  use crate::{
+    misc::SharedBytes,
+    quic::{
+      BodyRef, ConnState, Frame, QuicError, TransportErrorCode,
+      testing::{Behavior, Fail, Link, LinkOpts, TestApp, encode_frames},
+    },
+    sync::Arc,
   };
-  use alloc::{rc::Rc, vec, vec::Vec};
+  use alloc::{vec, vec::Vec};
 
   fn settled(opts: &LinkOpts) -> Link {
     let mut link = Link::new(opts);
@@ -309,20 +351,25 @@ mod tests {
 
   #[test]
   fn body_ref_range_is_checked() {
-    let bytes: Rc<[u8]> = vec![1, 2, 3, 4, 5, 6, 7, 8].into();
-    let body = BodyRef::new(bytes.clone(), 2..5).unwrap();
+    let bytes: Arc<[u8]> = Arc::from(vec![1, 2, 3, 4, 5, 6, 7, 8].into_boxed_slice());
+    let shared = || SharedBytes::new(bytes.clone());
+    let body = BodyRef::new(shared(), 2..5).unwrap();
     assert_eq!(body.as_slice(), [3, 4, 5]);
     assert_eq!(body.len(), 3);
-    assert!(BodyRef::new(bytes.clone(), 0..0).unwrap().is_empty());
+    assert!(BodyRef::new(shared(), 0..0).unwrap().is_empty());
     // Past the end, and a start after the end
     for range in [4..9, core::ops::Range { start: 6, end: 5 }] {
       assert!(matches!(
-        BodyRef::new(bytes.clone(), range),
+        BodyRef::new(shared(), range),
         Err(crate::Error::Quic(QuicError::BodyOutOfBounds))
       ));
     }
-    drop(body);
-    assert_eq!(Rc::strong_count(&bytes), 1);
+    // All of a shared range, which keeps its own range
+    let whole = BodyRef::try_from(shared().slice(1, 4)).unwrap();
+    assert_eq!(whole.as_slice(), [2, 3, 4]);
+    assert_eq!(BodyRef::new(shared().slice(1, 4), 1..3).unwrap().as_slice(), [3, 4]);
+    drop((body, whole));
+    assert_eq!(Arc::strong_count(&bytes), 1);
   }
 
   // Ruling T8-d: an error of a callback closes the connection with a transport CONNECTION_CLOSE,

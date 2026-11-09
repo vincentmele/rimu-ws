@@ -37,7 +37,12 @@ impl<T> Arc<T> {
   pub fn into_inner(this: Self) -> Option<T> {
     LocalTy::into_inner(this.0)
   }
+}
 
+impl<T> Arc<T>
+where
+  T: ?Sized,
+{
   /// Gets the number of strong pointers to this allocation.
   #[inline]
   pub fn strong_count(this: &Self) -> usize {

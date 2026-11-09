@@ -18,14 +18,12 @@ mod json_reply;
 mod methods;
 mod middleware;
 mod misc;
-mod path;
+pub(crate) mod path;
 mod path_params;
 mod redirect;
 mod res_finalizer;
 mod route_match;
 mod state;
-#[cfg(feature = "std")]
-mod static_files;
 #[cfg(all(test, feature = "io-uring"))]
 mod fw_tests;
 #[cfg(test)]
@@ -67,7 +65,7 @@ pub use res_finalizer::ResFinalizer;
 pub use route_match::RouteMatch;
 pub use state::{State, StateClean, StateGeneric, StateTest};
 #[cfg(feature = "std")]
-pub use static_files::StaticFiles;
+pub use crate::http::static_files::StaticFiles;
 pub use verbatim_params::VerbatimParams;
 
 /// HTTP/2 Server Framework

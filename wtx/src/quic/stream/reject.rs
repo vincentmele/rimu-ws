@@ -49,6 +49,15 @@ impl Streams {
     self.cold.as_deref().map_or(0, |el| el.rejects.iter().flatten().count())
   }
 
+  // If stream `id` was refused and its RESET_STREAM is not acknowledged yet.
+  pub(super) fn reset_unacked(&self, id: StreamId) -> bool {
+    self
+      .cold
+      .as_deref()
+      .and_then(|el| el.rejects.iter().flatten().find(|el| el.id == id))
+      .is_some_and(|el| !el.reset_acked)
+  }
+
   // Refuses stream `index` of `kind`, of the peer, for which no slot was left. Past
   // `MAX_REJECTED` refused streams, the connection closes as before.
   pub(super) fn reject(&mut self, kind: Kind, index: u64, err: crate::Error) -> crate::Result<()> {

@@ -101,7 +101,7 @@ mod tests {
     flow::top_up,
     testing::{Behavior, Link, LinkOpts, TestApp, encode_frames},
   };
-  use alloc::{rc::Rc, vec::Vec};
+  use alloc::vec::Vec;
 
   fn settled(opts: &LinkOpts) -> Link {
     let mut link = Link::new(opts);
@@ -142,7 +142,9 @@ mod tests {
     let mut link = settled(&opts);
     link.client.conn.streams_mut().never_send_blocked_frames();
     let len = 4u32 << 20;
-    let body: Rc<[u8]> = (0..len).map(|el| (el % 249) as u8).collect();
+    let body = crate::misc::SharedBytes::from_slice(
+      &(0..len).map(|el| (el % 249) as u8).collect::<Vec<u8>>(),
+    );
     let now_us = link.now_us;
     let id = link.client.with_ctx(now_us, |cx| {
       let id = cx.open_bidi()?;
@@ -153,7 +155,7 @@ mod tests {
     link.run_for(4096);
     let log = &link.server.app.streams[&id.0];
     assert!(log.fin);
-    assert!(log.data == *body);
+    assert!(log.data == body.as_slice());
     assert_eq!(link.client.conn.streams().blocked_frames_sent(), 0);
     let now_us = link.now_us;
     assert_eq!(link.client.with_ctx(now_us, |cx| cx.unsent_bytes()), 0);
@@ -233,7 +235,9 @@ mod tests {
     let mut link = settled(&opts);
     assert_eq!(link.client.conn.streams().conn_credit().2, CONN_CAP);
     let len = 1u32 << 20;
-    let body: Rc<[u8]> = (0..len).map(|el| (el % 247) as u8).collect();
+    let body = crate::misc::SharedBytes::from_slice(
+      &(0..len).map(|el| (el % 247) as u8).collect::<Vec<u8>>(),
+    );
     let now_us = link.now_us;
     let id = link
       .client
@@ -257,7 +261,7 @@ mod tests {
       }
     }
     let log = &link.server.app.streams[&id.0];
-    assert!(log.fin && log.data == *body);
+    assert!(log.fin && log.data == body.as_slice());
   }
 
   // Rule: data past the credit of a stream or of the connection is a FLOW_CONTROL_ERROR (RFC 9000

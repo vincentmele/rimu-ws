@@ -8,5 +8,5 @@ mod static_table;
 
 pub(crate) use decode_memo::DecodeMemo;
 pub(crate) use decoder::{DecodeOutcome, QpackDecoder};
-pub(crate) use encoder::encode_static;
+pub(crate) use encoder::{encode_static, encode_static_line, encode_static_prefix};
 pub(crate) use static_table::{STATIC_TABLE, find_exact, find_name};

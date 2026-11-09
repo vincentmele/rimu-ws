@@ -623,7 +623,8 @@ impl Streams {
   /// from the index of `from` on and below the index of `below` whose sending part is not done
   /// (what was written to it, its FIN or its reset, is not all acknowledged), with `true` if it
   /// still takes writes: the application never answered it, as for a stream that a later one
-  /// opened or whose data did not reach the application yet.
+  /// opened or whose data did not reach the application yet. A stream refused for want of a slot
+  /// (ruling T10-c) is not done while its RESET_STREAM is not acknowledged.
   #[inline]
   pub(crate) fn first_unanswered(
     &self,
@@ -648,7 +649,15 @@ impl Streams {
             return Some((stream.id, tx.exists && !tx.fin && tx.reset.is_none()));
           }
         }
-        Entry::Closed | Entry::NotOpened | Entry::Rejected => {}
+        // A stream refused for want of a slot is not done before its RESET_STREAM is
+        // acknowledged: a close must not overtake a reset that was lost (fix in passing of task 14)
+        Entry::Rejected => {
+          let id = StreamId::of(index, true, false);
+          if self.reset_unacked(id) {
+            return Some((id, false));
+          }
+        }
+        Entry::Closed | Entry::NotOpened => {}
       }
       index = index.wrapping_add(1);
     }

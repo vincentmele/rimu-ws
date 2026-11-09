@@ -898,8 +898,16 @@ fn endpoints_from_one_parent_draw_different_numbers() {
   let keys = Arc::new(EndpointKeys::new(&mut parent));
   let params = limits(|el| el.retry_above_half_open = 0);
   let mut make = || {
-    TestEndpoint::new(params, 0, 1, server_tls_config(), &mut parent, None, Arc::clone(&keys))
-      .unwrap()
+    TestEndpoint::new(
+      params,
+      0,
+      1,
+      Arc::new(server_tls_config()),
+      &mut parent,
+      None,
+      Arc::clone(&keys),
+    )
+    .unwrap()
   };
   let (mut first, mut second) = (make(), make());
   let mut net = net(1, QuicParams::default());
@@ -1003,4 +1011,35 @@ fn forwarded_datagrams_count_once() {
   let (here, there) = (net.servers[0].endpoint.stats(), net.servers[1].endpoint.stats());
   assert_eq!((here.datagrams_in, here.forwarded), (0, 1));
   assert_eq!((there.datagrams_in, there.conns), (1, 1));
+}
+
+// Ruling T14-d: a handler that answers later reaches its connection through the handle of the
+// connection, which its context gives; a handle whose connection is gone, or whose slot holds the
+// next connection, reaches nothing and the closure is not run.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn with_conn_reaches_the_connection_of_a_handle_and_ignores_a_stale_one() {
+  let mut net = net(1, QuicParams::default());
+  let client = net.add_client();
+  net.run();
+  let handle = net.servers[0].endpoint.handle_of(&server_cid(&net, client)).unwrap();
+  let now_us = net.now_us;
+  let server = &mut net.servers[0];
+  let seen = server.endpoint.with_conn(now_us, handle, &mut server.app, |_, cx| cx.handle());
+  assert_eq!(seen, Some(handle));
+  // The connection closes and its slot takes the next one
+  net.clients[client].conn.close_app(now_us, 0);
+  net.run();
+  net.advance(CLOSING_US);
+  assert_eq!(net.servers[0].endpoint.stats().conns, 0);
+  let next = net.add_client();
+  net.run();
+  let next_handle = net.servers[0].endpoint.handle_of(&server_cid(&net, next)).unwrap();
+  assert_eq!(next_handle.slot, handle.slot);
+  assert_ne!(next_handle, handle);
+  let now_us = net.now_us;
+  let server = &mut net.servers[0];
+  let mut ran = false;
+  assert!(server.endpoint.with_conn(now_us, handle, &mut server.app, |_, _| ran = true).is_none());
+  assert!(!ran);
 }

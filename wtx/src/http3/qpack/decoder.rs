@@ -255,6 +255,7 @@ impl QpackDecoder {
   /// ring, one field at a time; `sink` can stop the decoding with an error, which is returned as
   /// it is. A section that references the dynamic table queues its Section Acknowledgment. Errors
   /// of the section are a `QPACK_DECOMPRESSION_FAILED`.
+  #[cfg_attr(not(test), allow(dead_code, reason = "connections decode with a memo, tests without"))]
   pub(crate) fn decode(
     &mut self,
     stream: u64,

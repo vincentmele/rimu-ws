@@ -43,8 +43,8 @@
 use crate::{
   crypto::AEAD_TAG_LEN,
   quic::{
-    AckFrame, Cid, ConnCtx, DatagramMeta, Frame, FrameReader, FrameWriter, PacketKeys, PacketTy,
-    QUIC_V1, QuicApp, QuicError, Space, TransportErrorCode, TransportParams, TxArena,
+    AckFrame, Cid, ConnCtx, ConnHandle, DatagramMeta, Frame, FrameReader, FrameWriter, PacketKeys,
+    PacketTy, QUIC_V1, QuicApp, QuicError, Space, TransportErrorCode, TransportParams, TxArena,
     cc::CongestionControl as _,
     initial_keys,
     key_phase::{Generation, KeyPhase, confidentiality_limit, integrity_limit, threshold_for},
@@ -71,7 +71,7 @@ use alloc::boxed::Box;
 use core::{
   fmt::{Debug, Formatter},
   hint::cold_path,
-  net::{IpAddr, SocketAddr},
+  net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 
 /// The connection IDs of the peer that a connection stores, the `active_connection_id_limit`
@@ -165,6 +165,10 @@ pub(crate) struct ConnParams {
   pub(crate) test_integrity_limit: u32,
   /// Abuse limits.
   pub(crate) limits: ConnLimits,
+  /// The handle of the connection on the endpoint of its worker ([`QuicConn::set_handle`]).
+  pub(crate) handle: ConnHandle,
+  /// The address of the peer that opened the connection.
+  pub(crate) peer: IpAddr,
 }
 
 impl ConnParams {
@@ -253,6 +257,8 @@ impl Default for ConnParams {
       #[cfg(test)]
       test_integrity_limit: u32::MAX,
       limits: ConnLimits::default(),
+      handle: ConnHandle { generation: 0, slot: 0 },
+      peer: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
     }
   }
 }
@@ -381,6 +387,8 @@ pub(crate) struct TestClient {
   pub(crate) frames: alloc::vec::Vec<u8>,
   /// NEW_CONNECTION_ID frames received.
   pub(crate) new_connection_ids: u32,
+  /// The CONNECTION_CLOSE of the server, once it arrived: (application, code).
+  pub(crate) peer_close: Option<(bool, u64)>,
   /// The stateless reset token of the transport parameters of the server.
   pub(crate) peer_reset_token: Option<[u8; 16]>,
   /// The source CID of the Retry that the client followed.
@@ -472,6 +480,13 @@ where
   #[inline]
   pub(crate) fn close_app(&mut self, now_us: u64, code: u64) {
     self.enter_closing(now_us, CloseFrame { app: true, code, requested: false });
+  }
+
+  /// The handle of the connection on the endpoint of its worker, which its [`ConnCtx`] gives the
+  /// application ([`ConnCtx::handle`]).
+  #[inline]
+  pub(crate) const fn set_handle(&mut self, handle: ConnHandle) {
+    self.params.handle = handle;
   }
 
   /// The endpoint shuts down: the application of an established connection is asked whether it
@@ -589,9 +604,12 @@ where
   /// outside of the callbacks of [`QuicApp`], such as a handler that finished later. A close that
   /// it asks for is applied when `f` returns.
   #[inline]
-  #[allow(
-    dead_code,
-    reason = "for the handlers that finish later, which the server of task 14 runs"
+  #[cfg_attr(
+    not(feature = "http3-server-framework"),
+    allow(
+      dead_code,
+      reason = "only the HTTP/3 server framework resumes handlers that finish later"
+    )
   )]
   pub(crate) fn with_ctx<R>(
     &mut self,
@@ -1695,7 +1713,12 @@ where
       match frame {
         Frame::Padding(_) => {}
         Frame::Ack(ack) => self.on_ack(now_us, space, &ack, pools)?,
-        Frame::ConnectionClose { .. } => {
+        #[cfg_attr(not(test), expect(unused_variables, reason = "kept by clients of tests"))]
+        Frame::ConnectionClose { app, code, .. } => {
+          #[cfg(test)]
+          if IS_CLIENT {
+            self.test_client.get_or_insert_default().peer_close = Some((app, code));
+          }
           self.enter_draining(now_us);
           return Ok(ack_eliciting);
         }
@@ -2038,7 +2061,7 @@ where
       local: meta.local,
       local_cid,
       max_datagram: INITIAL_MAX_DATAGRAM,
-      params: *params,
+      params: ConnParams { peer: meta.peer.ip(), ..*params },
       path_response: None,
       peer: meta.peer,
       peer_cid,
@@ -3277,7 +3300,7 @@ mod tests {
     tests::_count_allocations_in,
     tls::CipherSuite,
   };
-  use alloc::{boxed::Box, rc::Rc, vec, vec::Vec};
+  use alloc::{boxed::Box, vec, vec::Vec};
   use core::sync::atomic::Ordering;
 
   const PING: [u8; 1] = [0x01];
@@ -3758,7 +3781,7 @@ mod tests {
       server_parts.pools.rx_blocks.give(Box::new([0; RX_BLOCK_LEN]));
       server_parts.pools.tx_blocks.give(Box::new([0; TX_BLOCK_LEN]));
     }
-    let body: Rc<[u8]> = vec![1; 3000].into();
+    let body = crate::misc::SharedBytes::from_slice(&[1; 3000]);
     let mut opts = LinkOpts::new(None);
     let response = BodyRef::new(body.clone(), 0..3000).unwrap();
     opts.server_app = TestApp::new(Behavior::RespondBody(&HEAD, response));
@@ -3783,13 +3806,13 @@ mod tests {
     assert_eq!(pools.stream_slots.live(), 2);
     assert_eq!((pools.rx_blocks.len(), pools.tx_blocks.len()), (3, 3));
     link.server.app.behavior = Behavior::Collect;
-    assert_eq!(Rc::strong_count(&body), 2);
+    assert_eq!(body.strong_count(), 2);
     link.server.abort();
     let pools = &link.server.parts.pools;
     assert_eq!(counts(&link.server.parts), warm);
     assert_eq!(pools.stream_slots.live(), 0);
     assert_eq!((pools.rx_blocks.len(), pools.tx_blocks.len()), (4, 4));
-    assert_eq!(Rc::strong_count(&body), 1);
+    assert_eq!(body.strong_count(), 1);
     // In the middle of spills (review J13): the keys of the next phase, the block of spilled
     // ranges, the spill of received packet numbers, the index of waiting data and a send queue that
     // grew go back too. The same connection twice: the second one finds the pools warm

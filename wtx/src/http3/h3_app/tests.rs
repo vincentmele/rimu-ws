@@ -1136,6 +1136,14 @@ fn authority_host_and_connection_fields_are_message_errors() {
     get(&[(b"proxy-connection", b"keep-alive")]),
     get(&[(b"upgrade", b"websocket")]),
     get(&[(b"content-length", b"5"), (b"content-length", b"6")]),
+    // The values disagree and the body has the length of the last one: only the check of the
+    // repeated value refuses it (fix in passing of task 14)
+    {
+      let fields = [(&b"content-length"[..], &b"6"[..]), (b"content-length", b"5")];
+      let mut request = headers_frame(&request_fields(b"POST", b"/", &fields));
+      request.extend_from_slice(&data_frame(b"hello"));
+      request
+    },
     get(&[(b"host", b"localhost"), (b"host", b"localhost")]),
     get(&[(b"host", b"other")]),
     get(&[(b"host", b"user@localhost")]),
@@ -1208,4 +1216,129 @@ fn first_request_coalesced_with_finished_is_answered_in_that_turn() {
   }
   let rsp = response(&net, client, id).unwrap();
   assert_eq!((rsp.field(b":status"), rsp.fin), (Some(&b"200"[..]), true));
+}
+
+// Fix in passing of task 14 (review of task 13): a graceful close does not overtake the
+// RESET_STREAM of a stream refused for want of a slot (ruling T10-c): lost, the reset is sent again
+// and acknowledged before the CONNECTION_CLOSE.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn graceful_close_waits_for_the_reset_of_a_refused_stream() {
+  let (mut net, client) = connected(H3Params::default(), &TestHandler::new(OK));
+  let live = net.servers[0].endpoint.pools().stream_slots.live();
+  net.servers[0].endpoint.pools_mut().stream_slots.set_cap(live);
+  let refused = send(&mut net, client, &headers_frame(&GET), true);
+  // The request arrives and is refused; the refusal is lost
+  net.clients[client].deaf = true;
+  let _ = net.step();
+  net.clients[client].deaf = false;
+  assert!(!resets(&net, client).contains(&(refused.0, 0x10b)));
+  let now_us = net.now_us;
+  let server = &mut net.servers[0];
+  server.endpoint.begin_shutdown(now_us, &mut server.app);
+  for _ in 0..64 {
+    net.run();
+    if server_close(&net, client).is_some() {
+      break;
+    }
+    assert!(net.advance_to_next_event());
+  }
+  assert_eq!(server_close(&net, client), Some((true, 0x100)));
+  assert!(resets(&net, client).contains(&(refused.0, 0x10b)), "{:?}", resets(&net, client));
+}
+
+// Fix in passing of task 14: during a graceful close, a stream that must be refused when the
+// worker has no slot left and the connection holds as many refused streams as it can (eight) is
+// refused once one of them is done, and the close stays graceful (H3_NO_ERROR, not
+// H3_INTERNAL_ERROR).
+#[cfg_attr(miri, ignore)]
+#[test]
+fn graceful_close_without_room_to_refuse_stays_graceful() {
+  let (mut net, client) = connected(H3Params::default(), &TestHandler::new(OK));
+  // No slot left on the worker, and none free
+  let live = net.servers[0].endpoint.pools().stream_slots.live();
+  net.servers[0].endpoint.pools_mut().stream_slots.set_cap(live);
+  // The first stream is never sent: the next ones open it on the server. They are refused, and
+  // their refusals lost: the connection keeps eight records of refused streams
+  let now_us = net.now_us;
+  let implicit = net.client_ctx(client, now_us, |cx| cx.open_bidi()).unwrap();
+  net.clients[client].deaf = true;
+  let refused: Vec<StreamId> =
+    (0..8).map(|_| send(&mut net, client, &headers_frame(&GET), true)).collect();
+  let _ = net.step();
+  net.clients[client].deaf = false;
+  assert_eq!(handler(&net).count, 0);
+  let now_us = net.now_us;
+  let server = &mut net.servers[0];
+  server.endpoint.begin_shutdown(now_us, &mut server.app);
+  for _ in 0..64 {
+    net.run();
+    if server_close(&net, client).is_some() {
+      break;
+    }
+    assert!(net.advance_to_next_event());
+  }
+  assert_eq!(server_close(&net, client), Some((true, 0x100)));
+  let resets = resets(&net, client);
+  for id in refused.iter().chain([&implicit]) {
+    assert!(resets.contains(&(id.0, 0x10b)), "{id:?} {resets:?}");
+  }
+}
+
+// Fix in passing of task 14: a request that the handler parks keeps small buffers only, so that a
+// parked upload does not hold the budget of the connection.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn parked_request_keeps_small_buffers() {
+  let params = H3Params { max_request_body: 600_000, ..H3Params::default() };
+  let (mut net, client) = connected(params, &TestHandler::new(OK));
+  let body = vec![7u8; 500_000];
+  let parked = send(&mut net, client, &post(b"/park", body.len(), &body), true);
+  net.run_for(1024);
+  assert_eq!(handler(&net).parked, [parked]);
+  assert_eq!(handler(&net).seen[0].body.len(), body.len());
+  assert!(buffered(&net, client) <= 64 * 1024, "{}", buffered(&net, client));
+  resume(&mut net, client, parked);
+  net.run();
+  let rsp = response(&net, client, parked).unwrap();
+  assert_eq!((rsp.field(b":status"), rsp.body.as_slice()), (Some(&b"200"[..]), &b"resumed"[..]));
+}
+
+// Fix in passing of task 14 (a 413 path that no test covered): a head whose decoded fields do not
+// fit in the buffer budget of the connection, while its frame fits in what the connection retains,
+// is answered with 413.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn head_over_the_buffer_budget_gets_413() {
+  let params = H3Params { max_buffered_body_per_conn: 2048, ..H3Params::default() };
+  let (mut net, client) = connected(params, &TestHandler::new(OK));
+  let value = vec![b'a'; 3000];
+  let fields = [(&b"x-large"[..], value.as_slice())];
+  let id = send(&mut net, client, &headers_frame(&request_fields(b"GET", b"/", &fields)), true);
+  net.run();
+  assert_eq!(status(&net, client, id).as_deref(), Some(&b"413"[..]));
+  assert!(stops(&net, client).contains(&(id.0, 0x100)));
+  assert_eq!(handler(&net).count, 0);
+  assert_eq!(server_close(&net, client), None);
+}
+
+// Fix in passing of task 14 (the other 413 path that no test covered): the bytes of a HEADERS frame
+// larger than what the connection retains wait in the head buffer of the request, within the
+// buffer budget: a first piece that does not fit, or pieces that fit one by one and not together,
+// are answered with 413.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn waiting_bytes_over_the_buffer_budget_get_413() {
+  for (budget, len) in [(1000u32, 6000usize), (8000, 9600)] {
+    let params = H3Params { max_buffered_body_per_conn: budget, ..H3Params::default() };
+    let (mut net, client) = connected(params, &TestHandler::new(OK));
+    let value = vec![b'b'; len];
+    let fields = [(&b"x-large"[..], value.as_slice())];
+    let id = send(&mut net, client, &headers_frame(&request_fields(b"GET", b"/", &fields)), true);
+    net.run();
+    assert_eq!(status(&net, client, id).as_deref(), Some(&b"413"[..]), "{budget}");
+    assert!(stops(&net, client).contains(&(id.0, 0x100)), "{budget}");
+    assert_eq!(handler(&net).count, 0);
+    assert_eq!(server_close(&net, client), None);
+  }
 }

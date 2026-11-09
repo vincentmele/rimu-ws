@@ -49,4 +49,10 @@ impl SharedBytes {
   pub fn is_empty(&self) -> bool {
     self.start == self.end
   }
+
+  /// The holders of the buffer, this one included, for tests that check that it is shared.
+  #[cfg(test)]
+  pub(crate) fn strong_count(&self) -> usize {
+    Arc::strong_count(&self.bytes)
+  }
 }

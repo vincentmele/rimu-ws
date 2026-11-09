@@ -11,9 +11,9 @@ mod cid;
 mod cid_table;
 mod conn;
 mod crypto;
-#[allow(
-  dead_code,
-  reason = "created by the HTTP/3 server of task 14, driven by the driver of task 11"
+#[cfg_attr(
+  not(feature = "http3-server-framework"),
+  allow(dead_code, reason = "only the HTTP/3 server framework creates and drives endpoints")
 )]
 mod endpoint;
 mod flow;
@@ -45,7 +45,7 @@ mod tx_arena;
 mod varint;
 mod writer;
 
-pub(crate) use app::{BodyRef, ConnCtx, QuicApp};
+pub(crate) use app::{BodyRef, ConnCtx, ConnHandle, QuicApp};
 pub use cid::{Cid, MAX_CID_LEN};
 pub(crate) use conn::{ConnParams, ConnState, FlushOutcome, QuicConn};
 use core::net::{IpAddr, SocketAddr};
@@ -54,8 +54,11 @@ pub(crate) use crypto::{
   remove_header_protection, wipe,
 };
 pub use endpoint::WorkerLoads;
-#[allow(unused_imports, reason = "created by the HTTP/3 server of task 14")]
-pub(crate) use endpoint::{Endpoint, EndpointStats, RecvOutcome};
+#[cfg_attr(
+  not(feature = "http3-server-framework"),
+  allow(unused_imports, reason = "only the HTTP/3 server framework creates endpoints")
+)]
+pub(crate) use endpoint::{Endpoint, RecvOutcome};
 pub(crate) use frame::{AckFrame, Frame, FrameReader, FrameWriter, Space};
 pub use limits::{QuicLimits, QuicParams};
 pub(crate) use packet::{
@@ -69,7 +72,10 @@ pub use steer::{STEERING_PROGRAM_LEN, SteeringProgram, steering_cbpf};
   reason = "the application interface, which the HTTP/3 layer of task 13 uses"
 )]
 pub(crate) use stream::StreamId;
-#[allow(unused_imports, reason = "created once per process by the HTTP/3 server of task 14")]
+#[cfg_attr(
+  not(feature = "http3-server-framework"),
+  allow(unused_imports, reason = "only the HTTP/3 server framework makes the keys of a process")
+)]
 pub(crate) use token::EndpointKeys;
 pub use transport_params::TransportParams;
 pub use tx_arena::{TrainId, TxArena, TxTrain};

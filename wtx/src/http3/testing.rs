@@ -9,7 +9,10 @@ use crate::{
     DecodeOutcome, H3App, H3ConnState, H3FrameTy, H3Handler, H3Params, H3ReqCtx, H3Request,
     H3Settings, QpackDecoder, ReqOutcome, decode_frame_header, encode_frame_header, encode_static,
   },
-  quic::{ConnState, QuicParams, StreamId, encode_varint, testing::Net},
+  quic::{
+    ConnState, QuicParams, StreamId, encode_varint,
+    testing::{Net, TestApp},
+  },
 };
 use alloc::{vec, vec::Vec};
 
@@ -228,7 +231,12 @@ pub(crate) fn stop_sending(net: &mut H3Net, client: usize, id: StreamId, code: u
 
 /// The response of stream `id` as client `client` got it, if anything arrived.
 pub(crate) fn response(net: &H3Net, client: usize, id: StreamId) -> Option<Response> {
-  let log = net.clients[client].app.streams.get(&id.0)?;
+  response_of(&net.clients[client].app, id)
+}
+
+/// The response of stream `id` as the application `app` of a client got it, if anything arrived.
+pub(crate) fn response_of(app: &TestApp, id: StreamId) -> Option<Response> {
+  let log = app.streams.get(&id.0)?;
   let mut rslt = Response { calls: log.calls.clone(), fin: log.fin, ..Response::default() };
   let mut decoder = QpackDecoder::new(0, 0).unwrap();
   let mut scratch = VectorUsize::new();
@@ -307,7 +315,7 @@ pub(crate) fn resume(net: &mut H3Net, client: usize, id: StreamId) {
   let server = &mut net.servers[0];
   server
     .endpoint
-    .with_conn(now_us, &cid, &mut server.app, |app, cx| app.resume(cx, id))
+    .with_cid(now_us, &cid, &mut server.app, |app, cx| app.resume(cx, id))
     .unwrap()
     .unwrap();
 }

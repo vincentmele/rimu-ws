@@ -15,6 +15,8 @@ mod http1_server_framework;
 pub mod http2_client_pool;
 #[cfg(feature = "http2-server-framework")]
 pub mod http2_server_framework;
+#[cfg(feature = "http3-server-framework")]
+pub mod http3_server_framework;
 mod http_client;
 mod http_error;
 mod http_recv_params;
@@ -49,6 +51,8 @@ mod session;
   feature = "web-socket-server-framework"
 ))]
 mod shutdown_signal;
+#[cfg(all(feature = "http2-server-framework", feature = "std"))]
+pub(crate) mod static_files;
 mod status_code;
 mod u31;
 mod version;
@@ -88,6 +92,8 @@ pub use session::*;
   feature = "web-socket-server-framework"
 ))]
 pub use shutdown_signal::ShutdownSignal;
+#[cfg(all(feature = "http2-server-framework", feature = "std"))]
+pub use static_files::StaticFiles;
 pub use status_code::StatusCode;
 pub use u31::U31;
 pub use version::Version;

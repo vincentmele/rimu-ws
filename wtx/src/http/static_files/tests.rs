@@ -2,8 +2,10 @@ use crate::{
   executor::StdRuntime,
   http::{
     AutoStream, Header, Method, MsgBufferString, Request, StatusCode,
-    http2_server_framework::{Endpoint, Get, HttpRouter, StaticFiles, static_files::opens},
+    http2_server_framework::{Endpoint, Get, HttpRouter, StaticFiles},
+    static_files::opens,
   },
+  paths,
 };
 use alloc::{
   format,

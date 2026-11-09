@@ -866,7 +866,7 @@ mod tests {
     sync::AtomicU64,
     tests::_count_allocations_in,
   };
-  use alloc::{rc::Rc, vec, vec::Vec};
+  use alloc::{vec, vec::Vec};
   use core::sync::atomic::Ordering;
 
   // A response that takes a block of the send queue
@@ -1145,7 +1145,8 @@ mod tests {
   #[cfg_attr(miri, ignore)]
   #[test]
   fn fin_rides_on_last_data_frame() {
-    let body: Rc<[u8]> = (0..10_000u32).map(|el| el as u8).collect();
+    let body =
+      crate::misc::SharedBytes::from_slice(&(0..10_000u32).map(|el| el as u8).collect::<Vec<u8>>());
     let fin_on_the_last = |calls: &[(usize, bool)]| {
       let (last, rest) = calls.split_last().unwrap();
       assert!(last.0 > 0 && last.1, "{calls:?}");
@@ -1177,7 +1178,7 @@ mod tests {
       }
       let logs = [&link.client.app.streams[&ids[0].0], &link.client.app.streams[&ids[1].0]];
       assert_eq!(logs[0].data, RESPONSE);
-      assert_eq!(logs[1].data, *body);
+      assert_eq!(logs[1].data, body.as_slice());
       // In datagrams of 1472 bytes once path MTU discovery is done: frames of 1440 bytes
       assert!(logs[1].calls.len() >= 7, "{:?}", logs[1].calls);
       for log in logs {
@@ -1204,7 +1205,7 @@ mod tests {
   #[cfg_attr(miri, ignore)]
   #[test]
   fn body_ref_released_on_ack() {
-    let body: Rc<[u8]> = vec![9; 5000].into();
+    let body = crate::misc::SharedBytes::from_slice(&[9; 5000]);
     let mut link = settled(&LinkOpts::new(None));
     let id = open_bidi(&mut link).unwrap();
     write(&mut link, id, b"GET /", false);
@@ -1215,11 +1216,11 @@ mod tests {
       link.server.with_ctx(now_us, |cx| cx.write_body(id, response, fin)).unwrap();
       let _ = link.server.flush(link.now_us);
       // Sent, not acknowledged
-      assert_eq!(Rc::strong_count(&body), 2);
+      assert_eq!(body.strong_count(), 2);
       assert!(link.deliver_to_client() > 0);
       let _ = link.client.flush(link.now_us);
       assert!(link.deliver_to_server() > 0);
-      assert_eq!(Rc::strong_count(&body), 1, "{fin}");
+      assert_eq!(body.strong_count(), 1, "{fin}");
     }
     let log = &link.client.app.streams[&id.0];
     assert_eq!((log.data.len(), log.fin), (8000, true));
@@ -1236,7 +1237,7 @@ mod tests {
     for first_len in [5, 300] {
       let mut link = settled(&LinkOpts::new(None));
       let blocks = link.client.parts.pools.tx_blocks.len();
-      let body: Rc<[u8]> = vec![7; 50].into();
+      let body = crate::misc::SharedBytes::from_slice(&[7; 50]);
       let first = vec![b'a'; first_len];
       let id = open_bidi(&mut link).unwrap();
       write(&mut link, id, &first, false);
@@ -1258,8 +1259,8 @@ mod tests {
       let log = &link.server.app.streams[&id.0];
       assert_eq!((log.data.as_slice(), log.fin), (expected.as_slice(), true));
       let log = &link.server.app.streams[&other.0];
-      assert_eq!((log.data.as_slice(), log.fin), (&*body, true));
-      assert_eq!(Rc::strong_count(&body), 1);
+      assert_eq!((log.data.as_slice(), log.fin), (body.as_slice(), true));
+      assert_eq!(body.strong_count(), 1);
       assert_eq!(link.client.parts.pools.tx_blocks.len(), blocks + usize::from(first_len > 256));
     }
   }
@@ -1309,7 +1310,7 @@ mod tests {
   fn steady_streams_allocate_nothing_after_warmup() {
     static OTHERS: AtomicU64 = AtomicU64::new(0);
     static SERVER: AtomicU64 = AtomicU64::new(0);
-    let body = BodyRef::new(vec![7; 3000].into(), 0..3000).unwrap();
+    let body = BodyRef::new(crate::misc::SharedBytes::from_slice(&[7; 3000]), 0..3000).unwrap();
     let mut opts = LinkOpts::new(None);
     opts.counters = Some((&SERVER, &OTHERS));
     opts.server_app = TestApp::new(Behavior::Mixed { small: RESPONSE, body, large: LARGE });
@@ -1576,7 +1577,7 @@ mod tests {
   #[cfg_attr(miri, ignore)]
   #[test]
   fn acked_ranges_spill_into_a_block_and_past_it_go_again() {
-    let body: Rc<[u8]> = vec![5; 12_000].into();
+    let body = crate::misc::SharedBytes::from_slice(&[5; 12_000]);
     let mut opts = LinkOpts::new(None);
     let response = BodyRef::new(body, 0..12_000).unwrap();
     opts.server_app = TestApp::new(Behavior::RespondBody(b"", response));

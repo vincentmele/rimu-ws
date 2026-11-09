@@ -37,11 +37,20 @@ const MAX_CHUNKS: usize = 1 << 15;
 // Entries of a free list at most
 const MAX_FREE: usize = 1024;
 // Entries kept by an idle pool
-#[allow(dead_code, reason = "the idle trim of the worker, which the server of task 14 runs")]
+#[cfg_attr(
+  not(feature = "http3-server-framework"),
+  allow(dead_code, reason = "only the HTTP/3 server framework trims idle workers")
+)]
 const IDLE_KEEP: usize = 4;
-#[allow(dead_code, reason = "the idle trim of the worker, which the server of task 14 runs")]
+#[cfg_attr(
+  not(feature = "http3-server-framework"),
+  allow(dead_code, reason = "only the HTTP/3 server framework trims idle workers")
+)]
 const IDLE_KEEP_CHUNKS: usize = 64;
-#[allow(dead_code, reason = "the idle trim of the worker, which the server of task 14 runs")]
+#[cfg_attr(
+  not(feature = "http3-server-framework"),
+  allow(dead_code, reason = "only the HTTP/3 server framework trims idle workers")
+)]
 const IDLE_KEEP_SLOTS: usize = 64;
 const NO_CHUNK: u32 = u32::MAX;
 
@@ -105,7 +114,10 @@ impl QuicPools {
   /// Frees all but a few entries of every pool, for a worker that has no connection: the frame
   /// reference pool and the stream slots only if none is in use.
   #[inline]
-  #[allow(dead_code, reason = "the idle trim of the worker, which the server of task 14 runs")]
+  #[cfg_attr(
+    not(feature = "http3-server-framework"),
+    allow(dead_code, reason = "only the HTTP/3 server framework trims idle workers")
+  )]
   pub(crate) fn trim_idle(&mut self) {
     self.conn_cold.trim(IDLE_KEEP);
     self.crypto_buffers.trim(IDLE_KEEP);
@@ -198,7 +210,10 @@ impl<T> FreeList<T> {
     (largest > than).then(|| self.items.swap_remove(idx))
   }
 
-  #[allow(dead_code, reason = "the idle trim of the worker, which the server of task 14 runs")]
+  #[cfg_attr(
+    not(feature = "http3-server-framework"),
+    allow(dead_code, reason = "only the HTTP/3 server framework trims idle workers")
+  )]
   fn trim(&mut self, keep: usize) {
     let excess = self.items.len().saturating_sub(keep);
     let _ = self.items.drain(..excess);
@@ -392,7 +407,10 @@ impl FrameRefPool {
     self.chunks.get_mut(usize::try_from(idx).ok()?)
   }
 
-  #[allow(dead_code, reason = "the idle trim of the worker, which the server of task 14 runs")]
+  #[cfg_attr(
+    not(feature = "http3-server-framework"),
+    allow(dead_code, reason = "only the HTTP/3 server framework trims idle workers")
+  )]
   fn trim_idle(&mut self, keep: usize) {
     if self.live != 0 {
       return;

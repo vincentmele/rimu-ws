@@ -45,7 +45,10 @@ pub(crate) struct EndpointKeys {
 
 impl EndpointKeys {
   /// Keys drawn from `rng`.
-  #[allow(dead_code, reason = "called by the HTTP/3 server of task 14, once per process")]
+  #[cfg_attr(
+    not(feature = "http3-server-framework"),
+    allow(dead_code, reason = "only the HTTP/3 server framework makes the keys of a process")
+  )]
   #[inline]
   pub(crate) fn new<RNG>(rng: &mut RNG) -> Self
   where

@@ -1034,7 +1034,7 @@ impl<SA: QuicApp> Net<SA> {
           params,
           worker,
           workers,
-          server_tls_config(),
+          Arc::new(server_tls_config()),
           &mut parent,
           Some(Arc::clone(&loads)),
           Arc::clone(&keys),

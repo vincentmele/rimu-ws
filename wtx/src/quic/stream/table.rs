@@ -54,14 +54,17 @@ impl StreamSlots {
 
   /// The number of slots that hold a stream.
   #[inline]
-  #[allow(dead_code, reason = "the idle trim of the worker, which the server of task 14 runs")]
+  #[cfg_attr(not(test), allow(dead_code, reason = "tests that run the slots out"))]
   pub(crate) const fn live(&self) -> usize {
     self.live
   }
 
   /// Frees all but `keep` slots if none holds a stream.
   #[inline]
-  #[allow(dead_code, reason = "the idle trim of the worker, which the server of task 14 runs")]
+  #[cfg_attr(
+    not(feature = "http3-server-framework"),
+    allow(dead_code, reason = "only the HTTP/3 server framework trims idle workers")
+  )]
   pub(crate) fn trim_idle(&mut self, keep: usize) {
     if self.live != 0 {
       return;
