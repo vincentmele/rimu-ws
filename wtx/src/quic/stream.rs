@@ -224,6 +224,9 @@ pub(crate) struct StreamSlots {
   entries: Vec<SlotEntry>,
   // The first free slot, the others linked from it
   free: u32,
+  // The generation of a slot that is made, above every generation of the slots that a trim let
+  // go: a frame reference of a stream of before never matches the stream of a slot made again
+  generation_floor: u32,
   live: usize,
 }
 
@@ -231,7 +234,7 @@ impl StreamSlots {
   /// No slots.
   #[inline]
   pub(crate) const fn new() -> Self {
-    Self { entries: Vec::new(), free: NO_SLOT, live: 0 }
+    Self { entries: Vec::new(), free: NO_SLOT, generation_floor: 0, live: 0 }
   }
 
   /// The number of slots that hold a stream.
@@ -245,6 +248,9 @@ impl StreamSlots {
   pub(crate) fn trim_idle(&mut self, keep: usize) {
     if self.live != 0 {
       return;
+    }
+    for entry in self.entries.get(keep..).unwrap_or_default() {
+      self.generation_floor = self.generation_floor.max(entry.generation.wrapping_add(1));
     }
     self.entries.truncate(keep);
     self.entries.shrink_to(keep);
@@ -263,7 +269,7 @@ impl StreamSlots {
       let idx = u32::try_from(self.entries.len()).map_err(|_err| exhausted())?;
       self.entries.try_reserve(1).map_err(|_err| exhausted())?;
       self.entries.push(SlotEntry {
-        generation: 0,
+        generation: self.generation_floor,
         live: false,
         next_free: NO_SLOT,
         stream: Stream::new()?,
@@ -1883,24 +1889,26 @@ impl Streams {
       };
       let mut cx = ConnCtx::new(state, self, pools, params, now_us);
       cx.delivered = len;
-      app.on_stream_data(&mut cx, id, bytes, fin)?;
+      let rslt = app.on_stream_data(&mut cx, id, bytes, fin);
       let retained = cx.retained.min(len);
       let tail = len.wrapping_sub(retained);
       let QuicPools { rx_blocks, stream_slots, .. } = &mut *pools;
-      let Some(stream) = stream_slots.get_mut(slot) else {
+      let (Some(stream), Some(cold)) = (stream_slots.get_mut(slot), self.cold.as_deref_mut())
+      else {
+        rslt?;
         break;
       };
       let rx = &mut stream.rx;
-      // Still receiving: the application did not ask the peer to stop
-      let live = rx.state == RxState::Recv;
-      let Some(cold) = self.cold.as_deref_mut() else {
-        break;
-      };
       let held = &mut cold.held;
+      // Still receiving: the application did not fail and did not ask the peer to stop. A block that
+      // was out for the call goes back in any case, before an error goes up.
+      let live = rslt.is_ok() && rx.state == RxState::Recv;
+      let mut kept = Ok(());
       match piece {
         Piece::Direct => {
           if live && retained > 0 {
-            rx.store_keep(direct.get(tail..).unwrap_or_default(), rx_blocks, held, &params.limits)?;
+            let bytes = direct.get(tail..).unwrap_or_default();
+            kept = rx.store_keep(bytes, rx_blocks, held, &params.limits);
           }
           direct = &[];
         }
@@ -1925,8 +1933,9 @@ impl Streams {
         }
         Piece::Block { block, no, pos } => {
           if live && retained > 0 {
-            let kept = block.get(pos.wrapping_add(tail)..pos.wrapping_add(len)).unwrap_or_default();
-            rx.store_keep(kept, rx_blocks, held, &params.limits)?;
+            let bytes =
+              block.get(pos.wrapping_add(tail)..pos.wrapping_add(len)).unwrap_or_default();
+            kept = rx.store_keep(bytes, rx_blocks, held, &params.limits);
           }
           // Back in its place, unless the stream let go of its blocks meanwhile
           match rx.ooo_blocks.binary_search_by_key(&no, |el| el.no) {
@@ -1940,6 +1949,8 @@ impl Streams {
         }
         Piece::Fin => {}
       }
+      rslt?;
+      kept?;
       if live && fin {
         rx.state = RxState::Done;
         rx.release(rx_blocks, held);
@@ -2761,6 +2772,16 @@ mod tests {
     let again: Vec<u32> = (0..64).map(|_| slots.alloc().unwrap()).collect();
     assert_eq!(slots.entries.len(), 64);
     assert!(again.iter().all(|el| *el < 64));
+    // A slot made again after a trim does not take a generation that its index had: a frame
+    // reference of a stream of before can not match the stream that is there now
+    let last = 99;
+    for _ in 0..36 {
+      let _slot = slots.alloc().unwrap();
+    }
+    assert!(slots.get(last).is_some());
+    for generation in 0..=1 {
+      assert!(slots.get_live(last, generation).is_none(), "{generation}");
+    }
   }
 
   // 1,000 requests of 100 bytes, 64 at a time, come back whole on their streams: four times the
@@ -3027,6 +3048,49 @@ mod tests {
     assert!(kinds(0).all(|el| el.len() == 3000));
     assert!(kinds(1).all(|el| el == LARGE));
     assert!(kinds(2).all(|el| el == RESPONSE));
+  }
+
+  // A second round of streams whose data comes out of order and whose lines the application
+  // retains in part, inline and in a block, allocates nothing on the server once its pools are
+  // warm.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn steady_reassembly_and_retain_allocate_nothing_after_warmup() {
+    static OTHERS: AtomicU64 = AtomicU64::new(0);
+    static SERVER: AtomicU64 = AtomicU64::new(0);
+    const STREAMS: usize = 64;
+    let mut data = vec![b'a'; 300];
+    data.push(b'\n');
+    data.extend_from_slice(&[b'b'; 300]);
+    data.push(b'\n');
+    let mut opts = LinkOpts::new(None);
+    opts.counters = Some((&SERVER, &OTHERS));
+    opts.server_app = TestApp::new(Behavior::LineCount);
+    _count_allocations_in(&OTHERS);
+    let mut link = settled(&opts);
+    let round = |link: &mut Link| {
+      for _ in 0..STREAMS {
+        let id = open_bidi(link).unwrap();
+        // The end first, which waits in a block; then the start, whose second line is retained
+        // inline and then, with the end, in a block
+        let end = Frame::Stream { id: id.0, offset: 400, data: &data[400..], fin: true };
+        client_sends(link, &[end]);
+        client_sends(
+          link,
+          &[Frame::Stream { id: id.0, offset: 0, data: &data[..400], fin: false }],
+        );
+        link.run();
+        assert_eq!(link.client.app.streams[&id.0].data, b"ok");
+      }
+    };
+    round(&mut link);
+    let before = SERVER.load(Ordering::Relaxed);
+    assert!(before > 0);
+    round(&mut link);
+    let allocations = SERVER.load(Ordering::Relaxed) - before;
+    assert_eq!(allocations, 0, "{allocations} allocations in {STREAMS} streams");
+    assert_eq!(link.server.app.line_count, 4 * STREAMS as u64);
+    assert_eq!(link.server.conn.streams().held_blocks(), 0);
   }
 
   // Rule: a stream above the limit given to the peer is a STREAM_LIMIT_ERROR (RFC 9000 section

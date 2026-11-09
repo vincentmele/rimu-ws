@@ -61,6 +61,9 @@ pub(crate) enum Behavior {
   /// Keeps the lines (ended by `\n`, or by the FIN) in [`TestApp::lines`], and retains what is
   /// left of a line until the rest of it arrives.
   Lines,
+  /// [`Self::Lines`] that only counts the lines, in [`TestApp::line_count`], and answers each
+  /// request with `ok` and the FIN once its FIN arrived: it allocates nothing.
+  LineCount,
 }
 
 /// How a [`TestApp`] fails on the first data that arrives.
@@ -96,11 +99,17 @@ pub(crate) struct TestApp {
   pub(crate) established: u32,
   /// How it fails, if it does.
   pub(crate) fail: Option<Fail>,
+  /// Calls of [`QuicApp::on_stream_data`].
+  pub(crate) calls: u64,
+  /// The calls of [`QuicApp::on_stream_data`] that succeed before [`Self::fail`] applies.
+  pub(crate) fail_after: u64,
   /// FINs that arrived.
   pub(crate) fins: u64,
   /// If it is the application of the server of a [`Link`], which sets it: the server answers a
   /// reset of the peer with a reset of its own sending part.
   pub(crate) is_server: bool,
+  /// The lines of [`Behavior::LineCount`].
+  pub(crate) line_count: u64,
   /// The lines of [`Behavior::Lines`].
   pub(crate) lines: Vec<Vec<u8>>,
   /// Calls of [`QuicApp::on_stream_reset`].
@@ -142,7 +151,8 @@ impl QuicApp for TestApp {
     data: &[u8],
     fin: bool,
   ) -> crate::Result<()> {
-    if let Some(fail) = self.fail {
+    self.calls = self.calls.wrapping_add(1);
+    if let Some(fail) = self.fail.filter(|_| self.calls > self.fail_after) {
       return match fail {
         Fail::Transport(code) => Err(crate::Error::QuicClose(code, QuicError::InvalidFrame)),
         Fail::Other => Err(crate::Error::ProgrammingError),
@@ -185,6 +195,16 @@ impl QuicApp for TestApp {
             1 => cx.write_body(id, body.clone(), true)?,
             _ => cx.write(id, large, true)?,
           }
+        }
+      }
+      Behavior::LineCount => {
+        let lines = data.iter().filter(|el| **el == b'\n').count();
+        self.line_count = self.line_count.wrapping_add(u64::try_from(lines).unwrap_or(0));
+        let tail = data.iter().rev().take_while(|el| **el != b'\n').count();
+        if fin {
+          cx.write(id, b"ok", true)?;
+        } else {
+          cx.retain(tail)?;
         }
       }
       Behavior::Lines => {

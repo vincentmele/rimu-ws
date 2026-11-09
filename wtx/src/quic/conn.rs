@@ -2249,13 +2249,14 @@ mod tests {
   #[cfg_attr(miri, ignore)]
   #[test]
   fn abort_returns_everything_to_the_pools() {
-    fn counts(parts: &Parts) -> (usize, usize, usize, usize) {
+    fn counts(parts: &Parts) -> (usize, usize, usize, usize, usize) {
       let pools = &parts.pools;
       (
         pools.frame_refs.live_chunks(),
         pools.handshake_spaces.len(),
         pools.sent_rings.len(),
         pools.crypto_buffers.len(),
+        pools.conn_cold.len(),
       )
     }
     let opts = LinkOpts::new(None);

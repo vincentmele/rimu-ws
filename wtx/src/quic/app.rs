@@ -217,8 +217,8 @@ impl BodyRef {
 #[cfg(test)]
 mod tests {
   use crate::quic::{
-    BodyRef, ConnState, QuicError, TransportErrorCode,
-    testing::{Behavior, Fail, Link, LinkOpts, TestApp},
+    BodyRef, ConnState, Frame, QuicError, TransportErrorCode,
+    testing::{Behavior, Fail, Link, LinkOpts, TestApp, encode_frames},
   };
   use alloc::{rc::Rc, vec, vec::Vec};
 
@@ -278,6 +278,39 @@ mod tests {
       let _ = link.server.flush(link.now_us);
       assert_eq!(link.deliver_to_client(), 1);
       assert_eq!(link.client.conn.state(), ConnState::Draining);
+    }
+  }
+
+  // A callback that fails while it was given bytes from a block, data that waited or retained
+  // bytes, gives the block back to the pool all the same.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn blocks_go_back_when_a_callback_fails() {
+    for retains in [false, true] {
+      let mut opts = LinkOpts::new(None);
+      opts.server_app = TestApp::new(if retains { Behavior::Lines } else { Behavior::Collect });
+      opts.server_app.fail = Some(Fail::Other);
+      // Retained: 300 bytes kept in a block, which the next call fails with. Waiting: [0, 10) and
+      // [10, 20) succeed, [20, 30) from its block fails.
+      opts.server_app.fail_after = if retains { 1 } else { 2 };
+      let mut link = settled(&opts);
+      let blocks = link.server.parts.pools.rx_blocks.len();
+      let id = request(&mut link, b"", false);
+      let long = [b'x'; 300];
+      let frames: Vec<(u64, &[u8])> = if retains {
+        vec![(0, &long), (300, b"y")]
+      } else {
+        vec![(0, &long[..10]), (20, &long[..10]), (10, &long[..10])]
+      };
+      for (offset, data) in frames {
+        let frame = Frame::Stream { id: id.0, offset, data, fin: false };
+        link.client.conn.queue_test_frames(&encode_frames(&[frame]));
+        let _ = link.client.flush(link.now_us);
+        assert_eq!(link.deliver_to_server(), 1);
+      }
+      assert_eq!(link.server.conn.close_code(), Some((false, 0x01)), "{retains}");
+      link.server.abort();
+      assert_eq!(link.server.parts.pools.rx_blocks.len(), blocks + 1, "{retains}");
     }
   }
 
