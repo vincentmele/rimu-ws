@@ -1,0 +1,58 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 109K of event 'cycles'
+# Event count (approx.): 718060093544
+#
+# Overhead  Shared Object                   Symbol                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        
+# ........  ..............................  ..............................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+     5.82%  [kernel.kallsyms]               [k] kernel_init_pages
+     2.27%  [kernel.kallsyms]               [k] rep_movs_alternative
+     2.10%  libc.so.6                       [.] 0x00000000001764f1
+     1.62%  libc.so.6                       [.] 0x000000000017654a
+     1.60%  libc.so.6                       [.] 0x0000000000176540
+     1.08%  aegon-arena                     [.] aegon::http::v3::Http3Stream::~Http3Stream()
+     0.91%  libnghttp3.so.9.9.1             [.] nghttp3_conn_writev_stream
+     0.85%  [kernel.kallsyms]               [k] entry_SYSRETQ_unsafe_stack
+     0.83%  libc.so.6                       [.] 0x0000000000176305
+     0.82%  libc.so.6                       [.] 0x0000000000176529
+     0.76%  libnghttp3.so.9.9.1             [.] nghttp3_qpack_encoder_encode
+     0.73%  libc.so.6                       [.] 0x0000000000176533
+     0.69%  [kernel.kallsyms]               [k] asm_sysvec_apic_timer_interrupt
+     0.63%  libc.so.6                       [.] 0x0000000000176e04
+     0.58%  libngtcp2.so.16.12.0            [.] 0x000000000001a8f4
+     0.58%  libngtcp2.so.16.12.0            [.] 0x000000000003555b
+     0.56%  libcrypto.so.3                  [.] CRYPTO_gcm128_encrypt_ctr32
+     0.54%  libc.so.6                       [.] 0x0000000000176524
+     0.53%  [kernel.kallsyms]               [k] _raw_spin_trylock
+     0.51%  libngtcp2.so.16.12.0            [.] ngtcp2_conn_writev_stream_versioned
+     0.50%  libc.so.6                       [.] 0x000000000017652e
+     0.49%  [kernel.kallsyms]               [k] aa_get_buffer
+     0.47%  [kernel.kallsyms]               [k] skb_release_data
+     0.46%  [kernel.kallsyms]               [k] _copy_from_iter
+     0.45%  libc.so.6                       [.] 0x0000000000176e0e
+     0.45%  aegon-arena                     [.] aegon::http::v3::Http3Connection::on_stream_read(long, unsigned int*, nghttp3_vec*, unsigned long)
+     0.44%  aegon-arena                     [.] aegon::http::v3::Http3Connection::flush_outbound() [clone .part.0]
+     0.42%  aegon-arena                     [.] aegon::http::v3::Http3Connection::submit_response(aegon::http::v3::Http3Stream*)
+     0.42%  libcrypto.so.3                  [.] EVP_EncryptUpdate
+     0.42%  libngtcp2.so.16.12.0            [.] 0x00000000000343f3
+     0.40%  aegon-arena                     [.] aegon::http::v3::Http3Connection::on_stream_header(long, int, nghttp3_rcbuf*, nghttp3_rcbuf*, unsigned char)
+     0.40%  libc.so.6                       [.] tolower
+     0.40%  libcrypto.so.3                  [.] 0x0000000000304000
+     0.38%  libc.so.6                       [.] 0x00000000001762f0
+     0.36%  aegon-arena                     [.] aegon::http::Router::static_files(std::basic_string_view<char, std::char_traits<char> >, std::basic_string_view<char, std::char_traits<char> >, aegon::http::StaticFilesOptions)::{lambda(aegon::http::Context&)#1}::operator()(aegon::http::Context&) const::{lambda(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, std::basic_string_view<char, std::char_traits<char> >, bool)#1}::operator()(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, std::basic_string_view<char, std::char_traits<char> >, bool) const
+     0.35%  [kernel.kallsyms]               [k] prepend_path
+     0.34%  libngtcp2_crypto_ossl.so.0.3.2  [.] ngtcp2_crypto_encrypt
+     0.34%  [kernel.kallsyms]               [k] memset_orig
+     0.33%  libngtcp2.so.16.12.0            [.] 0x000000000001a686
+     0.32%  libnghttp3.so.9.9.1             [.] nghttp3_conn_add_write_offset
+     0.31%  libc.so.6                       [.] 0x00000000001765bc
+     0.31%  [kernel.kallsyms]               [k] asm_sysvec_call_function
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

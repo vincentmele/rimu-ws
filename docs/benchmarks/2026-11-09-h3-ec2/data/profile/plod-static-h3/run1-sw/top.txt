@@ -1,0 +1,83 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 110K of event 'cycles'
+# Event count (approx.): 679824970390
+#
+# Overhead  Shared Object                                   Symbol                                            
+# ........  ..............................................  ..................................................
+#
+     5.24%  [kernel.kallsyms]                               [k] kernel_init_pages
+     3.67%  server-tls                                      [.] http_h3_flush_g4
+     3.44%  server-tls                                      [.] http_h3_head_block_g4.constprop.0
+     1.92%  [kernel.kallsyms]                               [k] rep_movs_alternative
+     1.87%  server-tls                                      [.] http_h3_frames_g4.constprop.0
+     1.79%  [kernel.kallsyms]                               [k] entry_SYSRETQ_unsafe_stack
+     1.53%  server-tls                                      [.] http_h3_serve_conn_g4
+     1.30%  [kernel.kallsyms]                               [k] _raw_spin_trylock
+     1.20%  server-tls                                      [.] http_qpack_string_g4
+     1.01%  server-tls                                      [.] http_each_field_g4.constprop.0
+     0.97%  [kernel.kallsyms]                               [k] native_queued_spin_lock_slowpath
+     0.94%  server-tls                                      [.] http_h3_field_section_g4.isra.0
+     0.90%  [kernel.kallsyms]                               [k] d_namespace_path.constprop.0
+     0.82%  libcrypto.so.3                                  [.] EVP_CIPHER_CTX_ctrl
+     0.77%  server-tls                                      [.] tlsg_quic_seal
+     0.76%  server-tls                                      [.] http_h3_data_frames_g4.isra.0
+     0.75%  [kernel.kallsyms]                               [k] aa_get_buffer
+     0.74%  [kernel.kallsyms]                               [k] asm_sysvec_apic_timer_interrupt
+     0.73%  server-tls                                      [.] http_file_head_g4_919.constprop.0
+     0.71%  server-tls                                      [.] gs_spans_alloc.isra.0
+     0.70%  [kernel.kallsyms]                               [k] native_write_msr
+     0.69%  [kernel.kallsyms]                               [k] prepend_path
+     0.68%  libc.so.6                                       [.] 0x0000000000197bb3
+     0.64%  server-tls                                      [.] gs_memcpy
+     0.62%  libc.so.6                                       [.] 0x0000000000197ba9
+     0.61%  [kernel.kallsyms]                               [k] aa_put_buffer
+     0.61%  [kernel.kallsyms]                               [k] link_path_walk
+     0.56%  [kernel.kallsyms]                               [k] __d_lookup_rcu
+     0.56%  [kernel.kallsyms]                               [k] aa_dfa_match
+     0.54%  [kernel.kallsyms]                               [k] skb_release_data
+     0.54%  server-tls                                      [.] gs_scan_any
+     0.52%  libcrypto.so.3                                  [.] 0x00000000000ef7c0
+     0.52%  libc.so.6                                       [.] 0x0000000000198484
+     0.52%  libc.so.6                                       [.] 0x000000000019848e
+     0.50%  libcrypto.so.3                                  [.] EVP_EncryptUpdate
+     0.50%  server-tls                                      [.] http_serve_cached_g4.constprop.0
+     0.50%  server-tls                                      [.] plod_attempt_g4_755
+     0.50%  [kernel.kallsyms]                               [k] aa_path_perm
+     0.49%  libc.so.6                                       [.] 0x0000000000197bae
+     0.48%  server-tls                                      [.] plod_on_g4
+     0.47%  libc.so.6                                       [.] 0x0000000000198493
+     0.45%  server-tls                                      [.] gs_sp_near
+     0.44%  libc.so.6                                       [.] 0x0000000000197b71
+     0.43%  libc.so.6                                       [.] 0x0000000000197ba4
+     0.43%  [kernel.kallsyms]                               [k] do_syscall_64
+     0.42%  libc.so.6                                       [.] 0x0000000000198489
+     0.41%  [kernel.kallsyms]                               [k] inode_permission
+     0.39%  [kernel.kallsyms]                               [k] lockref_get_not_dead
+     0.39%  libc.so.6                                       [.] 0x0000000000197bca
+     0.38%  [kernel.kallsyms]                               [k] ovl_permission
+     0.37%  libc.so.6                                       [.] 0x0000000000197bbb
+     0.37%  libc.so.6                                       [.] 0x0000000000197bc5
+     0.36%  [kernel.kallsyms]                               [k] __free_frozen_pages
+     0.35%  libcrypto.so.3                                  [.] CRYPTO_gcm128_finish
+     0.35%  libcrypto.so.3                                  [.] CRYPTO_gcm128_encrypt_ctr32
+     0.34%  [kernel.kallsyms]                               [k] copy_from_kernel_nofault
+     0.33%  libcrypto.so.3                                  [.] 0x000000000032f919
+     0.33%  [kernel.kallsyms]                               [k] memset_orig
+     0.33%  libcrypto.so.3                                  [.] 0x000000000032f812
+     0.33%  server-tls                                      [.] http_qv_put_g4
+     0.32%  server-tls                                      [.] http_strm_close_g4.isra.0
+     0.32%  libc.so.6                                       [.] 0x0000000000197bc0
+     0.31%  [kernel.kallsyms]                               [k] __ip_append_data
+     0.31%  libcrypto.so.3                                  [.] 0x000000000032f7a5
+     0.31%  [kernel.kallsyms]                               [k] generic_permission
+     0.30%  libcrypto.so.3                                  [.] CRYPTO_gcm128_aad
+     0.30%  server-tls                                      [.] http_h3_call_once_g4_1620.constprop.0.isra.0
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

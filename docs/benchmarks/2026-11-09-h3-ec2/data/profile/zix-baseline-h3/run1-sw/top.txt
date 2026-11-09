@@ -1,0 +1,64 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 100K of event 'cycles'
+# Event count (approx.): 203232373803
+#
+# Overhead  Shared Object                                   Symbol                                            
+# ........  ..............................................  ..................................................
+#
+     2.96%  zix-http3                                       [.] 0x00000000000379b8
+     2.57%  zix-http3                                       [.] 0x0000000000037a68
+     2.50%  zix-http3                                       [.] 0x000000000003686b
+     2.38%  zix-http3                                       [.] 0x0000000000037a08
+     2.30%  zix-http3                                       [.] 0x0000000000037ab8
+     1.98%  [kernel.kallsyms]                               [k] acpi_processor_ffh_cstate_enter
+     1.82%  zix-http3                                       [.] 0x0000000000037c58
+     1.71%  zix-http3                                       [.] 0x0000000000037968
+     1.14%  zix-http3                                       [.] 0x00000000000378c8
+     0.95%  zix-http3                                       [.] 0x00000000000367a9
+     0.83%  zix-http3                                       [.] 0x0000000000037a42
+     0.81%  zix-http3                                       [.] 0x0000000000037a9f
+     0.80%  [kernel.kallsyms]                               [k] native_write_msr
+     0.76%  zix-http3                                       [.] 0x00000000000367a0
+     0.71%  zix-http3                                       [.] 0x00000000000378fe
+     0.66%  [kernel.kallsyms]                               [k] native_read_msr
+     0.63%  [kernel.kallsyms]                               [k] udpv6_recvmsg
+     0.63%  [kernel.kallsyms]                               [k] perf_tp_event
+     0.63%  [kernel.kallsyms]                               [k] rep_movs_alternative
+     0.62%  zix-http3                                       [.] 0x00000000000379ed
+     0.59%  [kernel.kallsyms]                               [k] asm_sysvec_apic_timer_interrupt
+     0.53%  zix-http3                                       [.] 0x000000000003677c
+     0.52%  zix-http3                                       [.] 0x00000000000367a4
+     0.47%  zix-http3                                       [.] 0x000000000003794d
+     0.46%  [kernel.kallsyms]                               [k] entry_SYSRETQ_unsafe_stack
+     0.46%  zix-http3                                       [.] 0x00000000000367a6
+     0.45%  zix-http3                                       [.] 0x0000000000036781
+     0.45%  zix-http3                                       [.] 0x000000000003799e
+     0.42%  zix-http3                                       [.] 0x0000000000033e4e
+     0.42%  zix-http3                                       [.] 0x000000000003676a
+     0.41%  zix-http3                                       [.] 0x000000000003678e
+     0.39%  [kernel.kallsyms]                               [k] __raw_spin_lock_irqsave
+     0.39%  zix-http3                                       [.] 0x0000000000033563
+     0.36%  [kernel.kallsyms]                               [k] skb_defer_free_flush
+     0.36%  zix-http3                                       [.] 0x0000000000032a2e
+     0.36%  [kernel.kallsyms]                               [k] skb_release_data
+     0.35%  zix-http3                                       [.] 0x0000000000037c39
+     0.35%  zix-http3                                       [.] 0x0000000000037918
+     0.34%  zix-http3                                       [.] 0x0000000000032899
+     0.34%  zix-http3                                       [.] 0x00000000000378a6
+     0.33%  [kernel.kallsyms]                               [k] memset_orig
+     0.33%  [kernel.kallsyms]                               [k] __skb_datagram_iter
+     0.33%  zix-http3                                       [.] 0x000000000003678b
+     0.32%  [kernel.kallsyms]                               [k] menu_select
+     0.31%  zix-http3                                       [.] 0x0000000000031d87
+     0.31%  zix-http3                                       [.] 0x0000000000033e67
+     0.31%  [kernel.kallsyms]                               [k] __schedule
+     0.30%  [kernel.kallsyms]                               [k] __ip_append_data
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

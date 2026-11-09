@@ -1,0 +1,78 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 101K of event 'cycles'
+# Event count (approx.): 609533429164
+#
+# Overhead  Shared Object                                   Symbol                                            
+# ........  ..............................................  ..................................................
+#
+     3.83%  [kernel.kallsyms]                               [k] kernel_init_pages
+     2.40%  [kernel.kallsyms]                               [k] rep_movs_alternative
+     2.39%  zix-http3                                       [.] 0x000000000003686b
+     2.27%  [kernel.kallsyms]                               [k] memset_orig
+     1.63%  [kernel.kallsyms]                               [k] skb_release_data
+     1.54%  [kernel.kallsyms]                               [k] entry_SYSRETQ_unsafe_stack
+     1.39%  [kernel.kallsyms]                               [k] skb_defer_free_flush
+     1.23%  zix-http3                                       [.] 0x00000000000367a9
+     1.19%  [kernel.kallsyms]                               [k] perf_tp_event
+     1.00%  [kernel.kallsyms]                               [k] __ip_append_data
+     0.88%  zix-http3                                       [.] 0x00000000000367a6
+     0.82%  zix-http3                                       [.] 0x00000000000367a4
+     0.79%  zix-http3                                       [.] 0x00000000000367a0
+     0.78%  [kernel.kallsyms]                               [k] __ip_select_ident
+     0.76%  [kernel.kallsyms]                               [k] udp_sendmsg
+     0.73%  [kernel.kallsyms]                               [k] __udp_enqueue_schedule_skb
+     0.72%  [kernel.kallsyms]                               [k] nf_hook_slow
+     0.65%  zix-http3                                       [.] 0x000000000003677c
+     0.65%  [vdso]                                          [.] 0x0000000000000a09
+     0.61%  [kernel.kallsyms]                               [k] __alloc_skb
+     0.54%  [kernel.kallsyms]                               [k] udp_queue_rcv_one_skb
+     0.53%  zix-http3                                       [.] 0x000000000002ef71
+     0.53%  [kernel.kallsyms]                               [k] net_rx_action
+     0.51%  zix-http3                                       [.] 0x000000000002ef9e
+     0.51%  zix-http3                                       [.] 0x0000000000036761
+     0.51%  [kernel.kallsyms]                               [k] asm_sysvec_apic_timer_interrupt
+     0.50%  [kernel.kallsyms]                               [k] __raw_spin_lock_irqsave
+     0.49%  [kernel.kallsyms]                               [k] nf_conntrack_in
+     0.49%  zix-http3                                       [.] 0x000000000003678b
+     0.49%  zix-http3                                       [.] 0x000000000003676a
+     0.47%  zix-http3                                       [.] 0x000000000002ef87
+     0.47%  [kernel.kallsyms]                               [k] udpv6_sendmsg
+     0.46%  zix-http3                                       [.] 0x0000000000031d87
+     0.45%  zix-http3                                       [.] 0x000000000002ee41
+     0.45%  zix-http3                                       [.] 0x0000000000036781
+     0.44%  zix-http3                                       [.] 0x000000000002ef68
+     0.44%  zix-http3                                       [.] 0x000000000003676d
+     0.43%  zix-http3                                       [.] 0x000000000002ee47
+     0.43%  [kernel.kallsyms]                               [k] __netif_receive_skb_core.constprop.0
+     0.41%  zix-http3                                       [.] 0x000000000003678e
+     0.40%  zix-http3                                       [.] 0x000000000002ef8d
+     0.40%  [kernel.kallsyms]                               [k] do_perf_trace_net_dev_template
+     0.40%  [kernel.kallsyms]                               [k] ____sys_sendmsg
+     0.39%  [kernel.kallsyms]                               [k] process_backlog
+     0.39%  [kernel.kallsyms]                               [k] ip_finish_output2
+     0.39%  [kernel.kallsyms]                               [k] napi_consume_skb
+     0.38%  [kernel.kallsyms]                               [k] __dev_queue_xmit
+     0.38%  [kernel.kallsyms]                               [k] __wake_up_common
+     0.36%  [kernel.kallsyms]                               [k] do_syscall_64
+     0.36%  [kernel.kallsyms]                               [k] __ip_make_skb
+     0.36%  [kernel.kallsyms]                               [k] __udp4_lib_rcv
+     0.35%  [kernel.kallsyms]                               [k] enqueue_to_backlog
+     0.34%  [kernel.kallsyms]                               [k] _copy_from_user
+     0.34%  [kernel.kallsyms]                               [k] kmalloc_reserve
+     0.33%  [kernel.kallsyms]                               [k] ep_poll_callback
+     0.32%  [kernel.kallsyms]                               [k] __nf_conntrack_find_get
+     0.32%  zix-http3                                       [.] 0x00000000000367a8
+     0.32%  zix-http3                                       [.] 0x000000000002ef62
+     0.32%  [kernel.kallsyms]                               [k] ip_rcv
+     0.31%  [kernel.kallsyms]                               [k] __free_frozen_pages
+     0.31%  zix-http3                                       [.] 0x0000000000036760
+     0.31%  [kernel.kallsyms]                               [k] netif_rx_internal
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

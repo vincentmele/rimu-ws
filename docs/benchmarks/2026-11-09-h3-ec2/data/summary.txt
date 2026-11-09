@@ -1,0 +1,377 @@
+imds instance-type: m6a.24xlarge
+imds placement/availability-zone: sa-east-1b
+uname -r: 7.0.0-1016-aws
+server cpus 0,48,1,49,2,50,3,51,4,52,5,53,6,54,7,55,8,56,9,57,10,58,11,59,12,60,13,61,14,62,15,63,16,64,17,65,18,66,19,67,20,68,21,69,22,70,23,71 | generator cpus 24,72,25,73,26,74,27,75,28,76,29,77,30,78,31,79,32,80,33,81,34,82,35,83,36,84,37,85,38,86,39,87,40,88,41,89,42,90,43,91,44,92,45,93,46,94,47,95 | h2load -t 48
+pmu=yes
+
+## bench
+
+composite (median of the starts; reference = best of plod, fib, aegon, rimu):
+```
+server     composite               baseline-h3                 static-h3
+rimu-min        2000       5692k (1000) #2        1007k (1000) #1 
+rimu-full       1814       4726k ( 830) #4         990k ( 983) #2 
+cnetmod         1789       5584k ( 981) #3         814k ( 808) #4 
+zix             1631       5970k (1049) #1         586k ( 582) #7 
+fib             1623       4561k ( 801) #5         827k ( 821) #3 
+plod            1544       4464k ( 784) #6         765k ( 760) #5 
+aegon           1404       4445k ( 781) #7         627k!( 623) #6 
+```
+
+| profile | server | rps median of starts (per start) | srv us/req | gen us/req | errors | load1 range | dgrams in/req | dgrams out/req | pkts out/req | ACK-only share |
+|---|---|---|---|---|---|---|---|---|---|---|
+| baseline-h3 | aegon | 4445k (4445k, 4468k, 4418k) | 4.14 | 7.08 | 0 | 28-33 | - | - | - | - |
+| baseline-h3 | cnetmod | 5584k (5592k, 5542k, 5584k) | 2.74 | 7.07 | 0 | 26-33 | - | - | - | - |
+| baseline-h3 | fib | 4561k (4554k, 4561k, 4581k) | 5.50 | 7.11 | 0 | 25-36 | - | - | - | - |
+| baseline-h3 | plod | 4464k (4464k, 4464k, 4495k) | 5.21 | 8.66 | 0 | 17-31 | - | - | - | - |
+| baseline-h3 | rimu-full | 4726k (4737k, 4716k, 4726k) | 3.11 | 8.03 | 0 | 0-29 | 0.05 | 0.05 | 0.05 | 0.0% |
+| baseline-h3 | rimu-min | 5692k (5692k, 5621k, 5705k) | 2.48 | 6.89 | 0 | 11-29 | 0.05 | 0.02 | 0.02 | 0.0% |
+| baseline-h3 | zix | 5970k (5970k, 5917k, 5992k) | 1.39 | 7.06 | 0 | 28-31 | - | - | - | - |
+| static-h3 | aegon | 627k (627k, 636k, 627k) | 51.34 | 34.80 | 39 | 30-32 | - | - | - | - |
+| static-h3 | cnetmod | 814k (814k, 817k, 801k) | 37.68 | 41.56 | 0 | 29-30 | - | - | - | - |
+| static-h3 | fib | 827k (795k, 831k, 827k) | 44.35 | 38.27 | 0 | 29-31 | - | - | - | - |
+| static-h3 | plod | 765k (769k, 755k, 765k) | 46.34 | 42.41 | 0 | 26-32 | - | - | - | - |
+| static-h3 | rimu-full | 990k (991k, 990k, 983k) | 29.76 | 41.08 | 0 | 27-33 | 0.12 | 11.39 | 11.39 | 0.0% |
+| static-h3 | rimu-min | 1007k (991k, 1007k, 1012k) | 30.27 | 40.28 | 0 | 28-34 | 0.12 | 11.35 | 11.35 | 0.0% |
+| static-h3 | zix | 586k (579k, 589k, 586k) | 46.80 | 56.20 | 0 | 30-32 | - | - | - | - |
+
+rps of every start by pass (k = 1000; ! = errors; FAILED = no result after the retry):
+
+| profile | server | pass 1 | pass 2 | pass 3 | spread |
+|---|---|---|---|---|---|
+| baseline-h3 | aegon | 4445k | 4468k | 4418k | 1% |
+| baseline-h3 | cnetmod | 5592k | 5542k | 5584k | 1% |
+| baseline-h3 | fib | 4554k | 4561k | 4581k | 1% |
+| baseline-h3 | plod | 4464k | 4464k | 4495k | 1% |
+| baseline-h3 | rimu-full | 4737k | 4716k | 4726k | 0% |
+| baseline-h3 | rimu-min | 5692k | 5621k | 5705k | 1% |
+| baseline-h3 | zix | 5970k | 5917k | 5992k | 1% |
+| static-h3 | aegon | 627k | 636k! | 627k | 1% |
+| static-h3 | cnetmod | 814k | 817k | 801k | 2% |
+| static-h3 | fib | 795k | 831k | 827k | 4% |
+| static-h3 | plod | 769k | 755k | 765k | 2% |
+| static-h3 | rimu-full | 991k | 990k | 983k | 1% |
+| static-h3 | rimu-min | 991k | 1007k | 1012k | 2% |
+| static-h3 | zix | 579k | 589k | 586k | 2% |
+
+## profile: software profile windows
+
+| profile | server | req/s | srv us/req | user % | softirq % cores | UDP in/req | UDP out/req | rcvbuf/sndbuf/in err | ctx-sw/req | syscalls/req (top) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| baseline-h3 | aegon | ~4,328,581 | 4.43 | 91 | 0.8 | 0.047 | 0.031 | 0/0/0 | 0.020 | sendmmsg 0.02, io_uring_enter 0.01, recvmmsg 0.01, read 0.00 |
+| static-h3 | aegon | ~606,785 | 57.64 | 70 | 3.2 | 0.589 | 0.589 | 1688/0/1688 | 0.024 | sendmmsg 0.20, io_uring_enter 0.04, recvmmsg 0.04, epoll_pwait 0.00 |
+| baseline-h3 | cnetmod | ~5,485,261 | 3.00 | 80 | 1.0 | 0.032 | 0.032 | 0/0/0 | 0.038 | io_uring_enter 0.11, recvmmsg 0.03, write 0.02, read 0.02 |
+| static-h3 | cnetmod | ~790,554 | 43.42 | 63 | 5.7 | 0.927 | 0.928 | 7317/0/7317 | 0.049 | sendmmsg 0.74, io_uring_enter 0.12, recvmmsg 0.08, write 0.02 |
+| baseline-h3 | fib | ~4,498,756 | 5.51 | 84 | 1.2 | 0.043 | 0.043 | 0/0/0 | 0.137 | epoll_pwait 0.09, futex 0.04, sendto 0.02, recvmmsg 0.02 |
+| static-h3 | fib | ~804,568 | 44.50 | 64 | 5.0 | 0.669 | 0.670 | 4436/0/4436 | 0.312 | sendmmsg 0.53, epoll_pwait 0.28, futex 0.08, recvmmsg 0.07 |
+| baseline-h3 | plod | ~4,056,921 | 6.32 | 69 | 1.4 | 0.076 | 0.045 | 0/0/0 | 0.651 | io_uring_enter 0.33, recvmmsg 0.02, sendmmsg 0.02, read 0.00 |
+| static-h3 | plod | ~750,976 | 46.88 | 58 | 3.7 | 0.634 | 0.629 | 1640/0/1640 | 0.264 | sendmmsg 0.24, io_uring_enter 0.20, recvmmsg 0.06, write 0.00 |
+| baseline-h3 | rimu-full | 4,583,010 | 3.30 | 86 | 1.0 | 0.063 | 0.032 | 0/0/0 | 0.028 | io_uring_enter 0.03, read 0.00, write 0.00, futex 0.00 |
+| static-h3 | rimu-full | 960,520 | 32.36 | 58 | 5.0 | 0.505 | 0.504 | 1771/0/1771 | 0.188 | io_uring_enter 0.25, read 0.00, write 0.00, epoll_pwait 0.00 |
+| baseline-h3 | rimu-min | 5,608,459 | 2.69 | 85 | 0.9 | 0.063 | 0.032 | 0/0/0 | 0.028 | io_uring_enter 0.03, read 0.00, write 0.00, epoll_pwait 0.00 |
+| static-h3 | rimu-min | 984,741 | 30.37 | 58 | 5.1 | 0.504 | 0.503 | 1960/0/1960 | 0.197 | io_uring_enter 0.26, read 0.00, write 0.00, epoll_pwait 0.00 |
+| baseline-h3 | zix | ~5,781,377 | 1.52 | 74 | 1.1 | 0.077 | 0.046 | 0/0/0 | 0.030 | io_uring_enter 0.03, read 0.00, write 0.00, epoll_pwait 0.00 |
+| static-h3 | zix | ~546,485 | 53.75 | 49 | 9.5 | 3.358 | 3.358 | 596/0/596 | 0.069 | sendmsg 2.75, io_uring_enter 0.12, read 0.00, write 0.00 |
+
+~ = request rate from the run's h2load rps (rivals); rimu's comes from its own counters over the window.
+UDP counters are host-wide: both the server's and the generator's datagrams on the loopback.
+
+### baseline-h3 aegon  (profile/aegon-baseline-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.013/req, io_uring:io_uring_submit_req 0.013/req, io_uring:io_uring_task_add 0.000/req, net:net_dev_xmit 0.015/req, net:netif_receive_skb 0.015/req, net:netif_rx 0.015/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  2.80% aegon::http::v3::Http3Connection::on_stream_header(long, int (aegon-arena)
+  2.56% nghttp3_qpack_encoder_encode (libnghttp3.so.9.9.1)
+  2.53% nghttp3_qpack_decoder_read_request (libnghttp3.so.9.9.1)
+  1.71% free (libjemalloc.so.2)
+  1.63% aegon::http::v3::Http3Connection::submit_response(aegon::htt (aegon-arena)
+  1.62% aegon::http::v3::Http3Connection::get_or_create_stream(long) (aegon-arena)
+  1.19% tolower (libc.so.6)
+  1.14% 0x0000000000176e04 (libc.so.6)
+  1.09% 0x0000000000176e0e (libc.so.6)
+  1.09% aegon::core::simd::SimdString::iequals(std::basic_string_vie (aegon-arena)
+
+### static-h3 aegon  (profile/aegon-static-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.046/req, io_uring:io_uring_submit_req 0.046/req, io_uring:io_uring_task_add 0.000/req, net:net_dev_xmit 0.457/req, net:netif_receive_skb 0.457/req, net:netif_rx 0.457/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  5.82% kernel_init_pages ([kernel.kallsyms])
+  2.27% rep_movs_alternative ([kernel.kallsyms])
+  2.10% 0x00000000001764f1 (libc.so.6)
+  1.62% 0x000000000017654a (libc.so.6)
+  1.60% 0x0000000000176540 (libc.so.6)
+  1.08% aegon::http::v3::Http3Stream::~Http3Stream() (aegon-arena)
+  0.91% nghttp3_conn_writev_stream (libnghttp3.so.9.9.1)
+  0.85% entry_SYSRETQ_unsafe_stack ([kernel.kallsyms])
+  0.83% 0x0000000000176305 (libc.so.6)
+  0.82% 0x0000000000176529 (libc.so.6)
+
+### baseline-h3 cnetmod  (profile/cnetmod-baseline-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.077/req, io_uring:io_uring_submit_req 0.077/req, io_uring:io_uring_task_add 0.012/req, net:net_dev_xmit 0.016/req, net:netif_receive_skb 0.016/req, net:netif_rx 0.016/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  5.94% std::__1::__function::__func<main::$_0, std::__1::error_code (server-h3)
+  4.55% cnetmod::http::v3::http3_response@cnetmod.protocol.http.v3.s (server-h3)
+  3.05% cnetmod::http::v3::(anonymous namespace)::response_frames(cn (server-h3)
+  2.45% cnetmod::http::v2::huffman_decode@cnetmod.protocol.http.v2.h (server-h3)
+  2.19% cnetmod::udp_datagram_buffer@cnetmod.executor.async_op::udp_ (server-h3)
+  2.09% cnetmod::(anonymous namespace)::drain_recvfrom_batch_now(cne (server-h3)
+  1.96% acpi_processor_ffh_cstate_enter ([kernel.kallsyms])
+  1.88% cnetmod::quic::quic_connection@cnetmod.protocol.quic::proces (server-h3)
+  1.86% cnetmod::http::v3::qpack_decoder@cnetmod.protocol.http.v3.qp (server-h3)
+  1.78% cnetmod::http::v3::(anonymous namespace)::consume_request_he (server-h3)
+
+### static-h3 cnetmod  (profile/cnetmod-static-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.080/req, io_uring:io_uring_submit_req 0.080/req, io_uring:io_uring_task_add 0.006/req, net:net_dev_xmit 0.815/req, net:netif_receive_skb 0.815/req, net:netif_rx 0.815/req, skb:kfree_skb 0.001/req, udp:udp_fail_queue_rcv_skb 0.001/req
+  13.55% cnetmod::quic::quic_stream_scheduler@cnetmod.protocol.quic.s (server-h3)
+  10.11% kernel_init_pages ([kernel.kallsyms])
+  6.44% aes_gcm_enc_update_vaes_avx2 (server-h3)
+  4.04% cnetmod::quic::quic_connection@cnetmod.protocol.quic::pack_o (server-h3)
+  2.58% cnetmod::quic::retransmittable_frame_storage@cnetmod.protoco (server-h3)
+  2.40% rep_movs_alternative ([kernel.kallsyms])
+  1.80% cnetmod::quic::encode_varint_to@cnetmod.protocol.quic(unsign (server-h3)
+  1.61% cnetmod::quic::quic_send_frame@cnetmod.protocol.quic.send_pi (server-h3)
+  1.53% entry_SYSRETQ_unsafe_stack ([kernel.kallsyms])
+  1.47% operator new[](unsigned long) (server-h3)
+
+### baseline-h3 fib  (profile/fib-baseline-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.000/req, io_uring:io_uring_submit_req 0.000/req, io_uring:io_uring_task_add 0.000/req, net:net_dev_xmit 0.021/req, net:netif_receive_skb 0.021/req, net:netif_rx 0.021/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  2.32% acpi_processor_ffh_cstate_enter ([kernel.kallsyms])
+  1.25% native_write_msr ([kernel.kallsyms])
+  1.06% asm_sysvec_apic_timer_interrupt ([kernel.kallsyms])
+  1.01% entry_SYSRETQ_unsafe_stack ([kernel.kallsyms])
+  0.53% 0x000000000000eace (server)
+  0.48% update_load_avg ([kernel.kallsyms])
+  0.45% 0x000000000062e145 (server)
+  0.41% 0x0000000000668173 (server)
+  0.38% __schedule ([kernel.kallsyms])
+  0.37% 0x000000000065273a (server)
+
+### static-h3 fib  (profile/fib-static-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.000/req, io_uring:io_uring_submit_req 0.000/req, io_uring:io_uring_task_add 0.000/req, net:net_dev_xmit 0.554/req, net:netif_receive_skb 0.554/req, net:netif_rx 0.554/req, skb:kfree_skb 0.001/req, udp:udp_fail_queue_rcv_skb 0.001/req
+  10.78% kernel_init_pages ([kernel.kallsyms])
+  2.18% rep_movs_alternative ([kernel.kallsyms])
+  0.83% skb_release_data ([kernel.kallsyms])
+  0.76% asm_sysvec_apic_timer_interrupt ([kernel.kallsyms])
+  0.76% acpi_processor_ffh_cstate_enter ([kernel.kallsyms])
+  0.74% entry_SYSRETQ_unsafe_stack ([kernel.kallsyms])
+  0.64% _copy_from_iter ([kernel.kallsyms])
+  0.61% 0x0000000000092cb2 (server)
+  0.51% 0x0000000000651749 (server)
+  0.51% native_write_msr ([kernel.kallsyms])
+
+### baseline-h3 plod  (profile/plod-baseline-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.016/req, io_uring:io_uring_submit_req 0.016/req, io_uring:io_uring_task_add 0.000/req, net:net_dev_xmit 0.029/req, net:netif_receive_skb 0.029/req, net:netif_rx 0.029/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  9.13% native_write_msr ([kernel.kallsyms])
+  8.14% http_h3_serve_conn_g4 (server-tls)
+  3.89% http_qpack_string_g4 (server-tls)
+  3.79% asm_sysvec_apic_timer_interrupt ([kernel.kallsyms])
+  3.57% http_h3_field_section_g4.isra.0 (server-tls)
+  2.88% http_h3_frames_g4.constprop.0 (server-tls)
+  2.33% plod_on_g4 (server-tls)
+  1.89% http_strm_close_g4.isra.0 (server-tls)
+  1.75% http_h3_head_block_g4.constprop.0 (server-tls)
+  1.58% entry_SYSRETQ_unsafe_stack ([kernel.kallsyms])
+
+### static-h3 plod  (profile/plod-static-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.062/req, io_uring:io_uring_submit_req 0.062/req, io_uring:io_uring_task_add 0.000/req, net:net_dev_xmit 0.449/req, net:netif_receive_skb 0.449/req, net:netif_rx 0.449/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  5.24% kernel_init_pages ([kernel.kallsyms])
+  3.67% http_h3_flush_g4 (server-tls)
+  3.44% http_h3_head_block_g4.constprop.0 (server-tls)
+  1.92% rep_movs_alternative ([kernel.kallsyms])
+  1.87% http_h3_frames_g4.constprop.0 (server-tls)
+  1.79% entry_SYSRETQ_unsafe_stack ([kernel.kallsyms])
+  1.53% http_h3_serve_conn_g4 (server-tls)
+  1.30% _raw_spin_trylock ([kernel.kallsyms])
+  1.20% http_qpack_string_g4 (server-tls)
+  1.01% http_each_field_g4.constprop.0 (server-tls)
+
+### baseline-h3 rimu-full  (profile/rimu-full-baseline-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.063/req, io_uring:io_uring_submit_req 0.016/req, io_uring:io_uring_task_add 0.001/req, net:net_dev_xmit 0.016/req, net:netif_receive_skb 0.016/req, net:netif_rx 0.016/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  7.27% rimu_ws::http3::qpack::encoder::encode_static_line (arena-h2)
+  5.20% <rimu_ws::http::http3_server_framework::router_handler::Rout (arena-h2)
+  5.16% <rimu_ws::http3::h3_app::H3App<rimu_ws::http::http3_server_f (arena-h2)
+  3.99% <rimu_ws::http3::request::RequestHead>::push (arena-h2)
+  3.28% rimu_ws::http::http3_server_framework::router_handler::known (arena-h2)
+  2.37% <rimu_ws::http::http3_server_framework::router_handler::Resp (arena-h2)
+  2.05% memcpy (libc.so.6)
+  1.47% rimu_ws::http::http3_server_framework::router_handler::fill_ (arena-h2)
+  1.41% <(rimu_ws::http::http2_server_framework::path_params::PathPa (arena-h2)
+  1.39% <rimu_ws::net::uri::Uri<alloc::string::String>>::process (arena-h2)
+
+### static-h3 rimu-full  (profile/rimu-full-static-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.695/req, io_uring:io_uring_submit_req 0.618/req, io_uring:io_uring_task_add 0.004/req, net:net_dev_xmit 0.376/req, net:netif_receive_skb 0.376/req, net:netif_rx 0.376/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  12.97% kernel_init_pages ([kernel.kallsyms])
+  8.97% ring_core_0_17_14__aes_gcm_enc_update_vaes_avx2 (arena-h2)
+  3.34% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  2.54% ring::aead::aes_gcm::seal (arena-h2)
+  2.27% rep_movs_alternative ([kernel.kallsyms])
+  1.81% <rimu_ws::quic::stream::Streams>::write_stream_frame (arena-h2)
+  1.51% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  1.43% asm_sysvec_apic_timer_interrupt ([kernel.kallsyms])
+  1.27% rimu_ws::http::huffman::huffman_decode::<rimu_ws::http3::qpa (arena-h2)
+  1.17% ring_core_0_17_14__gcm_ghash_vpclmulqdq_avx2_1 (arena-h2)
+
+### baseline-h3 rimu-min  (profile/rimu-min-baseline-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.063/req, io_uring:io_uring_submit_req 0.016/req, io_uring:io_uring_task_add 0.001/req, net:net_dev_xmit 0.016/req, net:netif_receive_skb 0.016/req, net:netif_rx 0.016/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  6.47% <rimu_ws::http::http3_server_framework::router_handler::Rout (arena-h2)
+  6.38% <rimu_ws::http3::h3_app::H3App<rimu_ws::http::http3_server_f (arena-h2)
+  4.87% <rimu_ws::http3::request::RequestHead>::push (arena-h2)
+  2.06% rimu_ws::http::http3_server_framework::router_handler::fill_ (arena-h2)
+  1.85% <rimu_ws::net::uri::Uri<alloc::string::String>>::process (arena-h2)
+  1.84% <rimu_ws::http::http3_server_framework::router_handler::Resp (arena-h2)
+  1.82% memcpy (libc.so.6)
+  1.77% rimu_ws::http3::request::check_field (arena-h2)
+  1.74% <(rimu_ws::http::http2_server_framework::path_params::PathPa (arena-h2)
+  1.72% rimu_ws::http::http3_server_framework::router_handler::known (arena-h2)
+
+### static-h3 rimu-min  (profile/rimu-min-static-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.694/req, io_uring:io_uring_submit_req 0.617/req, io_uring:io_uring_task_add 0.004/req, net:net_dev_xmit 0.376/req, net:netif_receive_skb 0.376/req, net:netif_rx 0.376/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  11.64% kernel_init_pages ([kernel.kallsyms])
+  9.54% ring_core_0_17_14__aes_gcm_enc_update_vaes_avx2 (arena-h2)
+  3.47% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  2.64% ring::aead::aes_gcm::seal (arena-h2)
+  2.44% rep_movs_alternative ([kernel.kallsyms])
+  1.75% <rimu_ws::quic::stream::Streams>::write_stream_frame (arena-h2)
+  1.61% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  1.43% asm_sysvec_apic_timer_interrupt ([kernel.kallsyms])
+  1.41% rimu_ws::http::huffman::huffman_decode::<rimu_ws::http3::qpa (arena-h2)
+  1.23% ring_core_0_17_14__gcm_ghash_vpclmulqdq_avx2_1 (arena-h2)
+
+### baseline-h3 zix  (profile/zix-baseline-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.078/req, io_uring:io_uring_submit_req 0.031/req, io_uring:io_uring_task_add 0.001/req, net:net_dev_xmit 0.029/req, net:netif_receive_skb 0.029/req, net:netif_rx 0.029/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  2.96% 0x00000000000379b8 (zix-http3)
+  2.57% 0x0000000000037a68 (zix-http3)
+  2.50% 0x000000000003686b (zix-http3)
+  2.38% 0x0000000000037a08 (zix-http3)
+  2.30% 0x0000000000037ab8 (zix-http3)
+  1.98% acpi_processor_ffh_cstate_enter ([kernel.kallsyms])
+  1.82% 0x0000000000037c58 (zix-http3)
+  1.71% 0x0000000000037968 (zix-http3)
+  1.14% 0x00000000000378c8 (zix-http3)
+  0.95% 0x00000000000367a9 (zix-http3)
+
+### static-h3 zix  (profile/zix-static-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.589/req, io_uring:io_uring_submit_req 0.258/req, io_uring:io_uring_task_add 0.010/req, net:net_dev_xmit 2.996/req, net:netif_receive_skb 2.996/req, net:netif_rx 2.996/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  3.83% kernel_init_pages ([kernel.kallsyms])
+  2.40% rep_movs_alternative ([kernel.kallsyms])
+  2.39% 0x000000000003686b (zix-http3)
+  2.27% memset_orig ([kernel.kallsyms])
+  1.63% skb_release_data ([kernel.kallsyms])
+  1.54% entry_SYSRETQ_unsafe_stack ([kernel.kallsyms])
+  1.39% skb_defer_free_flush ([kernel.kallsyms])
+  1.23% 0x00000000000367a9 (zix-http3)
+  1.19% perf_tp_event ([kernel.kallsyms])
+  1.00% __ip_append_data ([kernel.kallsyms])
+
+## profile: hardware counter windows
+
+| profile | server | req/s | cycles/req | instr/req | IPC | branch-miss % | L1d miss % | LLC miss % | dTLB miss/req | iTLB miss/req |
+|---|---|---|---|---|---|---|---|---|---|---|
+| baseline-h3 | rimu-full | 4,564,989 | 9,571 | 13,341 | 1.39 | 1.05 | 2.85 | - | 0.65 | 0.56 |
+| static-h3 | rimu-full | 881,410 | 104,296 | 79,682 | 0.76 | 2.20 | 7.01 | - | 5.56 | 3.90 |
+| baseline-h3 | rimu-min | 5,231,013 | 8,179 | 10,244 | 1.25 | 1.22 | 2.94 | - | 0.69 | 0.53 |
+| static-h3 | rimu-min | 923,835 | 89,636 | 77,171 | 0.86 | 2.36 | 6.91 | - | 5.46 | 3.98 |
+
+### top-down baseline-h3 rimu-full
+  skipped: no top-down metrics in this box's perf
+
+### top-down static-h3 rimu-full
+  skipped: no top-down metrics in this box's perf
+
+### top-down baseline-h3 rimu-min
+  skipped: no top-down metrics in this box's perf
+
+### top-down static-h3 rimu-min
+  skipped: no top-down metrics in this box's perf
+
+### lbr baseline-h3 rimu-full (profile/rimu-full-baseline-h3/run4-lbr)
+  7.42% rimu_ws::http3::qpack::encoder::encode_static_line (arena-h2)
+  5.29% <rimu_ws::http::http3_server_framework::router_handler::Rout (arena-h2)
+  5.16% <rimu_ws::http3::h3_app::H3App<rimu_ws::http::http3_server_f (arena-h2)
+  4.00% <rimu_ws::http3::request::RequestHead>::push (arena-h2)
+  3.30% rimu_ws::http::http3_server_framework::router_handler::known (arena-h2)
+  2.22% <rimu_ws::http::http3_server_framework::router_handler::Resp (arena-h2)
+  2.06% memcpy (libc.so.6)
+  1.57% rimu_ws::http::http3_server_framework::router_handler::fill_ (arena-h2)
+  1.41% <(rimu_ws::http::http2_server_framework::path_params::PathPa (arena-h2)
+  1.39% <rimu_ws::net::uri::Uri<alloc::string::String>>::process (arena-h2)
+
+### cachemiss baseline-h3 rimu-full (profile/rimu-full-baseline-h3/run5-cachemiss)
+  2.72% <rimu_ws::http3::h3_app::H3App<rimu_ws::http::http3_server_f (arena-h2)
+  2.42% <rimu_ws::quic::stream::send::SendPart>::on_acked (arena-h2)
+  1.96% native_write_msr ([kernel.kallsyms])
+  1.57% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  1.43% <rimu_ws::quic::stream::send::SendPart>::copy_unsent (arena-h2)
+  1.39% <rimu_ws::http3::request::RequestHead>::push (arena-h2)
+  1.36% <rimu_ws::http::http3_server_framework::router_handler::Rout (arena-h2)
+  1.31% rep_movs_alternative ([kernel.kallsyms])
+  1.13% <rimu_ws::quic::stream::Streams>::write_stream_frame (arena-h2)
+  1.12% memcpy (libc.so.6)
+
+### lbr static-h3 rimu-full (profile/rimu-full-static-h3/run4-lbr)
+  11.02% kernel_init_pages ([kernel.kallsyms])
+  9.67% ring_core_0_17_14__aes_gcm_enc_update_vaes_avx2 (arena-h2)
+  3.51% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  2.72% ring::aead::aes_gcm::seal (arena-h2)
+  2.31% rep_movs_alternative ([kernel.kallsyms])
+  1.73% <rimu_ws::quic::stream::Streams>::write_stream_frame (arena-h2)
+  1.64% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  1.38% rimu_ws::http::huffman::huffman_decode::<rimu_ws::http3::qpa (arena-h2)
+  1.28% asm_sysvec_apic_timer_interrupt ([kernel.kallsyms])
+  1.24% ring_core_0_17_14__gcm_ghash_vpclmulqdq_avx2_1 (arena-h2)
+
+### cachemiss static-h3 rimu-full (profile/rimu-full-static-h3/run5-cachemiss)
+  9.50% kernel_init_pages ([kernel.kallsyms])
+  4.49% ring_core_0_17_14__aes_gcm_enc_update_vaes_avx2 (arena-h2)
+  3.71% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  3.00% rep_movs_alternative ([kernel.kallsyms])
+  1.79% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  1.43% rimu_ws::http::huffman::huffman_decode::<rimu_ws::http3::qpa (arena-h2)
+  1.31% native_write_msr ([kernel.kallsyms])
+  1.25% ring::aead::aes_gcm::seal (arena-h2)
+  1.14% asm_sysvec_apic_timer_interrupt ([kernel.kallsyms])
+  0.88% skb_release_data ([kernel.kallsyms])
+
+### lbr baseline-h3 rimu-min (profile/rimu-min-baseline-h3/run4-lbr)
+  6.63% <rimu_ws::http::http3_server_framework::router_handler::Rout (arena-h2)
+  6.49% <rimu_ws::http3::h3_app::H3App<rimu_ws::http::http3_server_f (arena-h2)
+  4.92% <rimu_ws::http3::request::RequestHead>::push (arena-h2)
+  1.94% rimu_ws::http::http3_server_framework::router_handler::fill_ (arena-h2)
+  1.81% <rimu_ws::http::http3_server_framework::router_handler::Resp (arena-h2)
+  1.75% memcpy (libc.so.6)
+  1.73% <rimu_ws::net::uri::Uri<alloc::string::String>>::process (arena-h2)
+  1.71% rimu_ws::http::http3_server_framework::router_handler::known (arena-h2)
+  1.70% rimu_ws::http3::request::check_field (arena-h2)
+  1.70% <(rimu_ws::http::http2_server_framework::path_params::PathPa (arena-h2)
+
+### cachemiss baseline-h3 rimu-min (profile/rimu-min-baseline-h3/run5-cachemiss)
+  3.01% <rimu_ws::http3::h3_app::H3App<rimu_ws::http::http3_server_f (arena-h2)
+  2.53% <rimu_ws::quic::stream::send::SendPart>::on_acked (arena-h2)
+  2.25% <rimu_ws::quic::stream::Streams>::maybe_close (arena-h2)
+  2.18% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  1.84% <rimu_ws::quic::stream::Streams>::write_stream_frame (arena-h2)
+  1.75% native_write_msr ([kernel.kallsyms])
+  1.69% <rimu_ws::quic::stream::send::SendPart>::copy_unsent (arena-h2)
+  1.69% <rimu_ws::http::http3_server_framework::router_handler::Rout (arena-h2)
+  1.55% <rimu_ws::http3::request::RequestHead>::push (arena-h2)
+  1.40% <rimu_ws::quic::stream::Streams>::on_frame_acked (arena-h2)
+
+### lbr static-h3 rimu-min (profile/rimu-min-static-h3/run4-lbr)
+  12.84% kernel_init_pages ([kernel.kallsyms])
+  9.57% ring_core_0_17_14__aes_gcm_enc_update_vaes_avx2 (arena-h2)
+  3.47% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  2.71% ring::aead::aes_gcm::seal (arena-h2)
+  2.34% rep_movs_alternative ([kernel.kallsyms])
+  1.76% <rimu_ws::quic::stream::Streams>::write_stream_frame (arena-h2)
+  1.61% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  1.40% rimu_ws::http::huffman::huffman_decode::<rimu_ws::http3::qpa (arena-h2)
+  1.29% asm_sysvec_apic_timer_interrupt ([kernel.kallsyms])
+  1.25% ring_core_0_17_14__gcm_ghash_vpclmulqdq_avx2_1 (arena-h2)
+
+### cachemiss static-h3 rimu-min (profile/rimu-min-static-h3/run5-cachemiss)
+  9.28% kernel_init_pages ([kernel.kallsyms])
+  4.11% ring_core_0_17_14__aes_gcm_enc_update_vaes_avx2 (arena-h2)
+  3.59% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  3.20% rep_movs_alternative ([kernel.kallsyms])
+  1.88% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  1.42% rimu_ws::http::huffman::huffman_decode::<rimu_ws::http3::qpa (arena-h2)
+  1.33% native_write_msr ([kernel.kallsyms])
+  1.28% ring::aead::aes_gcm::seal (arena-h2)
+  1.16% asm_sysvec_apic_timer_interrupt ([kernel.kallsyms])
+  0.96% <rimu_ws::quic::stream::Streams>::write_stream_frame (arena-h2)
+

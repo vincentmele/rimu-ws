@@ -1,0 +1,23 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 110K of event 'cycles'
+# Event count (approx.): 527345697197
+#
+# Overhead  Command          Shared Object       
+# ........  ...............  ....................
+#
+    39.36%  server-tls       server-tls          
+    30.48%  server-tls       [kernel.kallsyms]   
+    23.10%  swapper          [kernel.kallsyms]   
+     3.53%  server-tls       libc.so.6           
+     1.91%  server-tls       libcrypto.so.3      
+     0.60%  sleep            [kernel.kallsyms]   
+     0.37%  server-tls       liburing.so.2.14    
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

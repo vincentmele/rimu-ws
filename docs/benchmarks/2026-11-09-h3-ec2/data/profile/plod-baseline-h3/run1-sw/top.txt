@@ -1,0 +1,74 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 110K of event 'cycles'
+# Event count (approx.): 527345697197
+#
+# Overhead  Shared Object         Symbol                                          
+# ........  ....................  ................................................
+#
+     9.13%  [kernel.kallsyms]     [k] native_write_msr
+     8.14%  server-tls            [.] http_h3_serve_conn_g4
+     3.89%  server-tls            [.] http_qpack_string_g4
+     3.79%  [kernel.kallsyms]     [k] asm_sysvec_apic_timer_interrupt
+     3.57%  server-tls            [.] http_h3_field_section_g4.isra.0
+     2.88%  server-tls            [.] http_h3_frames_g4.constprop.0
+     2.33%  server-tls            [.] plod_on_g4
+     1.89%  server-tls            [.] http_strm_close_g4.isra.0
+     1.75%  server-tls            [.] http_h3_head_block_g4.constprop.0
+     1.58%  [kernel.kallsyms]     [k] entry_SYSRETQ_unsafe_stack
+     1.41%  server-tls            [.] http_h3_flush_g4
+     1.26%  [kernel.kallsyms]     [k] update_load_avg
+     1.19%  [kernel.kallsyms]     [k] __schedule
+     1.17%  server-tls            [.] on_call_g
+     1.10%  [kernel.kallsyms]     [k] psi_group_change
+     1.06%  [kernel.kallsyms]     [k] psi_task_switch
+     1.05%  server-tls            [.] http_query_of_g4
+     1.03%  server-tls            [.] gs_memcpy
+     1.01%  server-tls            [.] http_h3_call_once_g4_1620.constprop.0.isra.0
+     0.89%  [kernel.kallsyms]     [k] enqueue_entity
+     0.85%  [kernel.kallsyms]     [k] dequeue_entity
+     0.82%  [kernel.kallsyms]     [k] io_cqring_wait
+     0.81%  [kernel.kallsyms]     [k] __switch_to
+     0.73%  [kernel.kallsyms]     [k] finish_task_switch.isra.0
+     0.72%  [kernel.kallsyms]     [k] pvclock_clocksource_read_nowd
+     0.67%  [kernel.kallsyms]     [k] enqueue_task_fair
+     0.61%  server-tls            [.] plod_attempt_g4_755
+     0.60%  server-tls            [.] http_ring_loop_g4.constprop.0
+     0.59%  [kernel.kallsyms]     [k] __switch_to_asm
+     0.58%  [kernel.kallsyms]     [k] read_tsc
+     0.56%  [kernel.kallsyms]     [k] update_cfs_rq_load_avg
+     0.55%  server-tls            [.] http_h3_queue_frame_g4
+     0.54%  libc.so.6             [.] 0x0000000000197985
+     0.53%  server-tls            [.] http_h3_tick_g4.constprop.0
+     0.52%  [kernel.kallsyms]     [k] __pick_next_task
+     0.51%  server-tls            [.] http_h3_pass_g4
+     0.48%  libc.so.6             [.] 0x0000000000197b71
+     0.48%  [kernel.kallsyms]     [k] update_curr
+     0.44%  [kernel.kallsyms]     [k] __update_load_avg_cfs_rq
+     0.43%  [kernel.kallsyms]     [k] do_syscall_64
+     0.43%  [kernel.kallsyms]     [k] perf_tp_event
+     0.43%  [kernel.kallsyms]     [k] sched_balance_newidle
+     0.42%  [kernel.kallsyms]     [k] ___perf_sw_event
+     0.42%  server-tls            [.] plod_query_int_g4_766
+     0.40%  server-tls            [.] gs_spans_alloc.isra.0
+     0.39%  [kernel.kallsyms]     [k] psi_task_change
+     0.38%  [kernel.kallsyms]     [k] dequeue_entities
+     0.37%  server-tls            [.] plod_text_g4_779.constprop.0
+     0.36%  [kernel.kallsyms]     [k] __sched_balance_update_blocked_averages
+     0.35%  [kernel.kallsyms]     [k] set_next_entity
+     0.35%  [kernel.kallsyms]     [k] place_entity
+     0.34%  [kernel.kallsyms]     [k] try_to_wake_up
+     0.33%  server-tls            [.] plod_unescaped_g4
+     0.32%  [kernel.kallsyms]     [k] rep_movs_alternative
+     0.32%  [kernel.kallsyms]     [k] __calc_delta.constprop.0
+     0.31%  [kernel.kallsyms]     [k] perf_syscall_enter
+     0.30%  server-tls            [.] http_is_routable_g4
+     0.30%  [kernel.kallsyms]     [k] acpi_processor_ffh_cstate_enter
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

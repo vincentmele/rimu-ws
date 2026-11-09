@@ -1,0 +1,22 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 119K of event 'cycles'
+# Event count (approx.): 689555972945
+#
+# Overhead  Command          Shared Object       
+# ........  ...............  ....................
+#
+    53.29%  server-h3        server-h3           
+    38.69%  server-h3        [kernel.kallsyms]   
+     3.38%  server-h3        libc.so.6           
+     1.71%  server-h3        [vdso]              
+     1.21%  swapper          [kernel.kallsyms]   
+     1.15%  server-h3        libc++.so.1         
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

@@ -1,0 +1,32 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 134K of event 'cycles'
+# Event count (approx.): 546111074349
+#
+# Overhead  Shared Object         Symbol                                          
+# ........  ....................  ................................................
+#
+     2.32%  [kernel.kallsyms]     [k] acpi_processor_ffh_cstate_enter
+     1.25%  [kernel.kallsyms]     [k] native_write_msr
+     1.06%  [kernel.kallsyms]     [k] asm_sysvec_apic_timer_interrupt
+     1.01%  [kernel.kallsyms]     [k] entry_SYSRETQ_unsafe_stack
+     0.53%  server                [.] 0x000000000000eace
+     0.48%  [kernel.kallsyms]     [k] update_load_avg
+     0.45%  server                [.] 0x000000000062e145
+     0.41%  server                [.] 0x0000000000668173
+     0.38%  [kernel.kallsyms]     [k] __schedule
+     0.37%  server                [.] 0x000000000065273a
+     0.34%  [kernel.kallsyms]     [k] native_read_msr
+     0.34%  [kernel.kallsyms]     [k] menu_select
+     0.33%  server                [.] 0x000000000000c92d
+     0.33%  [kernel.kallsyms]     [k] pvclock_clocksource_read_nowd
+     0.31%  server                [.] 0x000000000066a0ac
+     0.31%  server                [.] 0x000000000063ebac
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

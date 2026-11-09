@@ -1,0 +1,21 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 269K of event 'cache-misses'
+# Event count (approx.): 12580414286
+#
+# Overhead  Command          Shared Object                                 
+# ........  ...............  ..............................................
+#
+    48.86%  arena-h2         [kernel.kallsyms]                             
+    40.47%  arena-h2         arena-h2                                      
+     7.05%  swapper          [kernel.kallsyms]                             
+     2.90%  arena-h2         libc.so.6                                     
+     0.34%  sleep            [kernel.kallsyms]                             
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

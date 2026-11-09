@@ -1,0 +1,117 @@
+--- /mnt/nvme1tb/claude-tmp/aws-h3/build/h3-bench.sh.bc19008d	2026-11-09 15:00:59.812050900 +0100
++++ /mnt/nvme1tb/claude-tmp/aws-h3/remote/h3-bench.sh	2026-11-09 14:39:36.646033486 +0100
+@@ -50,6 +50,16 @@
+ #   DURATION      h2load -D (default 5s)
+ #   GEN_LOCALHOST v4 (default: the generator resolves localhost to 127.0.0.1 only) or auto (the
+ #                 host's /etc/hosts: ::1 first on colossus)
++# Added for the aws-h3 kit (defaults keep colossus' behaviour above):
++#   SERVER_CPUS   CPU list of the server (default 0-5,12-17)
++#   LOAD_CPUS     CPU list of the generator (default 6-11,18-23)
++#   LOAD_THREADS  h2load -t (default 12)
++#   GEN_HOSTS     a ready hosts file to mount for GEN_LOCALHOST=v4 (default: written into the work dir)
++#   RUN_HOOK      a command started in the background at each run's go, waited for before the run's
++#                 `sleep 2` (the server is still up). It gets HOOK_RUN (1..RUNS), HOOK_SERVER, HOOK_PROFILE,
++#                 HOOK_PID (the native server's pid, empty for docker), HOOK_CGROUP (docker: its cgroup dir),
++#                 HOOK_LOG (the server's log), HOOK_SERVER_CPUS, HOOK_LOAD_CPUS and HOOK_OUT (this run's
++#                 h2load output). The run's numbers are taken exactly as without it.
+ 
+ set -euo pipefail
+ 
+@@ -60,9 +70,9 @@
+ bin=${ARENA_BIN:-$target/release/arena-h2}
+ runs=${RUNS:-3}
+ duration=${DURATION:-5s}
+-server_cpus=0-5,12-17
+-load_cpus=6-11,18-23
+-load_threads=12
++server_cpus=${SERVER_CPUS:-0-5,12-17}
++load_cpus=${LOAD_CPUS:-6-11,18-23}
++load_threads=${LOAD_THREADS:-12}
+ conns=64
+ streams=64
+ port=8443
+@@ -77,8 +87,9 @@
+ gen_hosts=()
+ case ${GEN_LOCALHOST:-v4} in
+ v4)
+-	printf '127.0.0.1 localhost\n' >"$work/hosts-v4"
+-	gen_hosts=(-v "$work/hosts-v4:/etc/hosts:ro")
++	hosts_file=${GEN_HOSTS:-$work/hosts-v4}
++	[ -n "${GEN_HOSTS:-}" ] || printf '127.0.0.1 localhost\n' >"$hosts_file"
++	gen_hosts=(-v "$hosts_file:/etc/hosts:ro")
+ 	;;
+ auto) ;;
+ *)
+@@ -138,7 +149,11 @@
+ cgroup=""
+ gen_name=h3load-$$
+ log=$work/server-$server-$profile.log
++hook=""
+ cleanup() {
++	if [ -n "$hook" ]; then
++		kill "$hook" 2>/dev/null || true
++	fi
+ 	docker rm -f "$gen_name" >/dev/null 2>&1 || true
+ 	rm -rf "$sync_dir"
+ 	if [ -n "$container" ]; then
+@@ -168,7 +183,7 @@
+ 
+ if [ "$server" = rimu ]; then
+ 	CERT_DIR=$arena/certs DATASET_PATH=$arena/data/dataset.json STATIC_DIR=$arena/data/static \
+-		taskset -c $server_cpus "$bin" >"$log" 2>&1 &
++		taskset -c "$server_cpus" "$bin" >"$log" 2>&1 &
+ 	server_pid=$!
+ else
+ 	image=httparena-$server
+@@ -176,7 +191,7 @@
+ 	docker rm -f "$container" >/dev/null 2>&1 || true
+ 	# HttpArena's framework_start: host network, unconfined seccomp, certs, data and static mounted.
+ 	docker run -d --name "$container" --network host --security-opt seccomp=unconfined \
+-		--ulimit memlock=-1:-1 --ulimit nofile=1048576:1048576 --cpuset-cpus $server_cpus \
++		--ulimit memlock=-1:-1 --ulimit nofile=1048576:1048576 --cpuset-cpus "$server_cpus" \
+ 		-v "$arena/data/dataset.json:/data/dataset.json:ro" -v "$arena/data/static:/data/static:ro" \
+ 		-v "$arena/certs:/certs:ro" "$image" >/dev/null
+ 	id=$(docker inspect -f '{{.Id}}' "$container")
+@@ -208,7 +223,7 @@
+ 	# A server that does not answer leaves h2load waiting for its 30 s idle timeout: give it 10 s
+ 	# (less, if the deadline comes sooner).
+ 	left=$((deadline - SECONDS))
+-	answer=$(timeout $((left < 10 ? left : 10)) docker run --rm --name "$gen_name" --network host --cpuset-cpus $load_cpus \
++	answer=$(timeout $((left < 10 ? left : 10)) docker run --rm --name "$gen_name" --network host --cpuset-cpus "$load_cpus" \
+ 		"${gen_hosts[@]}" "$generator" --alpn-list=h3 -n 1 -c 1 -t 1 "$probe_url" 2>/dev/null || true)
+ 	docker rm -f "$gen_name" >/dev/null 2>&1 || true
+ 	if [[ $answer == *" 1 2xx"* ]]; then
+@@ -292,7 +307,7 @@
+ 	# The generator prints its container's CPU time as its last line (the cgroup file of its own
+ 	# cgroup namespace); the container is gone as soon as it exits. It starts h2load when the
+ 	# script creates `go` and creates `done` when h2load has exited.
+-	docker run --rm --name "$name" --network host --cpuset-cpus $load_cpus "${gen_hosts[@]}" \
++	docker run --rm --name "$name" --network host --cpuset-cpus "$load_cpus" "${gen_hosts[@]}" \
+ 		--ulimit nofile=1048576:1048576 -v "$arena/requests:/requests:ro" -v "$sync_dir:/sync" \
+ 		--entrypoint sh "$generator" -c ': >/sync/ready
+ while [ ! -e /sync/go ]; do sleep 0.005; done
+@@ -313,6 +328,12 @@
+ 			before=$(server_cpu_usec)
+ 		fi
+ 		: >"$sync_dir/go"
++		if [ -n "${RUN_HOOK:-}" ]; then
++			HOOK_RUN=$run HOOK_SERVER=$server HOOK_PROFILE=$profile HOOK_PID=$server_pid HOOK_CGROUP=$cgroup \
++				HOOK_LOG=$log HOOK_SERVER_CPUS=$server_cpus HOOK_LOAD_CPUS=$load_cpus HOOK_OUT=$out \
++				"$RUN_HOOK" </dev/null >>"$work/hook.log" 2>&1 &
++			hook=$!
++		fi
+ 		# A server that stalls streams can keep h2load waiting long past -D: stop it after 30 s
+ 		# and count the run as failed.
+ 		if ! wait_for_file "$sync_dir/done" 3000 $gen; then
+@@ -328,6 +349,11 @@
+ 		echo "the generator container did not start within 30 s" >>"$out"
+ 	fi
+ 	wait $gen 2>/dev/null || true
++	# The hook (a profile window) finishes while the server is still up.
++	if [ -n "$hook" ]; then
++		wait "$hook" 2>/dev/null || true
++		hook=""
++	fi
+ 
+ 	ok=$(awk '/status codes:/ { print $3 }' "$out")
+ 	secs=$(awk '/^finished in/ { sub("s,", "", $3); print $3 }' "$out")

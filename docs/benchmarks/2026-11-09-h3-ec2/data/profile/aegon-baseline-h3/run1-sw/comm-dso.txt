@@ -1,0 +1,26 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 91K of event 'cycles'
+# Event count (approx.): 412063323197
+#
+# Overhead  Command          Shared Object                 
+# ........  ...............  ..............................
+#
+    33.19%  aegon-arena      libnghttp3.so.9.9.1           
+    15.76%  aegon-arena      aegon-arena                   
+    13.66%  aegon-arena      libjemalloc.so.2              
+    11.39%  aegon-arena      libngtcp2.so.16.12.0          
+    10.38%  aegon-arena      [kernel.kallsyms]             
+     8.39%  aegon-arena      libc.so.6                     
+     3.58%  swapper          [kernel.kallsyms]             
+     1.72%  aegon-arena      libcrypto.so.3                
+     0.73%  sleep            [kernel.kallsyms]             
+     0.45%  aegon-arena      libstdc++.so.6.0.36           
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

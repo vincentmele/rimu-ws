@@ -1,0 +1,37 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 136K of event 'cycles'
+# Event count (approx.): 719245305155
+#
+# Overhead  Shared Object         Symbol                                        
+# ........  ....................  ..............................................
+#
+    10.78%  [kernel.kallsyms]     [k] kernel_init_pages
+     2.18%  [kernel.kallsyms]     [k] rep_movs_alternative
+     0.83%  [kernel.kallsyms]     [k] skb_release_data
+     0.76%  [kernel.kallsyms]     [k] asm_sysvec_apic_timer_interrupt
+     0.76%  [kernel.kallsyms]     [k] acpi_processor_ffh_cstate_enter
+     0.74%  [kernel.kallsyms]     [k] entry_SYSRETQ_unsafe_stack
+     0.64%  [kernel.kallsyms]     [k] _copy_from_iter
+     0.61%  server                [.] 0x0000000000092cb2
+     0.51%  server                [.] 0x0000000000651749
+     0.51%  [kernel.kallsyms]     [k] native_write_msr
+     0.48%  [kernel.kallsyms]     [k] memset_orig
+     0.47%  server                [.] 0x0000000000648595
+     0.46%  [kernel.kallsyms]     [k] __ip_append_data
+     0.40%  [kernel.kallsyms]     [k] skb_defer_free_flush
+     0.40%  [kernel.kallsyms]     [k] __free_frozen_pages
+     0.38%  [kernel.kallsyms]     [k] perf_tp_event
+     0.35%  [kernel.kallsyms]     [k] __raw_spin_lock_irqsave
+     0.33%  server                [.] 0x000000000063f801
+     0.31%  server                [.] 0x00000000007465e2
+     0.31%  server                [.] 0x0000000000654675
+     0.31%  server                [.] 0x00000000007460ef
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

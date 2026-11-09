@@ -1,0 +1,21 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 101K of event 'cycles'
+# Event count (approx.): 609533429164
+#
+# Overhead  Command          Shared Object                                 
+# ........  ...............  ..............................................
+#
+    52.97%  zix-http3        [kernel.kallsyms]                             
+    44.56%  zix-http3        zix-http3                                     
+     0.93%  swapper          [kernel.kallsyms]                             
+     0.83%  zix-http3        [vdso]                                        
+     0.40%  sleep            [kernel.kallsyms]                             
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

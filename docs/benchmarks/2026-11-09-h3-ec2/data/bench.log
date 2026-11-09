@@ -1,0 +1,46 @@
+== bench: 7 servers x 2 profiles x 3 passes, 3 x 5s per start; server 0,48,1,49,2,50,3,51,4,52,5,53,6,54,7,55,8,56,9,57,10,58,11,59,12,60,13,61,14,62,15,63,16,64,17,65,18,66,19,67,20,68,21,69,22,70,23,71, generator 24,72,25,73,26,74,27,75,28,76,29,77,30,78,31,79,32,80,33,81,34,82,35,83,36,84,37,85,38,86,39,87,40,88,41,89,42,90,43,91,44,92,45,93,46,94,47,95 (-t 48); 14:10:49
+bench p1 baseline-h3 rimu-full rps  4737338 | srv 3.099 us/req gen 8.070 | errors 0 | runs 4716023,4737338,4705763
+bench p1 baseline-h3 rimu-min  rps  5691998 | srv 2.492 us/req gen 6.928 | errors 0 | runs 5652794,5639252,5691998
+bench p1 baseline-h3 plod      rps  4464375 | srv 5.117 us/req gen 8.623 | errors 0 | runs 4455474,4464375,4426684
+bench p1 baseline-h3 fib       rps  4554432 | srv 5.682 us/req gen 7.108 | errors 0 | runs 4554432,4523955,4511813
+bench p1 baseline-h3 aegon     rps  4444698 | srv 4.122 us/req gen 7.078 | errors 0 | runs 4444698,4378135,4377116
+bench p1 baseline-h3 cnetmod   rps  5592492 | srv 2.793 us/req gen 7.072 | errors 0 | runs 5552596,5564203,5592492
+bench p1 baseline-h3 zix       rps  5970113 | srv 1.381 us/req gen 7.061 | errors 0 | runs 5970113,5903590,5828508
+bench p1 static-h3   rimu-full rps   990697 | srv 29.758 us/req gen 41.080 | errors 0 | runs 982547,990697,981615
+bench p1 static-h3   rimu-min  rps   991425 | srv 30.267 us/req gen 40.099 | errors 0 | runs 991425,891824,990316
+bench p1 static-h3   plod      rps   768513 | srv 46.338 us/req gen 42.405 | errors 0 | runs 768513,741920,685417
+bench p1 static-h3   fib       rps   795001 | srv 47.667 us/req gen 39.281 | errors 0 | runs 788155,795001,776603
+bench p1 static-h3   aegon     rps   627497 | srv 51.339 us/req gen 34.126 | errors 0 | runs 599100,609732,627497
+bench p1 static-h3   cnetmod   rps   813575 | srv 37.677 us/req gen 41.777 | errors 0 | runs 774921,785521,813575
+bench p1 static-h3   zix       rps   578579 | srv 46.031 us/req gen 55.730 | errors 0 | runs 535050,534797,578579
+== pass 1 done 14:17:38 (409 s)
+bench p2 baseline-h3 rimu-min  rps  5621368 | srv 2.463 us/req gen 6.884 | errors 0 | runs 5619823,5621368,5542163
+bench p2 baseline-h3 plod      rps  4463718 | srv 5.859 us/req gen 8.810 | errors 0 | runs 4463718,4367225,4423729
+bench p2 baseline-h3 fib       rps  4561455 | srv 5.399 us/req gen 7.100 | errors 0 | runs 4561455,4500571,4555606
+bench p2 baseline-h3 aegon     rps  4467785 | srv 4.211 us/req gen 7.191 | errors 0 | runs 4436590,4467785,4408938
+bench p2 baseline-h3 cnetmod   rps  5541629 | srv 2.744 us/req gen 7.065 | errors 0 | runs 5541629,5540588,5535382
+bench p2 baseline-h3 zix       rps  5917139 | srv 1.405 us/req gen 7.063 | errors 0 | runs 5777904,5902643,5917139
+bench p2 baseline-h3 rimu-full rps  4715513 | srv 3.145 us/req gen 8.028 | errors 0 | runs 4709169,4715513,4714126
+bench p2 static-h3   rimu-min  rps  1006975 | srv 30.479 us/req gen 40.285 | errors 0 | runs 980579,1006975,1001565
+bench p2 static-h3   plod      rps   755437 | srv 45.738 us/req gen 41.703 | errors 0 | runs 755437,744833,734308
+bench p2 static-h3   fib       rps   831422 | srv 43.773 us/req gen 38.274 | errors 0 | runs 831422,784208,819370
+bench p2 static-h3   aegon     rps   636043 | srv 51.007 us/req gen 34.801 | errors 39 | runs 636043,615852,623931
+bench p2 static-h3   cnetmod   rps   817399 | srv 37.343 us/req gen 41.565 | errors 0 | runs 802412,817399,797216
+bench p2 static-h3   zix       rps   588661 | srv 46.797 us/req gen 57.281 | errors 0 | runs 588661,559917,565444
+bench p2 static-h3   rimu-full rps   990218 | srv 29.542 us/req gen 40.819 | errors 0 | runs 979825,986603,990218
+== pass 2 done 14:24:25 (816 s)
+bench p3 baseline-h3 plod      rps  4494756 | srv 5.212 us/req gen 8.657 | errors 0 | runs 4494756,4487442,4478349
+bench p3 baseline-h3 fib       rps  4581066 | srv 5.500 us/req gen 7.170 | errors 0 | runs 4489254,4581066,4567018
+bench p3 baseline-h3 aegon     rps  4417887 | srv 4.140 us/req gen 7.055 | errors 0 | runs 4391624,4417244,4417887
+bench p3 baseline-h3 cnetmod   rps  5583528 | srv 2.744 us/req gen 7.055 | errors 0 | runs 5536316,5564501,5583528
+bench p3 baseline-h3 zix       rps  5992329 | srv 1.386 us/req gen 7.015 | errors 0 | runs 5914549,5875522,5992329
+bench p3 baseline-h3 rimu-full rps  4725773 | srv 3.106 us/req gen 8.034 | errors 0 | runs 4714978,4725773,4694468
+bench p3 baseline-h3 rimu-min  rps  5704812 | srv 2.478 us/req gen 6.893 | errors 0 | runs 5671579,5704812,5684800
+bench p3 static-h3   plod      rps   764912 | srv 49.621 us/req gen 43.316 | errors 0 | runs 749742,746418,764912
+bench p3 static-h3   fib       rps   827079 | srv 44.352 us/req gen 38.267 | errors 0 | runs 803283,827079,824833
+bench p3 static-h3   aegon     rps   626991 | srv 52.379 us/req gen 34.907 | errors 0 | runs 626991,624890,620159
+bench p3 static-h3   cnetmod   rps   801371 | srv 39.529 us/req gen 40.933 | errors 0 | runs 801371,799256,776834
+bench p3 static-h3   zix       rps   585887 | srv 47.473 us/req gen 56.198 | errors 0 | runs 575369,531215,585887
+bench p3 static-h3   rimu-full rps   982993 | srv 29.829 us/req gen 41.527 | errors 0 | runs 973833,978708,982993
+bench p3 static-h3   rimu-min  rps  1011662 | srv 28.002 us/req gen 40.389 | errors 0 | runs 1008456,1011662,1006240
+== pass 3 done 14:31:12 (1223 s)

@@ -1,0 +1,62 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 91K of event 'cycles'
+# Event count (approx.): 412063323197
+#
+# Overhead  Shared Object                   Symbol                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        
+# ........  ..............................  ..............................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+     2.80%  aegon-arena                     [.] aegon::http::v3::Http3Connection::on_stream_header(long, int, nghttp3_rcbuf*, nghttp3_rcbuf*, unsigned char)
+     2.56%  libnghttp3.so.9.9.1             [.] nghttp3_qpack_encoder_encode
+     2.53%  libnghttp3.so.9.9.1             [.] nghttp3_qpack_decoder_read_request
+     1.71%  libjemalloc.so.2                [.] free
+     1.63%  aegon-arena                     [.] aegon::http::v3::Http3Connection::submit_response(aegon::http::v3::Http3Stream*)
+     1.62%  aegon-arena                     [.] aegon::http::v3::Http3Connection::get_or_create_stream(long)
+     1.19%  libc.so.6                       [.] tolower
+     1.14%  libc.so.6                       [.] 0x0000000000176e04
+     1.09%  libc.so.6                       [.] 0x0000000000176e0e
+     1.09%  aegon-arena                     [.] aegon::core::simd::SimdString::iequals(std::basic_string_view<char, std::char_traits<char> >, std::basic_string_view<char, std::char_traits<char> >)
+     1.03%  libjemalloc.so.2                [.] malloc
+     0.94%  aegon-arena                     [.] aegon::http::v3::Http3Connection::on_stream_read(long, unsigned int*, nghttp3_vec*, unsigned long)
+     0.90%  aegon-arena                     [.] aegon::http::v3::Http3Stream::~Http3Stream()
+     0.82%  aegon-arena                     [.] (anonymous namespace)::handle_baseline_get(aegon::http::Context&)
+     0.79%  aegon-arena                     [.] aegon::http::v3::Http3Connection::dispatch_pending_requests(aegon::http::v3::Http3Connection::_ZN5aegon4http2v315Http3Connection25dispatch_pending_requestsEv.Frame*) [clone .actor]
+     0.68%  libnghttp3.so.9.9.1             [.] 0x000000000000563c
+     0.68%  libnghttp3.so.9.9.1             [.] nghttp3_buf_len
+     0.68%  [kernel.kallsyms]               [k] acpi_processor_ffh_cstate_enter
+     0.67%  libnghttp3.so.9.9.1             [.] 0x0000000000005660
+     0.65%  aegon-arena                     [.] aegon::http::Router::match(aegon::http::Request&) const
+     0.61%  libnghttp3.so.9.9.1             [.] 0x0000000000009be4
+     0.59%  libnghttp3.so.9.9.1             [.] nghttp3_conn_writev_stream
+     0.58%  libjemalloc.so.2                [.] operator new(unsigned long)
+     0.58%  [kernel.kallsyms]               [k] asm_sysvec_apic_timer_interrupt
+     0.51%  libngtcp2.so.16.12.0            [.] 0x000000000002d1d4
+     0.51%  libngtcp2.so.16.12.0            [.] ngtcp2_conn_writev_stream_versioned
+     0.48%  libjemalloc.so.2                [.] operator delete(void*, unsigned long)
+     0.47%  libnghttp3.so.9.9.1             [.] 0x00000000000151ac
+     0.45%  libnghttp3.so.9.9.1             [.] nghttp3_rcbuf_decref
+     0.45%  libc.so.6                       [.] 0x0000000000176e09
+     0.45%  aegon-arena                     [.] aegon::http::v3::Http3Stream::add_header(std::basic_string_view<char, std::char_traits<char> >, std::basic_string_view<char, std::char_traits<char> >)
+     0.44%  libnghttp3.so.9.9.1             [.] nghttp3_buf_init
+     0.44%  libc.so.6                       [.] pthread_mutex_trylock
+     0.44%  libc.so.6                       [.] 0x00000000001762f0
+     0.44%  aegon-arena                     [.] std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::_M_replace(unsigned long, unsigned long, char const*, unsigned long)
+     0.43%  aegon-arena                     [.] aegon::http::v3::Http3Stream::cleanup_mmap()
+     0.43%  aegon-arena                     [.] aegon::http::v3::Http3Connection::submit_response(aegon::http::v3::Http3Stream*)::{lambda(unsigned char const*, unsigned long, unsigned char const*, unsigned long)#1}::operator()(unsigned char const*, unsigned long, unsigned char const*, unsigned long) const
+     0.41%  libnghttp3.so.9.9.1             [.] nghttp3_check_header_value
+     0.40%  libstdc++.so.6.0.36             [.] std::_Hash_bytes(void const*, unsigned long, unsigned long)
+     0.39%  libnghttp3.so.9.9.1             [.] nghttp3_conn_add_write_offset
+     0.39%  libc.so.6                       [.] 0x0000000000176e13
+     0.34%  [kernel.kallsyms]               [k] native_write_msr
+     0.34%  aegon-arena                     [.] aegon::http::v3::Http3Connection::on_stream_close(long, unsigned long)
+     0.32%  [kernel.kallsyms]               [k] native_read_msr
+     0.32%  aegon-arena                     [.] aegon::http::HeaderMap::set(std::basic_string_view<char, std::char_traits<char> >, std::basic_string_view<char, std::char_traits<char> >)
+     0.31%  libnghttp3.so.9.9.1             [.] nghttp3_qpack_encoder_read_decoder
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

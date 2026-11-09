@@ -1,0 +1,5 @@
+perf=/usr/bin/perf (perf version 7.0.14)
+pmu=yes sw_event=cycles record_z=1 lbr_cg=fp cm_event=cache-misses
+topdown_args=none
+hw_events=cycles,instructions,branches,branch-misses,cache-references,cache-misses,L1-dcache-loads,L1-dcache-load-misses,dTLB-load-misses,iTLB-load-misses
+tracepoints=syscalls:sys_enter_io_uring_enter,syscalls:sys_enter_sendmsg,syscalls:sys_enter_recvmsg,syscalls:sys_enter_sendmmsg,syscalls:sys_enter_recvmmsg,syscalls:sys_enter_sendto,syscalls:sys_enter_recvfrom,syscalls:sys_enter_epoll_wait,syscalls:sys_enter_epoll_pwait,syscalls:sys_enter_epoll_pwait2,syscalls:sys_enter_futex,syscalls:sys_enter_read,syscalls:sys_enter_write,syscalls:sys_enter_writev,io_uring:io_uring_submit_req,io_uring:io_uring_complete,io_uring:io_uring_task_add,net:net_dev_xmit,net:netif_receive_skb,net:netif_rx,skb:kfree_skb,udp:udp_fail_queue_rcv_skb

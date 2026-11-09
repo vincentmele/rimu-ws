@@ -1,0 +1,18 @@
+== setup A 14:10:05
+apt done 14:10:17
+pmu=yes
+took kit-common.tgz 14:10:20
+took kit-rimu-a.tar.zst 14:10:20
+Loaded image: httparena-h2load-h3:latest
+took kit-img-h2load-h3.tar.zst 14:10:22
+Loaded image: httparena-zix:latest
+took kit-img-zix.tar.zst 14:10:22
+Loaded image: httparena-fib:latest
+took kit-img-fib.tar.zst 14:10:22
+Loaded image: httparena-plod:latest
+took kit-img-plod.tar.zst 14:10:24
+Loaded image: httparena-cnetmod:latest
+took kit-img-cnetmod.tar.zst 14:10:30
+Loaded image: httparena-aegon:latest
+took kit-img-aegon.tar.zst 14:10:47
+== setup done 14:10:47
