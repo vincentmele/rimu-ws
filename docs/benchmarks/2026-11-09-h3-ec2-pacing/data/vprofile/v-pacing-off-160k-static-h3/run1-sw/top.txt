@@ -1,0 +1,65 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 117K of event 'cycles'
+# Event count (approx.): 509669701361
+#
+# Overhead  Shared Object         Symbol                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         
+# ........  ....................  ........................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+    14.07%  [kernel.kallsyms]     [k] kernel_init_pages
+    10.67%  arena-h2              [.] ring_core_0_17_14__aes_gcm_enc_update_vaes_avx2
+     3.71%  arena-h2              [.] <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App<rimu_ws::http::http3_server_framework::router_handler::RouterHandler<rimu_ws::http::http3_server_framework::router_handler::FwRouter<arena_h2::ConnAux, (rimu_ws::http::http2_server_framework::path_params::PathParams<rimu_ws::http::http2_server_framework::methods::get::Get<rimu_ws::futures::fn_fut::FnFutWrapper<(rimu_ws::http::http2_server_framework::state::StateGeneric<arena_h2::ConnAux, false>,), arena_h2::endpoint_baseline2>>>, rimu_ws::http::http2_server_framework::path_params::PathParams<rimu_ws::http::http2_server_framework::methods::get::Get<rimu_ws::futures::fn_fut::FnFutWrapper<(rimu_ws::http::http2_server_framework::state::StateGeneric<arena_h2::ConnAux, false>, rimu_ws::http::http2_server_framework::path::Path<usize>), arena_h2::endpoint_json>>>, rimu_ws::http::http2_server_framework::path_params::PathParams<rimu_ws::http::http2_server_framework::methods::get::Get<rimu_ws::http::static_files::StaticFiles>>), rimu_ws::error::Error, ()>, arena_h2::error_cb>>, rimu_ws::rng::cha_cha20::ChaCha20, rimu_ws::tls::tls_ctx::sk_ctx::SkCtx>>::flush_datagrams_with
+     3.03%  arena-h2              [.] ring::aead::aes_gcm::seal
+     2.63%  [kernel.kallsyms]     [k] rep_movs_alternative
+     2.05%  arena-h2              [.] <rimu_ws::quic::stream::Streams>::write_stream_frame
+     1.51%  arena-h2              [.] <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App<rimu_ws::http::http3_server_framework::router_handler::RouterHandler<rimu_ws::http::http3_server_framework::router_handler::FwRouter<arena_h2::ConnAux, (rimu_ws::http::http2_server_framework::path_params::PathParams<rimu_ws::http::http2_server_framework::methods::get::Get<rimu_ws::futures::fn_fut::FnFutWrapper<(rimu_ws::http::http2_server_framework::state::StateGeneric<arena_h2::ConnAux, false>,), arena_h2::endpoint_baseline2>>>, rimu_ws::http::http2_server_framework::path_params::PathParams<rimu_ws::http::http2_server_framework::methods::get::Get<rimu_ws::futures::fn_fut::FnFutWrapper<(rimu_ws::http::http2_server_framework::state::StateGeneric<arena_h2::ConnAux, false>, rimu_ws::http::http2_server_framework::path::Path<usize>), arena_h2::endpoint_json>>>, rimu_ws::http::http2_server_framework::path_params::PathParams<rimu_ws::http::http2_server_framework::methods::get::Get<rimu_ws::http::static_files::StaticFiles>>), rimu_ws::error::Error, ()>, arena_h2::error_cb>>, rimu_ws::rng::cha_cha20::ChaCha20, rimu_ws::tls::tls_ctx::sk_ctx::SkCtx>>::recv_frames
+     1.50%  arena-h2              [.] rimu_ws::http::huffman::huffman_decode::<rimu_ws::http3::qpack::decoder::Appender>
+     1.41%  arena-h2              [.] ring_core_0_17_14__aes_hw_ctr32_encrypt_blocks
+     1.34%  arena-h2              [.] ring_core_0_17_14__gcm_ghash_vpclmulqdq_avx2_1
+     1.05%  [kernel.kallsyms]     [k] skb_release_data
+     0.96%  [kernel.kallsyms]     [k] acpi_processor_ffh_cstate_enter
+     0.89%  arena-h2              [.] <rimu_ws::quic::stream::send::SendPart>::copy_unsent
+     0.87%  libc.so.6             [.] memcpy
+     0.72%  arena-h2              [.] rimu_ws::quic::crypto::seal_packet
+     0.72%  arena-h2              [.] <rimu_ws::quic::tx_arena::TxArena>::commit
+     0.66%  arena-h2              [.] <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App<rimu_ws::http::http3_server_framework::router_handler::RouterHandler<rimu_ws::http::http3_server_framework::router_handler::FwRouter<arena_h2::ConnAux, (rimu_ws::http::http2_server_framework::path_params::PathParams<rimu_ws::http::http2_server_framework::methods::get::Get<rimu_ws::futures::fn_fut::FnFutWrapper<(rimu_ws::http::http2_server_framework::state::StateGeneric<arena_h2::ConnAux, false>,), arena_h2::endpoint_baseline2>>>, rimu_ws::http::http2_server_framework::path_params::PathParams<rimu_ws::http::http2_server_framework::methods::get::Get<rimu_ws::futures::fn_fut::FnFutWrapper<(rimu_ws::http::http2_server_framework::state::StateGeneric<arena_h2::ConnAux, false>, rimu_ws::http::http2_server_framework::path::Path<usize>), arena_h2::endpoint_json>>>, rimu_ws::http::http2_server_framework::path_params::PathParams<rimu_ws::http::http2_server_framework::methods::get::Get<rimu_ws::http::static_files::StaticFiles>>), rimu_ws::error::Error, arena_h2::ServerHeader>, arena_h2::error_cb>>, rimu_ws::rng::cha_cha20::ChaCha20, rimu_ws::tls::tls_ctx::sk_ctx::SkCtx>>::space_wants_send
+     0.65%  arena-h2              [.] <rimu_ws::quic::stream::send::SendPart>::on_acked
+     0.63%  arena-h2              [.] <rimu_ws::quic::stream::Streams>::schedule
+     0.58%  arena-h2              [.] rimu_ws::quic::crypto::protect
+     0.57%  [kernel.kallsyms]     [k] asm_sysvec_apic_timer_interrupt
+     0.56%  arena-h2              [.] rimu_ws::quic::frame::put_stream_header
+     0.56%  arena-h2              [.] <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App<rimu_ws::http::http3_server_framework::router_handler::RouterHandler<rimu_ws::http::http3_server_framework::router_handler::FwRouter<arena_h2::ConnAux, (rimu_ws::http::http2_server_framework::path_params::PathParams<rimu_ws::http::http2_server_framework::methods::get::Get<rimu_ws::futures::fn_fut::FnFutWrapper<(rimu_ws::http::http2_server_framework::state::StateGeneric<arena_h2::ConnAux, false>,), arena_h2::endpoint_baseline2>>>, rimu_ws::http::http2_server_framework::path_params::PathParams<rimu_ws::http::http2_server_framework::methods::get::Get<rimu_ws::futures::fn_fut::FnFutWrapper<(rimu_ws::http::http2_server_framework::state::StateGeneric<arena_h2::ConnAux, false>, rimu_ws::http::http2_server_framework::path::Path<usize>), arena_h2::endpoint_json>>>, rimu_ws::http::http2_server_framework::path_params::PathParams<rimu_ws::http::http2_server_framework::methods::get::Get<rimu_ws::http::static_files::StaticFiles>>), rimu_ws::error::Error, arena_h2::ServerHeader>, arena_h2::error_cb>>, rimu_ws::rng::cha_cha20::ChaCha20, rimu_ws::tls::tls_ctx::sk_ctx::SkCtx>>::seal
+     0.55%  arena-h2              [.] <rimu_ws::quic::stream::Streams>::write_frames
+     0.55%  [kernel.kallsyms]     [k] __free_frozen_pages
+     0.53%  libc.so.6             [.] 0x00000000001a32f1
+     0.50%  arena-h2              [.] <rimu_ws::quic::stream::Streams>::on_frame_acked
+     0.47%  arena-h2              [.] <rimu_ws::http::static_files::Cache>::entry
+     0.46%  arena-h2              [.] <rimu_ws::quic::stream::Streams>::write_stream_data
+     0.45%  arena-h2              [.] <rimu_ws::quic::frame::FrameReader>::parse
+     0.45%  arena-h2              [.] <rimu_ws::http3::h3_app::H3App<rimu_ws::http::http3_server_framework::router_handler::RouterHandler<rimu_ws::http::http3_server_framework::router_handler::FwRouter<arena_h2::ConnAux, (rimu_ws::http::http2_server_framework::path_params::PathParams<rimu_ws::http::http2_server_framework::methods::get::Get<rimu_ws::futures::fn_fut::FnFutWrapper<(rimu_ws::http::http2_server_framework::state::StateGeneric<arena_h2::ConnAux, false>,), arena_h2::endpoint_baseline2>>>, rimu_ws::http::http2_server_framework::path_params::PathParams<rimu_ws::http::http2_server_framework::methods::get::Get<rimu_ws::futures::fn_fut::FnFutWrapper<(rimu_ws::http::http2_server_framework::state::StateGeneric<arena_h2::ConnAux, false>, rimu_ws::http::http2_server_framework::path::Path<usize>), arena_h2::endpoint_json>>>, rimu_ws::http::http2_server_framework::path_params::PathParams<rimu_ws::http::http2_server_framework::methods::get::Get<rimu_ws::http::static_files::StaticFiles>>), rimu_ws::error::Error, ()>, arena_h2::error_cb>>>::parse
+     0.45%  [kernel.kallsyms]     [k] __ip_append_data
+     0.44%  arena-h2              [.] <rimu_ws::tls::traffic_aead::TrafficAead>::seal_in_place
+     0.44%  [kernel.kallsyms]     [k] native_write_msr
+     0.43%  arena-h2              [.] <rimu_ws::quic::tx_arena::TxArena>::begin_at
+     0.43%  arena-h2              [.] <rimu_ws::http3::request::RequestHead>::push
+     0.42%  arena-h2              [.] <rimu_ws::http3::qpack::decoder::QpackDecoder>::decode_lines
+     0.42%  arena-h2              [.] rimu_ws::quic::conn::write_header
+     0.42%  arena-h2              [.] <std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<rimu_ws::http::static_files::Cache>>>>::with::<<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<rimu_ws::http::static_files::Cache>>>>::with_borrow_mut<<rimu_ws::http::static_files::StaticFiles>::serve<arena_h2::ConnAux>::{closure#0}, core::result::Result<rimu_ws::http::status_code::StatusCode, rimu_ws::error::Error>>::{closure#0}, core::result::Result<rimu_ws::http::status_code::StatusCode, rimu_ws::error::Error>>
+     0.41%  arena-h2              [.] <rimu_ws::quic::pools::FrameRefPool>::alloc
+     0.41%  [kernel.kallsyms]     [k] skb_defer_free_flush
+     0.40%  arena-h2              [.] <rimu_ws::http::static_files::Accepted>::parse
+     0.38%  arena-h2              [.] <rimu_ws::http::http3_server_framework::router_handler::RouterHandler<rimu_ws::http::http3_server_framework::router_handler::FwRouter<arena_h2::ConnAux, (rimu_ws::http::http2_server_framework::path_params::PathParams<rimu_ws::http::http2_server_framework::methods::get::Get<rimu_ws::futures::fn_fut::FnFutWrapper<(rimu_ws::http::http2_server_framework::state::StateGeneric<arena_h2::ConnAux, false>,), arena_h2::endpoint_baseline2>>>, rimu_ws::http::http2_server_framework::path_params::PathParams<rimu_ws::http::http2_server_framework::methods::get::Get<rimu_ws::futures::fn_fut::FnFutWrapper<(rimu_ws::http::http2_server_framework::state::StateGeneric<arena_h2::ConnAux, false>, rimu_ws::http::http2_server_framework::path::Path<usize>), arena_h2::endpoint_json>>>, rimu_ws::http::http2_server_framework::path_params::PathParams<rimu_ws::http::http2_server_framework::methods::get::Get<rimu_ws::http::static_files::StaticFiles>>), rimu_ws::error::Error, ()>, arena_h2::error_cb>>::poll
+     0.37%  [kernel.kallsyms]     [k] memset_orig
+     0.37%  arena-h2              [.] rimu_ws::quic::conn::write_crypto
+     0.37%  arena-h2              [.] ring::aead::quic::aes_new_mask
+     0.36%  [kernel.kallsyms]     [k] perf_tp_event
+     0.33%  arena-h2              [.] <ring::aead::quic::HeaderProtectionKey>::new_mask
+     0.32%  [kernel.kallsyms]     [k] __raw_spin_lock_irqsave
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

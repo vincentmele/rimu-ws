@@ -174,3 +174,11 @@ measurement.
 - Copies per byte stay at 2 on the loopback, the kernel's skb copy. Only a send path that hands the kernel pages it
   does not copy on local delivery would remove it, and the loopback copies zero-copy skbs by design.
 - static-h3's QPACK decode memo hits 0 % (pass3.md's lead; not examined here).
+
+## 8. Follow-up: the pacing hypothesis measured (EC2 run of 20:21 UTC)
+[`2026-11-09-h3-ec2-pacing/README.md`](2026-11-09-h3-ec2-pacing/README.md): unpaced trains at the loss-free bounds
+(`pacing-off-160k` −5.1 % rps / −18.7 % CPU, `pacing-off-192k` −3.4 % / −19.0 %) and `pacing-off` (−6.0 % / −16.7 %)
+all lose throughput outside the 1.3 % spread; base 1,035k req/s (fib 838k, zix 628k). Pacing stays on in the library and
+on the benchmark path (Ruling T19-f's opt-out not taken). The page-zeroing split did not reproduce on this host (base
+11.6 %, pacing-off-160k 14.1 %): the earlier 30 % vs 13.6 % was host-dependent. The fixed build (44752fa8) is neutral
+against 0e276984, with 100 % of owed ACKs carried and 0 ACK-only packets.

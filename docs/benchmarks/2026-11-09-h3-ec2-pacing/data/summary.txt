@@ -1,0 +1,146 @@
+imds instance-type: m6a.24xlarge
+imds placement/availability-zone: sa-east-1b
+uname -r: 7.0.0-1016-aws
+server cpus 0,48,1,49,2,50,3,51,4,52,5,53,6,54,7,55,8,56,9,57,10,58,11,59,12,60,13,61,14,62,15,63,16,64,17,65,18,66,19,67,20,68,21,69,22,70,23,71 | generator cpus 24,72,25,73,26,74,27,75,28,76,29,77,30,78,31,79,32,80,33,81,34,82,35,83,36,84,37,85,38,86,39,87,40,88,41,89,42,90,43,91,44,92,45,93,46,94,47,95 | h2load -t 48
+pmu=yes
+
+## variants (phase V)
+
+### baseline-h3 (median of 3 passes; base 5,937,851 req/s, 2.02 us/req)
+
+| variant | req/s | vs base | srv us/req | vs base | spread | verdict | gen us/req | resp/pkt | ACK-only | flushes w/ ACK | blocked in (streams/data/stream) | lost | PTO | resent | memo hits | starts |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| base | 5,937,851 | +0.0% | 2.02 | +0.0% | 0.6% | - | 6.80 | 64.0 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 100.0% | 3 |
+| prev | 5,904,948 | -0.6% | 2.03 | +0.7% | 1.1% | = [prev: read inverted] | 6.82 | 64.0 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 100.0% | 3 |
+| repeat-ack-off | 5,899,897 | -0.6% | 2.02 | +0.4% | 0.5% | = | 6.82 | 64.0 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 100.0% | 3 |
+| zix | 6,003,239 | +1.1% | 1.40 | -30.8% | 0.2% | - | 6.80 | - | - | - | -/-/- | - | - | - | - | 3 |
+
+The verdict of `prev` (the build before the one measured) reads inverted: its loss is the newer build's win. "within spread": the change is smaller than the spread of the passes of base or of the variant.
+
+transfer (baseline-h3, task 19; median of the passes): bytes and stream payload of a datagram (target >= 1,420 of 1,472), datagrams per GSO train, packets per response, copies per stream byte (target 1), flushes finishing a response that carried the ACK they owed, pacer holds per request, zero-copy (trains sent zero-copy / of them copied by the kernel anyway / workers that fell back):
+
+| variant | dgram B | payload B | segs/train | pkts/resp | copies/B | owed ACK carried | pacer holds/req | zc sent / copied / fallbacks |
+|---|---|---|---|---|---|---|---|---|
+| base | 996 | 576 | 1.00 | 0.02 | 3.00 | 100.0% | 0.000 | 0.0% / - / 0 |
+| prev | 996 | 576 | 1.00 | 0.02 | 3.00 | 0.0% | 0.000 | 0.0% / - / 0 |
+| repeat-ack-off | 996 | 576 | 1.00 | 0.02 | 3.00 | 100.0% | 0.000 | 0.0% / - / 0 |
+
+rps by pass (k = 1000; ! = errors):
+
+| variant | pass 1 | pass 2 | pass 3 |
+|---|---|---|---|
+| base | 5938k | 5912k | 5948k |
+| prev | 5872k | 5939k | 5905k |
+| repeat-ack-off | 5891k | 5900k | 5920k |
+| zix | 6003k | 6012k | 6003k |
+
+### static-h3 (median of 3 passes; base 1,035,447 req/s, 27.35 us/req)
+
+| variant | req/s | vs base | srv us/req | vs base | spread | verdict | gen us/req | resp/pkt | ACK-only | flushes w/ ACK | blocked in (streams/data/stream) | lost | PTO | resent | memo hits | starts |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| base | 1,035,447 | +0.0% | 27.35 | +0.0% | 1.3% | - | 39.91 | 0.1 | 0.0% | 100.0% | 0/0/0 | 64435 | 0 | 89914 | 0.0% | 3 |
+| prev | 1,031,568 | -0.4% | 26.96 | -1.5% | 0.0% | = [prev: read inverted] | 39.99 | 0.1 | 0.0% | 100.0% | 0/0/0 | 67714 | 0 | 93567 | 0.0% | 3 |
+| repeat-ack-off | 1,034,675 | -0.1% | 27.00 | -1.3% | 0.5% | = | 39.97 | 0.1 | 0.0% | 59.8% | 0/0/0 | 63242 | 0 | 121014 | 0.0% | 3 |
+| pacing-off | 973,618 | -6.0% | 22.80 | -16.7% | 0.9% | loss | 34.76 | 0.1 | 0.0% | 100.0% | 0/0/0 | 94797 | 0 | 193481 | 0.0% | 3 |
+| inflight160k | 988,923 | -4.5% | 27.25 | -0.4% | 0.7% | loss | 38.59 | 0.1 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 0.0% | 3 |
+| pacing-off-160k | 982,545 | -5.1% | 22.24 | -18.7% | 0.7% | loss | 34.30 | 0.1 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 0.0% | 3 |
+| pacing-off-192k | 1,000,694 | -3.4% | 22.16 | -19.0% | 0.5% | loss | 33.90 | 0.1 | 0.0% | 100.0% | 0/0/0 | 46 | 0 | 95 | 0.0% | 3 |
+| zix | 627,693 | -39.4% | 45.06 | +64.7% | 6.7% | - | 54.77 | - | - | - | -/-/- | - | - | - | - | 3 |
+| fib | 838,286 | -19.0% | 40.23 | +47.1% | 1.3% | - | 38.14 | - | - | - | -/-/- | - | - | - | - | 3 |
+
+The verdict of `prev` (the build before the one measured) reads inverted: its loss is the newer build's win. "within spread": the change is smaller than the spread of the passes of base or of the variant.
+
+transfer (static-h3, task 19; median of the passes): bytes and stream payload of a datagram (target >= 1,420 of 1,472), datagrams per GSO train, packets per response, copies per stream byte (target 1), flushes finishing a response that carried the ACK they owed, pacer holds per request, zero-copy (trains sent zero-copy / of them copied by the kernel anyway / workers that fell back):
+
+| variant | dgram B | payload B | segs/train | pkts/resp | copies/B | owed ACK carried | pacer holds/req | zc sent / copied / fallbacks |
+|---|---|---|---|---|---|---|---|---|
+| base | 1472 | 1435 | 29.71 | 11.36 | 2.00 | 100.0% | 0.137 | 0.0% / - / 0 |
+| prev | 1472 | 1435 | 29.64 | 11.36 | 2.00 | 0.0% | 0.135 | 0.0% / - / 0 |
+| repeat-ack-off | 1472 | 1435 | 29.71 | 11.36 | 2.00 | 59.8% | 0.136 | 0.0% / - / 0 |
+| pacing-off | 1472 | 1436 | 36.14 | 11.37 | 2.00 | 100.0% | 0.000 | 0.0% / - / 0 |
+| inflight160k | 1472 | 1436 | 27.88 | 11.35 | 2.00 | 100.0% | 0.076 | 0.0% / - / 0 |
+| pacing-off-160k | 1472 | 1436 | 36.19 | 11.35 | 2.00 | 100.0% | 0.000 | 0.0% / - / 0 |
+| pacing-off-192k | 1472 | 1436 | 33.57 | 11.35 | 2.00 | 100.0% | 0.000 | 0.0% / - / 0 |
+
+rps by pass (k = 1000; ! = errors):
+
+| variant | pass 1 | pass 2 | pass 3 |
+|---|---|---|---|
+| base | 1035k | 1039k | 1025k |
+| prev | 1032k | 1032k | 1032k |
+| repeat-ack-off | 1039k | 1034k | 1035k |
+| pacing-off | 974k | 974k | 964k |
+| inflight160k | 992k | 989k | 985k |
+| pacing-off-160k | 983k | 980k | 986k |
+| pacing-off-192k | 1003k | 998k | 1001k |
+| zix | 640k | 628k | 598k |
+| fib | 844k | 833k | 838k |
+
+knobs each variant ran with (first start; the server's own line):
+
+- base: headers=min data=reuse gro=1 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete hp=ring qpack=0 zc=0 pacing_burst=64 repeat_ack=1
+- prev: headers=min data=reuse gro=1 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete hp=ring qpack=0 zc=0 pacing_burst=64 repeat_ack=1
+- repeat-ack-off: headers=min data=reuse gro=1 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete hp=ring qpack=0 zc=0 pacing_burst=64 repeat_ack=0
+- pacing-off: headers=min data=reuse gro=1 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=0 pmtu_probe=now bodies=complete hp=ring qpack=0 zc=0 pacing_burst=64 repeat_ack=1
+- inflight160k: headers=min data=reuse gro=1 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=163840 pacing=1 pmtu_probe=now bodies=complete hp=ring qpack=0 zc=0 pacing_burst=64 repeat_ack=1
+- pacing-off-160k: headers=min data=reuse gro=1 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=163840 pacing=0 pmtu_probe=now bodies=complete hp=ring qpack=0 zc=0 pacing_burst=64 repeat_ack=1
+- pacing-off-192k: headers=min data=reuse gro=1 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=196608 pacing=0 pmtu_probe=now bodies=complete hp=ring qpack=0 zc=0 pacing_burst=64 repeat_ack=1
+
+## vprofile: software profile windows
+
+| profile | server | req/s | srv us/req | user % | softirq % cores | UDP in/req | UDP out/req | rcvbuf/sndbuf/in err | ctx-sw/req | syscalls/req (top) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| baseline-h3 | v-base | 5,870,015 | 2.20 | 84 | 0.9 | 0.031 | 0.031 | 0/0/0 | 0.028 | io_uring_enter 0.03, read 0.00, write 0.00, epoll_pwait 0.00 |
+| static-h3 | v-base | 1,005,687 | 29.48 | 63 | 4.1 | 0.504 | 0.504 | 2212/0/2212 | 0.193 | io_uring_enter 0.26, read 0.00, write 0.00, epoll_pwait 0.00 |
+| static-h3 | v-pacing-off-160k | 952,416 | 25.64 | 60 | 3.8 | 0.416 | 0.416 | 0/0/0 | 0.163 | io_uring_enter 0.18, read 0.00, write 0.00, epoll_pwait 0.00 |
+
+~ = request rate from the run's h2load rps (rivals); rimu's comes from its own counters over the window.
+UDP counters are host-wide: both the server's and the generator's datagrams on the loopback.
+
+### baseline-h3 v-base  (vprofile/v-base-baseline-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.031/req, io_uring:io_uring_submit_req 0.016/req, io_uring:io_uring_task_add 0.000/req, net:net_dev_xmit 0.016/req, net:netif_receive_skb 0.016/req, net:netif_rx 0.016/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  3.36% <rimu_ws::http::http3_server_framework::router_handler::Rout (arena-h2)
+  3.16% <rimu_ws::http3::h3_app::H3App<rimu_ws::http::http3_server_f (arena-h2)
+  2.91% <rimu_ws::http3::request::RequestHead>::push (arena-h2)
+  1.98% <(rimu_ws::http::http2_server_framework::path_params::PathPa (arena-h2)
+  1.76% memcpy (libc.so.6)
+  1.71% <rimu_ws::http3::request::RequestHead>::push_pseudo (arena-h2)
+  1.66% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  1.60% <rimu_ws::quic::stream::Streams>::deliver::<rimu_ws::http3:: (arena-h2)
+  1.57% <rimu_ws::quic::stream::Streams>::create (arena-h2)
+  1.55% rimu_ws::http3::request::pseudo_value_ok (arena-h2)
+
+### static-h3 v-base  (vprofile/v-base-static-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.694/req, io_uring:io_uring_submit_req 0.620/req, io_uring:io_uring_task_add 0.004/req, net:net_dev_xmit 0.377/req, net:netif_receive_skb 0.377/req, net:netif_rx 0.377/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  11.57% kernel_init_pages ([kernel.kallsyms])
+  9.77% ring_core_0_17_14__aes_gcm_enc_update_vaes_avx2 (arena-h2)
+  4.02% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  2.89% ring::aead::aes_gcm::seal (arena-h2)
+  2.47% rep_movs_alternative ([kernel.kallsyms])
+  1.85% <rimu_ws::quic::stream::Streams>::write_stream_frame (arena-h2)
+  1.60% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  1.33% rimu_ws::http::huffman::huffman_decode::<rimu_ws::http3::qpa (arena-h2)
+  1.30% acpi_processor_ffh_cstate_enter ([kernel.kallsyms])
+  1.30% asm_sysvec_apic_timer_interrupt ([kernel.kallsyms])
+
+### static-h3 v-pacing-off-160k  (vprofile/v-pacing-off-160k-static-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.414/req, io_uring:io_uring_submit_req 0.313/req, io_uring:io_uring_task_add 0.003/req, net:net_dev_xmit 0.310/req, net:netif_receive_skb 0.310/req, net:netif_rx 0.310/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  14.07% kernel_init_pages ([kernel.kallsyms])
+  10.67% ring_core_0_17_14__aes_gcm_enc_update_vaes_avx2 (arena-h2)
+  3.71% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  3.03% ring::aead::aes_gcm::seal (arena-h2)
+  2.63% rep_movs_alternative ([kernel.kallsyms])
+  2.05% <rimu_ws::quic::stream::Streams>::write_stream_frame (arena-h2)
+  1.51% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  1.50% rimu_ws::http::huffman::huffman_decode::<rimu_ws::http3::qpa (arena-h2)
+  1.41% ring_core_0_17_14__aes_hw_ctr32_encrypt_blocks (arena-h2)
+  1.34% ring_core_0_17_14__gcm_ghash_vpclmulqdq_avx2_1 (arena-h2)
+
+## vprofile: hardware counter windows
+
+| profile | server | req/s | cycles/req | instr/req | IPC | branch-miss % | L1d miss % | LLC miss % | dTLB miss/req | iTLB miss/req |
+|---|---|---|---|---|---|---|---|---|---|---|
+| baseline-h3 | v-base | 5,625,185 | 6,593 | 8,965 | 1.36 | 1.39 | 2.92 | - | 0.56 | 0.47 |
+| static-h3 | v-base | 958,441 | 77,539 | 77,225 | 1.00 | 2.56 | 6.61 | - | 5.14 | 4.07 |
+| static-h3 | v-pacing-off-160k | 884,067 | 77,527 | 74,583 | 0.96 | 2.12 | 6.50 | - | 4.54 | 3.90 |
+
