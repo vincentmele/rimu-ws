@@ -60,9 +60,7 @@ impl KeyUpdate {
       [RecordContentTy::ApplicationData.into(), 3, 3, 0, RecordContentTy::Handshake.into()];
     let mut encrypted =
       [HandshakeTy::KeyUpdate.into(), 0, 0, 1, a0, RecordContentTy::Handshake.into()];
-    let nonce = kss.nonce();
-    let secret = kss.cipher_key();
-    let tag = kss.cipher_suite().aes_encrypt(&header, &mut encrypted, nonce, secret)?;
+    let tag = kss.seal_record(&header, &mut encrypted)?;
     let [b0, b1, b2, b3, b4] = header;
     let [b5, b6, b7, b8, b9, b10] = encrypted;
     let mut rslt =
@@ -70,7 +68,6 @@ impl KeyUpdate {
     if let Some(elem) = rslt.last_chunk_mut::<AEAD_TAG_LEN>() {
       elem.copy_from_slice(&tag);
     }
-    kss.increment_counter();
     Ok(rslt)
   }
 

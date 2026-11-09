@@ -22,13 +22,12 @@
 use crate::{
   collections::ArrayVectorCopy,
   crypto::{
-    AEAD_NONCE_LEN, AEAD_TAG_LEN, AeadKey as _, Aes128GcmKeyGlobal, Aes128HpGlobal,
-    Aes256GcmKeyGlobal, Aes256HpGlobal, Chacha20HpGlobal, Chacha20Poly1305KeyGlobal, CryptoError,
+    AEAD_NONCE_LEN, AEAD_TAG_LEN, Aes128HpGlobal, Aes256HpGlobal, Chacha20HpGlobal, CryptoError,
     HpKey as _, MAX_HASH_LEN, drop_and_zero,
   },
   misc::zero_volatile,
   quic::{QuicError, decode_pn},
-  tls::{CipherSuite, key_schedule::hkdf_expand_label},
+  tls::{CipherSuite, TrafficAead, key_schedule::hkdf_expand_label},
 };
 use core::{
   cell::Cell,
@@ -59,53 +58,9 @@ const _: () = {
   assert!(MAX_HASH_LEN >= MAX_KEY_LEN);
 };
 
-/// The AEAD of one of the supported cipher suites, with its key already expanded.
-#[derive(Debug)]
-pub(crate) enum QuicAead {
-  Aes128(Aes128GcmKeyGlobal),
-  Aes256(Aes256GcmKeyGlobal),
-  Chacha(Chacha20Poly1305KeyGlobal),
-}
-
-impl QuicAead {
-  /// Expands `key`, which has the key length of `suite`.
-  #[inline]
-  pub(crate) fn new(suite: CipherSuite, key: &[u8]) -> crate::Result<Self> {
-    Ok(match suite {
-      CipherSuite::Aes128GcmSha256 => Self::Aes128(Aes128GcmKeyGlobal::new(key)?),
-      CipherSuite::Aes256GcmSha384 => Self::Aes256(Aes256GcmKeyGlobal::new(key)?),
-      CipherSuite::Chacha20Poly1305Sha256 => Self::Chacha(Chacha20Poly1305KeyGlobal::new(key)?),
-    })
-  }
-
-  #[inline]
-  fn open_in_place<'data>(
-    &self,
-    nonce: [u8; AEAD_NONCE_LEN],
-    aad: &[u8],
-    data: &'data mut [u8],
-  ) -> crate::Result<&'data mut [u8]> {
-    match self {
-      Self::Aes128(el) => el.open_in_place(nonce, aad, data),
-      Self::Aes256(el) => el.open_in_place(nonce, aad, data),
-      Self::Chacha(el) => el.open_in_place(nonce, aad, data),
-    }
-  }
-
-  #[inline]
-  fn seal_in_place(
-    &self,
-    nonce: [u8; AEAD_NONCE_LEN],
-    aad: &[u8],
-    data: &mut [u8],
-  ) -> crate::Result<[u8; AEAD_TAG_LEN]> {
-    match self {
-      Self::Aes128(el) => el.seal_in_place(nonce, aad, data),
-      Self::Aes256(el) => el.seal_in_place(nonce, aad, data),
-      Self::Chacha(el) => el.seal_in_place(nonce, aad, data),
-    }
-  }
-}
+/// The AEAD of one of the supported cipher suites, with its key already expanded: the one of
+/// the record layer of TLS.
+pub(crate) type QuicAead = TrafficAead;
 
 /// The header protection of one of the supported cipher suites, with its key already expanded.
 #[derive(Debug)]

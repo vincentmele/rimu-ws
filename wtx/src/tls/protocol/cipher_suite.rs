@@ -2,9 +2,8 @@ use crate::{
   codec::{Decode, Encode},
   collections::ArrayVectorCopy,
   crypto::{
-    AEAD_TAG_LEN, Aead as _, Aes128GcmGlobal, Aes256GcmGlobal, Chacha20Poly1305Global, Hash as _,
-    Hkdf as _, HkdfSha256Global, HkdfSha384Global, Hmac as _, HmacSha256Global, HmacSha384Global,
-    MAX_HASH_LEN, Sha256Global, Sha384Global,
+    Hash as _, Hkdf as _, HkdfSha256Global, HkdfSha384Global, Hmac as _, HmacSha256Global,
+    HmacSha384Global, MAX_HASH_LEN, Sha256Global, Sha384Global,
   },
   tls::{
     TlsError,
@@ -31,48 +30,6 @@ pub enum CipherSuite {
 impl CipherSuite {
   pub(crate) const PRIORITY: [Self; 3] =
     [Self::Aes128GcmSha256, Self::Aes256GcmSha384, Self::Chacha20Poly1305Sha256];
-
-  #[inline]
-  pub(crate) fn aes_decrypt<'data>(
-    self,
-    associated_data: &[u8],
-    data: &'data mut [u8],
-    nonce: [u8; 12],
-    secret: &[u8],
-  ) -> crate::Result<&'data mut [u8]> {
-    match self {
-      CipherSuite::Aes128GcmSha256 => {
-        Aes128GcmGlobal::decrypt_parts(associated_data, data, nonce, secret.try_into()?)
-      }
-      CipherSuite::Aes256GcmSha384 => {
-        Aes256GcmGlobal::decrypt_parts(associated_data, data, nonce, secret.try_into()?)
-      }
-      CipherSuite::Chacha20Poly1305Sha256 => {
-        Chacha20Poly1305Global::decrypt_parts(associated_data, data, nonce, secret.try_into()?)
-      }
-    }
-  }
-
-  #[inline]
-  pub(crate) fn aes_encrypt(
-    self,
-    associated_data: &[u8],
-    data: &mut [u8],
-    nonce: [u8; 12],
-    secret: &[u8],
-  ) -> crate::Result<[u8; AEAD_TAG_LEN]> {
-    match self {
-      CipherSuite::Aes128GcmSha256 => {
-        Aes128GcmGlobal::encrypt_parts(associated_data, nonce, data, secret.try_into()?)
-      }
-      CipherSuite::Aes256GcmSha384 => {
-        Aes256GcmGlobal::encrypt_parts(associated_data, nonce, data, secret.try_into()?)
-      }
-      CipherSuite::Chacha20Poly1305Sha256 => {
-        Chacha20Poly1305Global::encrypt_parts(associated_data, nonce, data, secret.try_into()?)
-      }
-    }
-  }
 
   #[inline]
   pub(crate) const fn cipher_key_len(self) -> u8 {

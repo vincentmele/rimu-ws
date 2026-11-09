@@ -40,6 +40,7 @@ mod tls_stream_bridge;
 pub(crate) mod tls_stream_common;
 mod tls_stream_reader;
 mod tls_stream_writer;
+mod traffic_aead;
 
 use crate::{collections::ArrayVectorCopy, crypto::MAX_HASH_LEN};
 pub use handshake_path::HandshakePath;
@@ -89,6 +90,7 @@ pub use tls_stream::TlsStream;
 pub use tls_stream_bridge::{TlsStreamBridge, TlsStreamBridgeData};
 pub use tls_stream_reader::TlsStreamReader;
 pub use tls_stream_writer::TlsStreamWriter;
+pub(crate) use traffic_aead::TrafficAead;
 
 const CHANGE_CIPHER_SPEC: [u8; 6] = [20, 3, 3, 0, 1, 1];
 const DLFT_MAX_FRAGMENT_LENGTH: u16 = 1 << 14;

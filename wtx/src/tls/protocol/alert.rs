@@ -131,16 +131,13 @@ impl Alert {
     let [a0, a1] = self.data_bytes();
     let header = [RecordContentTy::ApplicationData.into(), 3, 3, 0, 19];
     let mut encrypted = [a0, a1, RecordContentTy::Alert.into()];
-    let nonce = kss.nonce();
-    let secret = kss.cipher_key();
-    let tag = kss.cipher_suite().aes_encrypt(&header, &mut encrypted, nonce, secret)?;
+    let tag = kss.seal_record(&header, &mut encrypted)?;
     let [b0, b1, b2, b3, b4] = header;
     let [b5, b6, b7] = encrypted;
     let mut rslt = [b0, b1, b2, b3, b4, b5, b6, b7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     if let Some(elem) = rslt.last_chunk_mut::<AEAD_TAG_LEN>() {
       elem.copy_from_slice(&tag);
     }
-    kss.increment_counter();
     Ok(rslt)
   }
 

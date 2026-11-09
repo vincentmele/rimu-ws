@@ -109,17 +109,14 @@ where
   reader_buffer.read_payload(len.into(), stream_reader).await?;
   let mut trails: u16 = 0;
   let inner_ty = if let Some(elem) = kss {
-    let nonce = elem.nonce();
-    let secret = elem.cipher_key();
     let record = reader_buffer.current_mut();
-    if elem.cipher_suite().aes_decrypt(&header, record, nonce, secret).is_err() {
+    if elem.open_record(&header, record).is_err() {
       cold_path();
       return Err(crate::Error::TlsErrorReply(
         TlsError::UnencryptedRecord,
         AlertDescription::BadRecordMac,
       ));
     }
-    elem.increment_counter();
     let Some((plaintext, [maybe_ty, ..])) = record.split_last_chunk_mut::<17>() else {
       cold_path();
       return Err(TlsError::InvalidAesData.into());
@@ -562,12 +559,8 @@ pub(crate) fn seal_payloads(
     }
     records.push(inner_ty.into());
     let plaintext = records.get_mut(plaintext_begin_idx..).unwrap_or_default();
-    let ksw_state = ksw.state_mut();
-    let nonce = ksw_state.nonce();
-    let secret = ksw_state.cipher_key();
-    let tag = ksw_state.cipher_suite().aes_encrypt(&header, plaintext, nonce, secret)?;
+    let tag = ksw.state_mut().seal_record(&header, plaintext)?;
     records.extend_from_slice(&tag);
-    ksw_state.increment_counter();
   }
   Ok(())
 }

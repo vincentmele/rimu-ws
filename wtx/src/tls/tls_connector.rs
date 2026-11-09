@@ -293,10 +293,7 @@ where
         &[RecordContentTy::Handshake.into()],
       ])?;
       let kss = self.key_schedule.write_mut().state_mut();
-      let nonce = kss.nonce();
-      let secret = kss.cipher_key();
-      let tag = kss.cipher_suite().aes_encrypt(&header, &mut encrypted, nonce, secret)?;
-      kss.increment_counter();
+      let tag = kss.seal_record(&header, &mut encrypted)?;
       let _ = empty_cert.extend_from_copyable_slices([header.as_slice(), &encrypted, &tag])?;
     }
     let (_, ksw) = self.key_schedule.split_mut();

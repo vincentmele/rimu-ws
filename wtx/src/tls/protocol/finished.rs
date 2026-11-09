@@ -41,12 +41,9 @@ impl<'any> Finished<'any> {
       data_bytes,
       &[RecordContentTy::Handshake.into()],
     ])?;
-    let nonce = kss.nonce();
-    let secret = kss.cipher_key();
-    let tag = kss.cipher_suite().aes_encrypt(&header, &mut encrypted, nonce, secret)?;
+    let tag = kss.seal_record(&header, &mut encrypted)?;
     let mut rslt = ArrayVectorCopy::new();
     let _ = rslt.extend_from_copyable_slices([header.as_slice(), &encrypted, &tag])?;
-    kss.increment_counter();
     Ok(rslt)
   }
 }
