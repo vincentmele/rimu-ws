@@ -61,6 +61,8 @@ pub(super) struct SendPart {
   // The offset of the first segment
   pub(super) seg_base: u64,
   pub(super) segs: VecDeque<Seg>,
+  // The send queue of the slot while `segs` is a larger one of the pools
+  pub(super) spare: VecDeque<Seg>,
   // The first byte not sent yet
   pub(super) sent: u64,
   pub(super) stop_counted: bool,
@@ -238,18 +240,33 @@ impl SendPart {
     forgotten
   }
 
-  // A full send queue moves into the largest one of the pools, if that is larger, so that the room
-  // that streams with many segments need goes where it is needed, whatever the slot
+  // A full send queue moves into a larger one, the largest of the pools if it is larger, so that
+  // the room that streams with many segments need goes where it is needed, whatever the slot.
+  // The queue of the slot waits apart until the stream gives the larger one back.
   pub(super) fn push(
     &mut self,
     seg: Seg,
     queues: &mut FreeList<VecDeque<Seg>>,
   ) -> crate::Result<()> {
-    if self.segs.len() == self.segs.capacity()
-      && let Some(mut larger) = queues.take_largest(VecDeque::capacity, self.segs.capacity())
-    {
+    if self.segs.len() == self.segs.capacity() {
+      let capacity = self.segs.capacity();
+      let mut larger = match queues.take_largest(VecDeque::capacity, capacity) {
+        Some(elem) => elem,
+        None => {
+          let mut elem = VecDeque::new();
+          elem
+            .try_reserve(capacity.saturating_mul(2).max(RESERVED_SEGMENTS))
+            .map_err(|_err| exhausted())?;
+          elem
+        }
+      };
       larger.append(&mut self.segs);
-      queues.give(core::mem::replace(&mut self.segs, larger));
+      let smaller = core::mem::replace(&mut self.segs, larger);
+      if self.spare.capacity() == 0 {
+        self.spare = smaller;
+      } else {
+        queues.give(smaller);
+      }
     }
     self.segs.try_reserve(1).map_err(|_err| exhausted())?;
     self.segs.push_back(seg);
@@ -266,8 +283,10 @@ impl SendPart {
     while let Some(seg) = self.segs.pop_front() {
       self.release_seg(seg, blocks);
     }
-    if self.segs.capacity() > RESERVED_SEGMENTS {
-      queues.give(core::mem::take(&mut self.segs));
+    if self.spare.capacity() > 0 {
+      // The larger queue goes back to the pools, the one of the slot comes back
+      let spare = core::mem::take(&mut self.spare);
+      queues.give(core::mem::replace(&mut self.segs, spare));
     }
     let _gave_back = self.acked_ranges.release(range_blocks);
     self.cursor = 0;

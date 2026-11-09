@@ -166,18 +166,46 @@ impl Recovery {
     self.bytes_in_flight.saturating_add(size) <= window
   }
 
-  /// `packet`, sent at `sent_time_us`, was acknowledged at `now_us`.
+  /// `packet` was acknowledged: it leaves the bytes in flight. The window grows later, once loss
+  /// detection ran for the same acknowledgment ([`Self::grow`]).
   #[inline]
-  pub(crate) fn on_acked(&mut self, packet: &SentPacket, now_us: u64, max_in_flight: usize) {
-    if !packet.counts_for_congestion() {
-      return;
+  pub(crate) fn on_acked(&mut self, packet: &SentPacket) {
+    if packet.counts_for_congestion() {
+      self.bytes_in_flight = self.bytes_in_flight.saturating_sub(u64::from(packet.size));
     }
-    let size = u64::from(packet.size);
-    self.bytes_in_flight = self.bytes_in_flight.saturating_sub(size);
-    let window = u64::try_from(self.window(max_in_flight)).unwrap_or(u64::MAX);
-    // A window that the sender did not use does not grow
-    if self.in_flight_high.saturating_mul(2) >= window {
-      self.cc.on_acked(usize::from(packet.size), packet.time_us, now_us);
+  }
+
+  /// The window grows by what an acknowledgment acknowledged, once loss detection ran for it (RFC
+  /// 9002 appendices A.7 and B.5, review J1): `since_recovery`, the bytes of the packets sent after
+  /// `recovery_start_us`, the recovery period when it arrived, and the newest send time of them;
+  /// `all`, the same of every packet that congestion control counts. If the acknowledgment started
+  /// a recovery period, they were all sent before it and nothing grows; if it showed persistent
+  /// congestion, which ends recovery (appendix B.8), they all count. A window that was not used,
+  /// or above `max_in_flight`, which caps what is used (review J2), does not grow.
+  #[inline]
+  pub(crate) fn grow(
+    &mut self,
+    since_recovery: (usize, Option<u64>),
+    all: (usize, Option<u64>),
+    recovery_start_us: Option<u64>,
+    now_us: u64,
+    max_in_flight: usize,
+  ) {
+    let start = self.cc.recovery_start_us();
+    let (bytes, newest) = if start == recovery_start_us {
+      since_recovery
+    } else if start.is_none() {
+      all
+    } else {
+      return;
+    };
+    let Some(newest_us) = newest else {
+      return;
+    };
+    let cwnd = self.cc.window();
+    let used = u64::try_from(cwnd).unwrap_or(u64::MAX);
+    if cwnd < max_in_flight && self.in_flight_high.saturating_mul(2) >= used {
+      self.cc.on_acked(bytes, newest_us, now_us);
     }
   }
 
@@ -497,8 +525,104 @@ mod tests {
       lowest = lowest.min(link.server.conn.cwnd());
       assert!(link.now_us - blackout < 30_000_000, "the transfer never completed");
     }
-    assert_eq!(lowest, 2 * mss);
+    // The window went to its minimum, two datagrams. Persistent congestion ends recovery (RFC 9002
+    // appendix B.8), so the packets that the same acknowledgment acknowledged, the probes, grow it
+    // at once (appendix B.5, after loss detection as in appendix A.7): at most two more
+    assert_eq!(link.server.conn.stats().persistent_congestions, 1);
+    assert!((2 * mss..=4 * mss).contains(&lowest), "{lowest}");
     assert_eq!(link.client.app.streams[&id.0].data, &body[..]);
+  }
+
+  // A server whose response is in flight, the client having sent its request
+  fn responding(body_len: u32, change: fn(&mut LinkOpts)) -> (Link, crate::quic::StreamId) {
+    let body: alloc::rc::Rc<[u8]> = (0..body_len).map(|el| el as u8).collect();
+    let mut opts = LinkOpts::new(None);
+    let response = crate::quic::BodyRef::new(body, 0..body_len).unwrap();
+    opts.server_app = TestApp::new(Behavior::RespondBody(b"", response));
+    change(&mut opts);
+    let mut link = Link::new(&opts);
+    link.run();
+    assert_eq!(link.server.conn.state(), ConnState::Confirmed);
+    let now_us = link.now_us;
+    let id = link
+      .client
+      .with_ctx(now_us, |cx| {
+        let id = cx.open_bidi()?;
+        cx.write(id, b"GET /", true)?;
+        Ok::<_, crate::Error>(id)
+      })
+      .unwrap();
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
+    (link, id)
+  }
+
+  // Review J1, RFC 9002 appendix A.7: an ACK that acknowledges packets and declares one lost
+  // halves the window that was in use. The packets that it acknowledges were sent before the
+  // recovery period that the loss starts, so they make it grow first by nothing.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn ack_that_declares_a_loss_halves_the_window_without_growth() {
+    let (mut link, _id) = responding(100_000, |_| {});
+    let cwnd = link.server.conn.cwnd();
+    assert_eq!(link.server.conn.ssthresh(), usize::MAX);
+    let _ = link.server.flush(link.now_us);
+    let mut flight = link.server.take_datagrams();
+    assert!(flight.len() >= 8, "{}", flight.len());
+    // The first datagram is lost, the others arrive and one ACK reports them
+    for datagram in flight.iter_mut().skip(1) {
+      link.client.recv(link.now_us, datagram, crate::quic::testing::SERVER_ADDR);
+    }
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
+    assert_eq!(link.server.conn.stats().packets_lost, 1);
+    assert_eq!(link.server.conn.cwnd(), cwnd / 2);
+    assert_eq!(link.server.conn.ssthresh(), cwnd / 2);
+  }
+
+  // Review J2, RFC 9002 section 7.8: a window that `max_in_flight` caps is not used beyond the
+  // cap, so it does not grow far past it: a loss then reduces the bytes actually in flight.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn window_does_not_grow_past_the_in_flight_cap() {
+    const CAP: usize = 32 << 10;
+    static NTH: AtomicU64 = AtomicU64::new(0);
+    let (mut link, id) = responding(1 << 20, |el| el.server.max_in_flight = CAP);
+    link.impair(Impairment::delay(5_000));
+    let mut largest = 0;
+    while !link.client.app.streams.get(&id.0).is_some_and(|el| el.fin) {
+      if !link.step_impaired() {
+        assert!(link.advance_to_next_event());
+      }
+      largest = largest.max(link.server.conn.cwnd());
+      assert!(link.server.conn.cwnd() <= 2 * CAP, "{}", link.server.conn.cwnd());
+    }
+    assert!(largest >= CAP, "{largest}");
+    assert_eq!(link.server.conn.window_in_use(), CAP);
+    // One datagram of the next response is lost
+    NTH.store(0, Ordering::Relaxed);
+    link.filter = Some(|to_server, _| !to_server && NTH.fetch_add(1, Ordering::Relaxed) == 20);
+    let now_us = link.now_us;
+    let id = link
+      .client
+      .with_ctx(now_us, |cx| {
+        let id = cx.open_bidi()?;
+        cx.write(id, b"GET /", true)?;
+        Ok::<_, crate::Error>(id)
+      })
+      .unwrap();
+    let lost = link.server.conn.stats().packets_lost;
+    while link.server.conn.stats().packets_lost == lost {
+      if !link.step_impaired() {
+        assert!(link.advance_to_next_event());
+      }
+    }
+    assert!(link.server.conn.window_in_use() < CAP, "{}", link.server.conn.window_in_use());
+    while !link.client.app.streams.get(&id.0).is_some_and(|el| el.fin) {
+      if !link.step_impaired() {
+        assert!(link.advance_to_next_event());
+      }
+    }
   }
 
   // A connection that serves a lossy profile, with key updates, on pools that served the same

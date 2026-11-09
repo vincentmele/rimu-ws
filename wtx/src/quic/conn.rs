@@ -252,6 +252,8 @@ pub(crate) struct ConnStats {
   pub(crate) mtu_probes: u64,
   /// Packets declared lost.
   pub(crate) packets_lost: u64,
+  /// Losses that showed persistent congestion.
+  pub(crate) persistent_congestions: u64,
   /// Probe timeouts that fired.
   pub(crate) pto_probes: u64,
 }
@@ -272,6 +274,7 @@ impl ConnStats {
     late_acks: 0,
     mtu_probes: 0,
     packets_lost: 0,
+    persistent_congestions: 0,
     pto_probes: 0,
   };
 }
@@ -749,11 +752,14 @@ where
     if losses.persistent {
       recovery.cc.on_persistent_congestion();
     }
+    let persistent = u64::from(losses.persistent);
     if lost_count > 0 {
       recovery.timer_stale = true;
     }
     if let Some(elem) = cold.as_deref_mut() {
       elem.stats.packets_lost = elem.stats.packets_lost.wrapping_add(lost_count);
+      elem.stats.persistent_congestions =
+        elem.stats.persistent_congestions.wrapping_add(persistent);
     }
     rslt
   }
@@ -1213,6 +1219,10 @@ where
       sp.largest_acked = Some(ack.largest);
     }
     let PacketSpace { ack_eliciting_in_flight, crypto_lost, recv, sent, .. } = sp;
+    // The window grows after loss detection: what the packets acknowledged here would give, sent
+    // after the recovery period that is current now (RFC 9002 appendix A.7, review J1)
+    let recovery_start = recovery.cc.recovery_start_us();
+    let (mut since_recovery, mut all) = ((0usize, None), (0usize, None));
     let mut our_ack = None;
     let (mut largest_sent_us, mut ack_eliciting, mut late, mut newly) = (None, false, 0u64, false);
     // The frames of every acknowledged packet go back, even after an error
@@ -1230,7 +1240,15 @@ where
         }
         match packet.kind {
           SentKind::InFlight | SentKind::MtuProbe => {
-            recovery.on_acked(&packet, now_us, max_in_flight);
+            recovery.on_acked(&packet);
+            if packet.counts_for_congestion() {
+              let size = usize::from(packet.size);
+              all = (all.0.saturating_add(size), all.1.max(Some(packet.time_us)));
+              if recovery_start.is_none_or(|elem| packet.time_us > elem) {
+                let newest = since_recovery.1.max(Some(packet.time_us));
+                since_recovery = (since_recovery.0.saturating_add(size), newest);
+              }
+            }
             if packet.ack_eliciting {
               *ack_eliciting_in_flight = ack_eliciting_in_flight.saturating_sub(1);
             }
@@ -1297,6 +1315,7 @@ where
     }
     rslt?;
     self.detect_lost(space, now_us, pools)?;
+    self.recovery.grow(since_recovery, all, recovery_start, now_us, max_in_flight);
     // RFC 9002 appendix A.7: a client that is not sure that the server validated its address
     // keeps backing off
     if self.peer_validated_address() {
@@ -2050,6 +2069,14 @@ where
     }
   }
 
+  /// Updates the keys that seal 1-RTT packets now, whatever the rules for starting an update.
+  pub(crate) fn force_key_update(&mut self) {
+    let next_pn = self.data.sent.next_pn();
+    if let Some(keys) = self.data.keys.as_mut() {
+      self.key.update_local(keys, next_pn).unwrap();
+    }
+  }
+
   /// Declares lost every 1-RTT packet in flight, as loss detection would.
   pub(crate) fn declare_in_flight_lost(&mut self, pools: &mut QuicPools) {
     let Self { data, handshake_done_owed, max_datagram, pmtud, recovery, streams, .. } = self;
@@ -2082,6 +2109,16 @@ where
   pub(crate) fn cwnd(&self) -> usize {
     use crate::quic::cc::CongestionControl as _;
     self.recovery.cc.window()
+  }
+
+  /// The slow start threshold.
+  pub(crate) const fn ssthresh(&self) -> usize {
+    self.recovery.cc.ssthresh()
+  }
+
+  /// The bytes that can be in flight: the congestion window, at most `max_in_flight`.
+  pub(crate) fn window_in_use(&self) -> usize {
+    self.recovery.window(self.params.max_in_flight)
   }
 
   /// The key phases of the 1-RTT packets that are sent and of those that arrive.
@@ -3987,7 +4024,17 @@ mod tests {
     assert_eq!(link.server.conn.key_phases(), link.client.conn.key_phases());
     // Nothing was dropped for want of keys, the packets of the previous phase included
     assert_eq!((server.packets_dropped, client.packets_dropped), (0, 0));
+    // The previous keys go three PTOs after a flip; then one more update of the client, which the
+    // server follows and whose previous keys it keeps three PTOs again
+    let pto = link.server.conn.current_pto_us();
+    link.advance(3 * pto + 1);
+    assert!(!link.server.conn.keeps_previous_keys());
+    link.client.conn.force_key_update();
+    link.client.conn.queue_test_frames(&PING);
+    link.run();
     assert!(link.server.conn.keeps_previous_keys());
+    assert_eq!(link.server.conn.key_phases(), link.client.conn.key_phases());
+    assert_eq!(link.server.conn.stats().key_updates, server.key_updates + 1);
     let pto = link.server.conn.current_pto_us();
     link.advance(3 * pto + 1);
     assert!(!link.server.conn.keeps_previous_keys());

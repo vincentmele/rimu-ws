@@ -369,6 +369,7 @@ impl Stream {
         seg_base: 0,
         segs,
         sent: 0,
+        spare: VecDeque::new(),
         stop_counted: false,
       },
     })

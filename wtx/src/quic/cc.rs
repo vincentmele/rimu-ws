@@ -87,6 +87,12 @@ impl NewReno {
   pub(crate) const fn ssthresh(&self) -> usize {
     self.ssthresh
   }
+
+  /// When the current recovery period started, if one did.
+  #[inline]
+  pub(crate) const fn recovery_start_us(&self) -> Option<u64> {
+    self.recovery_start_us
+  }
 }
 
 impl CongestionControl for NewReno {
