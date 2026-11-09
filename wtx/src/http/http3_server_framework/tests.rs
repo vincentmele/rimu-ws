@@ -595,7 +595,11 @@ fn baseline2_route_answers_2() {
   let rsp = client.get("/nothing-here", &[]);
   assert_eq!((status(&rsp), rsp.field(b"content-length")), (&b"404"[..], Some(&b"0"[..])));
   assert!(rsp.body.is_empty());
-  assert_eq!(served.worker(0).requests, 3);
+  let worker = served.worker(0);
+  assert_eq!(worker.requests, 3);
+  // The packet counters of task 15: packets carry the datagrams, the ACK-only ones are a part
+  assert!(worker.datagrams_out > 0 && worker.packets_out >= worker.datagrams_out, "{worker:?}");
+  assert!(worker.ack_only_out <= worker.packets_out, "{worker:?}");
   assert_eq!(client.conn.state(), ConnState::Confirmed);
   assert!(served.errors().is_empty(), "{:?}", served.errors());
 }

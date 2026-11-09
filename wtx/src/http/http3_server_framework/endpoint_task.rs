@@ -644,6 +644,7 @@ where
     let endpoint = self.endpoint.stats();
     let handler = self.app.handler.counters();
     cell.0.store(&Http3WorkerStats {
+      ack_only_out: endpoint.ack_only_out,
       cid_steering: self.steering,
       conns: endpoint.conns.into(),
       datagrams_in: endpoint.datagrams_in,
@@ -652,6 +653,7 @@ where
       forward_dropped: self.forward_dropped,
       handler_panics: handler.panics,
       idle_trims: self.idle_trims,
+      packets_out: endpoint.packets_out,
       parked: u64::try_from(self.app.handler.parked()).unwrap_or(u64::MAX),
       park_refused: handler.park_refused,
       requests: handler.requests,

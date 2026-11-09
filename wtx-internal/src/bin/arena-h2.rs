@@ -1,10 +1,18 @@
-//! HttpArena HTTP/2 server: `/baseline2`, `/json/{count}` and `/static/{*file}` on h2c (8082) and
-//! h2 over TLS (8443), served by the HTTP/2 server framework on the io_uring executor. Used by `.scripts/h2-bench.sh`.
+//! HttpArena HTTP/2 and HTTP/3 server: `/baseline2`, `/json/{count}` and `/static/{*file}` on h2c
+//! (8082) and h2 over TLS (8443), served by the HTTP/2 server framework on the io_uring executor, and
+//! on h3 (UDP 8443, dual-stack), served by the HTTP/3 server framework. Used by `.scripts/h2-bench.sh`
+//! and `.scripts/h3-bench.sh`.
 //!
-//! Environment: `CERT_DIR` (default `/certs`, with `server.crt` and `server.key`), `DATASET_PATH`
-//! (default `/data/dataset.json`), `STATIC_DIR` (default `/data/static`), `ARENA_PARAMS`
-//! (`permissive` for `HttpRecvParams::with_permissive_params`, as upstream's wtx-http2 entry does;
-//! otherwise the library defaults).
+//! Environment: `CERT_DIR` (default `/certs`, with `server.crt` and `server.key`; without them
+//! only h2c is served), `DATASET_PATH` (default `/data/dataset.json`), `STATIC_DIR` (default
+//! `/data/static`), `ARENA_PARAMS` (`permissive` for `HttpRecvParams::with_permissive_params`, as
+//! upstream's wtx-http2 entry does; otherwise the library defaults), `ARENA_H3_HEADERS` (`full`, the
+//! default: `content-length`, `date` and the `server` middleware on h3 responses, as on h2; or
+//! `min`: no `date`, no `content-length`, no middleware, which is the A/B of the user's decision Q2).
+//!
+//! With TLS on, SIGUSR1 prints the sums of the counters of the h3 workers on one line starting with
+//! `h3-stats` (what `h3-bench.sh` reads), and SIGINT or SIGTERM prints them with one line per
+//! worker and exits.
 
 use core::ops::ControlFlow;
 use rimu_ws::{
@@ -17,6 +25,7 @@ use rimu_ws::{
       Get, Http2ServerFramework, HttpRouter, JsonReply, Middleware, Path, State, StaticFiles,
       VerbatimParams, get,
     },
+    http3_server_framework::{Http3ServerFramework, Http3Stats, Http3WorkerStats},
   },
   misc::JsonWriter,
   rng::{ChaCha20, CryptoSeedableRng as _},
@@ -24,16 +33,22 @@ use rimu_ws::{
   tls::TlsConfig,
 };
 
+macro_rules! paths {
+  () => {
+    rimu_ws::paths!(
+      ("/baseline2", get(endpoint_baseline2)),
+      ("/json/{count}", get(endpoint_json)),
+      ("/static/{*file}", Get(StaticFiles::new(static_dir())?))
+    )
+  };
+}
+
 macro_rules! router {
   () => {
-    HttpRouter::new(
-      rimu_ws::paths!(
-        ("/baseline2", get(endpoint_baseline2)),
-        ("/json/{count}", get(endpoint_json)),
-        ("/static/{*file}", Get(StaticFiles::new(static_dir())?))
-      ),
-      ServerHeader,
-    )
+    HttpRouter::new(paths!(), ServerHeader)
+  };
+  (no_middleware) => {
+    HttpRouter::paths(paths!())
   };
 }
 
@@ -45,11 +60,17 @@ fn main() -> rimu_ws::Result<()> {
   let dataset = load_dataset();
   let cert_dir = std::env::var("CERT_DIR").unwrap_or_else(|_| "/certs".into());
   let tls_enabled = std::path::Path::new(&cert_dir).join("server.crt").exists();
-  let tls = if tls_enabled {
+  // Before any thread exists, so that every thread inherits the mask
+  let signals = if tls_enabled { Some(stats_signals::block()) } else { None };
+  let (tls, h3) = if tls_enabled {
     let data = dataset.clone();
     let cert = std::fs::read(format!("{cert_dir}/server.crt"))?;
     let key = std::fs::read(format!("{cert_dir}/server.key"))?;
-    Some(std::thread::spawn(move || -> rimu_ws::Result<()> {
+    let (h3_stats, h3) = spawn_h3(&cert, key.clone(), ConnAux { dataset: dataset.clone() })?;
+    if let Some(elem) = signals {
+      stats_signals::spawn_reporter(elem, h3_stats);
+    }
+    let tls = std::thread::spawn(move || -> rimu_ws::Result<()> {
       let tls_config = TlsConfig::from_keys_pem(&cert, key.as_slice())?;
       Http2ServerFramework::<(), fn(rimu_ws::Error), UringExecutor, _, _, _>::new(
         UringExecutor::default(),
@@ -61,10 +82,11 @@ fn main() -> rimu_ws::Result<()> {
       .set_http_recv_params(recv_params())
       .set_local_runtime_cb(runtime)
       .run_in_threads("0.0.0.0:8443", router!()?)
-    }))
+    });
+    (Some(tls), Some(h3))
   } else {
     eprintln!("arena-h2: no {cert_dir}/server.crt, TLS on 8443 disabled");
-    None
+    (None, None)
   };
   Http2ServerFramework::<(), fn(rimu_ws::Error), UringExecutor, _, _, _>::new(
     UringExecutor::default(),
@@ -79,7 +101,52 @@ fn main() -> rimu_ws::Result<()> {
   if let Some(elem) = tls {
     elem.join().map_err(|_| std::io::Error::other("TLS thread panicked"))??;
   }
+  if let Some(elem) = h3 {
+    elem.join().map_err(|_| std::io::Error::other("h3 thread panicked"))??;
+  }
   Ok(())
+}
+
+/// Starts the HTTP/3 server on UDP 8443 (`[::]`, dual-stack) on a thread of its own. The framework
+/// is built here, so that its counters can be read from the first moment.
+fn spawn_h3(
+  cert: &[u8],
+  key: Vec<u8>,
+  data: ConnAux,
+) -> rimu_ws::Result<(Http3Stats, std::thread::JoinHandle<rimu_ws::Result<()>>)> {
+  let min_headers = match std::env::var("ARENA_H3_HEADERS").as_deref() {
+    Ok("min") => true,
+    Ok("full") | Err(_) => false,
+    Ok(other) => {
+      let msg = format!("ARENA_H3_HEADERS must be `min` or `full`, not `{other}`");
+      return Err(std::io::Error::other(msg).into());
+    }
+  };
+  let framework = Http3ServerFramework::<(), fn(rimu_ws::Error), UringExecutor, _, _, _>::new(
+    UringExecutor::default(),
+    ChaCha20::from_std_random()?,
+    TlsConfig::from_keys_pem(cert, key.as_slice())?,
+  )?
+  .set_data(data)
+  .set_error_cb(error_cb)
+  .set_http_recv_params(recv_params())
+  .set_local_runtime_cb(runtime);
+  let stats = framework.stats();
+  let handle = std::thread::spawn(move || -> rimu_ws::Result<()> {
+    let rslt = if min_headers {
+      framework
+        .set_content_length(false)
+        .set_date(false)
+        .run_in_threads("[::]:8443", router!(no_middleware)?)
+    } else {
+      framework.run_in_threads("[::]:8443", router!()?)
+    };
+    if let Err(err) = &rslt {
+      eprintln!("arena-h2: the h3 server ended: {err}");
+    }
+    rslt
+  });
+  Ok((stats, handle))
 }
 
 fn error_cb(err: rimu_ws::Error) {
@@ -98,6 +165,113 @@ fn recv_params() -> HttpRecvParams {
 
 fn runtime() -> rimu_ws::Result<UringRuntime> {
   UringRuntime::with_params(UringParams::default())
+}
+
+/// SIGUSR1 prints the counters of the h3 workers; SIGINT and SIGTERM print them and exit.
+///
+/// The signals are blocked in every thread (the mask is inherited, so it is set before the first
+/// thread starts) and one thread takes them with `sigwait`: no handler runs, and no worker's
+/// `io_uring_enter` is interrupted.
+mod stats_signals {
+  use super::{Http3Stats, Http3WorkerStats};
+
+  const REPORTED: [libc::c_int; 3] = [libc::SIGUSR1, libc::SIGINT, libc::SIGTERM];
+
+  pub(super) struct Blocked(libc::sigset_t);
+
+  pub(super) fn block() -> Blocked {
+    // SAFETY: `set` is a plain C structure that `sigemptyset` initializes before any other use;
+    // the arguments are valid for the calls and `pthread_sigmask` has no other precondition.
+    unsafe {
+      let mut set = core::mem::zeroed::<libc::sigset_t>();
+      libc::sigemptyset(&mut set);
+      for sig in REPORTED {
+        libc::sigaddset(&mut set, sig);
+      }
+      libc::pthread_sigmask(libc::SIG_BLOCK, &set, core::ptr::null_mut());
+      Blocked(set)
+    }
+  }
+
+  pub(super) fn spawn_reporter(blocked: Blocked, stats: Http3Stats) {
+    let _jh = std::thread::spawn(move || {
+      loop {
+        let mut sig: libc::c_int = 0;
+        // SAFETY: `blocked.0` was initialized by `sigemptyset` and `sig` is a valid `c_int`.
+        let rslt = unsafe { libc::sigwait(&blocked.0, &mut sig) };
+        if rslt != 0 {
+          continue;
+        }
+        let exits = sig != libc::SIGUSR1;
+        let workers = stats.workers();
+        let mut sum = Counters::default();
+        for worker in &workers {
+          sum.add(&Counters::of(worker));
+        }
+        eprintln!("h3-stats workers={} {}", workers.len(), sum.line());
+        if exits {
+          for (idx, worker) in workers.iter().enumerate() {
+            eprintln!("h3-worker {idx} {}", Counters::of(worker).line());
+          }
+          std::process::exit(0);
+        }
+      }
+    });
+  }
+
+  #[derive(Default)]
+  struct Counters([u64; 12]);
+
+  impl Counters {
+    const NAMES: [&'static str; 12] = [
+      "conns",
+      "requests",
+      "datagrams_in",
+      "datagrams_out",
+      "packets_out",
+      "ack_only_out",
+      "forwarded",
+      "forward_dropped",
+      "retries",
+      "stateless_resets",
+      "udp_send_errors",
+      "handler_panics",
+    ];
+
+    fn of(worker: &Http3WorkerStats) -> Self {
+      Self([
+        worker.conns,
+        worker.requests,
+        worker.datagrams_in,
+        worker.datagrams_out,
+        worker.packets_out,
+        worker.ack_only_out,
+        worker.forwarded,
+        worker.forward_dropped,
+        worker.retries,
+        worker.stateless_resets,
+        worker.udp_send_errors,
+        worker.handler_panics,
+      ])
+    }
+
+    fn add(&mut self, other: &Self) {
+      for (to, from) in self.0.iter_mut().zip(other.0) {
+        *to = to.wrapping_add(from);
+      }
+    }
+
+    fn line(&self) -> String {
+      let mut rslt = String::new();
+      for (name, value) in Self::NAMES.iter().zip(self.0) {
+        if !rslt.is_empty() {
+          rslt.push(' ');
+        }
+        rslt.push_str(&format!("{name}={value}"));
+      }
+      rslt
+    }
+  }
 }
 
 /// Adds `server: rimu-ws` to every response.

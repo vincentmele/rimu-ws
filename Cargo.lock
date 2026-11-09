@@ -1549,6 +1549,7 @@ name = "rimu-ws-internal"
 version = "0.0.0"
 dependencies = [
  "brotli",
+ "libc",
  "rimu-ws",
  "serde",
  "serde_json",

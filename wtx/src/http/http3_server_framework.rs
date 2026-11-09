@@ -40,6 +40,9 @@ pub struct Http3ManualStream {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct Http3WorkerStats {
+  /// Packets sent that were not ack-eliciting, other than CONNECTION_CLOSE: those that carry
+  /// acknowledgments and padding only.
+  pub ack_only_out: u64,
   /// If the datagrams of the worker are steered by connection ID (spec section 5.11), or reach it
   /// by the hash of the kernel (an attach of the steering program that failed, or a single
   /// worker that was not asked to steer).
@@ -58,6 +61,8 @@ pub struct Http3WorkerStats {
   pub handler_panics: u64,
   /// Times the pools of the worker were trimmed after it had no connection for a while.
   pub idle_trims: u64,
+  /// Packets sent, each packet of a coalesced datagram counted.
+  pub packets_out: u64,
   /// Requests parked now: their handlers wait.
   pub parked: u64,
   /// Requests whose handler would have waited past the parked requests a worker keeps, answered
@@ -115,13 +120,13 @@ struct WorkersStats {
 #[derive(Debug)]
 pub(crate) struct StatsCell {
   cid_steering: AtomicBool,
-  values: [AtomicU64; 13],
+  values: [AtomicU64; 15],
 }
 
 impl Default for StatsCell {
   #[inline]
   fn default() -> Self {
-    Self { cid_steering: AtomicBool::new(false), values: [const { AtomicU64::new(0) }; 13] }
+    Self { cid_steering: AtomicBool::new(false), values: [const { AtomicU64::new(0) }; 15] }
   }
 }
 
@@ -129,6 +134,7 @@ impl StatsCell {
   fn load(&self) -> Http3WorkerStats {
     let value = |idx: usize| self.values.get(idx).map_or(0, |el| el.load(Ordering::Relaxed));
     Http3WorkerStats {
+      ack_only_out: value(13),
       cid_steering: self.cid_steering.load(Ordering::Relaxed),
       conns: value(0),
       datagrams_in: value(1),
@@ -137,6 +143,7 @@ impl StatsCell {
       forward_dropped: value(4),
       handler_panics: value(5),
       idle_trims: value(6),
+      packets_out: value(14),
       parked: value(7),
       park_refused: value(8),
       requests: value(9),
@@ -162,6 +169,8 @@ impl StatsCell {
       stats.retries,
       stats.stateless_resets,
       stats.udp_send_errors,
+      stats.ack_only_out,
+      stats.packets_out,
     ];
     for (cell, value) in self.values.iter().zip(values) {
       cell.store(value, Ordering::Relaxed);
