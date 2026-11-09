@@ -619,6 +619,17 @@ impl Streams {
     }
   }
 
+  /// If stream `id` takes no more writes of the application: its FIN was written, it was reset or
+  /// it is not open for sending.
+  #[inline]
+  pub(crate) fn write_closed(&self, pools: &QuicPools, id: StreamId) -> bool {
+    self
+      .app_slot(id)
+      .filter(|_| !self.closed)
+      .and_then(|slot| pools.stream_slots.get(slot))
+      .is_none_or(|el| !el.tx.exists || el.tx.fin || el.tx.reset.is_some())
+  }
+
   /// If a frame is owed or data can be sent.
   #[inline]
   pub(crate) const fn wants_send(&self) -> bool {

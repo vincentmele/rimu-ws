@@ -1,4 +1,4 @@
-//! Error types of the HTTP/3 frame and QPACK codecs and, later, of the HTTP/3 connection.
+//! Error types of the HTTP/3 frame and QPACK codecs and of the HTTP/3 connection.
 
 // The crate-wide `Error` must stay small.
 const _: () = {
@@ -14,15 +14,29 @@ const _: () = {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum Http3Error {
+  /// A request handler answered a request that it had already answered.
+  AlreadyResponded,
   /// An output buffer is too small for what should be written to it.
   BufferTooSmall,
   /// A Set Dynamic Table Capacity instruction asks for more than the advertised
   /// `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (with [`H3ErrorCode::QpackEncoderStreamError`], RFC 9204
   /// section 4.3.1).
   CapacityAboveMaximum,
+  /// The peer closed or reset one of its control, QPACK encoder or QPACK decoder streams, or asked
+  /// for one of ours to stop (with [`H3ErrorCode::ClosedCriticalStream`], RFC 9114 section 6.2.1
+  /// and RFC 9204 section 4.2).
+  ClosedCriticalStream,
+  /// A frame of the control stream other than DATA, HEADERS and PUSH_PROMISE (and other than the
+  /// unknown ones, which are skipped) is longer than the 4 KiB that it is read in (with
+  /// [`H3ErrorCode::ExcessiveLoad`]).
+  ControlFrameTooLarge,
   /// The decoder-stream instructions that wait to be written grew past their bound (16 KiB): the
   /// peer does not read the decoder stream (with [`H3ErrorCode::ExcessiveLoad`]).
   DecoderStreamBacklog,
+  /// The decoder stream of the peer acknowledges a field section or inserts that the static-only
+  /// encoder of this implementation never sent (with [`H3ErrorCode::QpackDecoderStreamError`],
+  /// RFC 9204 section 4.4).
+  DecoderStreamInstruction,
   /// A SETTINGS frame carries the same identifier twice (with [`H3ErrorCode::SettingsError`], RFC
   /// 9114 section 7.2.4).
   DuplicateSetting,
@@ -30,9 +44,16 @@ pub enum Http3Error {
   /// in one receive turn than the budget of the decoder allows (with
   /// [`H3ErrorCode::ExcessiveLoad`]).
   EncoderInstructionBudget,
+  /// The part of an encoder-stream instruction that waits for the rest of it grew past four times
+  /// the advertised capacity, which no instruction that fits needs (with
+  /// [`H3ErrorCode::ExcessiveLoad`]).
+  EncoderStreamBacklog,
   /// An insert is larger than the capacity of the dynamic table (with
   /// [`H3ErrorCode::QpackEncoderStreamError`], RFC 9204 section 3.2.2).
   EntryTooLarge,
+  /// A field section decodes to more than the advertised `SETTINGS_MAX_FIELD_SECTION_SIZE`, counted
+  /// as RFC 9114 section 4.2.2 does: the request is answered with 431.
+  FieldSectionTooLarge,
   /// A Huffman string decodes to more bytes than its destination allows.
   HuffmanOutputTooLong,
   /// A prefixed integer is larger than 2^62 - 1 (RFC 9204 section 4.1.1).
@@ -45,6 +66,10 @@ pub enum Http3Error {
   InvalidDynamicIndex,
   /// A Huffman string has a bad code, an EOS symbol or padding that is not a prefix of EOS.
   InvalidHuffman,
+  /// A CANCEL_PUSH above the push identifiers that the client allowed, a MAX_PUSH_ID that lowers
+  /// them or a GOAWAY of the client that raises its identifier (with [`H3ErrorCode::IdError`], RFC
+  /// 9114 sections 5.2 and 7.2).
+  InvalidPushId,
   /// An encoded Required Insert Count that no conformant encoder produces (with
   /// [`H3ErrorCode::QpackDecompressionFailed`], RFC 9204 section 4.5.1.1).
   InvalidRequiredInsertCount,
@@ -53,6 +78,15 @@ pub enum Http3Error {
   /// A frame payload ends inside a field or has bytes after its fields (with
   /// [`H3ErrorCode::FrameError`], RFC 9114 section 7.1).
   MalformedFrame,
+  /// A request that RFC 9114 section 4.1.2 calls malformed: its stream is reset with
+  /// [`H3ErrorCode::MessageError`].
+  MalformedRequest,
+  /// The first frame of the control stream of the peer is not SETTINGS (with
+  /// [`H3ErrorCode::MissingSettings`], RFC 9114 section 6.2.1).
+  MissingSettings,
+  /// A client opened a push stream, which only servers do (with
+  /// [`H3ErrorCode::StreamCreationError`], RFC 9114 section 6.2.2).
+  PushStreamFromClient,
   /// A frame type that HTTP/2 used and HTTP/3 reserves: 0x02, 0x06, 0x08 or 0x09 (with
   /// [`H3ErrorCode::FrameUnexpected`], RFC 9114 section 7.2.8).
   ReservedFrameType,
@@ -62,6 +96,9 @@ pub enum Http3Error {
   /// The Required Insert Count of a field section is larger than its largest reference needs
   /// (with [`H3ErrorCode::QpackDecompressionFailed`], RFC 9204 section 2.2.1).
   RequiredInsertCountTooLarge,
+  /// The peer opened a second control, QPACK encoder or QPACK decoder stream (with
+  /// [`H3ErrorCode::StreamCreationError`], RFC 9114 section 6.2.1 and RFC 9204 section 4.2).
+  SecondCriticalStream,
   /// A field section would block more streams than the advertised
   /// `SETTINGS_QPACK_BLOCKED_STREAMS` (with [`H3ErrorCode::QpackDecompressionFailed`], RFC 9204
   /// section 2.1.2).
@@ -72,6 +109,14 @@ pub enum Http3Error {
   /// A field section ends inside a representation (with
   /// [`H3ErrorCode::QpackDecompressionFailed`]).
   Truncated,
+  /// A stream ends inside a frame (with [`H3ErrorCode::FrameError`], RFC 9114 section 7.1).
+  TruncatedFrame,
+  /// The peer does not allow the three unidirectional streams that HTTP/3 opens (with
+  /// [`H3ErrorCode::GeneralProtocolError`], RFC 9114 section 6.2).
+  UniStreamsBlocked,
+  /// A frame that is not allowed on its stream or at its place on it (with
+  /// [`H3ErrorCode::FrameUnexpected`], RFC 9114 sections 4.1 and 7.2).
+  UnexpectedFrame,
 }
 
 /// HTTP/3 error codes (RFC 9114 section 8.1) and QPACK error codes (RFC 9204 section 6), the reason

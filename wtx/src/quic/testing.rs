@@ -952,13 +952,13 @@ pub(crate) enum NetRoute {
   Worker(u8),
 }
 
-/// A worker of the server of a [`Net`].
+/// A worker of the server of a [`Net`], whose application is a `SA`.
 #[derive(Debug)]
-pub(crate) struct NetServer {
+pub(crate) struct NetServer<SA: QuicApp = TestApp> {
   /// The application of the worker.
-  pub(crate) app: TestApp,
+  pub(crate) app: SA,
   /// The endpoint.
-  pub(crate) endpoint: TestEndpoint,
+  pub(crate) endpoint: Endpoint<SA, ChaCha20, SkCtx>,
   /// The arena of the worker.
   pub(crate) tx: TxArena,
 }
@@ -978,10 +978,10 @@ pub(crate) struct NetClient {
   pub(crate) mute: bool,
 }
 
-/// Clients and the workers of a server, a fake network between them and a fake clock. See the
-/// [module documentation](self).
+/// Clients and the workers of a server, whose application is a `SA`, a fake network between them
+/// and a fake clock. See the [module documentation](self).
 #[derive(Debug)]
-pub(crate) struct Net {
+pub(crate) struct Net<SA: QuicApp = TestApp> {
   /// The clients, whose ports are 50,000 plus their index.
   pub(crate) clients: Vec<NetClient>,
   /// The parameters of the clients.
@@ -1001,13 +1001,21 @@ pub(crate) struct Net {
   pub(crate) route: NetRoute,
   scratch: Vec<u8>,
   /// The workers.
-  pub(crate) servers: Vec<NetServer>,
+  pub(crate) servers: Vec<NetServer<SA>>,
 }
 
 impl Net {
   /// A server of `workers` workers with `params`, whose applications are `server_app`, and no
   /// client.
   pub(crate) fn new(workers: u8, params: QuicParams, server_app: &TestApp) -> Self {
+    Self::with_apps(workers, params, |_| TestApp { is_server: true, ..server_app.clone() })
+  }
+}
+
+impl<SA: QuicApp> Net<SA> {
+  /// A server of `workers` workers with `params`, whose applications `app` makes for each worker,
+  /// and no client.
+  pub(crate) fn with_apps(workers: u8, params: QuicParams, mut app: impl FnMut(u8) -> SA) -> Self {
     let mut rng = ChaCha20::from_key([7; 32]);
     let keys = Arc::new(EndpointKeys::new(&mut rng));
     let loads = Arc::new(WorkerLoads::new(workers));
@@ -1026,8 +1034,7 @@ impl Net {
           Arc::clone(&keys),
         )
         .unwrap();
-        let app = TestApp { is_server: true, ..server_app.clone() };
-        NetServer { app, endpoint, tx: TxArena::new(TxArena::DEFAULT_BYTES).unwrap() }
+        NetServer { app: app(worker), endpoint, tx: TxArena::new(TxArena::DEFAULT_BYTES).unwrap() }
       })
       .collect();
     Self {
@@ -1141,6 +1148,17 @@ impl Net {
     }
     self.leave();
     rslt
+  }
+
+  /// Runs `f` with the context of the connection of client `client` at `now_us`, as the
+  /// application of the client does outside of the callbacks.
+  pub(crate) fn client_ctx<R>(
+    &mut self,
+    client: usize,
+    now_us: u64,
+    f: impl FnOnce(&mut ConnCtx<'_, ()>) -> R,
+  ) -> R {
+    self.clients[client].conn.with_ctx(now_us, &mut self.client_parts.pools, f)
   }
 
   /// Flushes client `client` and returns its datagrams, which do not leave.
@@ -1372,7 +1390,7 @@ impl Net {
   }
 }
 
-impl Drop for Net {
+impl<SA: QuicApp> Drop for Net<SA> {
   fn drop(&mut self) {
     self.abort_clients();
     for server in &mut self.servers {

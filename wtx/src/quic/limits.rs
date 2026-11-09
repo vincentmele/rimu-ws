@@ -97,6 +97,13 @@ pub struct QuicLimits {
   ///
   /// Defaults to 0x0100, H3_NO_ERROR (RFC 9114 section 8.1): set it for other applications.
   pub shutdown_app_code: u64,
+  /// How long, in milliseconds, the connections of an endpoint that shuts down have to finish
+  /// what is under way when their application drains them itself (HTTP/3 sends GOAWAY and lets
+  /// the requests that it accepted finish). Those still open then are closed with
+  /// [`Self::shutdown_app_code`].
+  ///
+  /// Defaults to 2,000.
+  pub shutdown_grace_ms: u64,
   /// The most stateless resets that a worker sends per second (RFC 9000 section 10.3), and,
   /// apart from them, the most Version Negotiation packets.
   ///
@@ -126,6 +133,7 @@ impl Default for QuicLimits {
       reset_budget: 100,
       retry_above_half_open: 64,
       shutdown_app_code: 0x0100,
+      shutdown_grace_ms: 2_000,
       stateless_reset_per_sec: 100,
       stream_rejected_app_code: 0x010b,
     }
@@ -551,6 +559,7 @@ mod tests {
     assert_eq!(limits.reset_budget, 100);
     assert_eq!(limits.retry_above_half_open, 64);
     assert_eq!(limits.shutdown_app_code, 0x0100);
+    assert_eq!(limits.shutdown_grace_ms, 2_000);
     assert_eq!(limits.stateless_reset_per_sec, 100);
     assert_eq!(limits.stream_rejected_app_code, 0x010b);
   }

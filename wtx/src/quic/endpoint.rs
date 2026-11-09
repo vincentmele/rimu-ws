@@ -224,6 +224,8 @@ where
   reset_budget: RateBudget,
   rng: RNG,
   shutdown: bool,
+  // When the connections that drain themselves after a shutdown are closed, if they are not yet
+  shutdown_deadline_us: Option<u64>,
   // Room for every connection is reserved once, so that a connection never moves
   slots: Vector<usize, Slot<A, RNG, TCX>>,
   stateless: StatelessQueue,
@@ -282,6 +284,7 @@ where
       reset_budget: RateBudget::default(),
       rng,
       shutdown: false,
+      shutdown_deadline_us: None,
       slots: Vector::with_exact_capacity(conns)?,
       stateless: StatelessQueue::new(),
       stats: EndpointStats::default(),
@@ -305,18 +308,30 @@ where
   /// Closes every connection with an application CONNECTION_CLOSE of
   /// [`crate::quic::QuicLimits::shutdown_app_code`] and drops the Initial packets of new
   /// clients from now on (ruling T10-b). The connections end after their closing period.
+  ///
+  /// An established connection whose application drains it itself ([`QuicApp::on_shutdown`],
+  /// ruling T13-d) stays open until the application closes it, or until
+  /// [`crate::quic::QuicLimits::shutdown_grace_ms`] passed, when it is closed as the others.
   #[inline]
   pub(crate) fn begin_shutdown(&mut self, now_us: u64, app: &mut A) {
     self.shutdown = true;
-    let code = self.params.limits().shutdown_app_code;
+    let limits = *self.params.limits();
+    let grace_us = limits.shutdown_grace_ms.saturating_mul(1_000);
+    self.shutdown_deadline_us = Some(now_us.saturating_add(grace_us));
     for idx in 0..self.slots_len() {
-      let Some(conn) = self.conn_at(idx) else {
+      let Self { pools, slots, .. } = self;
+      let Some(conn) = slots.get_mut(idx).and_then(|el| el.conn.as_mut()) else {
         continue;
       };
-      if matches!(conn.state(), ConnState::Handshake | ConnState::Confirmed) {
-        conn.close_app(now_us, code);
-        self.after_event(idx, app);
+      if !matches!(conn.state(), ConnState::Handshake | ConnState::Confirmed) {
+        continue;
       }
+      if !conn.on_shutdown(now_us, app, pools)
+        && matches!(conn.state(), ConnState::Handshake | ConnState::Confirmed)
+      {
+        conn.close_app(now_us, limits.shutdown_app_code);
+      }
+      self.after_event(idx, app);
     }
   }
 
@@ -405,6 +420,12 @@ where
         // A handshake that took too long (spec section 5.12): its resources go back now
         self.remove(slot_idx, app);
         continue;
+      }
+      if self.shutdown_deadline_us.is_some_and(|el| now_us >= el)
+        && matches!(conn.state(), ConnState::Handshake | ConnState::Confirmed)
+      {
+        // The grace period of a shutdown is over (ruling T13-d)
+        conn.close_app(now_us, self.params.limits().shutdown_app_code);
       }
       conn.on_timeout(now_us, app, &mut self.pools);
       self.after_event(slot_idx, app);
@@ -505,12 +526,14 @@ where
       return;
     };
     let deadline = slot.conn.as_ref().and_then(QuicConn::next_deadline);
-    let deadline = deadline.into_iter().chain(slot.handshake_deadline_us).min();
+    // A connection that drains itself after a shutdown is closed at the end of the grace period
+    let open = slot
+      .conn
+      .as_ref()
+      .is_some_and(|el| matches!(el.state(), ConnState::Handshake | ConnState::Confirmed));
+    let grace = self.shutdown_deadline_us.filter(|_| open);
+    let deadline = deadline.into_iter().chain(slot.handshake_deadline_us).chain(grace).min();
     self.timers.arm(idx, deadline);
-  }
-
-  fn conn_at(&mut self, idx: usize) -> Option<&mut QuicConn<A, RNG, TCX>> {
-    self.slots.get_mut(idx).and_then(|el| el.conn.as_mut())
   }
 
   // The datagram `chunk` to the connection of slot `idx`; a connection that it opens (`fresh`)
@@ -1162,6 +1185,32 @@ where
   /// The pools of the worker.
   pub(crate) const fn pools(&self) -> &QuicPools {
     &self.pools
+  }
+}
+
+#[cfg(test)]
+impl<A, RNG, TCX> Endpoint<A, RNG, TCX>
+where
+  A: QuicApp,
+  RNG: CryptoRng + CryptoSeedableRng,
+  TCX: TlsCtxSk,
+{
+  /// Runs `f` with `app` and the context of the connection that `cid`, one of ours, leads to, as
+  /// a handler that finished later does, and has the connection flushed with the next flush.
+  pub(crate) fn with_conn<R>(
+    &mut self,
+    now_us: u64,
+    cid: &[u8],
+    app: &mut A,
+    f: impl FnOnce(&mut A, &mut crate::quic::ConnCtx<'_, A::ConnState>) -> R,
+  ) -> Option<R> {
+    let conn = self.cids.get(cid)?;
+    let idx = usize::try_from(conn.slot).ok()?;
+    let Self { pools, slots, .. } = self;
+    let slot = slots.get_mut(idx).filter(|el| el.generation == conn.generation)?;
+    let rslt = slot.conn.as_mut()?.with_ctx(now_us, pools, |cx| f(app, cx));
+    self.after_event(idx, app);
+    Some(rslt)
   }
 }
 

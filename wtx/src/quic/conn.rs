@@ -474,16 +474,52 @@ where
     self.enter_closing(now_us, CloseFrame { app: true, code, requested: false });
   }
 
+  /// The endpoint shuts down: the application of an established connection is asked whether it
+  /// drains the connection itself ([`QuicApp::on_shutdown`]). Returns `true` if it does and the
+  /// connection is still open; `false` for a connection that the caller closes now, or that is
+  /// not open anymore.
+  #[inline]
+  pub(crate) fn on_shutdown(&mut self, now_us: u64, app: &mut A, pools: &mut QuicPools) -> bool {
+    if !self.handshake_complete
+      || !matches!(self.state, ConnState::Handshake | ConnState::Confirmed)
+    {
+      return false;
+    }
+    let drains = app.on_shutdown(&mut ConnCtx::new(
+      &mut self.app_state,
+      &mut self.streams,
+      pools,
+      &self.params,
+      now_us,
+    ));
+    let closing = self.apply_app_close(now_us);
+    drains && !closing
+  }
+
   /// Writes the packets that are due into `tx`, as many datagrams as needed. Packets in flight wait
   /// for room in the congestion window, or for the pacer ([`Self::next_deadline`]).
+  ///
+  /// The application of an established connection that is not closing is told first
+  /// ([`QuicApp::on_flush`], ruling T13-c): what it writes then leaves with these packets.
   #[inline]
   pub(crate) fn flush(
     &mut self,
     now_us: u64,
     tx: &mut TxArena,
-    _app: &mut A,
+    app: &mut A,
     pools: &mut QuicPools,
   ) -> FlushOutcome {
+    if self.handshake_complete && matches!(self.state, ConnState::Handshake | ConnState::Confirmed)
+    {
+      app.on_flush(&mut ConnCtx::new(
+        &mut self.app_state,
+        &mut self.streams,
+        pools,
+        &self.params,
+        now_us,
+      ));
+      let _closing = self.apply_app_close(now_us);
+    }
     let rslt = self.flush_datagrams(now_us, tx, pools);
     if self.recovery.timer_stale {
       self.set_loss_timer(now_us);
@@ -2496,6 +2532,11 @@ where
   /// The streams.
   pub(crate) const fn streams(&self) -> &Streams {
     &self.streams
+  }
+
+  /// The state of the application.
+  pub(crate) const fn app_state(&self) -> &A::ConnState {
+    &self.app_state
   }
 
   /// The streams, to change.

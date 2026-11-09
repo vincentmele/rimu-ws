@@ -177,8 +177,10 @@ impl QpackDecoder {
   /// Makes this decoder a new one for the advertised `capacity` and `blocked_streams`, as
   /// [`Self::new`] does, in the storage that it has: nothing is allocated when the new limits are
   /// at most those that it had. The table gets a new epoch, so a memo filled from the old one
-  /// replays nothing.
+  /// replays nothing: first, so that a reset that fails part way, which the caller must not use
+  /// again, never keeps the old epoch with storage partly cleared.
   pub(crate) fn reset(&mut self, capacity: u32, blocked_streams: u16) -> crate::Result<()> {
+    self.epoch = EPOCHS.fetch_add(1, Ordering::Relaxed);
     let ring_len = *Usize::from(capacity);
     let max_entries = capacity / 32;
     self.blocked.clear();
@@ -194,7 +196,6 @@ impl QpackDecoder {
     self.capacity = 0;
     self.entries_head = 0;
     self.entries_len = 0;
-    self.epoch = EPOCHS.fetch_add(1, Ordering::Relaxed);
     self.insert_count = 0;
     self.known_received = 0;
     self.max_blocked = blocked_streams.into();

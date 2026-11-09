@@ -66,6 +66,26 @@ pub(crate) trait QuicApp {
 
   /// The connection is over, whatever the reason: its state is not used anymore.
   fn on_closed(&mut self, state: &mut Self::ConnState);
+
+  /// The connection is about to build its packets: what the application writes now leaves with
+  /// them. Called at each flush of an established connection that is not closing, once per turn
+  /// unless the arena was full (ruling T13-c). A close that it asks for is applied before the
+  /// packets are built.
+  #[inline]
+  fn on_flush(&mut self, cx: &mut ConnCtx<'_, Self::ConnState>) {
+    let _cx = cx;
+  }
+
+  /// The endpoint shuts down (ruling T13-d). Returns `true` if the application closes the
+  /// established connection itself once it is done with it (with [`ConnCtx::close`], from a later
+  /// callback), within [`crate::quic::QuicLimits::shutdown_grace_ms`], after which the endpoint
+  /// closes it; `false`, the default, to have it closed at once with
+  /// [`crate::quic::QuicLimits::shutdown_app_code`].
+  #[inline]
+  fn on_shutdown(&mut self, cx: &mut ConnCtx<'_, Self::ConnState>) -> bool {
+    let _cx = cx;
+    false
+  }
 }
 
 /// What the application acts through: the streams of the connection and its state.
@@ -153,6 +173,13 @@ impl<'c, S> ConnCtx<'c, S> {
   #[inline]
   pub(crate) fn unsent_bytes(&self) -> usize {
     usize::try_from(self.streams.unsent()).unwrap_or(usize::MAX)
+  }
+
+  /// If stream `id` takes no more writes: its FIN was written, it was reset or it is not open for
+  /// sending.
+  #[inline]
+  pub(crate) fn write_closed(&self, id: StreamId) -> bool {
+    self.streams.write_closed(self.pools, id)
   }
 
   /// Writes `bytes` to stream `id`, copied into its send queue, and with them its end if `fin`.
