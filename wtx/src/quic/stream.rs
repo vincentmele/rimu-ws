@@ -637,6 +637,21 @@ impl Streams {
     self.cold.as_ref().map_or(0, |el| el.blocked_sent)
   }
 
+  /// Queues, as lost, a STREAM frame of a stream that is gone, which the next packet drops without
+  /// writing anything: what a frame lost after its stream was released or fully acknowledged
+  /// leaves behind.
+  #[cfg(test)]
+  pub(crate) fn queue_stale_lost(&mut self, pools: &mut QuicPools) -> crate::Result<()> {
+    let frame = crate::quic::sent::FrameRef::Stream {
+      slot: u32::MAX,
+      generation: 0,
+      offset: 0,
+      len: 1,
+      fin: false,
+    };
+    pools.frame_refs.queue_push(&mut self.lost, frame)
+  }
+
   /// Stops sending DATA_BLOCKED and STREAM_DATA_BLOCKED, as some peers do.
   #[cfg(test)]
   pub(crate) fn never_send_blocked_frames(&mut self) {

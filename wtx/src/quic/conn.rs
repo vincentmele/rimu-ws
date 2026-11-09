@@ -2433,24 +2433,31 @@ where
       let _written = fw.write_connection_close(app, code, (!app).then_some(0), reason);
     } else {
       // The first packet of the flush that sends stream data repeats an acknowledgment that the
-      // peer may lack (ruling T19-d), in a datagram with room for the data too, so that the ACK
-      // never goes alone
+      // peer may lack (ruling T19-d), in a datagram with room for the data too. It is kept only if
+      // the packet ends up with an ack-eliciting frame (below): it never goes alone
+      let pending = sp.recv.ack_pending();
       let repeat = space == Space::Data
+        && !pending
         && params.repeat_ack
         && allow_ae
         && !self.flush_acked
         && full_room
         && self.streams.wants_send()
         && sp.recv.ack_unconfirmed();
-      if (sp.recv.ack_pending() || repeat)
+      let mut repeated = None;
+      if (pending || repeat)
         && let Some(largest) = sp.recv.largest()
         && let Some(written) = sp.recv.write_ack(&mut fw, self.params.ack_delay_exponent, now_us)
       {
-        pools.frame_refs.push(&mut frames, FrameRef::Ack { largest })?;
-        self.flush_acked |= space == Space::Data;
-        // A frame with its first range only leaves the others owed (carried rule 4)
-        if written == AckWritten::All {
-          sp.recv.on_ack_sent(pools);
+        if repeat {
+          repeated = Some((largest, written));
+        } else {
+          pools.frame_refs.push(&mut frames, FrameRef::Ack { largest })?;
+          self.flush_acked |= space == Space::Data;
+          // A frame with its first range only leaves the others owed (carried rule 4)
+          if written == AckWritten::All {
+            sp.recv.on_ack_sent(pools);
+          }
         }
       }
       if space == Space::Data && allow_ae {
@@ -2497,6 +2504,17 @@ where
       }
       if probe && !ack_eliciting && fw.write_bytes(&PING_FRAME) {
         ack_eliciting = true;
+      }
+      if let Some((largest, written)) = repeated {
+        if !ack_eliciting {
+          // Nothing but the repeated ACK, the first frame: the packet does not go
+          return Ok(None);
+        }
+        pools.frame_refs.push(&mut frames, FrameRef::Ack { largest })?;
+        self.flush_acked = true;
+        if written == AckWritten::All {
+          sp.recv.on_ack_sent(pools);
+        }
       }
     }
     let mut payload_len = fw.len();
@@ -5317,5 +5335,35 @@ mod tests {
         assert!(!link.server.conn.data.recv.ack_unconfirmed());
       }
     }
+  }
+
+  // Ruling T19-d (review): the repeated acknowledgment stays only in a packet that carries an
+  // ack-eliciting frame. Here the streams want to send a STREAM frame lost after its stream went
+  // (which writes nothing) while the acknowledgment of a PING is unconfirmed: no packet goes, where
+  // one with the repeated ACK alone would be an ACK-only packet that answers nothing new.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn a_repeated_acknowledgment_never_goes_alone() {
+    let mut link = settled(&LinkOpts::new(None));
+    link.client.conn.queue_test_frames(&PING);
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
+    // The acknowledgment of the PING goes, and is lost
+    let _ = link.server.flush(link.now_us);
+    assert_eq!(link.server.take_datagrams().len(), 1);
+    assert!(!link.server.conn.data.recv.ack_pending());
+    assert!(link.server.conn.data.recv.ack_unconfirmed());
+    let pools = &mut link.server.parts.pools;
+    link.server.conn.streams.queue_stale_lost(pools).unwrap();
+    assert!(link.server.conn.streams.wants_send());
+    let before = *link.server.conn.stats();
+    let _ = link.server.flush(link.now_us);
+    let after = *link.server.conn.stats();
+    assert_eq!(after.ack_only_out, before.ack_only_out, "{after:?}");
+    assert_eq!(after.packets_out, before.packets_out, "{after:?}");
+    assert!(link.server.take_datagrams().is_empty());
+    // The stale entry is gone, and the acknowledgment is still unconfirmed for the next response
+    assert!(!link.server.conn.streams.wants_send());
+    assert!(link.server.conn.data.recv.ack_unconfirmed());
   }
 }
