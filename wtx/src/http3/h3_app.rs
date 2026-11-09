@@ -1211,9 +1211,14 @@ fn drain(
   while let Some((id, writable)) = cx.first_unanswered(from, below) {
     // A refusal that finds no room (no stream slot left on the worker and as many refused streams
     // as a connection keeps) is tried again at the next flush, and the grace period of the
-    // shutdown bounds the wait: the close stays graceful (fix in passing of task 14)
-    if writable && cx.refuse(id, H3ErrorCode::RequestRejected.code()).is_ok() {
-      conn.decoder.on_stream_cancelled(id.0)?;
+    // shutdown bounds the wait: the close stays graceful (fix in passing of task 14). Any other
+    // error closes the connection, as before (review X5).
+    if writable {
+      match cx.refuse(id, H3ErrorCode::RequestRejected.code()) {
+        Ok(()) => conn.decoder.on_stream_cancelled(id.0)?,
+        Err(crate::Error::QuicClose(_, QuicError::PoolExhausted)) => {}
+        Err(err) => return Err(err),
+      }
     }
     answered = false;
     from = StreamId(id.0.wrapping_add(4));

@@ -16,9 +16,11 @@
 //! second; `content-length` and the other fields are encoded per response. A body sent by
 //! reference ([`AutoStream::shared_body`], the cached files of
 //! [`StaticFiles`](crate::http::StaticFiles)) leaves without a copy ([`BodyRef`]).
-
-// `std::task::Wake` is implemented for `alloc::sync::Arc` only.
-#![allow(clippy::disallowed_types, reason = "`Waker::from` needs the standard `Arc`")]
+//!
+//! RFC 9110 (ruling T14-i): a response to `HEAD` has the fields that `GET` would get,
+//! `content-length` included, and no content (section 9.3.2); 1xx and 204 have neither content
+//! nor `content-length` (section 8.6), 304 no content and no `content-length` (section 15.4.5).
+//! `content-length` of the other responses can be left out (ruling T14-j).
 
 use crate::{
   collections::{ArrayVectorCopy, VectorUsize},
@@ -34,7 +36,7 @@ use crate::{
   http3::{H3Handler, H3ReqCtx, H3Request, ReqOutcome, encode_static_line, encode_static_prefix},
   misc::{SharedBytes, from_utf8_basic},
   quic::{BodyRef, ConnHandle, StreamId},
-  sync::{Arc, AtomicWaker, SyncMutex},
+  sync::{Arc, AtomicU64, AtomicWaker, SyncMutex},
 };
 use alloc::{boxed::Box, rc::Rc};
 use core::{
@@ -46,19 +48,25 @@ use core::{
 };
 
 /// The requests of a worker whose handlers wait at once, at most.
+///
+/// The steady state allocates nothing while at most [`MAX_MSGS`] requests are under way at once
+/// and their bodies fit in [`KEEP_BODY`]: past that, the request buffers of the requests above the
+/// bound are freed when they end and made again by the next burst (Task 20 measures it).
 pub(crate) const MAX_PARKED: usize = 1024;
 /// The combinations of the fields of a response that are kept encoded.
 const MAX_BLOCKS: usize = 16;
 /// The bytes of the values of a combination past which it is encoded per response.
 const MAX_BLOCK_KEY: usize = 512;
-/// The request buffers that a worker keeps for the next requests.
+/// The request buffers that a worker keeps for the next requests: fewer than [`MAX_PARKED`], see
+/// there for the bound of the steady state.
 const MAX_MSGS: usize = 64;
 /// The bytes of fields that a new request buffer has room for: a request, then its response,
 /// rarely need more, and a buffer that does grows once and keeps the room.
 const MSG_FIELDS: usize = 1024;
 /// The bytes of URI that a new request buffer has room for.
 const MSG_URI: usize = 256;
-/// The capacity of the body of a request buffer that is kept.
+/// The capacity of the body of a request buffer that is kept: a buffer of a larger request or
+/// response body is freed when it goes back to the pool (see [`MAX_PARKED`]).
 const KEEP_BODY: usize = 64 * 1024;
 /// What [`RouterHandler::trim_idle`] keeps of the request buffers and of the slots.
 const IDLE_KEEP: usize = 4;
@@ -135,6 +143,7 @@ pub(crate) struct RouterHandler<D, EC>
 where
   D: AutoDispatch,
 {
+  content_length: bool,
   counters: HandlerCounters,
   data: D::Data,
   date: Option<DateLine>,
@@ -152,10 +161,17 @@ where
   D: AutoDispatch,
   EC: Fn(D::Err),
 {
-  /// The handler of a worker: `dispatch` runs the requests, with clones of `data`; with `date`,
-  /// responses carry a `date` header.
-  pub(crate) fn new(data: D::Data, date: bool, dispatch: D, error_cb: EC) -> crate::Result<Self> {
+  /// The handler of a worker: `dispatch` runs the requests, with clones of `data`; with
+  /// `content_length`, responses with content carry `content-length`, and with `date` a `date`
+  /// header.
+  pub(crate) fn new(
+    data: D::Data,
+    (content_length, date): (bool, bool),
+    dispatch: D,
+    error_cb: EC,
+  ) -> crate::Result<Self> {
     Ok(Self {
+      content_length,
       counters: HandlerCounters::default(),
       data,
       date: if date { Some(DateLine::new()?) } else { None },
@@ -214,17 +230,30 @@ where
     self.slots.trim_idle(IDLE_KEEP);
   }
 
-  // Answers with `status`, the fields of `msg` and its body, or `shared`, by reference.
+  // Answers a request, of `HEAD` if `head`, with `status`, the fields of `msg` and its body, or
+  // `shared`, by reference: no content, and no `content-length`, where RFC 9110 says so (see the
+  // module documentation).
   fn answer(
     &mut self,
     cx: &mut H3ReqCtx<'_, '_>,
+    head: bool,
     status: StatusCode,
     msg: MsgBufferString,
     shared: Option<SharedBytes>,
   ) -> crate::Result<ReqOutcome> {
+    let code = u16::from(status);
+    let without_length = (100..200).contains(&code) || code == 204 || code == 304;
     let body_len = shared.as_ref().map_or(msg.body.len(), SharedBytes::len);
+    let length = if without_length {
+      None
+    } else if head || self.content_length {
+      Some(body_len)
+    } else {
+      None
+    };
     let date = self.date.as_ref().map(DateLine::line);
-    let rslt = match self.head.encode(status, &msg.headers, body_len, date) {
+    let rslt = match self.head.encode(status, &msg.headers, length, date) {
+      Ok(section) if head || without_length => cx.respond(section, &[]),
       Ok(section) => match shared {
         Some(body) => BodyRef::try_from(body).and_then(|el| cx.respond_body(section, el)),
         None => cx.respond(section, msg.body.as_slice()),
@@ -235,15 +264,16 @@ where
     rslt.map(|()| ReqOutcome::Responded)
   }
 
-  // Answers with `status` and nothing else of `msg`.
+  // Answers a request, of `HEAD` if `head`, with `status` and nothing else of `msg`.
   fn answer_plain(
     &mut self,
     cx: &mut H3ReqCtx<'_, '_>,
+    head: bool,
     status: StatusCode,
     mut msg: MsgBufferString,
   ) -> crate::Result<ReqOutcome> {
     msg.clear();
-    self.answer(cx, status, msg, None)
+    self.answer(cx, head, status, msg, None)
   }
 
   // Polls the future of slot `idx`, in the context of its request.
@@ -256,20 +286,22 @@ where
         cold_path();
         self.slots.release(idx);
         self.counters.park_refused = self.counters.park_refused.wrapping_add(1);
+        // Without content: the same for HEAD as for the other methods
         let msg = self.take_msg()?;
-        self.answer_plain(cx, StatusCode::ServiceUnavailable, msg)
+        self.answer_plain(cx, false, StatusCode::ServiceUnavailable, msg)
       }
       SlotPoll::Done((auto_stream, rslt)) => {
         let AutoStream { req, shared_body, .. } = auto_stream;
+        let head = req.method == Method::Head;
         let mut msg = req.msg_data;
         match rslt {
-          Ok(status) => self.answer(cx, status, msg, shared_body),
+          Ok(status) => self.answer(cx, head, status, msg, shared_body),
           Err(err) => {
             cold_path();
             (self.error_cb)(err);
             // What a failed handler left behind is not a response
             msg.clear();
-            self.answer(cx, StatusCode::InternalServerError, msg, None)
+            self.answer(cx, head, StatusCode::InternalServerError, msg, None)
           }
         }
       }
@@ -277,7 +309,7 @@ where
         cold_path();
         self.counters.panics = self.counters.panics.wrapping_add(1);
         let msg = self.take_msg()?;
-        self.answer_plain(cx, StatusCode::InternalServerError, msg)
+        self.answer_plain(cx, false, StatusCode::InternalServerError, msg)
       }
     }
   }
@@ -322,17 +354,18 @@ where
   ) -> crate::Result<ReqOutcome> {
     self.counters.requests = self.counters.requests.wrapping_add(1);
     let mut msg = self.take_msg()?;
+    let head = req.method == b"HEAD";
     let method = match fill_request(&mut msg, req) {
       Ok(elem) => elem,
-      Err(status) => return self.answer_plain(cx, status, msg),
+      Err(status) => return self.answer_plain(cx, head, status, msg),
     };
     let Some((matches, om)) = self.dispatch.route(msg.uri.path()) else {
-      return self.answer_plain(cx, StatusCode::NotFound, msg);
+      return self.answer_plain(cx, head, StatusCode::NotFound, msg);
     };
     if om == OperationMode::Manual {
       cold_path();
       (self.error_cb)(crate::Error::from(Http2ServerFrameworkError::OperationModeMismatch).into());
-      return self.answer_plain(cx, StatusCode::InternalServerError, msg);
+      return self.answer_plain(cx, head, StatusCode::InternalServerError, msg);
     }
     let auto_stream =
       AutoStream::new(self.data.clone(), cx.peer(), None, Request::new(method, msg));
@@ -482,13 +515,13 @@ impl ResponseHead {
     }
   }
 
-  // The field section of a response of `status`, `headers`, a body of `body_len` bytes and the
+  // The field section of a response of `status`, `headers`, `content-length` if `length` and the
   // `date` line if any.
   fn encode(
     &mut self,
     status: StatusCode,
     headers: &Headers,
-    body_len: usize,
+    length: Option<usize>,
     date: Option<&[u8]>,
   ) -> crate::Result<&[u8]> {
     let [mut content_type, mut content_encoding, mut vary] = [None; 3];
@@ -514,8 +547,10 @@ impl ResponseHead {
     if let Some(elem) = date {
       self.section.extend_from_copyable_slice(elem)?;
     }
-    let mut digits = [0u8; 20];
-    encode_static_line(b"content-length", decimal(body_len, &mut digits), &mut self.section)?;
+    if let Some(elem) = length {
+      let mut digits = [0u8; 20];
+      encode_static_line(b"content-length", decimal(elem, &mut digits), &mut self.section)?;
+    }
     let mut firsts = [true; 3];
     for header in headers.iter() {
       let name = header.name.as_bytes();
@@ -657,7 +692,7 @@ fn decimal(mut value: usize, buffer: &mut [u8; 20]) -> &[u8] {
 }
 
 /// How the poll of a slot ended.
-enum SlotPoll<T> {
+pub(super) enum SlotPoll<T> {
   /// The future finished.
   Done(T),
   /// The future panicked; its slot is free again.
@@ -668,17 +703,23 @@ enum SlotPoll<T> {
 
 /// What wakes the endpoint task: the slots whose futures want another poll, each queued once.
 struct WakeShared {
+  // Wakes that found the queue full, and were lost: never, while the queue has room for every
+  // slot (review X2)
+  lost: AtomicU64,
   task: AtomicWaker,
   woken: SyncMutex<VectorUsize<u32>>,
 }
 
 /// The waker of a slot.
+// `std::task::Wake` is implemented for `alloc::sync::Arc` only
+#[allow(clippy::disallowed_types, reason = "`Waker::from` needs the standard `Arc`")]
 struct SlotWaker {
   idx: u32,
   queued: AtomicBool,
   shared: Arc<WakeShared>,
 }
 
+#[allow(clippy::disallowed_types, reason = "`Waker::from` needs the standard `Arc`")]
 impl std::task::Wake for SlotWaker {
   fn wake(self: alloc::sync::Arc<Self>) {
     self.wake_by_ref();
@@ -686,14 +727,22 @@ impl std::task::Wake for SlotWaker {
 
   fn wake_by_ref(self: &alloc::sync::Arc<Self>) {
     if !self.queued.swap(true, Ordering::AcqRel) {
-      // Room for every slot is reserved when the slot is made: no allocation here
-      let _rslt = self.shared.woken.lock().push(self.idx);
+      // The queue has room for every slot, each queued at most once: a push never allocates, and
+      // one that would is not made: the wake is counted lost, and the next one queues the slot
+      let mut woken = self.shared.woken.lock();
+      if woken.len() >= woken.capacity() || woken.push(self.idx).is_err() {
+        cold_path();
+        drop(woken);
+        self.queued.store(false, Ordering::Release);
+        let _ = self.shared.lost.fetch_add(1, Ordering::Relaxed);
+      }
     }
     self.shared.task.wake();
   }
 }
 
 /// A slot of a future: pinned once, used again without allocating.
+#[allow(clippy::disallowed_types, reason = "`Waker::from` needs the standard `Arc`")]
 struct Slot<F> {
   conn: ConnHandle,
   fut: Pin<Box<Option<F>>>,
@@ -703,7 +752,7 @@ struct Slot<F> {
 }
 
 /// The slots of the futures of a worker.
-struct TaskSlots<F> {
+pub(super) struct TaskSlots<F> {
   free: VectorUsize<u32>,
   // The futures held
   len: usize,
@@ -715,11 +764,12 @@ impl<F> TaskSlots<F>
 where
   F: Future,
 {
-  fn new() -> Self {
+  pub(super) fn new() -> Self {
     Self {
       free: VectorUsize::new(),
       len: 0,
       shared: Arc::new(WakeShared {
+        lost: AtomicU64::new(0),
         task: AtomicWaker::new(),
         woken: SyncMutex::new(VectorUsize::new()),
       }),
@@ -740,13 +790,26 @@ where
   }
 
   // Pins `fut`, of the request of `stream` of `conn`, into a free slot.
-  fn insert(&mut self, fut: F, conn: ConnHandle, stream: StreamId) -> crate::Result<u32> {
+  #[allow(clippy::disallowed_types, reason = "`Waker::from` needs the standard `Arc`")]
+  pub(super) fn insert(
+    &mut self,
+    fut: F,
+    conn: ConnHandle,
+    stream: StreamId,
+  ) -> crate::Result<u32> {
     let idx = if let Some(idx) = self.free.pop() {
       idx
     } else {
       let idx = u32::try_from(self.slots.len()).map_err(|_err| crate::Error::ProgrammingError)?;
-      self.free.reserve(usize::try_from(idx).unwrap_or(usize::MAX).wrapping_add(1))?;
-      self.shared.woken.lock().reserve(1)?;
+      let slots = usize::try_from(idx).unwrap_or(usize::MAX).wrapping_add(1);
+      self.free.reserve(slots)?;
+      {
+        // Room in the queue of woken slots for every slot, this one included (review X2): the
+        // capacity of the queue never shrinks, so the wakers of slots that a trim let go fit too
+        let mut woken = self.shared.woken.lock();
+        let len = woken.len();
+        woken.reserve(slots.saturating_sub(len))?;
+      }
       let wake = alloc::sync::Arc::new(SlotWaker {
         idx,
         queued: AtomicBool::new(false),
@@ -768,7 +831,7 @@ where
   }
 
   // Polls the future of slot `idx` with the waker of the slot, a panic caught and confined to it.
-  fn poll(&mut self, idx: u32) -> SlotPoll<F::Output> {
+  pub(super) fn poll(&mut self, idx: u32) -> SlotPoll<F::Output> {
     let Some(slot) = self.slots.get_mut(usize::try_from(idx).unwrap_or(usize::MAX)) else {
       return SlotPoll::Pending;
     };
@@ -823,11 +886,17 @@ where
   }
 
   // Moves the slots woken since the last call into `out`.
-  fn take_woken(&self, out: &mut VectorUsize<u32>) -> crate::Result<()> {
+  pub(super) fn take_woken(&self, out: &mut VectorUsize<u32>) -> crate::Result<()> {
     let mut woken = self.shared.woken.lock();
     out.extend_from_copyable_slice(woken.as_slice())?;
     woken.clear();
     Ok(())
+  }
+
+  // The wakes that found the queue of woken slots full.
+  #[cfg(test)]
+  pub(super) fn wakes_lost(&self) -> u64 {
+    self.shared.lost.load(Ordering::Relaxed)
   }
 
   // The connection and stream of the request of slot `idx`, if it holds a future.

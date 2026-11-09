@@ -12,6 +12,8 @@
 //! T14-f, the degraded mode of ruling T11-a). Each worker then makes its endpoint, whose
 //! generator is derived from the one of the worker, itself derived from the one of the process on
 //! the thread that started the server (ruling T14-c), with the keys and the loads of the process.
+//! A worker that can not start (its bind fails, say) ends the server with its error; the workers
+//! that waited for it stop and report nothing of their own (review X1).
 //!
 //! # Turn
 //!
@@ -32,6 +34,8 @@
 //! state and of the router handler (ruling T14-e). Its counters are stored for
 //! [`crate::http::http3_server_framework::Http3Stats`] at each turn.
 
+#[cfg(test)]
+use crate::http::http3_server_framework::tests::PoolSizes;
 use crate::{
   collections::VectorUsize,
   executor::{UdpInbox, UdpParams, UringSleep, UringUdpSocket},
@@ -73,6 +77,7 @@ const SHUTDOWN_LINGER: Duration = Duration::from_secs(5);
 /// What a worker is given.
 pub(crate) struct WorkerParams<DA, EC, EN, ER, M, RNG, TCX> {
   pub(crate) addr: SocketAddr,
+  pub(crate) content_length: bool,
   pub(crate) cpu: Option<usize>,
   pub(crate) data: DA,
   pub(crate) date: bool,
@@ -125,16 +130,56 @@ impl Startup {
     self.failed.store(true, Ordering::Release);
   }
 
-  // Waits until `turn` workers bound. Fails if one of them failed.
-  fn wait_turn(&self, turn: usize) -> crate::Result<()> {
+  // Waits until `turn` workers bound. `Aborted` if a worker failed to start, which reports why.
+  fn wait_turn(&self, turn: usize) -> Result<(), Start> {
     while self.turn.load(Ordering::Acquire) < turn {
       if self.failed.load(Ordering::Acquire) {
-        return Err(crate::Error::ClosedHttpConnection);
+        return Err(Start::Aborted);
       }
       std::thread::sleep(Duration::from_micros(100));
     }
     Ok(())
   }
+}
+
+/// How a worker ended without serving.
+#[derive(Debug)]
+pub(crate) enum WorkerEnd<ER> {
+  /// It stopped waiting for a worker that failed to start, and that reports why.
+  Aborted,
+  /// It failed.
+  Failed(ER),
+}
+
+impl<ER> WorkerEnd<ER>
+where
+  ER: From<crate::Error>,
+{
+  /// The error, for a caller that has no other worker to report it.
+  pub(crate) fn into_error(self) -> ER {
+    match self {
+      Self::Aborted => crate::Error::ClosedHttpConnection.into(),
+      Self::Failed(err) => err,
+    }
+  }
+}
+
+impl<ER> From<crate::Error> for WorkerEnd<ER>
+where
+  ER: From<crate::Error>,
+{
+  #[inline]
+  fn from(from: crate::Error) -> Self {
+    Self::Failed(from.into())
+  }
+}
+
+// How the start of a worker failed.
+enum Start {
+  // Another worker failed
+  Aborted,
+  // The bind failed
+  Failed(crate::Error),
 }
 
 /// The address `addr` names, the first one if several.
@@ -144,9 +189,10 @@ pub(crate) fn resolve(addr: &str) -> crate::Result<SocketAddr> {
     .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::AddrNotAvailable).into())
 }
 
-/// The CPUs of the process, the first thread of each physical core first, then the others.
-pub(crate) fn cpu_order() -> Vec<usize> {
-  let allowed = affinity::allowed();
+/// The CPUs of the process, the first thread of each physical core first, then the others. Fails
+/// if the kernel does not tell the CPUs of the process.
+pub(crate) fn cpu_order() -> crate::Result<Vec<usize>> {
+  let allowed = affinity::allowed()?;
   let first_of_core = |cpu: &usize| {
     let path = alloc::format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
     std::fs::read_to_string(path).map_or(true, |list| {
@@ -156,7 +202,7 @@ pub(crate) fn cpu_order() -> Vec<usize> {
   };
   let (mut rslt, others): (Vec<usize>, Vec<usize>) = allowed.into_iter().partition(first_of_core);
   rslt.extend(others);
-  rslt
+  Ok(rslt)
 }
 
 /// Pins the thread of the worker to its CPU, if it has one. A failure is reported to the error
@@ -176,7 +222,7 @@ where
 /// Runs the worker of `params` until its server shuts down.
 pub(crate) async fn run<DA, EC, EN, ER, M, RNG, TCX>(
   params: WorkerParams<DA, EC, EN, ER, M, RNG, TCX>,
-) -> Result<(), ER>
+) -> Result<(), WorkerEnd<ER>>
 where
   DA: Clone + 'static,
   EC: Clone + Fn(ER) + 'static,
@@ -188,6 +234,7 @@ where
 {
   let WorkerParams {
     addr,
+    content_length,
     cpu: _,
     data,
     date,
@@ -226,6 +273,10 @@ where
         false
       }
     }
+  })
+  .map_err(|el| match el {
+    Start::Aborted => WorkerEnd::Aborted,
+    Start::Failed(err) => WorkerEnd::Failed(err.into()),
   })?;
   #[cfg(test)]
   if let Some(elem) = &test.bound {
@@ -252,7 +303,8 @@ where
     Some(loads),
     keys,
   )?;
-  let handler = RouterHandler::new(data, date, FwRouter::new(router), error_cb.clone())?;
+  let handler =
+    RouterHandler::new(data, (content_length, date), FwRouter::new(router), error_cb.clone())?;
   let app = H3App::new(handler, h3_params);
   #[cfg(test)]
   let idle_trim_after = test.idle_trim_after.unwrap_or(IDLE_TRIM_AFTER);
@@ -275,11 +327,13 @@ where
     socket,
     stats,
     steering,
+    #[cfg(test)]
+    trims: test.trims,
     trimmed: false,
     woken: VectorUsize::new(),
     worker,
   };
-  let rslt = poll_fn(|cx| task.turn(cx)).await;
+  let rslt = poll_fn(|cx| task.turn(cx)).await.map_err(WorkerEnd::Failed);
   let Task { app, endpoint, .. } = &mut task;
   endpoint.abort_all(app);
   task.store_stats();
@@ -294,7 +348,7 @@ fn bind_in_order(
   (addr, udp_params): (SocketAddr, &UdpParams),
   (worker, workers): (u8, u8),
   steer: &dyn Fn(&UringUdpSocket) -> bool,
-) -> crate::Result<UringUdpSocket> {
+) -> Result<UringUdpSocket, Start> {
   let worker = usize::from(worker);
   startup.wait_turn(worker)?;
   let mut addr = addr;
@@ -306,7 +360,7 @@ fn bind_in_order(
     Ok(elem) => elem,
     Err(err) => {
       startup.fail();
-      return Err(err);
+      return Err(Start::Failed(err));
     }
   };
   if worker == 0 {
@@ -376,6 +430,8 @@ where
   socket: UringUdpSocket,
   stats: Arc<[CachePadded<StatsCell>]>,
   steering: bool,
+  #[cfg(test)]
+  trims: Option<crate::sync::Arc<std::sync::Mutex<Vec<(PoolSizes, PoolSizes)>>>>,
   // The pools were trimmed since the worker was last busy
   trimmed: bool,
   woken: VectorUsize<u32>,
@@ -490,12 +546,29 @@ where
     if self.trimmed || now_us.saturating_sub(since) < self.idle_trim_us {
       return;
     }
+    #[cfg(test)]
+    let before = self.pool_sizes();
     self.endpoint.trim_idle();
     self.app.trim_idle();
     self.app.handler.trim_idle();
     crate::tls::trim_idle_pools();
+    #[cfg(test)]
+    if let Some(elem) = &self.trims {
+      let after = self.pool_sizes();
+      elem.lock().unwrap().push((before, after));
+    }
     self.trimmed = true;
     self.idle_trims = self.idle_trims.wrapping_add(1);
+  }
+
+  // The sizes of the pools that an idle trim frees down.
+  #[cfg(test)]
+  fn pool_sizes(&self) -> PoolSizes {
+    PoolSizes {
+      quic_conns: self.endpoint.pools().conn_cold.len(),
+      tls_states: crate::tls::pooled_states(),
+      h3_conns: self.app.pooled(),
+    }
   }
 
   // Begins the shutdown of the endpoint once its signal is triggered.
@@ -594,17 +667,18 @@ pub(crate) mod affinity {
   use alloc::vec::Vec;
 
   /// The CPUs that the process may run on, in increasing order.
-  pub(crate) fn allowed() -> Vec<usize> {
+  pub(crate) fn allowed() -> crate::Result<Vec<usize>> {
     // SAFETY: a `cpu_set_t` is a plain bitmask, valid when all zeroes
     let mut set: libc::cpu_set_t = unsafe { core::mem::zeroed() };
     // SAFETY: `set` outlives the call, which writes at most the size that is passed
     let rslt = unsafe { libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &raw mut set) };
     if rslt != 0 {
-      return Vec::new();
+      core::hint::cold_path();
+      return Err(std::io::Error::last_os_error().into());
     }
     let max = usize::try_from(libc::CPU_SETSIZE).unwrap_or(0);
     // SAFETY: `CPU_ISSET` reads the bit of a CPU below `CPU_SETSIZE` of `set`, which is valid
-    (0..max).filter(|el| unsafe { libc::CPU_ISSET(*el, &set) }).collect()
+    Ok((0..max).filter(|el| unsafe { libc::CPU_ISSET(*el, &set) }).collect())
   }
 
   /// Pins the calling thread to `cpu`.

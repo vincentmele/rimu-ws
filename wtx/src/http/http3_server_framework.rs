@@ -172,6 +172,7 @@ impl StatsCell {
 /// HTTP/3 Server Framework: see the [module documentation](self).
 #[derive(Debug)]
 pub struct Http3ServerFramework<DA, EC, EX, RC, RNG, TCX> {
+  content_length: bool,
   data: DA,
   date: bool,
   error_cb: EC,
@@ -210,6 +211,7 @@ where
     let error_cb: fn(_) = |_| {};
     let local_runtime_cb: fn() -> _ = || Ok(EX::LocalRuntime::new()?);
     Ok(Self {
+      content_length: true,
       data: (),
       date: true,
       error_cb,
@@ -242,6 +244,7 @@ impl<DA, EC, EX, RC, RNG, TCX> Http3ServerFramework<DA, EC, EX, RC, RNG, TCX> {
   #[inline]
   pub fn set_data<_DA>(self, value: _DA) -> Http3ServerFramework<_DA, EC, EX, RC, RNG, TCX> {
     Http3ServerFramework {
+      content_length: self.content_length,
       data: value,
       date: self.date,
       error_cb: self.error_cb,
@@ -261,6 +264,16 @@ impl<DA, EC, EX, RC, RNG, TCX> Http3ServerFramework<DA, EC, EX, RC, RNG, TCX> {
     }
   }
 
+  /// If responses with content carry `content-length` (RFC 9110 section 8.6: a SHOULD when the size
+  /// is known; HTTP/3 frames the content without it). A response to `HEAD` carries it either way.
+  /// Defaults to `true`.
+  #[inline]
+  #[must_use = must_use_itself_doc!()]
+  pub const fn set_content_length(mut self, value: bool) -> Self {
+    self.content_length = value;
+    self
+  }
+
   /// If responses carry a `date` header (RFC 9110 section 6.6.1: an origin server with a clock
   /// must send one), formatted once a second. Defaults to `true`.
   #[inline]
@@ -274,6 +287,7 @@ impl<DA, EC, EX, RC, RNG, TCX> Http3ServerFramework<DA, EC, EX, RC, RNG, TCX> {
   #[inline]
   pub fn set_error_cb<_EC>(self, value: _EC) -> Http3ServerFramework<DA, _EC, EX, RC, RNG, TCX> {
     Http3ServerFramework {
+      content_length: self.content_length,
       data: self.data,
       date: self.date,
       error_cb: value,
@@ -322,6 +336,7 @@ impl<DA, EC, EX, RC, RNG, TCX> Http3ServerFramework<DA, EC, EX, RC, RNG, TCX> {
     value: _RC,
   ) -> Http3ServerFramework<DA, EC, EX, _RC, RNG, TCX> {
     Http3ServerFramework {
+      content_length: self.content_length,
       data: self.data,
       date: self.date,
       error_cb: self.error_cb,
@@ -401,7 +416,7 @@ mod uring {
       http2_server_framework::{EndpointNode, HttpRouter, Middleware},
       http3_server_framework::{
         Http3ManualStream, Http3ServerFramework,
-        endpoint_task::{self, Startup, WorkerParams, cpu_order},
+        endpoint_task::{self, Startup, WorkerEnd, WorkerParams, cpu_order},
       },
     },
     quic::{EndpointKeys, WorkerLoads},
@@ -454,14 +469,23 @@ mod uring {
       let loads = Arc::new(WorkerLoads::new(workers));
       let startup = Arc::new(Startup::new(workers));
       let stats = self.stats.start(workers.into());
-      let cpus = if self.pin_workers { cpu_order() } else { Vec::new() };
+      let cpus = if self.pin_workers {
+        // Without the CPUs of the process the workers run unpinned, which the callback is told once
+        cpu_order().unwrap_or_else(|err| {
+          (self.error_cb)(err.into());
+          Vec::new()
+        })
+      } else {
+        Vec::new()
+      };
       let epoch = std::time::Instant::now();
-      let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(), ER>>();
+      let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(), WorkerEnd<ER>>>();
       for worker in 0..workers {
         let params = WorkerParams {
           addr,
           cpu: cpus.get(usize::from(worker) % cpus.len().max(1)).copied(),
           data: self.data.clone(),
+          content_length: self.content_length,
           date: self.date,
           epoch,
           error_cb: self.error_cb.clone(),
@@ -485,23 +509,27 @@ mod uring {
         let thread_done = done_tx.clone();
         let thread_startup = startup.clone();
         let _jh = std::thread::spawn(move || {
-          let body = move || -> Result<(), ER> {
+          let body = move || -> Result<(), WorkerEnd<ER>> {
             endpoint_task::pin(&params);
-            let runtime = local_runtime_cb()?;
+            let runtime = local_runtime_cb().map_err(WorkerEnd::Failed)?;
             runtime.block_on(endpoint_task::run(params))
           };
           let rslt = std::panic::catch_unwind(core::panic::AssertUnwindSafe(body))
-            .unwrap_or_else(|payload| Err(crate::Error::from(payload).into()));
-          if rslt.is_err() {
+            .unwrap_or_else(|payload| Err(WorkerEnd::Failed(crate::Error::from(payload).into())));
+          if let Err(WorkerEnd::Failed(_)) = &rslt {
             thread_startup.fail();
           }
           let _rslt = thread_done.send(rslt);
         });
       }
       drop(done_tx);
+      // The first error of a worker ends the call; a worker that stopped waiting for another that
+      // failed to start reports nothing of its own (review X1)
       let mut ended = 0usize;
       while let Ok(rslt) = done_rx.recv() {
-        rslt?;
+        if let Err(WorkerEnd::Failed(err)) = rslt {
+          return Err(err);
+        }
         ended = ended.wrapping_add(1);
         if ended == usize::from(workers) {
           break;
@@ -524,6 +552,7 @@ mod uring {
       let keys = Arc::new(EndpointKeys::new(&mut self.rng));
       let params = WorkerParams {
         addr: endpoint_task::resolve(addr)?,
+        content_length: self.content_length,
         cpu: None,
         data: self.data,
         date: self.date,
@@ -545,7 +574,7 @@ mod uring {
         worker: 0,
         workers: 1,
       };
-      endpoint_task::run(params).await
+      endpoint_task::run(params).await.map_err(WorkerEnd::into_error)
     }
   }
 }

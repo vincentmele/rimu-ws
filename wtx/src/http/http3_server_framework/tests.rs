@@ -3,16 +3,20 @@
 //! run by [`Http3ServerFramework::run_in_threads`].
 
 use crate::{
+  collections::{ArrayVectorCopy, VectorUsize},
   executor::{Runtime as _, UdpInbox, UdpParams, UringExecutor, UringRuntime, UringUdpSocket},
   futures::Sleep,
   http::{
-    AutoStream, Header, KnownHeaderName, MsgDataMut as _, ShutdownSignal, StaticFiles, StatusCode,
+    AutoStream, Header, KnownHeaderName, ManualStream, MsgBufferString, MsgDataMut as _, Request,
+    Response as HttpResponse, ShutdownSignal, StaticFiles, StatusCode,
     http2_server_framework::{
-      Endpoint, Get, HttpRouter, RouteMatch, State, VerbatimParams, get, post,
+      Endpoint, EndpointNode, Get, HttpRouter, Middleware, RouteMatch, State, VerbatimParams, get,
+      post,
     },
     http3_server_framework::{
-      Http3ServerFramework, Http3Stats, Http3WorkerStats,
+      Http3ManualStream, Http3ServerFramework, Http3Stats, Http3WorkerStats,
       endpoint_task::{IDLE_TRIM_AFTER, affinity, cpu_order, forward},
+      router_handler::{SlotPoll, TaskSlots},
     },
   },
   http3::{
@@ -21,8 +25,8 @@ use crate::{
   },
   misc::SharedBytes,
   quic::{
-    Cid, ConnParams, ConnState, DatagramMeta, QuicParams, RecvOutcome, SteeringProgram, StreamId,
-    decode_varint,
+    Cid, ConnHandle, ConnParams, ConnState, DatagramMeta, QuicParams, RecvOutcome, SteeringProgram,
+    StreamId, decode_varint,
     testing::{ClientConn, Net, Parts, SERVER_ADDR, TestApp, client_conn, server_tls_config},
   },
   rng::{ChaCha20, CryptoSeedableRng as _, Rng as _},
@@ -38,7 +42,10 @@ use alloc::{
 use core::{
   net::{IpAddr, Ipv4Addr, SocketAddr},
   num::NonZeroUsize,
+  ops::ControlFlow,
+  pin::Pin,
   sync::atomic::Ordering,
+  task::{Context, Poll, Waker},
   time::Duration,
 };
 use std::{
@@ -60,6 +67,20 @@ pub(crate) struct TestHooks {
   pub(crate) idle_trim_after: Option<Duration>,
   /// Replaces the steering program, to make its attach fail.
   pub(crate) steering: Option<fn(u8) -> SteeringProgram>,
+  /// Each idle trim of a worker pushes the sizes of its pools before and after it.
+  pub(crate) trims: Option<Arc<Mutex<Vec<(PoolSizes, PoolSizes)>>>>,
+}
+
+/// The sizes of the pools of a worker that an idle trim frees down: free connection states of the
+/// QUIC pools, TLS handshake states of the thread and boxes of the HTTP/3 connection layer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PoolSizes {
+  /// Free states of QUIC connections.
+  pub(crate) quic_conns: usize,
+  /// Free TLS handshake states of the thread.
+  pub(crate) tls_states: usize,
+  /// Free boxes of HTTP/3 connections.
+  pub(crate) h3_conns: usize,
 }
 
 // ---- endpoints
@@ -110,6 +131,83 @@ fn text(state: State<'_, ()>, args: core::fmt::Arguments<'_>) -> crate::Result<V
   Ok(VerbatimParams(StatusCode::Ok))
 }
 
+async fn manual(_: ManualStream<(), Http3ManualStream>) -> crate::Result<()> {
+  Ok(())
+}
+
+/// Answers any method with `status`, `content-type: text/plain` and `body`.
+#[derive(Clone, Copy)]
+struct Status {
+  body: &'static [u8],
+  status: StatusCode,
+}
+
+impl<D, E, S> Endpoint<D, E, S> for Status
+where
+  E: From<crate::Error>,
+{
+  async fn auto(
+    &self,
+    auto_stream: &mut AutoStream<D>,
+    _: (u8, &[RouteMatch]),
+  ) -> Result<StatusCode, E> {
+    let msg = &mut auto_stream.req.msg_data;
+    msg.clear();
+    msg.body.extend_from_copyable_slice(self.body)?;
+    let content_type = KnownHeaderName::ContentType.into();
+    msg.headers.push_from_iter(Header::from_name_and_value(content_type, ["text/plain"]))?;
+    Ok(self.status)
+  }
+}
+
+impl<D, E, S> EndpointNode<D, E, S> for Status
+where
+  E: From<crate::Error>,
+{
+  const IS_ROUTER: bool = false;
+
+  fn paths_indices(
+    &self,
+    _: ArrayVectorCopy<RouteMatch, 4>,
+    _: &mut VectorUsize<ArrayVectorCopy<RouteMatch, 4>>,
+  ) -> crate::Result<()> {
+    Ok(())
+  }
+}
+
+/// Adds `server: rimu-ws` to every response, and answers `/blocked` with 403 itself.
+struct ServerHeader;
+
+impl Middleware<(), crate::Error> for ServerHeader {
+  type Aux = ();
+
+  fn aux(&self) -> Self::Aux {}
+
+  async fn req(
+    &self,
+    _: &mut (),
+    _: &mut Self::Aux,
+    req: &mut Request<MsgBufferString>,
+  ) -> crate::Result<ControlFlow<StatusCode, ()>> {
+    if req.msg_data.uri.path() == "/blocked" {
+      req.msg_data.clear();
+      return Ok(ControlFlow::Break(StatusCode::Forbidden));
+    }
+    Ok(ControlFlow::Continue(()))
+  }
+
+  async fn res(
+    &self,
+    _: &mut (),
+    _: &mut Self::Aux,
+    res: HttpResponse<&mut MsgBufferString>,
+  ) -> crate::Result<ControlFlow<StatusCode, ()>> {
+    let server = KnownHeaderName::Server.into();
+    res.msg_data.headers.push_from_iter(Header::from_name_and_value(server, ["rimu-ws"]))?;
+    Ok(ControlFlow::Continue(()))
+  }
+}
+
 /// [`StaticFiles`] that keeps, if `record`, the bodies that it answers with by reference.
 #[derive(Clone)]
 struct Probe {
@@ -140,6 +238,7 @@ where
 // ---- the server
 
 struct Opts {
+  content_length: bool,
   count: Option<&'static AtomicU64>,
   date: bool,
   drain: Duration,
@@ -153,6 +252,7 @@ struct Opts {
 impl Opts {
   fn new(name: &str) -> Self {
     Self {
+      content_length: true,
       count: None,
       date: true,
       drain: Duration::from_secs(1),
@@ -229,6 +329,7 @@ fn serve(opts: Opts) -> Served {
   )
   .unwrap()
   .set_error_cb(error_cb)
+  .set_content_length(opts.content_length)
   .set_date(opts.date)
   .set_h3_params(opts.h3)
   .set_local_runtimes(NonZeroUsize::new(opts.workers))
@@ -248,14 +349,20 @@ fn serve(opts: Opts) -> Served {
   let probe =
     Probe { files: StaticFiles::new(&opts.root).unwrap(), record: opts.record, seen: seen.clone() };
   let run = std::thread::spawn(move || {
-    let router = HttpRouter::paths(crate::paths!(
+    let paths = crate::paths!(
       ("/baseline2", get(baseline2)),
+      ("/blocked", get(baseline2)),
+      ("/hello", Status { body: b"hello", status: StatusCode::Ok }),
+      ("/manual", get(manual)),
+      ("/no-content", Status { body: b"x", status: StatusCode::NoContent }),
+      ("/not-modified", Status { body: b"x", status: StatusCode::NotModified }),
       ("/panic", get(panics)),
       ("/sleep", get(sleep)),
       ("/sleep-panic", get(sleep_then_panic)),
       ("/static/{*file}", Get(probe)),
       ("/upload", post(upload)),
-    ))?;
+    );
+    let router = HttpRouter::new(paths, ServerHeader)?;
     fw.run_in_threads(&addr, router)
   });
   let addr = bound_rx.recv_timeout(TIMEOUT).expect("the server did not bind");
@@ -309,6 +416,24 @@ impl Client {
 
   fn now_us(&self) -> u64 {
     u64::try_from(self.epoch.elapsed().as_micros()).unwrap()
+  }
+
+  /// Sends what the connection has to send.
+  fn flush(&mut self) {
+    let now_us = self.now_us();
+    let _ = self.conn.flush(now_us, &mut self.parts.tx, &mut self.app, &mut self.parts.pools);
+    loop {
+      let next =
+        self.parts.tx.pending().next().map(|el| (el.id, el.bytes.to_vec(), el.segment_size));
+      let Some((id, bytes, segment)) = next else {
+        break;
+      };
+      self.parts.tx.mark_submitted(id);
+      self.parts.tx.release(id);
+      for datagram in bytes.chunks(usize::from(segment).max(1)) {
+        let _ = self.socket.send_to(datagram, self.server).unwrap();
+      }
+    }
   }
 
   /// Sends what the connection has to send, then takes what arrives for at most `wait` (or until
@@ -718,11 +843,12 @@ fn cbpf_attach_failure_falls_back_to_kernel_hash() {
     assert!(!worker.cid_steering, "{worker:?}");
     assert_eq!((worker.forwarded, worker.forward_dropped), (0, 0), "{worker:?}");
   }
-  // Each connection is on the worker that its CID names
-  let on_worker = |client: &Client| client.conn.peer_cid().as_slice()[0];
-  let total: u64 = served.stats.workers().iter().map(|el| el.requests).sum();
-  assert_eq!(total, 4);
-  assert!(clients.iter().all(|el| on_worker(el) < 2));
+  // Each connection is on the worker that its CID names, which served its request
+  for (idx, worker) in served.stats.workers().iter().enumerate() {
+    let on_it = clients.iter().filter(|el| usize::from(el.conn.peer_cid().as_slice()[0]) == idx);
+    let on_it = u64::try_from(on_it.count()).unwrap();
+    assert_eq!((worker.conns, worker.requests), (on_it, on_it), "worker {idx}: {worker:?}");
+  }
 }
 
 // Ruling T14-c: with steering on, a second client goes to the other worker (balancing), and the
@@ -776,23 +902,44 @@ fn forward_dropped_gives_back_the_place() {
   }
 }
 
-// Ruling T14-e: a worker that has had no connection for a while trims its pools, once.
+// Ruling T14-e: a worker that has had no connection for a while trims its pools, once per idle
+// period: the free QUIC connection states, the TLS handshake states of the thread and the boxes of
+// the HTTP/3 connections that eight connections at once left go down to a few.
 #[cfg_attr(miri, ignore)]
 #[test]
 fn idle_worker_trims_its_pools() {
   assert_eq!(IDLE_TRIM_AFTER, Duration::from_secs(1));
+  let trims = Arc::new(Mutex::new(Vec::new()));
   let mut opts = Opts::new("idle");
   opts.hooks.idle_trim_after = Some(Duration::from_millis(100));
+  opts.hooks.trims = Some(trims.clone());
   let served = serve(opts);
   served.wait_stats(|el| el[0].idle_trims == 1);
-  let mut client = Client::connect(served.addr);
-  assert_eq!(client.get("/baseline2?a=1&b=1", &[]).body, b"2");
-  let now_us = client.now_us();
-  client.conn.close_app(now_us, 0x100);
-  client.step(Duration::from_millis(1));
-  client.wait_server(&served, |el| el[0].conns == 0 && el[0].idle_trims == 2);
+  // Eight handshakes at once: each Initial leaves before any handshake ends
+  let mut clients: Vec<Client> = (0..8).map(|_| Client::new(served.addr)).collect();
+  for client in &mut clients {
+    client.flush();
+  }
+  let begin = Instant::now();
+  while !clients.iter().all(|el| el.conn.state() == ConnState::Confirmed) {
+    assert!(begin.elapsed() < TIMEOUT, "no handshake");
+    for client in &mut clients {
+      client.step(Duration::from_millis(1));
+    }
+  }
+  for client in &mut clients {
+    assert_eq!(client.get("/baseline2?a=1&b=1", &[]).body, b"2");
+    let now_us = client.now_us();
+    client.conn.close_app(now_us, 0x100);
+    client.step(Duration::from_millis(1));
+  }
+  served.wait_stats(|el| el[0].conns == 0 && el[0].idle_trims == 2);
   std::thread::sleep(Duration::from_millis(300));
   assert_eq!(served.worker(0).idle_trims, 2);
+  let (before, after) = trims.lock().unwrap()[1];
+  assert!(before.quic_conns > after.quic_conns && after.quic_conns <= 4, "{before:?} {after:?}");
+  assert!(before.tls_states > after.tls_states && after.tls_states <= 4, "{before:?} {after:?}");
+  assert!(before.h3_conns > after.h3_conns && after.h3_conns <= 4, "{before:?} {after:?}");
 }
 
 // Brief step 1 (zero allocations after warm-up): once warm, a round of requests (inline routes,
@@ -895,8 +1042,8 @@ fn run_local_serves_on_the_current_runtime() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn workers_are_pinned_physical_cores_first() {
-  let allowed = affinity::allowed();
-  let order = cpu_order();
+  let allowed = affinity::allowed().unwrap();
+  let order = cpu_order().unwrap();
   let mut sorted = order.clone();
   sorted.sort_unstable();
   assert_eq!(sorted, allowed);
@@ -915,8 +1062,153 @@ fn workers_are_pinned_physical_cores_first() {
   let cpu = order[0];
   std::thread::spawn(move || {
     affinity::pin(cpu).unwrap();
-    assert_eq!(affinity::allowed(), [cpu]);
+    assert_eq!(affinity::allowed().unwrap(), [cpu]);
   })
   .join()
   .unwrap();
+}
+
+// Fix X1: a worker that can not bind its socket ends the server with the error of the bind, never
+// with the error of a worker that stopped waiting for it.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn startup_failure_reports_the_bind_error() {
+  let held = UdpSocket::bind("127.0.0.1:0").unwrap();
+  let addr = held.local_addr().unwrap().to_string();
+  for _ in 0..5 {
+    let fw = Http3ServerFramework::<(), fn(crate::Error), UringExecutor, _, _, _>::new(
+      UringExecutor::default(),
+      ChaCha20::from_std_random().unwrap(),
+      server_tls_config(),
+    )
+    .unwrap()
+    .set_local_runtimes(NonZeroUsize::new(8))
+    .set_pin_workers(false);
+    let router = HttpRouter::paths(crate::paths!(("/baseline2", get(baseline2)))).unwrap();
+    let err = fw.run_in_threads(&addr, router).unwrap_err();
+    assert!(
+      matches!(&err, crate::Error::Io(el) if el.kind() == std::io::ErrorKind::AddrInUse),
+      "{err:?}"
+    );
+  }
+}
+
+/// A future that waits until it is polled again after its first poll, keeping its waker.
+struct Gate {
+  polled: bool,
+  wakers: Arc<Mutex<Vec<Waker>>>,
+}
+
+impl Future for Gate {
+  type Output = ();
+
+  fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    if self.polled {
+      return Poll::Ready(());
+    }
+    self.polled = true;
+    self.wakers.lock().unwrap().push(cx.waker().clone());
+    Poll::Pending
+  }
+}
+
+// Fix X2: the parked slots can all be woken at once: the queue of woken slots has room for every
+// slot, so that a wake allocates nothing and is never lost, and each slot is polled again.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn every_parked_slot_wakes_at_once_without_allocating() {
+  static WAKES: AtomicU64 = AtomicU64::new(0);
+  static OTHERS: AtomicU64 = AtomicU64::new(0);
+  const SLOTS: usize = 64;
+  let wakers = Arc::new(Mutex::new(Vec::new()));
+  let mut slots = TaskSlots::new();
+  for nth in 0..SLOTS {
+    let fut = Gate { polled: false, wakers: wakers.clone() };
+    let idx = slots.insert(fut, ConnHandle::default(), StreamId(4 * nth as u64)).unwrap();
+    assert!(matches!(slots.poll(idx), SlotPoll::Pending));
+  }
+  let wakers = core::mem::take(&mut *wakers.lock().unwrap());
+  assert_eq!(wakers.len(), SLOTS);
+  _count_allocations_in(&WAKES);
+  for waker in &wakers {
+    waker.wake_by_ref();
+  }
+  _count_allocations_in(&OTHERS);
+  assert_eq!(WAKES.load(Ordering::Relaxed), 0);
+  let mut woken = VectorUsize::new();
+  slots.take_woken(&mut woken).unwrap();
+  let mut indexes: Vec<u32> = woken.iter().copied().collect();
+  indexes.sort_unstable();
+  indexes.dedup();
+  assert_eq!(indexes.len(), SLOTS);
+  for idx in indexes {
+    assert!(matches!(slots.poll(idx), SlotPoll::Done(())));
+  }
+  assert_eq!(slots.wakes_lost(), 0);
+}
+
+// Ruling T14-i (RFC 9110 sections 9.3.2, 8.6, 15.3.5 and 15.4.5): a response to HEAD has the fields
+// that GET gets, `content-length` included, and no content; 204 has neither content nor
+// `content-length`; 304 has no content.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn head_204_and_304_carry_no_content() {
+  let served = serve(Opts::new("no-content"));
+  let mut client = Client::connect(served.addr);
+  let get = client.get("/hello", &[]);
+  assert_eq!((get.field(b"content-length"), get.body.as_slice()), (Some(&b"5"[..]), &b"hello"[..]));
+  let id = client.request(b"HEAD", "/hello", &[]);
+  let head = client.wait(id);
+  assert_eq!(status(&head), b"200");
+  assert_eq!(head.field(b"content-length"), Some(&b"5"[..]));
+  assert_eq!(head.field(b"content-type"), Some(&b"text/plain"[..]));
+  assert_eq!((head.frames.as_slice(), head.body.as_slice()), (&[0x01][..], &b""[..]));
+  for path in ["/no-content", "/not-modified"] {
+    for method in [&b"GET"[..], b"HEAD"] {
+      let id = client.request(method, path, &[]);
+      let rsp = client.wait(id);
+      assert_eq!(rsp.field(b"content-length"), None, "{path}");
+      assert_eq!((rsp.frames.as_slice(), rsp.body.as_slice()), (&[0x01][..], &b""[..]), "{path}");
+    }
+  }
+  assert_eq!(status(&client.get("/no-content", &[])), b"204");
+  assert_eq!(status(&client.get("/not-modified", &[])), b"304");
+  assert!(served.errors().is_empty(), "{:?}", served.errors());
+}
+
+// Ruling T14-j: `set_content_length(false)` leaves `content-length` out of responses with content
+// (HTTP/3 frames the body), and a response to HEAD keeps it.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn content_length_toggles() {
+  let served = serve(Opts::new("length-on"));
+  let mut client = Client::connect(served.addr);
+  assert_eq!(client.get("/baseline2?a=1&b=1", &[]).field(b"content-length"), Some(&b"1"[..]));
+  drop((client, served));
+  let mut opts = Opts::new("length-off");
+  opts.content_length = false;
+  let served = serve(opts);
+  let mut client = Client::connect(served.addr);
+  let rsp = client.get("/baseline2?a=1&b=1", &[]);
+  assert_eq!((rsp.field(b"content-length"), rsp.body.as_slice()), (None, &b"2"[..]));
+  let id = client.request(b"HEAD", "/hello", &[]);
+  let head = client.wait(id);
+  assert_eq!((head.field(b"content-length"), head.body.as_slice()), (Some(&b"5"[..]), &b""[..]));
+}
+
+// Fix X6: a manual-mode route answers 500 on HTTP/3, with OperationModeMismatch to the error
+// callback; the middlewares of the router run around the endpoints, and can answer themselves.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn manual_routes_and_middlewares_on_h3() {
+  let served = serve(Opts::new("manual"));
+  let mut client = Client::connect(served.addr);
+  assert_eq!(status(&client.get("/manual", &[])), b"500");
+  let errors = served.errors();
+  assert!(errors.len() == 1 && errors[0].contains("OperationModeMismatch"), "{errors:?}");
+  let rsp = client.get("/baseline2?a=1&b=1", &[]);
+  assert_eq!((rsp.field(b"server"), rsp.body.as_slice()), (Some(&b"rimu-ws"[..]), &b"2"[..]));
+  let rsp = client.get("/blocked", &[]);
+  assert_eq!((status(&rsp), rsp.field(b"server")), (&b"403"[..], Some(&b"rimu-ws"[..])));
+  assert!(rsp.body.is_empty());
 }

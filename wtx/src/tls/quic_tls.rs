@@ -85,6 +85,12 @@ std::thread_local! {
     const { core::cell::RefCell::new(alloc::vec::Vec::new()) };
 }
 
+/// The state boxes that this thread's pool holds, for tests.
+#[cfg(all(test, feature = "std"))]
+pub(crate) fn pooled_states() -> usize {
+  STATE_POOL.with(|pool| pool.borrow().len())
+}
+
 /// Frees the oldest state boxes of this thread's pool until a few are left: with the other TLS
 /// pools ([`crate::tls::tls_pool`]), once the thread has no connection open.
 #[cfg(all(feature = "std", feature = "io-uring", target_os = "linux"))]
