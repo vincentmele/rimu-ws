@@ -9,10 +9,16 @@
 //! field section references it.
 //!
 //! Every length read from the wire is checked against the bytes present before anything is
-//! copied or reserved, and Huffman output is bounded by 8/5 of its input.
+//! copied or reserved, and Huffman output is bounded by 8/5 of its input. The encoder stream has a
+//! budget per receive turn of the connection ([`QpackDecoder::start_turn`]): instructions, and bytes
+//! copied out of the table, which a one-byte Duplicate of a large entry would otherwise multiply.
+//!
+//! One [`DecodeMemo`] goes with one decoder: its entries carry the epoch of the table that they were
+//! decoded against, unique per [`QpackDecoder::new`] and [`QpackDecoder::reset`] in the process, so
+//! a memo never replays the fields of another table (another connection's) for the same bytes.
 
 use crate::{
-  collections::{Clear, SingleTypeStorage, TryExtend, VectorUsize},
+  collections::{Clear, ExpansionTy, SingleTypeStorage, TryExtend, VectorUsize},
   http::{
     huffman::huffman_decode,
     prefix_int::{decode_prefix_int, encode_prefix_int},
@@ -22,17 +28,24 @@ use crate::{
     qpack::{DecodeMemo, static_table::STATIC_TABLE},
   },
   misc::{Lease, Usize},
+  sync::AtomicU64,
 };
-use core::hint::cold_path;
+use core::{hint::cold_path, sync::atomic::Ordering};
 
 /// The bytes that an entry adds to the size of the table on top of its name and value (RFC 9204
 /// section 3.2.1).
 const ENTRY_OVERHEAD: u64 = 32;
 /// Decoder-stream bytes that may wait for the connection to write them.
 const MAX_PENDING_OUTPUT: usize = 16 * 1024;
-/// Encoder-stream instructions allowed between two flushes of the decoder stream on top of two per
-/// entry that the table can hold.
+/// Encoder-stream instructions allowed per turn on top of two per entry that the table can hold.
 const INSTRUCTION_BUDGET_BASE: u64 = 64;
+/// Bytes that Duplicates and dynamic name references may copy out of the table per turn, in
+/// advertised capacities: an encoder has no reason to copy its whole table more than once in a
+/// turn, four times leaves room, and each copied byte is written twice (staging and ring).
+const COPY_BUDGET_CAPACITIES: u64 = 4;
+
+/// The source of the decoder epochs, see the module documentation.
+static EPOCHS: AtomicU64 = AtomicU64::new(0);
 
 /// What became of a field section.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,13 +111,17 @@ impl<'any> Part<'any> {
 pub(crate) struct QpackDecoder {
   /// Blocked streams and the Required Insert Count that they wait for.
   blocked: VectorUsize<(u64, u64)>,
-  /// Encoder-stream instructions left before the next flush.
+  /// Encoder-stream instructions left in this turn.
   budget: u64,
   /// The capacity that the encoder set, at most `max_capacity`.
   capacity: u64,
+  /// Bytes that may still be copied out of the table in this turn.
+  copy_budget: u64,
   entries: VectorUsize<Entry>,
   entries_head: usize,
   entries_len: usize,
+  /// Identifies the table that this decoder holds since its last `new` or `reset`.
+  epoch: u64,
   insert_count: u64,
   /// Inserts that the encoder knows of from what was queued on the decoder stream, apart from a
   /// trailing Insert Count Increment.
@@ -130,30 +147,66 @@ impl QpackDecoder {
   /// `SETTINGS_QPACK_BLOCKED_STREAMS` of `blocked_streams`. The table storage is allocated here,
   /// once: twice `capacity` bytes and 12 bytes per 32 of `capacity`.
   pub(crate) fn new(capacity: u32, blocked_streams: u16) -> crate::Result<Self> {
-    let ring_len = *Usize::from(capacity);
-    let max_entries = capacity / 32;
-    let max_entries_usize = *Usize::from(max_entries);
-    Ok(Self {
-      blocked: VectorUsize::with_capacity(blocked_streams.into())?,
-      budget: Self::budget(max_entries.into()),
+    let mut this = Self {
+      blocked: VectorUsize::new(),
+      budget: 0,
       capacity: 0,
-      entries: VectorUsize::from_cloneable_elem(max_entries_usize, Entry::default())?,
+      copy_budget: 0,
+      entries: VectorUsize::new(),
       entries_head: 0,
       entries_len: 0,
+      epoch: 0,
       insert_count: 0,
       known_received: 0,
-      max_blocked: blocked_streams.into(),
-      max_capacity: capacity.into(),
-      max_entries: max_entries.into(),
+      max_blocked: 0,
+      max_capacity: 0,
+      max_entries: 0,
       out: VectorUsize::new(),
       out_start: 0,
       pending_increment: None,
-      ring: VectorUsize::from_cloneable_elem(ring_len, 0)?,
+      ring: VectorUsize::new(),
       ring_head: 0,
       ring_len: 0,
       size: 0,
-      staging: VectorUsize::with_capacity(ring_len)?,
-    })
+      staging: VectorUsize::new(),
+    };
+    this.reset(capacity, blocked_streams)?;
+    Ok(this)
+  }
+
+  /// Makes this decoder a new one for the advertised `capacity` and `blocked_streams`, as
+  /// [`Self::new`] does, in the storage that it has: nothing is allocated when the new limits are
+  /// at most those that it had. The table gets a new epoch, so a memo filled from the old one
+  /// replays nothing.
+  pub(crate) fn reset(&mut self, capacity: u32, blocked_streams: u16) -> crate::Result<()> {
+    let ring_len = *Usize::from(capacity);
+    let max_entries = capacity / 32;
+    self.blocked.clear();
+    self.blocked.reserve(blocked_streams.into())?;
+    self.entries.clear();
+    self.entries.expand(ExpansionTy::Len(*Usize::from(max_entries)), Entry::default())?;
+    self.out.clear();
+    // Zeroed: no byte of the previous table stays
+    self.ring.clear();
+    self.ring.expand(ExpansionTy::Len(ring_len), 0)?;
+    self.staging.clear();
+    self.staging.reserve(ring_len)?;
+    self.capacity = 0;
+    self.entries_head = 0;
+    self.entries_len = 0;
+    self.epoch = EPOCHS.fetch_add(1, Ordering::Relaxed);
+    self.insert_count = 0;
+    self.known_received = 0;
+    self.max_blocked = blocked_streams.into();
+    self.max_capacity = capacity.into();
+    self.max_entries = max_entries.into();
+    self.out_start = 0;
+    self.pending_increment = None;
+    self.ring_head = 0;
+    self.ring_len = 0;
+    self.size = 0;
+    self.start_turn();
+    Ok(())
   }
 
   /// Inserts and duplications so far.
@@ -167,8 +220,9 @@ impl QpackDecoder {
   /// Returns the number of bytes consumed: an instruction that `bytes` does not hold whole is left
   /// for the caller to keep and give again with what follows it. An insert whose lengths already
   /// show that it does not fit fails at once, so what the caller keeps is bounded by about four
-  /// times the capacity. At most `2 * capacity / 32 + 64` instructions are applied between two
-  /// calls of [`Self::consume_decoder_output`], more are an `H3_EXCESSIVE_LOAD`.
+  /// times the capacity. Per turn ([`Self::start_turn`]) at most `2 * capacity / 32 + 64`
+  /// instructions are applied and at most `4 * capacity` bytes copied out of the table by
+  /// Duplicates and dynamic name references; more is an `H3_EXCESSIVE_LOAD`.
   pub(crate) fn on_encoder_stream(&mut self, bytes: &[u8]) -> crate::Result<usize> {
     let mut consumed = 0usize;
     while let Some(rest) = bytes.get(consumed..)
@@ -207,7 +261,8 @@ impl QpackDecoder {
 
   /// [`Self::decode`] that replays the fields of a section kept in `memo`, or keeps the section
   /// once it is decoded. A replay has the effects of a decode: a stream that would block blocks,
-  /// and the Section Acknowledgment is queued.
+  /// and the Section Acknowledgment is queued. `memo` is this decoder's: it replays only what was
+  /// decoded against the table of this decoder since its last `new` or `reset`.
   pub(crate) fn decode_with_memo<const N: usize>(
     &mut self,
     memo: &mut DecodeMemo<N>,
@@ -221,13 +276,13 @@ impl QpackDecoder {
       return self.block(stream, prefix.ric);
     }
     self.unblock(stream);
-    if let Some(fields) = memo.lookup(prefix.ric, section, self.oldest_live()) {
+    if let Some(fields) = memo.lookup(self.epoch, prefix.ric, section, self.oldest_live()) {
       for (name, value) in fields {
         sink(name, value)?;
       }
       return self.finish(stream, prefix.ric);
     }
-    let mut recorder = memo.insert(prefix.ric, section);
+    let mut recorder = memo.insert(self.epoch, prefix.ric, section);
     let lowest = self.decode_lines(prefix, section, scratch, &mut |name, value| {
       if let Some(elem) = &mut recorder {
         elem.push(name, value);
@@ -259,10 +314,17 @@ impl QpackDecoder {
     self.out.get(self.out_start..).unwrap_or_default()
   }
 
-  /// `n` bytes of [`Self::decoder_stream_output`] were written. Called once per flush of the
-  /// decoder stream (also with 0), it starts a new instruction budget.
-  pub(crate) fn consume_decoder_output(&mut self, n: usize) {
+  /// Starts a receive turn of the connection: a new budget of encoder-stream instructions and of
+  /// bytes copied out of the dynamic table. The connection calls it once per turn, before it feeds
+  /// the encoder stream.
+  pub(crate) fn start_turn(&mut self) {
     self.budget = Self::budget(self.max_entries);
+    self.copy_budget = self.max_capacity.saturating_mul(COPY_BUDGET_CAPACITIES);
+  }
+
+  /// `n` bytes of [`Self::decoder_stream_output`] were written; it can be called any number of
+  /// times.
+  pub(crate) fn consume_decoder_output(&mut self, n: usize) {
     let len = self.out.len();
     self.out_start = self.out_start.saturating_add(n).min(len);
     if let Some((start, acknowledged)) = self.pending_increment
@@ -440,7 +502,7 @@ impl QpackDecoder {
       let Some((value, value_len)) = self.encoder_string(value_bytes, 8, name_len)? else {
         return Ok(None);
       };
-      self.spend_budget()?;
+      self.spend_budget(if first & 0b0100_0000 != 0 { 0 } else { name_len })?;
       self.staging.clear();
       if first & 0b0100_0000 != 0 {
         self.staging.extend_from_copyable_slice(static_name(idx)?)?;
@@ -461,7 +523,7 @@ impl QpackDecoder {
       let Some((value, value_len)) = self.encoder_string(value_bytes, 8, name_min)? else {
         return Ok(None);
       };
-      self.spend_budget()?;
+      self.spend_budget(0)?;
       self.staging.clear();
       self.stage_string(name)?;
       let staged_name_len = self.staging.len();
@@ -477,7 +539,7 @@ impl QpackDecoder {
         cold_path();
         return Err(encoder_stream_error(Http3Error::CapacityAboveMaximum));
       }
-      self.spend_budget()?;
+      self.spend_budget(0)?;
       self.capacity = capacity;
       self.evict_down_to(capacity);
       Ok(Some(len))
@@ -487,13 +549,11 @@ impl QpackDecoder {
         return Ok(None);
       };
       let entry = self.encoder_entry(idx)?;
-      self.spend_budget()?;
-      self.staging.clear();
       let name_len = *Usize::from(entry.name_len);
-      self.stage_ring(
-        *Usize::from(entry.start),
-        name_len.wrapping_add(*Usize::from(entry.value_len)),
-      )?;
+      let len_copied = name_len.wrapping_add(*Usize::from(entry.value_len));
+      self.spend_budget(len_copied)?;
+      self.staging.clear();
+      self.stage_ring(*Usize::from(entry.start), len_copied)?;
       self.insert(name_len)?;
       Ok(Some(len))
     }
@@ -682,8 +742,12 @@ impl QpackDecoder {
     }
   }
 
-  fn spend_budget(&mut self) -> crate::Result<()> {
-    let Some(budget) = self.budget.checked_sub(1) else {
+  // One instruction of the turn's budget, which copies `copied` bytes out of the table.
+  fn spend_budget(&mut self, copied: usize) -> crate::Result<()> {
+    let copied = u64::try_from(copied).unwrap_or(u64::MAX);
+    let (Some(budget), Some(copy_budget)) =
+      (self.budget.checked_sub(1), self.copy_budget.checked_sub(copied))
+    else {
       cold_path();
       return Err(crate::Error::Http3Close(
         H3ErrorCode::ExcessiveLoad,
@@ -691,6 +755,7 @@ impl QpackDecoder {
       ));
     };
     self.budget = budget;
+    self.copy_budget = copy_budget;
     Ok(())
   }
 
@@ -1255,6 +1320,12 @@ mod tests {
       decode(&mut decoder, 0, &section).unwrap(),
       (DONE_DYNAMIC, pairs(&[("cccccccc", "ddddddddddd")]))
     );
+    // A prefixed integer above 62 bits (4.1.1): 31 in the 5-bit prefix of Set Dynamic Table
+    // Capacity, then nine continuation bytes and one more
+    let mut overflow = alloc::vec![0x3f];
+    overflow.extend_from_slice(&[0xff; 9]);
+    overflow.push(0x7f);
+    assert!(refused(decoder.on_encoder_stream(&overflow), Http3Error::IntegerOverflow));
     // Without a dynamic table nothing can be inserted
     let mut decoder = QpackDecoder::new(0, 0).unwrap();
     assert_eq!(decoder.on_encoder_stream(&[0x20]).unwrap(), 1);
@@ -1266,18 +1337,107 @@ mod tests {
 
   #[test]
   fn instruction_budget_is_excessive_load() {
-    let mut decoder = QpackDecoder::new(4096, 0).unwrap();
-    // 2 * 128 entries + 64 instructions between two flushes
+    let budget_exceeded =
+      |rslt| fails(rslt, H3ErrorCode::ExcessiveLoad, Http3Error::EncoderInstructionBudget);
+    // 2 * 128 entries + 64 instructions per turn
     let budget = 2 * 128 + 64;
+    let mut decoder = QpackDecoder::new(4096, 0).unwrap();
+    decoder.start_turn();
+    // Draining the decoder stream many times in one turn gives nothing back
+    for _ in 0..budget / 4 {
+      assert_eq!(decoder.on_encoder_stream(&[0x20; 4]).unwrap(), 4);
+      let len = decoder.decoder_stream_output().len();
+      decoder.consume_decoder_output(len);
+      decoder.consume_decoder_output(0);
+    }
+    assert!(budget_exceeded(decoder.on_encoder_stream(&[0x20])));
+    // A new turn does
+    let mut decoder = QpackDecoder::new(4096, 0).unwrap();
     let instructions = alloc::vec![0x20; budget];
     assert_eq!(decoder.on_encoder_stream(&instructions).unwrap(), budget);
-    decoder.consume_decoder_output(0);
+    decoder.start_turn();
     assert_eq!(decoder.on_encoder_stream(&instructions).unwrap(), budget);
+    assert!(budget_exceeded(decoder.on_encoder_stream(&[0x20])));
+  }
+
+  // A one-byte Duplicate of a 4 KiB entry copies 4 KiB twice: the bytes copied out of the table in a
+  // turn are bounded by four times the advertised capacity
+  #[test]
+  fn duplicate_flood_is_excessive_load() {
+    let mut decoder = QpackDecoder::new(4096, 0).unwrap();
+    let mut encoder = Vec::new();
+    wire::set_capacity(&mut encoder, 4096);
+    wire::insert_literal(&mut encoder, b"x", &[b'v'; 4031], false);
+    assert_eq!(decoder.on_encoder_stream(&encoder).unwrap(), encoder.len());
+    assert_eq!(decoder.size, 4064);
+    // 4 * 4032 <= 4 * 4096 < 5 * 4032
+    assert_eq!(decoder.on_encoder_stream(&[0x00; 4]).unwrap(), 4);
     assert!(fails(
-      decoder.on_encoder_stream(&[0x20]),
+      decoder.on_encoder_stream(&[0x00]),
       H3ErrorCode::ExcessiveLoad,
       Http3Error::EncoderInstructionBudget
     ));
+    // The next turn may copy again; dynamic name references count their names
+    let mut decoder = QpackDecoder::new(4096, 0).unwrap();
+    assert_eq!(decoder.on_encoder_stream(&encoder).unwrap(), encoder.len());
+    assert_eq!(decoder.on_encoder_stream(&[0x00; 4]).unwrap(), 4);
+    decoder.start_turn();
+    assert_eq!(decoder.on_encoder_stream(&[0x00; 4]).unwrap(), 4);
+    let mut name_refs = Vec::new();
+    let mut name_decoder = QpackDecoder::new(4096, 0).unwrap();
+    encoder.clear();
+    wire::set_capacity(&mut encoder, 4096);
+    wire::insert_literal(&mut encoder, &[b'n'; 2000], b"", false);
+    assert_eq!(name_decoder.on_encoder_stream(&encoder).unwrap(), encoder.len());
+    for _ in 0..8 {
+      wire::insert_name_ref(&mut name_refs, false, 0, b"", false);
+    }
+    assert_eq!(name_decoder.on_encoder_stream(&name_refs).unwrap(), name_refs.len());
+    assert!(fails(
+      name_decoder.on_encoder_stream(&name_refs),
+      H3ErrorCode::ExcessiveLoad,
+      Http3Error::EncoderInstructionBudget
+    ));
+  }
+
+  // A pooled decoder starts over: no entry, no blocked stream, no pending output, the RFC bytes
+  // again, and nothing allocated when the new limits fit in the old storage
+  #[test]
+  fn reset_reuses_the_allocations_and_starts_over() {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut decoder = after_b4();
+    assert_eq!(decoder.on_encoder_stream(&B5_ENCODER).unwrap(), B5_ENCODER.len());
+    let mut blocked = Vec::new();
+    wire::prefix(&mut blocked, 6, 6, 6);
+    wire::indexed(&mut blocked, false, 0);
+    assert_eq!(
+      decode(&mut decoder, 40, &blocked).unwrap().0,
+      DecodeOutcome::Blocked { required_insert_count: 6 }
+    );
+    assert!(!decoder.decoder_stream_output().is_empty());
+    _count_allocations_in(&COUNTER);
+    let before = COUNTER.load(Ordering::SeqCst);
+    decoder.reset(220, 2).unwrap();
+    decoder.reset(100, 1).unwrap();
+    decoder.reset(220, 2).unwrap();
+    assert_eq!(COUNTER.load(Ordering::SeqCst) - before, 0);
+    assert_eq!((decoder.insert_count(), decoder.size, decoder.capacity), (0, 0, 0));
+    assert_eq!((decoder.entries_len, decoder.blocked.len()), (0, 0));
+    assert_eq!(decoder.decoder_stream_output(), b"");
+    decoder.check_invariants();
+    // The RFC exchange from the start
+    assert_eq!(decoder.on_encoder_stream(&B2_ENCODER).unwrap(), B2_ENCODER.len());
+    assert_eq!(decoder.decoder_stream_output(), [0x02]);
+    let expected = pairs(&[(":authority", "www.example.com"), (":path", "/sample/path")]);
+    assert_eq!(decode(&mut decoder, 4, &B2_STREAM_4).unwrap(), (DONE_DYNAMIC, expected));
+    assert_eq!(output(&mut decoder), [0x84]);
+    // Larger limits are allowed, with new storage
+    decoder.reset(4096, 4).unwrap();
+    let mut encoder = Vec::new();
+    wire::set_capacity(&mut encoder, 4096);
+    wire::insert_literal(&mut encoder, &[b'a'; 1000], &[b'b'; 3000], false);
+    assert_eq!(decoder.on_encoder_stream(&encoder).unwrap(), encoder.len());
+    decoder.check_invariants();
   }
 
   #[test]
@@ -1390,6 +1550,7 @@ mod tests {
     for round in 0..64u64 {
       let name = alloc::format!("n{:0w$}", round, w = usize::try_from(round % 7).unwrap() + 1);
       let value = alloc::format!("v{:0w$}", round, w = usize::try_from(round % 11).unwrap() + 1);
+      decoder.start_turn();
       encoder.clear();
       wire::insert_literal(&mut encoder, name.as_bytes(), value.as_bytes(), round % 2 == 0);
       // The same name with another value, then a duplicate of it
@@ -1511,6 +1672,7 @@ mod tests {
         checksum = checksum.wrapping_add(name.len()).wrapping_add(value.len());
         Ok(())
       };
+      decoder.start_turn();
       assert_eq!(decoder.on_encoder_stream(&round.encoder).unwrap(), round.encoder.len());
       let done = decoder.decode_with_memo(&mut memo, stream, &statics, &mut scratch, &mut sink);
       assert_eq!(done.unwrap(), DONE_STATIC);

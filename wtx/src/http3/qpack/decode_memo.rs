@@ -3,9 +3,12 @@
 //! Clients repeat requests byte for byte. A field section decodes to the same fields as long as the
 //! dynamic table entries that it references are there: the key is the absolute Required Insert
 //! Count with the bytes of the section, and an entry is replayed only while the lowest absolute
-//! index that its section referenced is not evicted (absolute indices are never reused). The
-//! decoder replays a kept section with the same effects as a decode: the blocked check before and
-//! the Section Acknowledgment after.
+//! index that its section referenced is not evicted. Absolute indices are never reused within one
+//! table only: each entry also carries the epoch of the decoder table that it was decoded against
+//! (unique per `QpackDecoder::new` and `QpackDecoder::reset`), and replays only for it, so a memo
+//! that outlives its decoder, or is given to another, never replays another connection's fields.
+//! One memo goes with one decoder. The decoder replays a kept section with the same effects as a
+//! decode: the blocked check before and the Section Acknowledgment after.
 
 use crate::collections::VectorUsize;
 
@@ -19,6 +22,8 @@ pub(crate) const MAX_DECODED_LEN: usize = 2048;
 struct Entry {
   /// Names and values, one after the other.
   bytes: VectorUsize<u8>,
+  /// The decoder table that the section was decoded against.
+  epoch: u64,
   /// Name and value lengths of each field, in order.
   fields: VectorUsize<(u32, u32)>,
   last_use: u64,
@@ -33,6 +38,7 @@ impl Entry {
   const fn new() -> Self {
     Self {
       bytes: VectorUsize::new(),
+      epoch: 0,
       fields: VectorUsize::new(),
       last_use: 0,
       lowest_dynamic: 0,
@@ -42,8 +48,9 @@ impl Entry {
     }
   }
 
-  fn holds(&self, ric: u64, section: &[u8]) -> bool {
+  fn holds(&self, epoch: u64, ric: u64, section: &[u8]) -> bool {
     self.section_len != 0
+      && self.epoch == epoch
       && self.ric == ric
       && self.section.get(..usize::from(self.section_len)) == Some(section)
   }
@@ -69,10 +76,21 @@ impl<const N: usize> DecodeMemo<N> {
     }
   }
 
-  /// The fields that `section` with the absolute Required Insert Count `ric` decoded to, if it is
-  /// kept and the lowest dynamic table entry that it referenced is at or above `oldest_live`.
+  /// Forgets every kept section; the storage stays for the next ones.
+  pub(crate) fn clear(&mut self) {
+    for entry in &mut self.entries {
+      entry.last_use = 0;
+      entry.section_len = 0;
+    }
+    self.uses = 0;
+  }
+
+  /// The fields that `section` with the absolute Required Insert Count `ric` decoded to against
+  /// the table of `epoch`, if it is kept and the lowest dynamic table entry that it referenced is
+  /// at or above `oldest_live`.
   pub(crate) fn lookup(
     &mut self,
+    epoch: u64,
     ric: u64,
     section: &[u8],
     oldest_live: u64,
@@ -82,7 +100,7 @@ impl<const N: usize> DecodeMemo<N> {
     }
     self.uses = self.uses.wrapping_add(1);
     let uses = self.uses;
-    let entry = self.entries.iter_mut().find(|el| el.holds(ric, section))?;
+    let entry = self.entries.iter_mut().find(|el| el.holds(epoch, ric, section))?;
     if entry.lowest_dynamic < oldest_live {
       return None;
     }
@@ -94,17 +112,22 @@ impl<const N: usize> DecodeMemo<N> {
     Some(MemoFields { bytes: entry.bytes.as_slice(), fields: entry.fields.iter() })
   }
 
-  /// Starts keeping `section` with the absolute Required Insert Count `ric`, in place of the entry
-  /// that holds the same section or else of the entry used least recently: the fields are pushed
-  /// to the recorder as they are decoded, which keeps them once it is sealed. `None` if the
-  /// section is too long to be kept.
-  pub(crate) fn insert(&mut self, ric: u64, section: &[u8]) -> Option<MemoRecorder<'_>> {
+  /// Starts keeping `section` with the absolute Required Insert Count `ric`, decoded against the
+  /// table of `epoch`, in place of the entry that holds the same section or else of the entry used
+  /// least recently: the fields are pushed to the recorder as they are decoded, which keeps them
+  /// once it is sealed. `None` if the section is too long to be kept.
+  pub(crate) fn insert(
+    &mut self,
+    epoch: u64,
+    ric: u64,
+    section: &[u8],
+  ) -> Option<MemoRecorder<'_>> {
     let section_len =
       u8::try_from(section.len()).ok().filter(|el| usize::from(*el) <= MAX_SECTION_LEN)?;
     if section_len == 0 {
       return None;
     }
-    let same = self.entries.iter().position(|el| el.holds(ric, section));
+    let same = self.entries.iter().position(|el| el.holds(epoch, ric, section));
     let idx = same.or_else(|| {
       self.entries.iter().enumerate().min_by_key(|(_, el)| el.last_use).map(|(idx, _)| idx)
     })?;
@@ -112,6 +135,7 @@ impl<const N: usize> DecodeMemo<N> {
     let entry = self.entries.get_mut(idx)?;
     entry.bytes.clear();
     entry.fields.clear();
+    entry.epoch = epoch;
     entry.last_use = self.uses;
     entry.ric = ric;
     entry.section.get_mut(..section.len())?.copy_from_slice(section);
@@ -281,6 +305,54 @@ mod tests {
     ));
     assert_eq!(memo.hits, 4);
     assert_eq!(output(&mut decoder), b"");
+  }
+
+  // A memo replays only for the table that it was filled from: with a new decoder, or the same one
+  // reset, the same bytes and Required Insert Count decode against the new table
+  #[test]
+  fn decode_memo_never_replays_another_table() {
+    let ours = hexd!(b"3fbd01c00f7777772e6578616d706c652e636f6dc10c2f73616d706c652f70617468");
+    let mut theirs = Vec::new();
+    wire::set_capacity(&mut theirs, 220);
+    wire::insert_name_ref(&mut theirs, true, 0, b"other.example", false);
+    wire::insert_name_ref(&mut theirs, true, 1, b"/other", false);
+    let dynamic = hexd!(b"03811011");
+    let expected = pairs(&[(":authority", "www.example.com"), (":path", "/sample/path")]);
+    let other = pairs(&[(":authority", "other.example"), (":path", "/other")]);
+    let mut memo = DecodeMemo::<2>::new();
+    let mut first = QpackDecoder::new(220, 2).unwrap();
+    assert_eq!(first.on_encoder_stream(&ours).unwrap(), ours.len());
+    let _ = decode(&mut first, &mut memo, 4, &dynamic).unwrap();
+    assert_eq!(decode(&mut first, &mut memo, 8, &dynamic).unwrap().1, expected);
+    assert_eq!(memo.hits, 1);
+    // A new decoder whose table has other entries at the same absolute indices
+    let mut second = QpackDecoder::new(220, 2).unwrap();
+    assert_eq!(second.on_encoder_stream(&theirs).unwrap(), theirs.len());
+    assert_eq!(decode(&mut second, &mut memo, 4, &dynamic).unwrap().1, other);
+    assert_eq!(memo.hits, 1);
+    // The first decoder reset and refilled the same way
+    first.reset(220, 2).unwrap();
+    assert_eq!(first.on_encoder_stream(&theirs).unwrap(), theirs.len());
+    assert_eq!(decode(&mut first, &mut memo, 4, &dynamic).unwrap().1, other);
+    assert_eq!(memo.hits, 1);
+    // Reset and refilled, then emptied: the RFC error, not a replay
+    first.reset(220, 2).unwrap();
+    let mut emptied = theirs.clone();
+    wire::set_capacity(&mut emptied, 0);
+    assert_eq!(first.on_encoder_stream(&emptied).unwrap(), emptied.len());
+    assert!(matches!(
+      decode(&mut first, &mut memo, 8, &dynamic),
+      Err(Error::Http3Close(
+        H3ErrorCode::QpackDecompressionFailed,
+        Http3Error::InvalidDynamicIndex
+      ))
+    ));
+    // A cleared memo keeps nothing
+    let fixed = hexd!(b"0000510b2f696e6465782e68746d6c");
+    let _ = decode(&mut second, &mut memo, 12, &fixed).unwrap();
+    memo.clear();
+    let _ = decode(&mut second, &mut memo, 16, &fixed).unwrap();
+    assert_eq!(memo.hits, 1);
   }
 
   // A kept section is not replayed while its stream would block: a decoder whose table is behind

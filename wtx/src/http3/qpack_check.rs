@@ -40,14 +40,18 @@ pub(crate) fn check_model(data: &[u8]) {
   wire::set_capacity(&mut encoder_stream, max_capacity.into());
   let mut kept: Vec<(u64, Vec<u64>, Vec<u8>, Fields)> = Vec::new();
   let mut stream = 0u64;
-  // Instructions written since the decoder stream was last flushed: a connection flushes it every
-  // turn, which starts a new instruction budget of the decoder (at least 64)
-  let mut since_flush = 0u32;
+  // Instructions, and bytes copied out of the table, written since the turn of the decoder
+  // started: the encoder keeps them below the budgets of a turn (at least 64 instructions and 4
+  // times the capacity), starting a new turn when it would go past half of them
+  let (mut since_flush, mut copied) = (0u32, 0u64);
+  fn new_turn(decoder: &mut QpackDecoder, encoder_stream: &mut Vec<u8>) {
+    feed(decoder, encoder_stream, usize::MAX);
+    decoder.start_turn();
+  }
   while !input.0.is_empty() {
     if since_flush >= 32 {
-      feed(&mut decoder, &mut encoder_stream, usize::MAX);
-      decoder.consume_decoder_output(0);
-      since_flush = 0;
+      new_turn(&mut decoder, &mut encoder_stream);
+      (since_flush, copied) = (0, 0);
     }
     match input.byte() % 10 {
       0 => {
@@ -80,6 +84,12 @@ pub(crate) fn check_model(data: &[u8]) {
         let duplicate = input.bit();
         let (name, old_value) = model.relative(relative).clone();
         let value = if duplicate { old_value } else { input.word() };
+        let to_copy = u64::try_from(name.len() + if duplicate { value.len() } else { 0 }).unwrap();
+        if copied + to_copy > u64::from(max_capacity) {
+          new_turn(&mut decoder, &mut encoder_stream);
+          (since_flush, copied) = (0, 0);
+        }
+        copied += to_copy;
         if duplicate {
           if model.insert(&name, &value) {
             wire::duplicate(&mut encoder_stream, relative);
@@ -254,10 +264,21 @@ fn check_decoders(data: &[u8]) {
           return;
         }
       }
-      _ => {
+      5 | 6 => {
         let len = usize::from(tag >> 3);
         plain.consume_decoder_output(len);
         memoized.consume_decoder_output(len);
+      }
+      _ if *tag == 0xff => {
+        // A new connection on pooled decoders; the memo stays and the kept sections are tried
+        // again: the memo must not replay the old table
+        plain.reset(capacity, blocked).unwrap();
+        memoized.reset(capacity, blocked).unwrap();
+        encoder_stream.clear();
+      }
+      _ => {
+        plain.start_turn();
+        memoized.start_turn();
       }
     }
     assert_eq!(plain.decoder_stream_output(), memoized.decoder_stream_output());

@@ -26,8 +26,9 @@ pub enum Http3Error {
   /// A SETTINGS frame carries the same identifier twice (with [`H3ErrorCode::SettingsError`], RFC
   /// 9114 section 7.2.4).
   DuplicateSetting,
-  /// More encoder-stream instructions arrived between two flushes of the decoder stream than the
-  /// budget of the decoder allows (with [`H3ErrorCode::ExcessiveLoad`]).
+  /// More encoder-stream instructions arrived, or more bytes were copied out of the dynamic table,
+  /// in one receive turn than the budget of the decoder allows (with
+  /// [`H3ErrorCode::ExcessiveLoad`]).
   EncoderInstructionBudget,
   /// An insert is larger than the capacity of the dynamic table (with
   /// [`H3ErrorCode::QpackEncoderStreamError`], RFC 9204 section 3.2.2).
