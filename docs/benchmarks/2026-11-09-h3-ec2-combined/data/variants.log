@@ -1,0 +1,85 @@
+== variants: base prev gro-off steer-kernel balance-off hp-batched qpack4096 zc inflight160k inflight192k pace-burst16 repeat-ack-off (reference: zix fib@static-h3) x baseline-h3 static-h3 x 3 passes = 69 starts, 3 x 5s per start; then profiles of base pacing-off zc; server 0,48,1,49,2,50,3,51,4,52,5,53,6,54,7,55,8,56,9,57,10,58,11,59,12,60,13,61,14,62,15,63,16,64,17,65,18,66,19,67,20,68,21,69,22,70,23,71, generator 24,72,25,73,26,74,27,75,28,76,29,77,30,78,31,79,32,80,33,81,34,82,35,83,36,84,37,85,38,86,39,87,40,88,41,89,42,90,43,91,44,92,45,93,46,94,47,95 (-t 48); 19:21:44
+vbench p1 baseline-h3 v-base    rps  5950942 | srv 2.039 us/req gen 6.784 | errors 0 | runs 5930709,5950942,5873533
+vbench p1 baseline-h3 v-prev    rps  5921288 | srv 2.010 us/req gen 6.816 | errors 0 | runs 5898599,5921288,5895176
+vbench p1 baseline-h3 v-gro-off rps  5875950 | srv 2.111 us/req gen 6.799 | errors 0 | runs 5820127,5875950,5854844
+vbench p1 baseline-h3 v-steer-kernel rps  5945039 | srv 1.881 us/req gen 6.797 | errors 0 | runs 5859983,5874040,5945039
+vbench p1 baseline-h3 v-balance-off rps  5924679 | srv 1.872 us/req gen 6.799 | errors 0 | runs 5924679,5883563,5893802
+vbench p1 baseline-h3 v-hp-batched rps  5940950 | srv 2.038 us/req gen 6.792 | errors 0 | runs 5869334,5923162,5940950
+vbench p1 baseline-h3 v-qpack4096 rps  5787997 | srv 2.110 us/req gen 7.003 | errors 0 | runs 5705230,5746984,5787997
+vbench p1 baseline-h3 v-zc      rps  5882811 | srv 2.087 us/req gen 6.838 | errors 0 | runs 5882811,5875098,5869399
+vbench p1 baseline-h3 zix       rps  6035467 | srv 1.377 us/req gen 6.867 | errors 0 | runs 6035467,5954663,5951359
+vbench p1 static-h3   v-base    rps  1007388 | srv 33.180 us/req gen 38.621 | errors 0 | runs 957909,969538,1007388
+vbench p1 static-h3   v-prev    rps   977490 | srv 38.759 us/req gen 38.051 | errors 0 | runs 948124,977490,956044
+vbench p1 static-h3   v-gro-off rps   948448 | srv 40.629 us/req gen 37.287 | errors 0 | runs 910635,948448,915812
+vbench p1 static-h3   v-steer-kernel rps   977737 | srv 27.790 us/req gen 36.772 | errors 0 | runs 940255,977737,918989
+vbench p1 static-h3   v-balance-off rps   954293 | srv 29.226 us/req gen 35.249 | errors 0 | runs 924884,954293,936063
+vbench p1 static-h3   v-hp-batched rps  1007127 | srv 33.692 us/req gen 38.282 | errors 0 | runs 1007127,995369,938880
+vbench p1 static-h3   v-qpack4096 rps  1011321 | srv 35.723 us/req gen 39.368 | errors 0 | runs 994975,1011321,966941
+vbench p1 static-h3   v-zc      rps   953946 | srv 39.709 us/req gen 39.859 | errors 0 | runs 943718,953946,944388
+vbench p1 static-h3   v-inflight160k rps   970312 | srv 32.086 us/req gen 38.053 | errors 0 | runs 947340,970312,940881
+vbench p1 static-h3   v-inflight192k rps   957927 | srv 39.654 us/req gen 37.120 | errors 0 | runs 944587,957927,938323
+vbench p1 static-h3   v-pace-burst16 rps   421448 | srv 32.403 us/req gen 41.320 | errors 0 | runs 421448,221739,267144
+vbench p1 static-h3   v-repeat-ack-off rps  1008325 | srv 32.234 us/req gen 38.762 | errors 0 | runs 1008325,986422,981324
+vbench p1 static-h3   zix       rps   602484 | srv 47.919 us/req gen 56.257 | errors 0 | runs 571662,590704,602484
+vbench p1 static-h3   fib       rps   809151 | srv 44.399 us/req gen 36.948 | errors 0 | runs 801342,809151,802405
+== pass 1 done 19:33:11 (687 s)
+vbench p2 baseline-h3 v-balance-off rps  5940091 | srv 1.889 us/req gen 6.769 | errors 0 | runs 5912950,5885812,5940091
+vbench p2 baseline-h3 v-hp-batched rps  5915793 | srv 2.022 us/req gen 6.813 | errors 0 | runs 5915793,5911653,5889109
+vbench p2 baseline-h3 v-qpack4096 rps  5765189 | srv 2.074 us/req gen 7.021 | errors 0 | runs 5633861,5765189,5744178
+vbench p2 baseline-h3 v-zc      rps  5926986 | srv 2.081 us/req gen 6.808 | errors 0 | runs 5914990,5869603,5926986
+vbench p2 baseline-h3 zix       rps  6010202 | srv 1.355 us/req gen 6.785 | errors 0 | runs 5998540,5996129,6010202
+vbench p2 baseline-h3 v-base    rps  5931194 | srv 2.021 us/req gen 6.826 | errors 0 | runs 5931194,5767011,5913435
+vbench p2 baseline-h3 v-prev    rps  5951338 | srv 2.019 us/req gen 6.785 | errors 0 | runs 5951338,5899922,5938462
+vbench p2 baseline-h3 v-gro-off rps  5948465 | srv 2.071 us/req gen 6.799 | errors 0 | runs 5896763,5851104,5948465
+vbench p2 baseline-h3 v-steer-kernel rps  5910101 | srv 1.901 us/req gen 6.816 | errors 0 | runs 5895265,5882643,5910101
+vbench p2 static-h3   v-balance-off rps   932499 | srv 32.674 us/req gen 34.900 | errors 0 | runs 917158,906962,932499
+vbench p2 static-h3   v-hp-batched rps  1020448 | srv 28.672 us/req gen 39.266 | errors 0 | runs 1020448,1004913,1015040
+vbench p2 static-h3   v-qpack4096 rps   962819 | srv 39.907 us/req gen 37.567 | errors 0 | runs 949589,962819,956318
+vbench p2 static-h3   v-zc      rps   955640 | srv 39.968 us/req gen 40.039 | errors 0 | runs 955640,949307,953581
+vbench p2 static-h3   v-inflight160k rps   947754 | srv 34.577 us/req gen 37.553 | errors 0 | runs 930623,947754,932697
+vbench p2 static-h3   v-inflight192k rps   965523 | srv 38.990 us/req gen 36.945 | errors 0 | runs 938492,965523,933699
+vbench p2 static-h3   v-pace-burst16 rps   360283 | srv 31.991 us/req gen 42.217 | errors 0 | runs 314334,360283,272122
+vbench p2 static-h3   v-repeat-ack-off rps  1020308 | srv 30.728 us/req gen 39.329 | errors 0 | runs 999086,963474,1020308
+vbench p2 static-h3   zix       rps   582827 | srv 47.509 us/req gen 55.089 | errors 0 | runs 554952,539080,582827
+vbench p2 static-h3   fib       rps   809628 | srv 45.446 us/req gen 36.984 | errors 0 | runs 809628,799773,804925
+vbench p2 static-h3   v-base    rps   956056 | srv 40.795 us/req gen 37.060 | errors 0 | runs 953607,956056,953501
+vbench p2 static-h3   v-prev    rps  1014722 | srv 32.364 us/req gen 38.649 | errors 0 | runs 1014722,939626,945323
+vbench p2 static-h3   v-gro-off rps   961119 | srv 40.323 us/req gen 36.616 | errors 0 | runs 961119,951647,955368
+vbench p2 static-h3   v-steer-kernel rps   957663 | srv 28.316 us/req gen 35.500 | errors 0 | runs 921280,957663,886814
+== pass 2 done 19:44:36 (1372 s)
+vbench p3 baseline-h3 zix       rps  5993564 | srv 1.370 us/req gen 6.769 | errors 0 | runs 5852040,5993564,5973122
+vbench p3 baseline-h3 v-base    rps  5936714 | srv 2.039 us/req gen 6.794 | errors 0 | runs 5898764,5936714,5890983
+vbench p3 baseline-h3 v-prev    rps  5925929 | srv 2.023 us/req gen 6.827 | errors 0 | runs 5925929,5849409,5907289
+vbench p3 baseline-h3 v-gro-off rps  5847317 | srv 2.062 us/req gen 6.909 | errors 0 | runs 5833488,5844048,5847317
+vbench p3 baseline-h3 v-steer-kernel rps  5922040 | srv 1.906 us/req gen 6.824 | errors 0 | runs 5823924,5907811,5922040
+vbench p3 baseline-h3 v-balance-off rps  5937224 | srv 1.923 us/req gen 6.756 | errors 0 | runs 5888727,5937224,5816759
+vbench p3 baseline-h3 v-hp-batched rps  5907761 | srv 2.032 us/req gen 6.825 | errors 0 | runs 5907761,5891423,5901551
+vbench p3 baseline-h3 v-qpack4096 rps  5768593 | srv 2.103 us/req gen 7.010 | errors 0 | runs 5768593,5739359,5746244
+vbench p3 baseline-h3 v-zc      rps  5891995 | srv 2.088 us/req gen 6.681 | errors 0 | runs 5848746,5826239,5891995
+vbench p3 static-h3   v-inflight160k rps   963397 | srv 32.527 us/req gen 38.053 | errors 0 | runs 952196,923871,963397
+vbench p3 static-h3   v-inflight192k rps   961476 | srv 40.109 us/req gen 37.526 | errors 0 | runs 961476,943925,946441
+vbench p3 static-h3   v-pace-burst16 rps   332455 | srv 31.873 us/req gen 41.921 | errors 0 | runs 332455,329723,298572
+vbench p3 static-h3   v-repeat-ack-off rps  1000697 | srv 37.192 us/req gen 38.159 | errors 0 | runs 955690,1000697,933882
+vbench p3 static-h3   zix       rps   591204 | srv 50.308 us/req gen 57.515 | errors 0 | runs 538962,591204,556206
+vbench p3 static-h3   fib       rps   822163 | srv 41.095 us/req gen 37.259 | errors 0 | runs 800370,822163,811782
+vbench p3 static-h3   v-base    rps   997719 | srv 38.378 us/req gen 37.908 | errors 0 | runs 992081,969206,997719
+vbench p3 static-h3   v-prev    rps   988670 | srv 37.140 us/req gen 37.894 | errors 0 | runs 988670,949816,984055
+vbench p3 static-h3   v-gro-off rps   986351 | srv 39.584 us/req gen 38.362 | errors 0 | runs 967416,964026,986351
+vbench p3 static-h3   v-steer-kernel rps   983017 | srv 25.830 us/req gen 36.791 | errors 0 | runs 928033,983017,925041
+vbench p3 static-h3   v-balance-off rps   968994 | srv 27.942 us/req gen 36.814 | errors 0 | runs 968994,922565,965345
+vbench p3 static-h3   v-hp-batched rps   980798 | srv 37.383 us/req gen 37.876 | errors 0 | runs 914248,980798,960191
+vbench p3 static-h3   v-qpack4096 rps  1003665 | srv 33.101 us/req gen 39.086 | errors 0 | runs 957100,961999,1003665
+vbench p3 static-h3   v-zc      rps   955681 | srv 37.632 us/req gen 40.068 | errors 0 | runs 942405,955681,952301
+== pass 3 done 19:56:03 (2059 s)
+perf=/usr/bin/perf (perf version 7.0.14)
+pmu=yes sw_event=cycles record_z=1 lbr_cg=fp cm_event=cache-misses
+topdown_args=none
+hw_events=cycles,instructions,branches,branch-misses,cache-references,cache-misses,L1-dcache-loads,L1-dcache-load-misses,dTLB-load-misses,iTLB-load-misses
+tracepoints=syscalls:sys_enter_io_uring_enter,syscalls:sys_enter_sendmsg,syscalls:sys_enter_recvmsg,syscalls:sys_enter_sendmmsg,syscalls:sys_enter_recvmmsg,syscalls:sys_enter_sendto,syscalls:sys_enter_recvfrom,syscalls:sys_enter_epoll_wait,syscalls:sys_enter_epoll_pwait,syscalls:sys_enter_epoll_pwait2,syscalls:sys_enter_futex,syscalls:sys_enter_read,syscalls:sys_enter_write,syscalls:sys_enter_writev,io_uring:io_uring_submit_req,io_uring:io_uring_complete,io_uring:io_uring_task_add,net:net_dev_xmit,net:netif_receive_skb,net:netif_rx,skb:kfree_skb,udp:udp_fail_queue_rcv_skb
+== variant profiles: base pacing-off zc x baseline-h3 static-h3, 12s runs, window +3s for 6s, -F 499; pmu=yes; 19:56:08
+vprofile p1 baseline-h3 v-base    rps  5904772 | srv 2.101 us/req gen 6.787 | errors 0 | runs 5904772,5697846
+vprofile p1 static-h3   v-base    rps   911699 | srv 43.044 us/req gen 35.851 | errors 0 | runs 911699,901569
+vprofile p1 static-h3   v-pacing-off rps   950040 | srv 24.696 us/req gen 34.966 | errors 0 | runs 950040,918948
+vprofile p1 baseline-h3 v-zc      rps  5859969 | srv 2.164 us/req gen 6.821 | errors 0 | runs 5859969,5699008
+vprofile p1 static-h3   v-zc      rps   938110 | srv 40.879 us/req gen 40.993 | errors 0 | runs 938110,887948
+== variants done 19:59:41 (2277 s)

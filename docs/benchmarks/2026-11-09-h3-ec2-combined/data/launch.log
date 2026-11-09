@@ -1,0 +1,386 @@
+phase A kit: 233.1 MiB over ssh: 39 s at 50 Mbit/s, 10 s at 200 Mbit/s
+phase B kit: 44.9 MiB over ssh: 8 s at 50 Mbit/s, 2 s at 200 Mbit/s
+phase V kit: 55.7 MiB over ssh: 9 s at 50 Mbit/s, 2 s at 200 Mbit/s
+run rimuh3-1794252041, phases V, results in /mnt/nvme1tb/claude-tmp/aws-h3/results/run-20261109-192041
++ aws sts get-caller-identity --region sa-east-1 --query Arn --output text
+arn:aws:iam::<account>:root
++ aws ec2 describe-vpcs --region sa-east-1 --filters Name=isDefault,Values=true --query Vpcs[0].VpcId --output text
++ aws service-quotas get-service-quota --region sa-east-1 --service-code ec2 --quota-code L-34B43A08 --query Quota.Value --output text
+spot vCPU quota (standard): 96.0
++ aws ec2 describe-spot-price-history --region sa-east-1 --product-descriptions Linux/UNIX --start-time 2026-11-09T19:20:46Z --instance-types c6a.24xlarge c6a.16xlarge c7i.metal-24xl m7i.metal-24xl c5.metal m6a.24xlarge c6a.24xlarge --query SpotPriceHistory[].[AvailabilityZone,InstanceType,SpotPrice] --output text
+sa-east-1a	c5.metal	0.628800
+sa-east-1a	c6a.16xlarge	0.475500
+sa-east-1a	c6a.24xlarge	0.565900
+sa-east-1a	c7i.metal-24xl	0.660200
+sa-east-1a	m6a.24xlarge	0.789300
+sa-east-1a	m7i.metal-24xl	0.771100
+sa-east-1b	c5.metal	0.628800
+sa-east-1b	c6a.16xlarge	0.754700
+sa-east-1b	c6a.24xlarge	0.565900
+sa-east-1b	c7i.metal-24xl	0.660200
+sa-east-1b	m6a.24xlarge	0.770600
+sa-east-1b	m7i.metal-24xl	0.771100
+sa-east-1c	c5.metal	0.628800
+sa-east-1c	c6a.16xlarge	0.516900
+sa-east-1c	c6a.24xlarge	0.565900
+sa-east-1c	c7i.metal-24xl	0.660200
+sa-east-1c	m6a.24xlarge	0.776100
+sa-east-1c	m7i.metal-24xl	0.771100
++ aws ec2 create-key-pair --region sa-east-1 --key-name rimuh3-1794252041 --key-type ed25519 --tag-specifications ResourceType=key-pair,Tags=[{Key=Name,Value=rimuh3-1794252041},{Key=project,Value=rimu-h3-bench}] --query KeyMaterial --output text
++ aws ec2 create-security-group --region sa-east-1 --group-name rimuh3-1794252041 --description rimu-h3 bench: ssh from one IP --tag-specifications ResourceType=security-group,Tags=[{Key=Name,Value=rimuh3-1794252041},{Key=project,Value=rimu-h3-bench}] --query GroupId --output text
++ aws ec2 authorize-security-group-ingress --region sa-east-1 --group-id sg-0fc50a98a04965844 --protocol tcp --port 22 --cidr <colossus-ip>/32
++ aws ssm get-parameter --region sa-east-1 --name /aws/service/canonical/ubuntu/server/26.04/stable/current/amd64/hvm/ebs-gp3/ami-id --query Parameter.Value --output text
++ aws ec2 describe-images --region sa-east-1 --image-ids ami-0a3186a7d0fa2c9e4 --query Images[0].RootDeviceName --output text
++ aws ec2 run-instances --region sa-east-1 --image-id ami-0a3186a7d0fa2c9e4 --instance-type m6a.24xlarge --count 1 --key-name rimuh3-1794252041 --security-group-ids sg-0fc50a98a04965844 --placement AvailabilityZone=sa-east-1b --instance-market-options MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate} --instance-initiated-shutdown-behavior terminate --metadata-options HttpTokens=required,HttpEndpoint=enabled --block-device-mappings DeviceName=/dev/sda1,Ebs={VolumeSize=40,VolumeType=gp3,Iops=3000,Throughput=250,DeleteOnTermination=true} --user-data #!/bin/sh
+shutdown -h +70 --tag-specifications ResourceType=instance,Tags=[{Key=Name,Value=rimuh3-1794252041},{Key=project,Value=rimu-h3-bench},{Key=phase,Value=V}] ResourceType=volume,Tags=[{Key=Name,Value=rimuh3-1794252041},{Key=project,Value=rimu-h3-bench}] ResourceType=spot-instances-request,Tags=[{Key=Name,Value=rimuh3-1794252041},{Key=project,Value=rimu-h3-bench}] --query Instances[0].InstanceId --output text
+launched i-01a779ccf3f635d56 (m6a.24xlarge, sa-east-1b, ami-0a3186a7d0fa2c9e4) for phase V at 19:20:57
++ aws ec2 describe-instances --region sa-east-1 --instance-ids i-01a779ccf3f635d56 --query Reservations[0].Instances[0].[SpotInstanceRequestId,Placement.AvailabilityZone] --output text
++ aws ec2 wait instance-running --region sa-east-1 --instance-ids i-01a779ccf3f635d56
++ aws ec2 describe-instances --region sa-east-1 --instance-ids i-01a779ccf3f635d56 --query Reservations[0].Instances[0].PublicIpAddress --output text
+running: 18.230.189.40 (sa-east-1b, spot request sir-y6ffmt6k)
++ ssh ubuntu@18.230.189.40 sudo shutdown -h +55 && mkdir -p kit/dl && sudo systemctl stop unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service 2>/dev/null; sudo systemd-run --quiet --unit=rimuh3-apt --collect bash -c 'timeout 120 cloud-init status --wait >/dev/null 2>&1
+export DEBIAN_FRONTEND=noninteractive; o="-q -o DPkg::Lock::Timeout=300"
+for i in 1 2 3; do apt-get $o update && { apt-get $o install -y docker.io zstd rsync linux-tools-common linux-tools-$(uname -r) ||
+apt-get $o install -y docker.io zstd rsync linux-tools-common linux-tools-aws; } && touch /var/tmp/rimuh3-apt.ok && exit 0; sleep 10; done
+touch /var/tmp/rimuh3-apt.failed'
+Shutdown scheduled for Mon 2026-11-09 20:16:19 UTC, use 'shutdown -c' to cancel.
+box answered at 19:21:20: halts itself at +55 min; ssh phases end by 20:01:20
++ ssh ubuntu@18.230.189.40 command -v rsync
++ ssh ubuntu@18.230.189.40 cat > kit/dl/parts.txt
++ ssh ubuntu@18.230.189.40 cat > kit/dl/kit.sha256
++ rsync -a --partial-dir=.rsync-partial --timeout=60 -e ssh /mnt/nvme1tb/claude-tmp/aws-h3/parts/kit-common.tgz ubuntu@18.230.189.40:kit/dl/ (try 1)
++ ssh ubuntu@18.230.189.40 touch kit/dl/kit-common.tgz.done
++ ssh ubuntu@18.230.189.40 cd kit && tar -xzf dl/kit-common.tgz && sudo systemd-run --quiet --unit=rimuh3-setup --collect 		bash -c 'exec /home/ubuntu/kit/remote/run.sh setup V >/home/ubuntu/kit/setup.log 2>&1'
++ rsync -a --partial-dir=.rsync-partial --timeout=60 -e ssh /mnt/nvme1tb/claude-tmp/aws-h3/parts/kit-rimu-v.tar.zst ubuntu@18.230.189.40:kit/dl/ (try 1)
++ ssh ubuntu@18.230.189.40 touch kit/dl/kit-rimu-v.tar.zst.done
++ rsync -a --partial-dir=.rsync-partial --timeout=60 -e ssh /mnt/nvme1tb/claude-tmp/aws-h3/parts/kit-img-h2load-h3.tar.zst ubuntu@18.230.189.40:kit/dl/ (try 1)
++ ssh ubuntu@18.230.189.40 touch kit/dl/kit-img-h2load-h3.tar.zst.done
++ rsync -a --partial-dir=.rsync-partial --timeout=60 -e ssh /mnt/nvme1tb/claude-tmp/aws-h3/parts/kit-img-zix.tar.zst ubuntu@18.230.189.40:kit/dl/ (try 1)
++ ssh ubuntu@18.230.189.40 touch kit/dl/kit-img-zix.tar.zst.done
++ rsync -a --partial-dir=.rsync-partial --timeout=60 -e ssh /mnt/nvme1tb/claude-tmp/aws-h3/parts/kit-img-fib.tar.zst ubuntu@18.230.189.40:kit/dl/ (try 1)
++ ssh ubuntu@18.230.189.40 touch kit/dl/kit-img-fib.tar.zst.done
+kit uploaded in 19 s
++ ssh ubuntu@18.230.189.40 timeout 2378 sh -c 'until [ -e kit/setup.ok ] || [ -e kit/setup.failed ]; do sleep 2; done'; cat kit/setup.log; [ -e kit/setup.ok ]
+== setup V 19:21:26
+apt done 19:21:36
+pmu=yes
+took kit-common.tgz 19:21:39
+took kit-rimu-v.tar.zst 19:21:40
+Loaded image: httparena-h2load-h3:latest
+took kit-img-h2load-h3.tar.zst 19:21:41
+Loaded image: httparena-zix:latest
+took kit-img-zix.tar.zst 19:21:41
+Loaded image: httparena-fib:latest
+took kit-img-fib.tar.zst 19:21:41
+== setup done 19:21:42
+setup done at 19:21:43 (39 min of the budget left)
+== variants: up to 39 min (19:21:43)
++ ssh ubuntu@18.230.189.40 sudo PASSES='' SERVERS='' PROFILES='' VARIANTS='base prev gro-off steer-kernel balance-off hp-batched qpack4096 zc inflight160k inflight192k pace-burst16 repeat-ack-off' VREF='zix fib@static-h3' 		VPROF='base pacing-off zc' systemd-run --quiet --unit=rimuh3-variants --collect 		-p RuntimeMaxSec=2376 --setenv=PASSES --setenv=SERVERS --setenv=PROFILES --setenv=VARIANTS --setenv=VREF --setenv=VPROF 		bash -c 'exec /home/ubuntu/kit/remote/run.sh variants >/home/ubuntu/kit/variants.log 2>&1'
+== variants: base prev gro-off steer-kernel balance-off hp-batched qpack4096 zc inflight160k inflight192k pace-burst16 repeat-ack-off (reference: zix fib@static-h3) x baseline-h3 static-h3 x 3 passes = 69 starts, 3 x 5s per start; then profiles of base pacing-off zc; server 0,48,1,49,2,50,3,51,4,52,5,53,6,54,7,55,8,56,9,57,10,58,11,59,12,60,13,61,14,62,15,63,16,64,17,65,18,66,19,67,20,68,21,69,22,70,23,71, generator 24,72,25,73,26,74,27,75,28,76,29,77,30,78,31,79,32,80,33,81,34,82,35,83,36,84,37,85,38,86,39,87,40,88,41,89,42,90,43,91,44,92,45,93,46,94,47,95 (-t 48); 19:21:44
+vbench p1 baseline-h3 v-base    rps  5950942 | srv 2.039 us/req gen 6.784 | errors 0 | runs 5930709,5950942,5873533
+vbench p1 baseline-h3 v-prev    rps  5921288 | srv 2.010 us/req gen 6.816 | errors 0 | runs 5898599,5921288,5895176
+vbench p1 baseline-h3 v-gro-off rps  5875950 | srv 2.111 us/req gen 6.799 | errors 0 | runs 5820127,5875950,5854844
+vbench p1 baseline-h3 v-steer-kernel rps  5945039 | srv 1.881 us/req gen 6.797 | errors 0 | runs 5859983,5874040,5945039
+vbench p1 baseline-h3 v-balance-off rps  5924679 | srv 1.872 us/req gen 6.799 | errors 0 | runs 5924679,5883563,5893802
+vbench p1 baseline-h3 v-hp-batched rps  5940950 | srv 2.038 us/req gen 6.792 | errors 0 | runs 5869334,5923162,5940950
+vbench p1 baseline-h3 v-qpack4096 rps  5787997 | srv 2.110 us/req gen 7.003 | errors 0 | runs 5705230,5746984,5787997
+vbench p1 baseline-h3 v-zc      rps  5882811 | srv 2.087 us/req gen 6.838 | errors 0 | runs 5882811,5875098,5869399
+vbench p1 baseline-h3 zix       rps  6035467 | srv 1.377 us/req gen 6.867 | errors 0 | runs 6035467,5954663,5951359
+vbench p1 static-h3   v-base    rps  1007388 | srv 33.180 us/req gen 38.621 | errors 0 | runs 957909,969538,1007388
+vbench p1 static-h3   v-prev    rps   977490 | srv 38.759 us/req gen 38.051 | errors 0 | runs 948124,977490,956044
+vbench p1 static-h3   v-gro-off rps   948448 | srv 40.629 us/req gen 37.287 | errors 0 | runs 910635,948448,915812
+vbench p1 static-h3   v-steer-kernel rps   977737 | srv 27.790 us/req gen 36.772 | errors 0 | runs 940255,977737,918989
+vbench p1 static-h3   v-balance-off rps   954293 | srv 29.226 us/req gen 35.249 | errors 0 | runs 924884,954293,936063
+vbench p1 static-h3   v-hp-batched rps  1007127 | srv 33.692 us/req gen 38.282 | errors 0 | runs 1007127,995369,938880
+vbench p1 static-h3   v-qpack4096 rps  1011321 | srv 35.723 us/req gen 39.368 | errors 0 | runs 994975,1011321,966941
+vbench p1 static-h3   v-zc      rps   953946 | srv 39.709 us/req gen 39.859 | errors 0 | runs 943718,953946,944388
+vbench p1 static-h3   v-inflight160k rps   970312 | srv 32.086 us/req gen 38.053 | errors 0 | runs 947340,970312,940881
+vbench p1 static-h3   v-inflight192k rps   957927 | srv 39.654 us/req gen 37.120 | errors 0 | runs 944587,957927,938323
+vbench p1 static-h3   v-pace-burst16 rps   421448 | srv 32.403 us/req gen 41.320 | errors 0 | runs 421448,221739,267144
+vbench p1 static-h3   v-repeat-ack-off rps  1008325 | srv 32.234 us/req gen 38.762 | errors 0 | runs 1008325,986422,981324
+vbench p1 static-h3   zix       rps   602484 | srv 47.919 us/req gen 56.257 | errors 0 | runs 571662,590704,602484
+vbench p1 static-h3   fib       rps   809151 | srv 44.399 us/req gen 36.948 | errors 0 | runs 801342,809151,802405
+== pass 1 done 19:33:11 (687 s)
+vbench p2 baseline-h3 v-balance-off rps  5940091 | srv 1.889 us/req gen 6.769 | errors 0 | runs 5912950,5885812,5940091
+vbench p2 baseline-h3 v-hp-batched rps  5915793 | srv 2.022 us/req gen 6.813 | errors 0 | runs 5915793,5911653,5889109
+vbench p2 baseline-h3 v-qpack4096 rps  5765189 | srv 2.074 us/req gen 7.021 | errors 0 | runs 5633861,5765189,5744178
+vbench p2 baseline-h3 v-zc      rps  5926986 | srv 2.081 us/req gen 6.808 | errors 0 | runs 5914990,5869603,5926986
+vbench p2 baseline-h3 zix       rps  6010202 | srv 1.355 us/req gen 6.785 | errors 0 | runs 5998540,5996129,6010202
+vbench p2 baseline-h3 v-base    rps  5931194 | srv 2.021 us/req gen 6.826 | errors 0 | runs 5931194,5767011,5913435
+vbench p2 baseline-h3 v-prev    rps  5951338 | srv 2.019 us/req gen 6.785 | errors 0 | runs 5951338,5899922,5938462
+vbench p2 baseline-h3 v-gro-off rps  5948465 | srv 2.071 us/req gen 6.799 | errors 0 | runs 5896763,5851104,5948465
+vbench p2 baseline-h3 v-steer-kernel rps  5910101 | srv 1.901 us/req gen 6.816 | errors 0 | runs 5895265,5882643,5910101
+vbench p2 static-h3   v-balance-off rps   932499 | srv 32.674 us/req gen 34.900 | errors 0 | runs 917158,906962,932499
+vbench p2 static-h3   v-hp-batched rps  1020448 | srv 28.672 us/req gen 39.266 | errors 0 | runs 1020448,1004913,1015040
+vbench p2 static-h3   v-qpack4096 rps   962819 | srv 39.907 us/req gen 37.567 | errors 0 | runs 949589,962819,956318
+vbench p2 static-h3   v-zc      rps   955640 | srv 39.968 us/req gen 40.039 | errors 0 | runs 955640,949307,953581
+vbench p2 static-h3   v-inflight160k rps   947754 | srv 34.577 us/req gen 37.553 | errors 0 | runs 930623,947754,932697
+vbench p2 static-h3   v-inflight192k rps   965523 | srv 38.990 us/req gen 36.945 | errors 0 | runs 938492,965523,933699
+vbench p2 static-h3   v-pace-burst16 rps   360283 | srv 31.991 us/req gen 42.217 | errors 0 | runs 314334,360283,272122
+vbench p2 static-h3   v-repeat-ack-off rps  1020308 | srv 30.728 us/req gen 39.329 | errors 0 | runs 999086,963474,1020308
+vbench p2 static-h3   zix       rps   582827 | srv 47.509 us/req gen 55.089 | errors 0 | runs 554952,539080,582827
+vbench p2 static-h3   fib       rps   809628 | srv 45.446 us/req gen 36.984 | errors 0 | runs 809628,799773,804925
+vbench p2 static-h3   v-base    rps   956056 | srv 40.795 us/req gen 37.060 | errors 0 | runs 953607,956056,953501
+vbench p2 static-h3   v-prev    rps  1014722 | srv 32.364 us/req gen 38.649 | errors 0 | runs 1014722,939626,945323
+vbench p2 static-h3   v-gro-off rps   961119 | srv 40.323 us/req gen 36.616 | errors 0 | runs 961119,951647,955368
+vbench p2 static-h3   v-steer-kernel rps   957663 | srv 28.316 us/req gen 35.500 | errors 0 | runs 921280,957663,886814
+== pass 2 done 19:44:36 (1372 s)
+vbench p3 baseline-h3 zix       rps  5993564 | srv 1.370 us/req gen 6.769 | errors 0 | runs 5852040,5993564,5973122
+vbench p3 baseline-h3 v-base    rps  5936714 | srv 2.039 us/req gen 6.794 | errors 0 | runs 5898764,5936714,5890983
+vbench p3 baseline-h3 v-prev    rps  5925929 | srv 2.023 us/req gen 6.827 | errors 0 | runs 5925929,5849409,5907289
+vbench p3 baseline-h3 v-gro-off rps  5847317 | srv 2.062 us/req gen 6.909 | errors 0 | runs 5833488,5844048,5847317
+vbench p3 baseline-h3 v-steer-kernel rps  5922040 | srv 1.906 us/req gen 6.824 | errors 0 | runs 5823924,5907811,5922040
+vbench p3 baseline-h3 v-balance-off rps  5937224 | srv 1.923 us/req gen 6.756 | errors 0 | runs 5888727,5937224,5816759
+vbench p3 baseline-h3 v-hp-batched rps  5907761 | srv 2.032 us/req gen 6.825 | errors 0 | runs 5907761,5891423,5901551
+vbench p3 baseline-h3 v-qpack4096 rps  5768593 | srv 2.103 us/req gen 7.010 | errors 0 | runs 5768593,5739359,5746244
+vbench p3 baseline-h3 v-zc      rps  5891995 | srv 2.088 us/req gen 6.681 | errors 0 | runs 5848746,5826239,5891995
+vbench p3 static-h3   v-inflight160k rps   963397 | srv 32.527 us/req gen 38.053 | errors 0 | runs 952196,923871,963397
+vbench p3 static-h3   v-inflight192k rps   961476 | srv 40.109 us/req gen 37.526 | errors 0 | runs 961476,943925,946441
+vbench p3 static-h3   v-pace-burst16 rps   332455 | srv 31.873 us/req gen 41.921 | errors 0 | runs 332455,329723,298572
+vbench p3 static-h3   v-repeat-ack-off rps  1000697 | srv 37.192 us/req gen 38.159 | errors 0 | runs 955690,1000697,933882
+vbench p3 static-h3   zix       rps   591204 | srv 50.308 us/req gen 57.515 | errors 0 | runs 538962,591204,556206
+vbench p3 static-h3   fib       rps   822163 | srv 41.095 us/req gen 37.259 | errors 0 | runs 800370,822163,811782
+vbench p3 static-h3   v-base    rps   997719 | srv 38.378 us/req gen 37.908 | errors 0 | runs 992081,969206,997719
+vbench p3 static-h3   v-prev    rps   988670 | srv 37.140 us/req gen 37.894 | errors 0 | runs 988670,949816,984055
+vbench p3 static-h3   v-gro-off rps   986351 | srv 39.584 us/req gen 38.362 | errors 0 | runs 967416,964026,986351
+vbench p3 static-h3   v-steer-kernel rps   983017 | srv 25.830 us/req gen 36.791 | errors 0 | runs 928033,983017,925041
+vbench p3 static-h3   v-balance-off rps   968994 | srv 27.942 us/req gen 36.814 | errors 0 | runs 968994,922565,965345
+vbench p3 static-h3   v-hp-batched rps   980798 | srv 37.383 us/req gen 37.876 | errors 0 | runs 914248,980798,960191
+vbench p3 static-h3   v-qpack4096 rps  1003665 | srv 33.101 us/req gen 39.086 | errors 0 | runs 957100,961999,1003665
+vbench p3 static-h3   v-zc      rps   955681 | srv 37.632 us/req gen 40.068 | errors 0 | runs 942405,955681,952301
+== pass 3 done 19:56:03 (2059 s)
+perf=/usr/bin/perf (perf version 7.0.14)
+pmu=yes sw_event=cycles record_z=1 lbr_cg=fp cm_event=cache-misses
+topdown_args=none
+hw_events=cycles,instructions,branches,branch-misses,cache-references,cache-misses,L1-dcache-loads,L1-dcache-load-misses,dTLB-load-misses,iTLB-load-misses
+tracepoints=syscalls:sys_enter_io_uring_enter,syscalls:sys_enter_sendmsg,syscalls:sys_enter_recvmsg,syscalls:sys_enter_sendmmsg,syscalls:sys_enter_recvmmsg,syscalls:sys_enter_sendto,syscalls:sys_enter_recvfrom,syscalls:sys_enter_epoll_wait,syscalls:sys_enter_epoll_pwait,syscalls:sys_enter_epoll_pwait2,syscalls:sys_enter_futex,syscalls:sys_enter_read,syscalls:sys_enter_write,syscalls:sys_enter_writev,io_uring:io_uring_submit_req,io_uring:io_uring_complete,io_uring:io_uring_task_add,net:net_dev_xmit,net:netif_receive_skb,net:netif_rx,skb:kfree_skb,udp:udp_fail_queue_rcv_skb
+== variant profiles: base pacing-off zc x baseline-h3 static-h3, 12s runs, window +3s for 6s, -F 499; pmu=yes; 19:56:08
+vprofile p1 baseline-h3 v-base    rps  5904772 | srv 2.101 us/req gen 6.787 | errors 0 | runs 5904772,5697846
+vprofile p1 static-h3   v-base    rps   911699 | srv 43.044 us/req gen 35.851 | errors 0 | runs 911699,901569
+vprofile p1 static-h3   v-pacing-off rps   950040 | srv 24.696 us/req gen 34.966 | errors 0 | runs 950040,918948
+vprofile p1 baseline-h3 v-zc      rps  5859969 | srv 2.164 us/req gen 6.821 | errors 0 | runs 5859969,5699008
+vprofile p1 static-h3   v-zc      rps   938110 | srv 40.879 us/req gen 40.993 | errors 0 | runs 938110,887948
+== variants done 19:59:41 (2277 s)
++ ssh ubuntu@18.230.189.40 systemctl is-active -q rimuh3-variants
+== fetch variants
+fetched variants into /mnt/nvme1tb/claude-tmp/aws-h3/results/run-20261109-192041/V (30M)
+imds instance-type: m6a.24xlarge
+imds placement/availability-zone: sa-east-1b
+uname -r: 7.0.0-1016-aws
+server cpus 0,48,1,49,2,50,3,51,4,52,5,53,6,54,7,55,8,56,9,57,10,58,11,59,12,60,13,61,14,62,15,63,16,64,17,65,18,66,19,67,20,68,21,69,22,70,23,71 | generator cpus 24,72,25,73,26,74,27,75,28,76,29,77,30,78,31,79,32,80,33,81,34,82,35,83,36,84,37,85,38,86,39,87,40,88,41,89,42,90,43,91,44,92,45,93,46,94,47,95 | h2load -t 48
+pmu=yes
+
+## variants (phase V)
+
+### baseline-h3 (median of 3 passes; base 5,936,714 req/s, 2.04 us/req)
+
+| variant | req/s | vs base | srv us/req | vs base | spread | verdict | gen us/req | resp/pkt | ACK-only | flushes w/ ACK | blocked in (streams/data/stream) | lost | PTO | resent | memo hits | starts |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| base | 5,936,714 | +0.0% | 2.04 | +0.0% | 0.3% | - | 6.79 | 64.0 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 100.0% | 3 |
+| prev | 5,925,929 | -0.2% | 2.02 | -1.0% | 0.5% | = [prev: read inverted] | 6.82 | 64.0 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 100.0% | 3 |
+| gro-off | 5,875,950 | -1.0% | 2.07 | +1.6% | 1.7% | loss (within spread) | 6.80 | 61.9 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 100.0% | 3 |
+| steer-kernel | 5,922,040 | -0.2% | 1.90 | -6.8% | 0.6% | WIN (within spread) | 6.82 | 64.0 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 100.0% | 3 |
+| balance-off | 5,937,224 | +0.0% | 1.89 | -7.4% | 0.3% | WIN (within spread) | 6.77 | 64.0 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 100.0% | 3 |
+| hp-batched | 5,915,793 | -0.4% | 2.03 | -0.3% | 0.6% | = | 6.81 | 64.0 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 100.0% | 3 |
+| qpack4096 | 5,768,593 | -2.8% | 2.10 | +3.1% | 0.4% | loss | 7.01 | 64.0 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 100.0% | 3 |
+| zc | 5,891,995 | -0.8% | 2.09 | +2.4% | 0.7% | loss | 6.81 | 64.0 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 100.0% | 3 |
+| zix | 6,010,202 | +1.2% | 1.37 | -32.8% | 0.7% | - | 6.79 | - | - | - | -/-/- | - | - | - | - | 3 |
+
+The verdict of `prev` (the build before the one measured) reads inverted: its loss is the newer build's win. "within spread": the change is smaller than the spread of the passes of base or of the variant.
+
+transfer (baseline-h3, task 19; median of the passes): bytes and stream payload of a datagram (target >= 1,420 of 1,472), datagrams per GSO train, packets per response, copies per stream byte (target 1), flushes finishing a response that carried the ACK they owed, pacer holds per request, zero-copy (trains sent zero-copy / of them copied by the kernel anyway / workers that fell back):
+
+| variant | dgram B | payload B | segs/train | pkts/resp | copies/B | owed ACK carried | pacer holds/req | zc sent / copied / fallbacks |
+|---|---|---|---|---|---|---|---|---|
+| base | 996 | 576 | 1.00 | 0.02 | 3.00 | 100.0% | 0.000 | 0.0% / - / 0 |
+| gro-off | 966 | 558 | 1.00 | 0.02 | 3.00 | 100.0% | 0.000 | 0.0% / - / 0 |
+| steer-kernel | 996 | 576 | 1.00 | 0.02 | 3.00 | 100.0% | 0.000 | 0.0% / - / 0 |
+| balance-off | 996 | 576 | 1.00 | 0.02 | 3.00 | 100.0% | 0.000 | 0.0% / - / 0 |
+| hp-batched | 996 | 576 | 1.00 | 0.02 | 3.00 | 100.0% | 0.000 | 0.0% / - / 0 |
+| qpack4096 | 1260 | 832 | 1.00 | 0.02 | 3.00 | 100.0% | 0.000 | 0.0% / - / 0 |
+| zc | 996 | 576 | 1.00 | 0.02 | 3.00 | 100.0% | 0.000 | 100.0% / 100.0% / 0 |
+
+rps by pass (k = 1000; ! = errors):
+
+| variant | pass 1 | pass 2 | pass 3 |
+|---|---|---|---|
+| base | 5951k | 5931k | 5937k |
+| prev | 5921k | 5951k | 5926k |
+| gro-off | 5876k | 5948k | 5847k |
+| steer-kernel | 5945k | 5910k | 5922k |
+| balance-off | 5925k | 5940k | 5937k |
+| hp-batched | 5941k | 5916k | 5908k |
+| qpack4096 | 5788k | 5765k | 5769k |
+| zc | 5883k | 5927k | 5892k |
+| zix | 6035k | 6010k | 5994k |
+
+### static-h3 (median of 3 passes; base 997,719 req/s, 38.38 us/req)
+
+| variant | req/s | vs base | srv us/req | vs base | spread | verdict | gen us/req | resp/pkt | ACK-only | flushes w/ ACK | blocked in (streams/data/stream) | lost | PTO | resent | memo hits | starts |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| base | 997,719 | +0.0% | 38.38 | +0.0% | 5.1% | - | 37.91 | 0.1 | 0.0% | 100.0% | 0/0/0 | 35012 | 0 | 46786 | 0.0% | 3 |
+| prev | 988,670 | -0.9% | 37.14 | -3.2% | 3.8% | WIN (within spread) [prev: read inverted] | 38.05 | 0.1 | 0.0% | 72.0% | 0/0/0 | 37134 | 0 | 66554 | 0.0% | 3 |
+| gro-off | 961,119 | -3.7% | 40.32 | +5.1% | 3.9% | loss (within spread) | 37.29 | 0.1 | 0.0% | 100.0% | 0/0/0 | 29443 | 0 | 39626 | 0.0% | 3 |
+| steer-kernel | 977,737 | -2.0% | 27.79 | -27.6% | 2.6% | loss (within spread) | 36.77 | 0.1 | 0.0% | 100.0% | 0/0/0 | 29187 | 0 | 39746 | 0.0% | 3 |
+| balance-off | 954,293 | -4.4% | 29.23 | -23.8% | 3.8% | loss (within spread) | 35.25 | 0.1 | 0.0% | 100.0% | 0/0/0 | 22062 | 0 | 30203 | 0.0% | 3 |
+| hp-batched | 1,007,127 | +0.9% | 33.69 | -12.2% | 3.9% | WIN (within spread) | 38.28 | 0.1 | 0.0% | 100.0% | 0/0/0 | 49975 | 0 | 68835 | 0.0% | 3 |
+| qpack4096 | 1,003,665 | +0.6% | 35.72 | -6.9% | 4.8% | WIN (within spread) | 39.09 | 0.1 | 0.0% | 100.0% | 0/0/0 | 35868 | 0 | 50006 | 0.0% | 3 |
+| zc | 955,640 | -4.2% | 39.71 | +3.5% | 0.2% | loss (within spread) | 40.04 | 0.1 | 0.0% | 100.0% | 0/0/0 | 35650 | 0 | 60479 | 0.0% | 3 |
+| inflight160k | 963,397 | -3.4% | 32.53 | -15.2% | 2.3% | loss (within spread) | 38.05 | 0.1 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 0.0% | 3 |
+| inflight192k | 961,476 | -3.6% | 39.65 | +3.3% | 0.8% | loss (within spread) | 37.12 | 0.1 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 0.0% | 3 |
+| pace-burst16 | 360,283 | -63.9% | 31.99 | -16.6% | 24.7% | loss | 41.92 | 0.1 | 0.0% | 65.3% | 0/0/0 | 367 | 0 | 624 | 0.0% | 3 |
+| repeat-ack-off | 1,008,325 | +1.1% | 32.23 | -16.0% | 1.9% | WIN (within spread) | 38.76 | 0.1 | 0.0% | 67.0% | 0/0/0 | 58189 | 0 | 108526 | 0.0% | 3 |
+| zix | 591,204 | -40.7% | 47.92 | +24.9% | 3.3% | - | 56.26 | - | - | - | -/-/- | - | - | - | - | 3 |
+| fib | 809,628 | -18.9% | 44.40 | +15.7% | 1.6% | - | 36.98 | - | - | - | -/-/- | - | - | - | - | 3 |
+
+The verdict of `prev` (the build before the one measured) reads inverted: its loss is the newer build's win. "within spread": the change is smaller than the spread of the passes of base or of the variant.
+
+transfer (static-h3, task 19; median of the passes): bytes and stream payload of a datagram (target >= 1,420 of 1,472), datagrams per GSO train, packets per response, copies per stream byte (target 1), flushes finishing a response that carried the ACK they owed, pacer holds per request, zero-copy (trains sent zero-copy / of them copied by the kernel anyway / workers that fell back):
+
+| variant | dgram B | payload B | segs/train | pkts/resp | copies/B | owed ACK carried | pacer holds/req | zc sent / copied / fallbacks |
+|---|---|---|---|---|---|---|---|---|
+| base | 1472 | 1435 | 30.46 | 11.36 | 2.00 | 100.0% | 0.148 | 0.0% / - / 0 |
+| gro-off | 1472 | 1435 | 30.58 | 11.36 | 2.00 | 100.0% | 0.152 | 0.0% / - / 0 |
+| steer-kernel | 1472 | 1435 | 30.48 | 11.36 | 2.00 | 100.0% | 0.150 | 0.0% / - / 0 |
+| balance-off | 1472 | 1435 | 30.49 | 11.35 | 2.00 | 100.0% | 0.150 | 0.0% / - / 0 |
+| hp-batched | 1472 | 1435 | 30.11 | 11.36 | 2.00 | 100.0% | 0.141 | 0.0% / - / 0 |
+| qpack4096 | 1472 | 1435 | 30.18 | 11.36 | 2.00 | 100.0% | 0.141 | 0.0% / - / 0 |
+| zc | 1472 | 1435 | 30.33 | 11.36 | 2.00 | 100.0% | 0.146 | 100.0% / 100.0% / 0 |
+| inflight160k | 1472 | 1436 | 27.85 | 11.35 | 2.00 | 100.0% | 0.064 | 0.0% / - / 0 |
+| inflight192k | 1472 | 1436 | 29.55 | 11.35 | 2.00 | 100.0% | 0.167 | 0.0% / - / 0 |
+| pace-burst16 | 1472 | 1436 | 15.75 | 11.35 | 2.00 | 100.0% | 0.708 | 0.0% / - / 0 |
+| repeat-ack-off | 1472 | 1435 | 30.05 | 11.36 | 2.00 | 67.4% | 0.142 | 0.0% / - / 0 |
+
+rps by pass (k = 1000; ! = errors):
+
+| variant | pass 1 | pass 2 | pass 3 |
+|---|---|---|---|
+| base | 1007k | 956k | 998k |
+| prev | 977k | 1015k | 989k |
+| gro-off | 948k | 961k | 986k |
+| steer-kernel | 978k | 958k | 983k |
+| balance-off | 954k | 932k | 969k |
+| hp-batched | 1007k | 1020k | 981k |
+| qpack4096 | 1011k | 963k | 1004k |
+| zc | 954k | 956k | 956k |
+| inflight160k | 970k | 948k | 963k |
+| inflight192k | 958k | 966k | 961k |
+| pace-burst16 | 421k | 360k | 332k |
+| repeat-ack-off | 1008k | 1020k | 1001k |
+| zix | 602k | 583k | 591k |
+| fib | 809k | 810k | 822k |
+
+knobs each variant ran with (first start; the server's own line):
+
+- base: headers=min data=reuse gro=1 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete hp=ring qpack=0 zc=0 pacing_burst=64 repeat_ack=1
+- prev: headers=min data=reuse gro=1 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete hp=ring qpack=0
+- gro-off: headers=min data=reuse gro=0 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete hp=ring qpack=0 zc=0 pacing_burst=64 repeat_ack=1
+- steer-kernel: headers=min data=reuse gro=1 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=kernel balance=0 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete hp=ring qpack=0 zc=0 pacing_burst=64 repeat_ack=1
+- balance-off: headers=min data=reuse gro=1 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=0 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete hp=ring qpack=0 zc=0 pacing_burst=64 repeat_ack=1
+- hp-batched: headers=min data=reuse gro=1 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete hp=batched qpack=0 zc=0 pacing_burst=64 repeat_ack=1
+- qpack4096: headers=min data=reuse gro=1 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete hp=ring qpack=4096 zc=0 pacing_burst=64 repeat_ack=1
+- zc: headers=min data=reuse gro=1 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete hp=ring qpack=0 zc=1 pacing_burst=64 repeat_ack=1
+- inflight160k: headers=min data=reuse gro=1 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=163840 pacing=1 pmtu_probe=now bodies=complete hp=ring qpack=0 zc=0 pacing_burst=64 repeat_ack=1
+- inflight192k: headers=min data=reuse gro=1 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=196608 pacing=1 pmtu_probe=now bodies=complete hp=ring qpack=0 zc=0 pacing_burst=64 repeat_ack=1
+- pace-burst16: headers=min data=reuse gro=1 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete hp=ring qpack=0 zc=0 pacing_burst=16 repeat_ack=1
+- repeat-ack-off: headers=min data=reuse gro=1 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete hp=ring qpack=0 zc=0 pacing_burst=64 repeat_ack=0
+
+## vprofile: software profile windows
+
+| profile | server | req/s | srv us/req | user % | softirq % cores | UDP in/req | UDP out/req | rcvbuf/sndbuf/in err | ctx-sw/req | syscalls/req (top) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| baseline-h3 | v-base | 5,893,636 | 2.16 | 83 | 0.9 | 0.031 | 0.031 | 0/0/0 | 0.028 | io_uring_enter 0.03, read 0.00, write 0.00, epoll_pwait 0.00 |
+| static-h3 | v-base | 901,660 | 44.55 | 44 | 7.0 | 0.523 | 0.523 | 493/0/493 | 0.102 | io_uring_enter 0.20, write 0.00, read 0.00, futex 0.00 |
+| static-h3 | v-pacing-off | 942,442 | 25.04 | 62 | 3.5 | 0.406 | 0.406 | 5390/0/5390 | 0.148 | io_uring_enter 0.16, read 0.00, write 0.00, futex 0.00 |
+| baseline-h3 | v-zc | 5,842,414 | 2.22 | 82 | 1.3 | 0.031 | 0.031 | 0/0/0 | 0.028 | io_uring_enter 0.03, read 0.00, write 0.00, epoll_pwait 0.00 |
+| static-h3 | v-zc | 932,831 | 41.41 | 47 | 32.4 | 0.523 | 0.523 | 1997/0/1997 | 0.113 | io_uring_enter 0.21, read 0.00, write 0.00, epoll_pwait 0.00 |
+
+~ = request rate from the run's h2load rps (rivals); rimu's comes from its own counters over the window.
+UDP counters are host-wide: both the server's and the generator's datagrams on the loopback.
+
+### baseline-h3 v-base  (vprofile/v-base-baseline-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.031/req, io_uring:io_uring_submit_req 0.016/req, io_uring:io_uring_task_add 0.000/req, net:net_dev_xmit 0.016/req, net:netif_receive_skb 0.016/req, net:netif_rx 0.016/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  3.19% <rimu_ws::http::http3_server_framework::router_handler::Rout (arena-h2)
+  3.03% <rimu_ws::http3::h3_app::H3App<rimu_ws::http::http3_server_f (arena-h2)
+  2.78% <rimu_ws::http3::request::RequestHead>::push (arena-h2)
+  2.00% <(rimu_ws::http::http2_server_framework::path_params::PathPa (arena-h2)
+  1.93% memcpy (libc.so.6)
+  1.72% rimu_ws::http3::request::pseudo_value_ok (arena-h2)
+  1.62% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  1.59% <rimu_ws::http3::request::RequestHead>::push_pseudo (arena-h2)
+  1.57% <rimu_ws::quic::stream::Streams>::deliver::<rimu_ws::http3:: (arena-h2)
+  1.55% rimu_ws::http::http3_server_framework::router_handler::fill_ (arena-h2)
+
+### static-h3 v-base  (vprofile/v-base-static-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.734/req, io_uring:io_uring_submit_req 0.604/req, io_uring:io_uring_task_add 0.005/req, net:net_dev_xmit 0.361/req, net:netif_receive_skb 0.361/req, net:netif_rx 0.361/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  29.98% kernel_init_pages ([kernel.kallsyms])
+  6.99% ring_core_0_17_14__aes_gcm_enc_update_vaes_avx2 (arena-h2)
+  2.82% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  2.53% rep_movs_alternative ([kernel.kallsyms])
+  1.97% ring::aead::aes_gcm::seal (arena-h2)
+  1.83% asm_sysvec_apic_timer_interrupt ([kernel.kallsyms])
+  1.60% <rimu_ws::quic::stream::Streams>::write_stream_frame (arena-h2)
+  1.53% skb_release_data ([kernel.kallsyms])
+  1.29% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  0.95% rimu_ws::http::huffman::huffman_decode::<rimu_ws::http3::qpa (arena-h2)
+
+### static-h3 v-pacing-off  (vprofile/v-pacing-off-static-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.404/req, io_uring:io_uring_submit_req 0.314/req, io_uring:io_uring_task_add 0.003/req, net:net_dev_xmit 0.311/req, net:netif_receive_skb 0.311/req, net:netif_rx 0.311/req, skb:kfree_skb 0.001/req, udp:udp_fail_queue_rcv_skb 0.001/req
+  13.58% kernel_init_pages ([kernel.kallsyms])
+  10.94% ring_core_0_17_14__aes_gcm_enc_update_vaes_avx2 (arena-h2)
+  3.38% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  2.95% ring::aead::aes_gcm::seal (arena-h2)
+  2.68% rep_movs_alternative ([kernel.kallsyms])
+  2.02% <rimu_ws::quic::stream::Streams>::write_stream_frame (arena-h2)
+  1.70% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  1.46% ring_core_0_17_14__gcm_ghash_vpclmulqdq_avx2_1 (arena-h2)
+  1.46% rimu_ws::http::huffman::huffman_decode::<rimu_ws::http3::qpa (arena-h2)
+  1.32% ring_core_0_17_14__aes_hw_ctr32_encrypt_blocks (arena-h2)
+
+### baseline-h3 v-zc  (vprofile/v-zc-baseline-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.047/req, io_uring:io_uring_submit_req 0.016/req, io_uring:io_uring_task_add 0.000/req, net:net_dev_xmit 0.016/req, net:netif_receive_skb 0.016/req, net:netif_rx 0.016/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  3.15% <rimu_ws::http::http3_server_framework::router_handler::Rout (arena-h2)
+  2.99% <rimu_ws::http3::h3_app::H3App<rimu_ws::http::http3_server_f (arena-h2)
+  2.78% <rimu_ws::http3::request::RequestHead>::push (arena-h2)
+  2.00% <(rimu_ws::http::http2_server_framework::path_params::PathPa (arena-h2)
+  1.97% memcpy (libc.so.6)
+  1.73% rimu_ws::http3::request::pseudo_value_ok (arena-h2)
+  1.64% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  1.55% <rimu_ws::quic::stream::Streams>::deliver::<rimu_ws::http3:: (arena-h2)
+  1.54% <rimu_ws::quic::stream::Streams>::create (arena-h2)
+  1.50% rimu_ws::http::http3_server_framework::router_handler::fill_ (arena-h2)
+
+### static-h3 v-zc  (vprofile/v-zc-static-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 1.108/req, io_uring:io_uring_submit_req 0.623/req, io_uring:io_uring_task_add 0.004/req, net:net_dev_xmit 0.369/req, net:netif_receive_skb 0.369/req, net:netif_rx 0.369/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  20.50% kernel_init_pages ([kernel.kallsyms])
+  7.48% ring_core_0_17_14__aes_gcm_enc_update_vaes_avx2 (arena-h2)
+  5.28% skb_release_data ([kernel.kallsyms])
+  3.30% memcpy_orig ([kernel.kallsyms])
+  2.95% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  2.02% ring::aead::aes_gcm::seal (arena-h2)
+  1.62% asm_sysvec_apic_timer_interrupt ([kernel.kallsyms])
+  1.54% <rimu_ws::quic::stream::Streams>::write_stream_frame (arena-h2)
+  1.39% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  1.01% skb_copy_ubufs ([kernel.kallsyms])
+
+## vprofile: hardware counter windows
+
+| profile | server | req/s | cycles/req | instr/req | IPC | branch-miss % | L1d miss % | LLC miss % | dTLB miss/req | iTLB miss/req |
+|---|---|---|---|---|---|---|---|---|---|---|
+| baseline-h3 | v-base | 5,566,243 | 6,588 | 8,940 | 1.36 | 1.31 | 2.87 | - | 0.55 | 0.42 |
+| static-h3 | v-base | 857,910 | 116,674 | 75,193 | 0.64 | 2.22 | 7.12 | - | 4.53 | 4.17 |
+| static-h3 | v-pacing-off | 880,709 | 84,391 | 73,673 | 0.87 | 2.00 | 6.61 | - | 3.61 | 2.39 |
+| baseline-h3 | v-zc | 5,542,599 | 6,916 | 9,003 | 1.30 | 1.44 | 2.96 | - | 0.58 | 0.42 |
+| static-h3 | v-zc | 848,974 | 109,066 | 86,022 | 0.79 | 2.74 | 6.24 | - | 5.59 | 4.38 |
+
++ aws ec2 cancel-spot-instance-requests --region sa-east-1 --spot-instance-request-ids sir-y6ffmt6k
++ aws ec2 terminate-instances --region sa-east-1 --instance-ids i-01a779ccf3f635d56
++ aws ec2 wait instance-terminated --region sa-east-1 --instance-ids i-01a779ccf3f635d56
+terminated i-01a779ccf3f635d56
++ aws ec2 delete-security-group --region sa-east-1 --group-id sg-0fc50a98a04965844
+{
+    "Return": true,
+    "GroupId": "sg-0fc50a98a04965844"
+}
++ aws ec2 delete-key-pair --region sa-east-1 --key-name rimuh3-1794252041
+cleaned up rimuh3-1794252041 (sg sg-0fc50a98a04965844, key rimuh3-1794252041) after 39 min; results in /mnt/nvme1tb/claude-tmp/aws-h3/results/run-20261109-192041

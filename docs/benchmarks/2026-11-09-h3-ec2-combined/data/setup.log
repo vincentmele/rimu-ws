@@ -1,0 +1,12 @@
+== setup V 19:21:26
+apt done 19:21:36
+pmu=yes
+took kit-common.tgz 19:21:39
+took kit-rimu-v.tar.zst 19:21:40
+Loaded image: httparena-h2load-h3:latest
+took kit-img-h2load-h3.tar.zst 19:21:41
+Loaded image: httparena-zix:latest
+took kit-img-zix.tar.zst 19:21:41
+Loaded image: httparena-fib:latest
+took kit-img-fib.tar.zst 19:21:41
+== setup done 19:21:42
