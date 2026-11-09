@@ -29,7 +29,7 @@
 
 use crate::{
   executor::uring_executor::{
-    BUF_GROUP_UDP, BufRing, CURRENT, ClearOnDrop, KIND_CANCEL, KIND_MSG_RING, KIND_UDP_RECV,
+    BUF_GROUP_UDP, BufRing, CURRENT, ClearOnDrop, KIND_MSG_RING, KIND_MSG_RING_SENT, KIND_UDP_RECV,
     KIND_UDP_SEND, Message, Reactor, bump, cancel_sqe, io_err, own_reactor, send_to_runtime,
     set_waker, user_data, with_reactor, write_sockaddr,
   },
@@ -43,16 +43,18 @@ use core::{
   sync::atomic::Ordering,
   task::{Context, Poll, Waker},
 };
-use io_uring::{cqueue, opcode, squeue, types};
+use io_uring::{cqueue, opcode, types};
 use std::os::fd::{FromRawFd, RawFd};
 
 // A receive buffer starts with what the kernel writes before the payload: its header
 // (`io_uring_recvmsg_out`), room for the peer's address (a `sockaddr_in6` has 28 bytes) and room
 // for the control messages: `IPV6_PKTINFO` (40 bytes) and `IP_PKTINFO` (32), which an IPv4
-// datagram on a dual-stack socket gets both of, and `UDP_GRO` (24).
+// datagram on a dual-stack socket gets both of, and `UDP_GRO` (24), with 32 bytes to spare for
+// one the socket did not ask for. Control messages that still don't fit are counted
+// (`UdpStats::control_truncated`).
 const RECV_OUT_LEN: usize = 16;
 const RECV_NAME_LEN: usize = 32;
-const RECV_CONTROL_LEN: usize = 96;
+const RECV_CONTROL_LEN: usize = 128;
 const RECV_HEADROOM: usize = RECV_OUT_LEN + RECV_NAME_LEN + RECV_CONTROL_LEN;
 // What a buffer holds of a coalesced datagram, which carries at most 65,535 bytes of IP payload
 const GRO_RECV_LEN: u32 = 65_536;
@@ -98,6 +100,11 @@ pub struct UdpParams {
   /// `SO_REUSEPORT`, so that one socket per worker binds the same address and port: the order in
   /// which they bind is the index that [`UringUdpSocket::attach_reuseport_cbpf`] steers to.
   /// Defaults to `true`.
+  ///
+  /// With it, a bind to port 0 can get the port of a live `SO_REUSEPORT` socket of the same user
+  /// and join its group (the kernel does not take such a port for used), which then shares its
+  /// datagrams. Servers bind a fixed port; a socket bound to port 0, a client's or a test's,
+  /// should turn this off.
   pub reuseport: bool,
   /// Bytes of the socket's [`TxArena`]. Defaults to [`TxArena::DEFAULT_BYTES`], 512 × 1500.
   pub tx_arena_bytes: usize,
@@ -135,6 +142,11 @@ pub struct UdpStats {
   pub datagrams_in: u64,
   /// Datagrams longer than a receive buffer, dropped (see [`UdpParams::recv_buffer_len`]).
   pub datagrams_truncated: u64,
+  /// Datagrams whose source the kernel did not report as an IPv4 or IPv6 address, dropped.
+  pub datagrams_without_address: u64,
+  /// Datagrams handed out whose control messages did not all fit their room (`MSG_CTRUNC`):
+  /// their local address or segment size may be missing.
+  pub control_truncated: u64,
   /// Times the multishot receive ended because every receive buffer was in use; the datagrams
   /// waited in the socket meanwhile (see [`UdpParams::recv_buffers`]).
   pub recv_buffers_exhausted: u64,
@@ -259,35 +271,50 @@ impl UringUdpSocket {
     let _draining = ClearOnDrop(&shared.recv_draining);
     let stale = set_waker(&mut shared.recv_waker.borrow_mut(), cx);
     drop(stale);
-    let mut count = 0;
+    let mut count: usize = 0;
     let mut recycled = false;
     loop {
       let Some((bid, len)) = shared.completed.borrow_mut().pop_front() else {
         break;
       };
-      let mut bufs = shared.bufs.borrow_mut();
-      if let Some(buffer) = bufs.buffer_mut(bid, len as usize) {
-        match parse_recvmsg(buffer) {
-          Some((start, meta)) => {
-            if let Some(payload) = buffer.get_mut(start..) {
-              f(payload, meta);
-              count += 1;
-            }
-          }
-          None => {
+      let len = len as usize;
+      let bufs = shared.bufs.borrow_mut();
+      if !bufs.holds(bid, len) {
+        // Not a buffer of the ring, which must not get it
+        core::hint::cold_path();
+        continue;
+      }
+      let mut lent = LentBuffer { bufs, bid };
+      recycled = true;
+      let Some(buffer) = lent.bufs.buffer_mut(bid, len) else {
+        continue;
+      };
+      let counters = &shared.counters;
+      match parse_recvmsg(buffer) {
+        Ok(received) => {
+          if received.control_truncated {
             core::hint::cold_path();
-            bump(&shared.counters.datagrams_truncated);
+            bump(&counters.control_truncated);
+          }
+          bump(&counters.datagrams_in);
+          count = count.wrapping_add(1);
+          if let Some(payload) = buffer.get_mut(received.start..) {
+            f(payload, received.meta);
           }
         }
+        Err(Dropped::Truncated) => {
+          core::hint::cold_path();
+          bump(&counters.datagrams_truncated);
+        }
+        Err(Dropped::NoAddress) => {
+          core::hint::cold_path();
+          bump(&counters.datagrams_without_address);
+        }
       }
-      bufs.push(bid);
-      recycled = true;
     }
     if recycled {
       shared.bufs.borrow().publish();
     }
-    let counter = &shared.counters.datagrams_in;
-    counter.set(counter.get().wrapping_add(count as u64));
     // Every buffer is back in the ring
     if shared.recv_rearm.get() && !shared.recv_armed.get() {
       reactor.arm_udp_recv(self.idx, self.generation, shared);
@@ -377,7 +404,7 @@ impl UringUdpSocket {
 
   /// The socket's inbox, for the other workers to forward datagrams to this one.
   #[inline]
-  pub fn inbox(&self) -> Arc<UdpInbox> {
+  pub fn inbox(&self) -> UdpInbox {
     self.shared.inbox.clone()
   }
 
@@ -396,7 +423,7 @@ impl UringUdpSocket {
       return Poll::Pending;
     }
     let _draining = ClearOnDrop(&shared.inbox_draining);
-    let inbox = &*shared.inbox;
+    let inbox = &*shared.inbox.inner;
     inbox.waker.register(cx.waker());
     // Before the queue is read: a push that this misses sees the flag clear and signals again
     let _signalled = inbox.signalled.swap(false, Ordering::AcqRel);
@@ -419,6 +446,8 @@ impl UringUdpSocket {
     UdpStats {
       datagrams_in: counters.datagrams_in.get(),
       datagrams_truncated: counters.datagrams_truncated.get(),
+      datagrams_without_address: counters.datagrams_without_address.get(),
+      control_truncated: counters.control_truncated.get(),
       recv_buffers_exhausted: counters.recv_buffers_exhausted.get(),
       recv_errors: counters.recv_errors.get(),
       trains_out: counters.trains_out.get(),
@@ -445,7 +474,7 @@ impl core::fmt::Debug for UringUdpSocket {
 impl Drop for UringUdpSocket {
   #[inline]
   fn drop(&mut self) {
-    self.shared.inbox.closed.store(true, Ordering::Release);
+    self.shared.inbox.inner.closed.store(true, Ordering::Release);
     match own_reactor(self.runtime) {
       Some(reactor) => reactor.drop_udp(self.idx, self.generation),
       None => send_to_runtime(self.runtime, Message::DropUdp(self.idx, self.generation)),
@@ -453,10 +482,33 @@ impl Drop for UringUdpSocket {
   }
 }
 
+/// A receive buffer that `poll_recv` hands out: it goes back to the ring when this drops, also
+/// when the callback panics, which then publishes it at once (the end of `poll_recv` won't).
+struct LentBuffer<'shared> {
+  bufs: RefMut<'shared, BufRing>,
+  bid: u16,
+}
+
+impl Drop for LentBuffer<'_> {
+  fn drop(&mut self) {
+    self.bufs.push(self.bid);
+    if std::thread::panicking() {
+      self.bufs.publish();
+    }
+  }
+}
+
 /// The inbox of a [`UringUdpSocket`]: a bounded queue of datagrams that other threads push and the
 /// socket takes with [`UringUdpSocket::poll_inbox`]. Each of its [`Self::SLOTS`] slots holds a
-/// datagram of up to [`Self::DATAGRAM_LEN`] bytes, allocated with the socket.
+/// datagram of up to [`Self::DATAGRAM_LEN`] bytes, allocated with the socket. A handle: its clones
+/// push into the same inbox.
+#[derive(Clone)]
 pub struct UdpInbox {
+  inner: Arc<InboxShared>,
+}
+
+/// What the handles of an inbox share.
+struct InboxShared {
   // The socket is gone: pushes are refused
   closed: AtomicBool,
   queue: InboxQueue,
@@ -484,17 +536,18 @@ impl UdpInbox {
   /// from anywhere else through the socket's waker.
   #[inline]
   pub fn push(&self, datagram: &[u8], meta: DatagramMeta) -> bool {
-    if self.closed.load(Ordering::Acquire) || !self.queue.push(datagram, meta) {
+    let inner = &*self.inner;
+    if inner.closed.load(Ordering::Acquire) || !inner.queue.push(datagram, meta) {
       return false;
     }
-    if !self.signalled.swap(true, Ordering::AcqRel) {
+    if !inner.signalled.swap(true, Ordering::AcqRel) {
       self.signal();
     }
     true
   }
 
   fn new(ring_fd: RawFd, ring_user_data: u64, runtime: u32) -> crate::Result<Self> {
-    Ok(Self {
+    let inner = InboxShared {
       closed: AtomicBool::new(false),
       queue: InboxQueue::new(Self::SLOTS)?,
       ring_fd,
@@ -502,24 +555,28 @@ impl UdpInbox {
       runtime,
       signalled: AtomicBool::new(false),
       waker: AtomicWaker::new(),
-    })
+    };
+    Ok(Self { inner: Arc::new(inner) })
   }
 
   fn signal(&self) {
+    let inner = &*self.inner;
     let reactor = CURRENT.with(Cell::get);
     // SAFETY: set by `block_on`, which outlives everything it polls
     match unsafe { reactor.as_ref() } {
-      Some(reactor) if reactor.id != self.runtime => {
-        // A socket gone with its ring fails the message, and its completion is ignored
-        let sqe = opcode::MsgRingData::new(types::Fd(self.ring_fd), 0, self.ring_user_data, None)
-          .build()
-          .flags(squeue::Flags::SKIP_SUCCESS)
-          .user_data(user_data(KIND_CANCEL, 0, 0));
-        reactor.push_sqe(&sqe);
+      Some(reactor) if reactor.id != inner.runtime => {
+        // The ring that sends the message keeps the inbox until the message's own completion,
+        // which, if the message failed, clears `signalled` and wakes the owner its other way
+        // (`Reactor::on_msg_ring_sent`). Once the owner's runtime is gone its descriptor may be
+        // another ring's: that ring finds no socket of that slot and generation, or a spurious
+        // wake at worst, and the inbox is marked closed with the runtime anyway.
+        let held = reactor.udp.hold_signal(self.inner.clone());
+        let msg = opcode::MsgRingData::new(types::Fd(inner.ring_fd), 0, inner.ring_user_data, None);
+        reactor.push_sqe(&msg.build().user_data(user_data(KIND_MSG_RING_SENT, 0, held)));
       }
       // On the socket's own runtime the wake schedules its task at once; anywhere else it goes
       // through the runtime's eventfd.
-      _ => self.waker.wake(),
+      _ => inner.waker.wake(),
     }
   }
 }
@@ -527,7 +584,8 @@ impl UdpInbox {
 impl core::fmt::Debug for UdpInbox {
   #[inline]
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    f.debug_struct("UdpInbox").field("closed", &self.closed.load(Ordering::Relaxed)).finish()
+    let closed = self.inner.closed.load(Ordering::Relaxed);
+    f.debug_struct("UdpInbox").field("closed", &closed).finish()
   }
 }
 
@@ -646,16 +704,31 @@ impl InboxQueue {
     if slot.seq.load(Ordering::Acquire) != pos.wrapping_add(1) {
       return false;
     }
+    let _free = FreeSlot { queue: self, slot, pos };
     // SAFETY: the producer released the slot by storing `pos + 1`, and no producer writes it
-    // before it holds `pos + capacity`; the caller guarantees the only consumer
+    // before `_free` stores `pos + capacity`, after the last use of `elem`; the caller guarantees
+    // the only consumer
     let elem = unsafe { &mut *slot.datagram.get() };
     let len = usize::from(elem.len);
     if let Some(bytes) = elem.bytes.get_mut(..len) {
       f(bytes, elem.meta);
     }
-    self.head.store(pos.wrapping_add(1), Ordering::Relaxed);
-    slot.seq.store(pos.wrapping_add(self.slots.len()), Ordering::Release);
     true
+  }
+}
+
+/// The slot of position `pos` that `InboxQueue::pop` handed out: freed for the producers, and the
+/// head moved past it, when this drops, also when the callback panics.
+struct FreeSlot<'queue> {
+  queue: &'queue InboxQueue,
+  slot: &'queue InboxSlot,
+  pos: usize,
+}
+
+impl Drop for FreeSlot<'_> {
+  fn drop(&mut self) {
+    self.queue.head.store(self.pos.wrapping_add(1), Ordering::Relaxed);
+    self.slot.seq.store(self.pos.wrapping_add(self.queue.slots.len()), Ordering::Release);
   }
 }
 
@@ -694,14 +767,16 @@ struct UdpShared {
   // ---- closing
   closing: Cell<bool>,
   cancel_sent: Cell<bool>,
-  inbox: Arc<UdpInbox>,
+  inbox: UdpInbox,
   counters: UdpCounters,
 }
 
 #[derive(Default)]
 struct UdpCounters {
+  control_truncated: Cell<u64>,
   datagrams_in: Cell<u64>,
   datagrams_truncated: Cell<u64>,
+  datagrams_without_address: Cell<u64>,
   inbox_in: Cell<u64>,
   inbox_wakes: Cell<u64>,
   recv_buffers_exhausted: Cell<u64>,
@@ -783,6 +858,10 @@ impl SendSlot {
 pub(super) struct UdpTable {
   entries: RefCell<Vec<UdpEntry>>,
   free: RefCell<Vec<u32>>,
+  // The inboxes of other runtimes that this one sent a message to, until its completion: as many
+  // as there are messages in flight at once, then reused
+  signals: RefCell<Vec<Option<Arc<InboxShared>>>>,
+  free_signals: RefCell<Vec<u32>>,
 }
 
 struct UdpEntry {
@@ -797,7 +876,7 @@ impl UdpTable {
   pub(super) fn close_all(&mut self) {
     for shared in self.entries.get_mut().iter().filter_map(|el| el.socket.as_ref()) {
       // Its ring descriptor goes with the runtime
-      shared.inbox.closed.store(true, Ordering::Release);
+      shared.inbox.inner.closed.store(true, Ordering::Release);
       // SAFETY: closed once, here; the ring that could still use it is dropped right after
       let _rslt = unsafe { libc::close(shared.fd) };
     }
@@ -830,6 +909,26 @@ impl UdpTable {
     if let Some(entry) = self.entries.borrow_mut().get_mut(idx as usize) {
       entry.socket = Some(shared);
     }
+  }
+
+  /// Keeps `inbox` until the completion of the message sent to its ring, whose index this is.
+  fn hold_signal(&self, inbox: Arc<InboxShared>) -> u32 {
+    let mut signals = self.signals.borrow_mut();
+    if let Some(idx) = self.free_signals.borrow_mut().pop()
+      && let Some(slot) = signals.get_mut(idx as usize)
+    {
+      *slot = Some(inbox);
+      return idx;
+    }
+    signals.push(Some(inbox));
+    u32::try_from(signals.len().wrapping_sub(1)).unwrap_or(u32::MAX)
+  }
+
+  /// The inbox that `hold_signal` kept with index `idx`.
+  fn take_signal(&self, idx: u32) -> Option<Arc<InboxShared>> {
+    let inbox = self.signals.borrow_mut().get_mut(idx as usize)?.take()?;
+    self.free_signals.borrow_mut().push(idx);
+    Some(inbox)
   }
 
   /// Frees a slot, which the next socket takes with a new generation.
@@ -891,7 +990,7 @@ impl Reactor {
     let sends = SendSlots::new(tx.max_trains())?;
     let ring_fd = std::os::fd::AsRawFd::as_raw_fd(&*self.ring.borrow());
     let inbox_user_data = user_data(KIND_MSG_RING, generation, idx);
-    let inbox = Arc::new(UdpInbox::new(ring_fd, inbox_user_data, self.id)?);
+    let inbox = UdpInbox::new(ring_fd, inbox_user_data, self.id)?;
     // SAFETY: all zeroes is a valid `msghdr`: null pointers and zero lengths
     let mut recv_msg: libc::msghdr = unsafe { core::mem::zeroed() };
     recv_msg.msg_namelen = RECV_NAME_LEN as libc::socklen_t;
@@ -995,22 +1094,26 @@ impl Reactor {
     let Some(shared) = self.udp.get(idx, generation) else {
       return;
     };
-    let train = {
+    let id = {
       let mut sends = shared.sends.borrow_mut();
       let train = sends.slots.get_mut(usize::from(slot_idx)).and_then(|el| el.train.take());
+      let Some(id) = train else {
+        // A slot that holds no train is already free: a second entry on the free list would
+        // give it to two sends at once
+        core::hint::cold_path();
+        return;
+      };
       sends.free.push(slot_idx);
-      train
+      id
     };
     shared.sends_inflight.set(shared.sends_inflight.get().saturating_sub(1));
     if res < 0 {
       core::hint::cold_path();
       bump(&shared.counters.send_errors);
     }
-    if let Some(id) = train {
-      match shared.tx.try_borrow_mut() {
-        Ok(mut tx) => tx.release(id),
-        Err(_err) => shared.sends.borrow_mut().late.push(id),
-      }
+    match shared.tx.try_borrow_mut() {
+      Ok(mut tx) => tx.release(id),
+      Err(_err) => shared.sends.borrow_mut().late.push(id),
     }
     if shared.closing.get() {
       self.maybe_close_udp(idx, generation, &shared);
@@ -1023,7 +1126,22 @@ impl Reactor {
       return;
     };
     bump(&shared.counters.inbox_wakes);
-    shared.inbox.waker.wake();
+    shared.inbox.inner.waker.wake();
+  }
+
+  /// A message this ring sent to the ring of another runtime's inbox completed. If it failed
+  /// (that ring is out of memory, overflowing, or gone), the inbox would stay signalled and no
+  /// later push would send another: its signal is cleared, so that the next push sends one, and
+  /// its owner is woken through its waker instead.
+  pub(super) fn on_msg_ring_sent(&self, idx: u32, res: i32) {
+    let Some(inbox) = self.udp.take_signal(idx) else {
+      return;
+    };
+    if res < 0 {
+      core::hint::cold_path();
+      inbox.signalled.store(false, Ordering::Release);
+      inbox.waker.wake();
+    }
   }
 
   /// The handle of a socket was dropped: its receive is cancelled, and it closes once nothing of
@@ -1033,7 +1151,7 @@ impl Reactor {
       return;
     };
     shared.closing.set(true);
-    shared.inbox.closed.store(true, Ordering::Release);
+    shared.inbox.inner.closed.store(true, Ordering::Release);
     let stale = shared.recv_waker.borrow_mut().take();
     if shared.recv_armed.get() && !shared.cancel_sent.replace(true) {
       self.push_sqe(&cancel_sqe(user_data(KIND_UDP_RECV, generation, idx)));
@@ -1162,10 +1280,15 @@ fn socket_local_addr(fd: RawFd) -> crate::Result<SocketAddr> {
 }
 
 impl BufRing {
+  /// Whether buffer `bid` is one of the ring's and holds `len` bytes.
+  fn holds(&self, bid: u16, len: usize) -> bool {
+    bid < self.count && len <= self.len
+  }
+
   /// The first `len` bytes of buffer `bid`, which the kernel filled, to be read and changed in
   /// place.
   fn buffer_mut(&mut self, bid: u16, len: usize) -> Option<&mut [u8]> {
-    if bid >= self.count || len > self.len {
+    if !self.holds(bid, len) {
       return None;
     }
     let begin = usize::from(bid).wrapping_mul(self.len);
@@ -1173,29 +1296,55 @@ impl BufRing {
   }
 }
 
-/// The offset of the payload in a buffer that a multishot recvmsg filled, and where the datagram
-/// came from. `None` if the payload was truncated or the name is no address.
-fn parse_recvmsg(buffer: &[u8]) -> Option<(usize, DatagramMeta)> {
-  let header = buffer.get(..RECV_OUT_LEN)?;
+/// A datagram that a multishot recvmsg left in a buffer.
+#[derive(Debug, PartialEq)]
+struct Received {
+  // Where the payload starts in the buffer
+  start: usize,
+  meta: DatagramMeta,
+  // Some control messages did not fit their room (`MSG_CTRUNC`): `meta` may lack what they said
+  control_truncated: bool,
+}
+
+/// Why a buffer that a multishot recvmsg filled holds no datagram to hand out.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Dropped {
+  // The payload did not fit the buffer (`MSG_TRUNC`)
+  Truncated,
+  // The name is no IPv4 or IPv6 address
+  NoAddress,
+}
+
+/// The payload of a buffer that a multishot recvmsg filled, and where the datagram came from.
+fn parse_recvmsg(buffer: &[u8]) -> Result<Received, Dropped> {
+  let header = buffer.get(..RECV_OUT_LEN).ok_or(Dropped::Truncated)?;
   let field = |idx: usize| {
     let bytes = header.get(idx.wrapping_mul(4)..idx.wrapping_mul(4).wrapping_add(4))?;
     Some(u32::from_ne_bytes(bytes.try_into().ok()?) as usize)
   };
-  let (namelen, controllen, flags) = (field(0)?, field(1)?, field(3)?);
+  let (Some(namelen), Some(controllen), Some(flags)) = (field(0), field(1), field(3)) else {
+    return Err(Dropped::Truncated);
+  };
   if flags & (libc::MSG_TRUNC as usize) != 0 {
     core::hint::cold_path();
-    return None;
+    return Err(Dropped::Truncated);
   }
-  let name = buffer.get(RECV_OUT_LEN..RECV_OUT_LEN.wrapping_add(namelen.min(RECV_NAME_LEN)))?;
+  let name_end = RECV_OUT_LEN.wrapping_add(namelen.min(RECV_NAME_LEN));
   let control_start = RECV_OUT_LEN.wrapping_add(RECV_NAME_LEN);
   let control_end = control_start.wrapping_add(controllen.min(RECV_CONTROL_LEN));
-  let control = buffer.get(control_start..control_end)?;
+  let (Some(name), Some(control)) =
+    (buffer.get(RECV_OUT_LEN..name_end), buffer.get(control_start..control_end))
+  else {
+    return Err(Dropped::Truncated);
+  };
   if buffer.len() < RECV_HEADROOM {
-    return None;
+    return Err(Dropped::Truncated);
   }
-  let peer = parse_sockaddr(name)?;
+  let peer = parse_sockaddr(name).ok_or(Dropped::NoAddress)?;
   let (local, segment_size) = parse_cmsgs(control);
-  Some((RECV_HEADROOM, DatagramMeta { peer, local, segment_size }))
+  let meta = DatagramMeta { peer, local, segment_size };
+  let control_truncated = flags & (libc::MSG_CTRUNC as usize) != 0;
+  Ok(Received { start: RECV_HEADROOM, meta, control_truncated })
 }
 
 /// A `sockaddr_in` or `sockaddr_in6`, a v4-mapped address as a plain IPv4 one.
@@ -1418,6 +1567,13 @@ mod tests {
 
   type Received = Vec<(Vec<u8>, DatagramMeta)>;
 
+  // The settings of a test socket: without SO_REUSEPORT, as a port-0 bind with it can return the
+  // port of a live socket of another test, which then shares its datagrams (see
+  // `UdpParams::reuseport`). Only `cbpf_steers_by_dcid_byte` makes a group, on purpose.
+  fn params() -> UdpParams {
+    UdpParams { reuseport: false, ..UdpParams::new() }
+  }
+
   // One datagram written into the arena; it joins the newest train if it can.
   fn queue(sock: &UringUdpSocket, peer: SocketAddr, local: Option<IpAddr>, bytes: &[u8]) {
     let mut tx = sock.tx();
@@ -1496,8 +1652,8 @@ mod tests {
   #[test]
   fn udp_round_trip_on_loopback() {
     UringRuntime::new().unwrap().block_on(async {
-      let server = UringUdpSocket::bind(V4, &UdpParams::new()).unwrap();
-      let client = UringUdpSocket::bind(V4, &UdpParams::new()).unwrap();
+      let server = UringUdpSocket::bind(V4, &params()).unwrap();
+      let client = UringUdpSocket::bind(V4, &params()).unwrap();
       let (server_addr, client_addr) = (server.local_addr(), client.local_addr());
       assert_ne!(server_addr.port(), 0);
       let fd = server.shared.fd;
@@ -1558,7 +1714,7 @@ mod tests {
       client_burst_sent.store(true, Ordering::SeqCst);
     });
     UringRuntime::new().unwrap().block_on(async {
-      let sock = UringUdpSocket::bind(V4, &UdpParams::new()).unwrap();
+      let sock = UringUdpSocket::bind(V4, &params()).unwrap();
       addr_tx.send(sock.local_addr()).unwrap();
       let mut next = 0u64;
       let mut largest = 0;
@@ -1608,7 +1764,7 @@ mod tests {
     let receiver = std_socket("127.0.0.1:0");
     let peer = receiver.local_addr().unwrap();
     UringRuntime::new().unwrap().block_on(async {
-      let sock = UringUdpSocket::bind(V4, &UdpParams::new()).unwrap();
+      let sock = UringUdpSocket::bind(V4, &params()).unwrap();
       for idx in 0..4u8 {
         queue(&sock, peer, None, &[idx; 1472]);
       }
@@ -1631,9 +1787,8 @@ mod tests {
   #[test]
   fn gro_coalesces_when_enabled() {
     UringRuntime::new().unwrap().block_on(async {
-      let receiver =
-        UringUdpSocket::bind(V4, &UdpParams { gro: true, ..UdpParams::new() }).unwrap();
-      let sender = UringUdpSocket::bind(V4, &UdpParams::new()).unwrap();
+      let receiver = UringUdpSocket::bind(V4, &UdpParams { gro: true, ..params() }).unwrap();
+      let sender = UringUdpSocket::bind(V4, &params()).unwrap();
       let fd = receiver.shared.fd;
       assert_eq!(sockopt(fd, libc::SOL_UDP, libc::UDP_GRO), 1);
       for idx in 0..4u8 {
@@ -1685,7 +1840,7 @@ mod tests {
     ];
     UringRuntime::new().unwrap().block_on(async {
       let any = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
-      let server = UringUdpSocket::bind_with(any, &UdpParams::new(), &bind_to_loopback).unwrap();
+      let server = UringUdpSocket::bind_with(any, &params(), &bind_to_loopback).unwrap();
       let port = server.local_addr().port();
       let fd = server.shared.fd;
       assert_eq!(sockopt(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY), 0);
@@ -1750,7 +1905,7 @@ mod tests {
     let (inbox_tx, inbox_rx) = std::sync::mpsc::channel();
     let owner = std::thread::spawn(move || {
       UringRuntime::new().unwrap().block_on(async {
-        let sock = UringUdpSocket::bind(V4, &UdpParams::new()).unwrap();
+        let sock = UringUdpSocket::bind(V4, &params()).unwrap();
         inbox_tx.send(sock.inbox()).unwrap();
         let mut received: Received = Vec::new();
         let begin = std::time::Instant::now();
@@ -1767,7 +1922,7 @@ mod tests {
         (received, begin.elapsed(), sock.stats())
       })
     });
-    let inbox: crate::sync::Arc<UdpInbox> = inbox_rx.recv().unwrap();
+    let inbox: UdpInbox = inbox_rx.recv().unwrap();
     UringRuntime::new().unwrap().block_on(async {
       for batch in 0..10u8 {
         for idx in 0..10u8 {
@@ -1795,7 +1950,7 @@ mod tests {
   #[test]
   fn inbox_push_from_a_thread_without_a_runtime_wakes_the_owner() {
     UringRuntime::new().unwrap().block_on(async {
-      let sock = UringUdpSocket::bind(V4, &UdpParams::new()).unwrap();
+      let sock = UringUdpSocket::bind(V4, &params()).unwrap();
       let inbox = sock.inbox();
       let pusher = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(50));
@@ -1823,7 +1978,7 @@ mod tests {
   #[test]
   fn inbox_is_bounded_and_closes_with_its_socket() {
     UringRuntime::new().unwrap().block_on(async {
-      let sock = UringUdpSocket::bind(V4, &UdpParams::new()).unwrap();
+      let sock = UringUdpSocket::bind(V4, &params()).unwrap();
       let inbox = sock.inbox();
       let from = meta(sock.local_addr(), IpAddr::V4(Ipv4Addr::LOCALHOST));
       assert!(!inbox.push(&[0; UdpInbox::DATAGRAM_LEN + 1], from));
@@ -1854,7 +2009,7 @@ mod tests {
     let receiver = std_socket("127.0.0.1:0");
     let peer = receiver.local_addr().unwrap();
     UringRuntime::new().unwrap().block_on(async {
-      let sock = UringUdpSocket::bind(V4, &UdpParams::new()).unwrap();
+      let sock = UringUdpSocket::bind(V4, &params()).unwrap();
       send(&sock, peer, Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))), b"lost");
       settle(&sock).await;
       assert_eq!(sock.stats().send_errors, 1);
@@ -1870,18 +2025,138 @@ mod tests {
     assert_eq!(&buffer[..len], b"sent");
   }
 
-  // After a warm-up round, 10,000 datagrams received and echoed allocate nothing on the thread of
-  // the runtime.
+  // A waker that counts its wakes in `WOKEN`.
+  static WOKEN: crate::sync::AtomicUsize = crate::sync::AtomicUsize::new(0);
+
+  fn counting_waker() -> core::task::Waker {
+    use core::task::{RawWaker, RawWakerVTable};
+    fn clone(data: *const ()) -> RawWaker {
+      RawWaker::new(data, &VTABLE)
+    }
+    fn wake(_: *const ()) {
+      let _ = WOKEN.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
+    fn drop(_: *const ()) {}
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake, drop);
+    // SAFETY: the vtable never reads the data pointer
+    unsafe { core::task::Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
+  }
+
+  // A message to a ring that fails (here the "ring" of the inbox is a plain socket, as for a ring
+  // that is gone or out of memory) comes back on the ring that sent it: the inbox's signal is
+  // cleared, so that the next push signals again, and the owner is woken through its waker.
+  #[test]
+  fn a_failed_msg_ring_clears_the_signal_and_wakes_the_owner() {
+    use core::sync::atomic::Ordering;
+    let not_a_ring = std_socket("127.0.0.1:0");
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&not_a_ring);
+    let inbox = UdpInbox::new(fd, 0, u32::MAX).unwrap();
+    let from = meta(not_a_ring.local_addr().unwrap(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    UringRuntime::new().unwrap().block_on(async {
+      for round in 1..=2 {
+        inbox.inner.waker.register(&counting_waker());
+        assert!(inbox.push(&[round; 8], from));
+        assert!(inbox.inner.signalled.load(Ordering::SeqCst));
+        let begin = std::time::Instant::now();
+        while inbox.inner.signalled.load(Ordering::SeqCst) {
+          assert!(begin.elapsed() < TIMEOUT, "the failed message left the inbox signalled");
+          Sleep::new(Duration::from_millis(1)).unwrap().await.unwrap();
+        }
+        assert_eq!(WOKEN.load(Ordering::SeqCst), usize::from(round));
+      }
+    });
+  }
+
+  // A callback that panics in `poll_recv` still gives its buffer back: with two buffers, two
+  // panics would otherwise leave the ring empty for good.
+  #[test]
+  fn a_panicking_recv_callback_gives_its_buffer_back() {
+    let client = std_socket("127.0.0.1:0");
+    UringRuntime::new().unwrap().block_on(async {
+      let sock = UringUdpSocket::bind(V4, &UdpParams { recv_buffers: 2, ..params() }).unwrap();
+      for _ in 0..2 {
+        let _len = client.send_to(b"boom", sock.local_addr()).unwrap();
+        let begin = std::time::Instant::now();
+        while sock.shared.completed.borrow().is_empty() {
+          assert!(begin.elapsed() < TIMEOUT, "no datagram");
+          Sleep::new(Duration::from_millis(1)).unwrap().await.unwrap();
+        }
+        poll_fn(|cx| {
+          let unwound = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
+            sock.poll_recv(cx, &mut |_, _| panic!("a callback that panics"))
+          }));
+          assert!(unwound.is_err());
+          Poll::Ready(())
+        })
+        .await;
+      }
+      for idx in 0..4u8 {
+        let _len = client.send_to(&[idx; 4], sock.local_addr()).unwrap();
+      }
+      let received = recv(&sock, 4).await;
+      let bytes: Vec<Vec<u8>> = received.into_iter().map(|el| el.0).collect();
+      assert_eq!(bytes, (0..4u8).map(|el| alloc::vec![el; 4]).collect::<Vec<_>>());
+    });
+  }
+
+  // A completion for a send slot that holds no train, as a stray or repeated one would be, frees
+  // nothing: the slot is not put on the free list a second time, where two sends would share it.
+  #[test]
+  fn a_stray_send_completion_frees_no_slot() {
+    UringRuntime::new().unwrap().block_on(async {
+      let sock = UringUdpSocket::bind(V4, &params()).unwrap();
+      let free = || sock.shared.sends.borrow().free.len();
+      let before = free();
+      crate::executor::uring_executor::with_reactor(|reactor| {
+        reactor.on_udp_send((7 << 16) | sock.idx, sock.generation, 0);
+        Ok(())
+      })
+      .unwrap();
+      assert_eq!(free(), before);
+      assert_eq!(sock.shared.sends_inflight.get(), 0);
+    });
+  }
+
+  // Resolves at the second poll, having woken itself at the first.
+  async fn yield_now() {
+    let mut yielded = false;
+    poll_fn(|cx| {
+      if yielded {
+        return Poll::Ready(());
+      }
+      yielded = true;
+      cx.waker().wake_by_ref();
+      Poll::Pending
+    })
+    .await;
+  }
+
+  // Once warm, nothing allocates on the thread of a runtime: 10,000 datagrams received and echoed;
+  // 1,024 datagrams forwarded into its inbox by another runtime, which wakes it with a message on
+  // its ring (nothing allocates on the forwarding thread either); 200 sends whose completion finds
+  // the arena borrowed, so that their trains are released at its next borrow.
+  #[expect(
+    clippy::await_holding_refcell_ref,
+    reason = "the arena stays borrowed for a turn, so that a send completes meanwhile"
+  )]
   #[test]
   fn udp_steady_state_allocates_nothing() {
-    use crate::{sync::AtomicU64, tests::_count_allocations_in};
+    use crate::{
+      sync::{Arc, AtomicBool, AtomicU64, AtomicUsize},
+      tests::_count_allocations_in,
+    };
     use core::sync::atomic::Ordering;
     static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+    static FORWARDER_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
     const WARM_UP: usize = 1_000;
     const COUNTED: usize = 10_000;
     const WINDOW: usize = 64;
     // Whole windows, the warm-up and the counted datagrams included
     const TOTAL: usize = (WARM_UP + COUNTED).div_ceil(WINDOW) * WINDOW;
+    const FORWARD_WARM_UP: usize = 4 * WINDOW;
+    const FORWARDED: usize = FORWARD_WARM_UP + 16 * WINDOW;
+    const LATE_WARM_UP: usize = 8;
+    const LATE: usize = LATE_WARM_UP + 200;
     let (addr_tx, addr_rx) = std::sync::mpsc::channel();
     let client = std::thread::spawn(move || {
       let addr: SocketAddr = addr_rx.recv().unwrap();
@@ -1899,9 +2174,42 @@ mod tests {
         }
       }
     });
+    // Pushes `FORWARDED` datagrams into the inbox, a window at a time, once told to
+    let forwarding = Arc::new(AtomicBool::new(false));
+    let taken = Arc::new(AtomicUsize::new(0));
+    let (inbox_tx, inbox_rx) = std::sync::mpsc::channel();
+    let (forwarder_forwarding, forwarder_taken) = (forwarding.clone(), taken.clone());
+    let forwarder = std::thread::spawn(move || {
+      let inbox: UdpInbox = inbox_rx.recv().unwrap();
+      UringRuntime::new().unwrap().block_on(async move {
+        let wait = async |done: &dyn Fn() -> bool| {
+          let begin = std::time::Instant::now();
+          while !done() {
+            assert!(begin.elapsed() < TIMEOUT, "the owner stalled");
+            Sleep::new(Duration::from_micros(100)).unwrap().await.unwrap();
+          }
+        };
+        wait(&|| forwarder_forwarding.load(Ordering::SeqCst)).await;
+        let from = meta(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9), V4.ip());
+        let mut before = 0;
+        for seq in 0..FORWARDED {
+          if seq == FORWARD_WARM_UP {
+            _count_allocations_in(&FORWARDER_ALLOCATIONS);
+            before = FORWARDER_ALLOCATIONS.load(Ordering::SeqCst);
+          }
+          assert!(inbox.push(&(seq as u64).to_be_bytes(), from), "{seq}");
+          if (seq + 1) % WINDOW == 0 {
+            wait(&|| forwarder_taken.load(Ordering::SeqCst) > seq).await;
+          }
+        }
+        FORWARDER_ALLOCATIONS.load(Ordering::SeqCst) - before
+      })
+    });
+    let sink = std_socket("127.0.0.1:0");
     let allocations = UringRuntime::new().unwrap().block_on(async {
-      let sock = UringUdpSocket::bind(V4, &UdpParams::new()).unwrap();
+      let sock = UringUdpSocket::bind(V4, &params()).unwrap();
       addr_tx.send(sock.local_addr()).unwrap();
+      inbox_tx.send(sock.inbox()).unwrap();
       let mut echoed = 0;
       let (mut before, mut after) = (None, None);
       let mut timeout = Sleep::new(Duration::from_secs(60)).unwrap();
@@ -1933,12 +2241,60 @@ mod tests {
         Poll::Pending
       })
       .await;
-      // The last window goes out before the runtime ends
+      // The last window goes out before the next phase
       settle(&sock).await;
-      after.unwrap() - before.unwrap()
+      let echoing = after.unwrap() - before.unwrap();
+      // The inbox
+      forwarding.store(true, Ordering::SeqCst);
+      let mut next = 0u64;
+      let (mut before, mut after) = (None, None);
+      poll_fn(|cx| {
+        let _poll = sock.poll_inbox(cx, &mut |bytes, _| {
+          assert_eq!(bytes, next.to_be_bytes());
+          next += 1;
+        });
+        let seen = next as usize;
+        taken.store(seen, Ordering::SeqCst);
+        if seen >= FORWARD_WARM_UP && before.is_none() {
+          before = Some(ALLOCATIONS.load(Ordering::SeqCst));
+        }
+        if seen >= FORWARDED {
+          after = Some(ALLOCATIONS.load(Ordering::SeqCst));
+          return Poll::Ready(());
+        }
+        assert!(Pin::new(&mut timeout).poll(cx).is_pending(), "{seen} forwarded");
+        Poll::Pending
+      })
+      .await;
+      let forwarded = after.unwrap() - before.unwrap();
+      // Sends that complete while the arena is borrowed
+      let peer = sink.local_addr().unwrap();
+      let mut late_before = 0;
+      for round in 0..LATE {
+        if round == LATE_WARM_UP {
+          late_before = ALLOCATIONS.load(Ordering::SeqCst);
+        }
+        send(&sock, peer, None, &[round as u8; 100]);
+        let held = sock.tx();
+        let begin = std::time::Instant::now();
+        while sock.shared.sends.borrow().late.is_empty() {
+          assert!(begin.elapsed() < TIMEOUT, "the send never completed");
+          yield_now().await;
+        }
+        drop(held);
+        drop(sock.tx());
+        assert!(sock.shared.sends.borrow().late.is_empty());
+      }
+      let late = ALLOCATIONS.load(Ordering::SeqCst) - late_before;
+      let stats = sock.stats();
+      assert_eq!(stats.inbox_in, FORWARDED as u64);
+      assert!(stats.inbox_wakes > 0, "{stats:?}");
+      (echoing, forwarded, late)
     });
     client.join().unwrap();
-    assert_eq!(allocations, 0, "allocations while echoing {COUNTED} datagrams");
+    let forwarding_allocations = forwarder.join().unwrap();
+    assert_eq!(allocations, (0, 0, 0), "echoing {COUNTED}, forwarded, late releases");
+    assert_eq!(forwarding_allocations, 0, "allocations on the forwarding runtime");
   }
 
   // The TCP paths of a runtime that also has a UDP socket with traffic: an echo over TCP works
@@ -1965,7 +2321,7 @@ mod tests {
       assert_eq!(echoed, payload);
     });
     UringRuntime::new().unwrap().block_on(async {
-      let sock = UringUdpSocket::bind(V4, &UdpParams::new()).unwrap();
+      let sock = UringUdpSocket::bind(V4, &params()).unwrap();
       let listener = crate::executor::UringTcpListener::bind(tcp_addr, TcpParams::default()).await;
       let listener = listener.unwrap();
       let (mut stream, _) = listener.accept(TcpParams::default()).await.unwrap();
@@ -1996,8 +2352,8 @@ mod miri {
     executor::uring_executor::{
       BufRing,
       udp::{
-        InboxQueue, RECV_CONTROL_LEN, RECV_HEADROOM, RECV_NAME_LEN, RECV_OUT_LEN, SendSlot,
-        parse_recvmsg, prepare_send, put_cmsg,
+        Dropped, InboxQueue, RECV_CONTROL_LEN, RECV_HEADROOM, RECV_NAME_LEN, RECV_OUT_LEN,
+        SendSlot, parse_recvmsg, prepare_send, put_cmsg,
       },
     },
     quic::DatagramMeta,
@@ -2149,23 +2505,43 @@ mod miri {
     ];
     for (idx, (name, cmsgs, meta)) in cases.iter().enumerate() {
       let mut buffer = recvmsg_buffer(name, cmsgs, b"payload", 0);
-      let (start, parsed) = parse_recvmsg(&buffer).unwrap();
+      let received = parse_recvmsg(&buffer).unwrap();
+      let (start, parsed) = (received.start, received.meta);
       assert_eq!(parsed, *meta, "{idx}");
       assert_eq!(start, RECV_HEADROOM);
       buffer[start..].copy_from_slice(b"PAYLOAD");
       assert_eq!(&buffer[RECV_HEADROOM..], b"PAYLOAD");
     }
     let empty = recvmsg_buffer(&sockaddr_in(v4.octets(), 1), &[], b"", 0);
-    assert_eq!(parse_recvmsg(&empty).map(|el| el.0), Some(empty.len()));
+    assert_eq!(parse_recvmsg(&empty).map(|el| el.start), Ok(empty.len()));
     let truncated = recvmsg_buffer(&sockaddr_in(v4.octets(), 1), &[], b"x", libc::MSG_TRUNC as u32);
-    assert!(parse_recvmsg(&truncated).is_none());
-    assert!(parse_recvmsg(&recvmsg_buffer(&[0; 16], &[], b"x", 0)).is_none());
-    assert!(parse_recvmsg(&[0; RECV_HEADROOM - 1]).is_none());
+    assert_eq!(parse_recvmsg(&truncated), Err(Dropped::Truncated));
+    assert_eq!(parse_recvmsg(&recvmsg_buffer(&[0; 16], &[], b"x", 0)), Err(Dropped::NoAddress));
+    assert_eq!(parse_recvmsg(&[0; RECV_HEADROOM - 1]), Err(Dropped::Truncated));
+    // Control messages that did not all fit: the datagram is handed out, and says so
+    let ctrunc = libc::MSG_CTRUNC as u32;
+    let buffer = recvmsg_buffer(&sockaddr_in(v4.octets(), 1), &[], b"x", ctrunc);
+    let received = parse_recvmsg(&buffer).unwrap();
+    assert_eq!((received.control_truncated, received.meta.peer.port()), (true, 1));
+    assert!(!parse_recvmsg(&empty).unwrap().control_truncated);
+    // Room for one more control message of 32 bytes than the three the socket asks for (a
+    // timestamp, say), wherever the kernel puts it
+    let timestamp = [0u8; 16];
+    let cmsgs: [(i32, i32, &[u8]); 4] = [
+      (libc::SOL_SOCKET, libc::SO_TIMESTAMPNS, &timestamp),
+      (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO, &in6_pktinfo(Ipv6Addr::LOCALHOST.octets())),
+      (libc::SOL_IP, libc::IP_PKTINFO, &in_pktinfo([127, 0, 0, 1])),
+      (libc::SOL_UDP, libc::UDP_GRO, &gro),
+    ];
+    let buffer = recvmsg_buffer(&sockaddr_in6(mapped, 1, 0), &cmsgs, b"x", 0);
+    let received = parse_recvmsg(&buffer).unwrap();
+    assert_eq!(received.meta.segment_size, Some(1200));
+    assert_eq!(received.meta.local, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
     // A control message whose length runs past the control area ends the walk
     let mut buffer = recvmsg_buffer(&sockaddr_in(v4.octets(), 1), &[], b"x", 0);
     buffer[4..8].copy_from_slice(&(RECV_CONTROL_LEN as u32).to_ne_bytes());
     buffer[RECV_OUT_LEN + RECV_NAME_LEN..][..8].copy_from_slice(&1000usize.to_ne_bytes());
-    assert_eq!(parse_recvmsg(&buffer).unwrap().1.local, None);
+    assert_eq!(parse_recvmsg(&buffer).unwrap().meta.local, None);
   }
 
   // The control messages of a send, read back the way the kernel walks them.
@@ -2244,6 +2620,29 @@ mod miri {
       prepare_send(&mut slot, &bytes, 1000, v6_peer, None, false),
       Err(libc::EAFNOSUPPORT)
     );
+  }
+
+  // A callback that panics while it has a datagram of the inbox still frees its slot: the next
+  // pop hands out the next datagram, not the same one again, and the slot takes a new one.
+  #[test]
+  fn a_panicking_inbox_callback_frees_its_slot() {
+    let queue = InboxQueue::new(2).unwrap();
+    let meta = DatagramMeta {
+      peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+      local: None,
+      segment_size: None,
+    };
+    assert!(queue.push(b"one", meta) && queue.push(b"two", meta));
+    let unwound = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
+      // SAFETY: this thread is the only consumer
+      unsafe { queue.pop(|_, _| panic!("a callback that panics")) }
+    }));
+    assert!(unwound.is_err());
+    let mut next = alloc::vec::Vec::new();
+    // SAFETY: this thread is the only consumer
+    assert!(unsafe { queue.pop(|bytes, _| next.extend_from_slice(bytes)) });
+    assert_eq!(next, b"two");
+    assert!(queue.push(b"three", meta));
   }
 
   // Datagrams pushed from two threads come out whole and in each thread's order; a full queue

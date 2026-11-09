@@ -57,13 +57,16 @@ const KIND_ACCEPT_RETRY: u64 = 6;
 const KIND_DOORBELL: u64 = 7;
 const KIND_SLEEP: u64 = 8;
 const KIND_CONNECT: u64 = 9;
-// A UDP socket's multishot receive, one of its sends, and a push into its inbox from another ring
+// A UDP socket's multishot receive, one of its sends, a push into its inbox from another ring, and
+// the completion of such a message on the ring that sent it
 #[cfg(feature = "quic")]
 const KIND_UDP_RECV: u64 = 10;
 #[cfg(feature = "quic")]
 const KIND_UDP_SEND: u64 = 11;
 #[cfg(feature = "quic")]
 const KIND_MSG_RING: u64 = 12;
+#[cfg(feature = "quic")]
+const KIND_MSG_RING_SENT: u64 = 13;
 // One-shot accepts kept armed per listener with direct descriptors close to running out
 const ACCEPT_DEPTH: u32 = 16;
 // The `generation` of a one-shot accept's `user_data`; a multishot accept's is 0.
@@ -1849,7 +1852,7 @@ impl BufRing {
 
 impl Drop for BufRing {
   fn drop(&mut self) {
-    // SAFETY: allocated in `Reactor::new` with this layout
+    // SAFETY: allocated in `BufRing::new` with this layout
     unsafe { alloc::alloc::dealloc(self.entries, self.layout) };
   }
 }
@@ -2563,6 +2566,8 @@ impl Reactor {
         KIND_UDP_SEND => self.on_udp_send(idx, generation, res),
         #[cfg(feature = "quic")]
         KIND_MSG_RING => self.on_msg_ring(idx, generation),
+        #[cfg(feature = "quic")]
+        KIND_MSG_RING_SENT => self.on_msg_ring_sent(idx, res),
         _ => {}
       }
     }
