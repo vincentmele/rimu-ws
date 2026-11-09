@@ -1389,13 +1389,14 @@ async fn counted(state: State<'_, Counted>) -> crate::Result<VerbatimParams> {
   Ok(VerbatimParams(StatusCode::Ok))
 }
 
-// Ruling T16-a (EC2 profile: the clone and drop of the data of each request, an `Arc` shared by
-// every worker, took 7 % of the cycles of baseline-h3): a worker keeps the clones of its data that
-// its requests used and gives them to its next requests, so that a request clones nothing in the
-// steady state; with `set_fresh_data(true)` each request clones the data, as HTTP/2 does.
+// Rulings T16-a and T16-e (EC2 profile: the clone and drop of the data of each request, an `Arc`
+// shared by every worker, took 7 % of the cycles of baseline-h3): with `set_reuse_data(true)` a
+// worker keeps the clones of its data that its requests used and gives them to its next requests,
+// so that a request clones nothing in the steady state; without it each request clones the data,
+// as HTTP/2 does.
 #[cfg_attr(miri, ignore)]
 #[test]
-fn requests_reuse_the_clones_of_the_data_unless_fresh() {
+fn requests_reuse_the_clones_of_the_data_only_when_asked() {
   static REUSED: AtomicU64 = AtomicU64::new(0);
   static FRESH: AtomicU64 = AtomicU64::new(0);
   for (fresh, clones) in [(false, &REUSED), (true, &FRESH)] {
@@ -1408,7 +1409,7 @@ fn requests_reuse_the_clones_of_the_data_unless_fresh() {
     )
     .unwrap()
     .set_data(Counted(clones))
-    .set_fresh_data(fresh)
+    .set_reuse_data(!fresh)
     .set_local_runtimes(NonZeroUsize::new(1))
     .set_pin_workers(false)
     .set_shutdown(signal.clone(), Duration::from_millis(100))
@@ -1467,4 +1468,63 @@ fn worker_stats_round_trip_through_their_cell() {
   let cell = crate::http::http3_server_framework::StatsCell::default();
   cell.store(&stats);
   assert_eq!(cell.load(), stats);
+}
+
+// Data that counts the requests that saw it: its clone is an independent copy.
+#[derive(Clone, Debug, Default)]
+struct Visits(u64);
+
+async fn visits(state: State<'_, Visits>) -> crate::Result<VerbatimParams> {
+  state.data.0 += 1;
+  let seen = state.data.0;
+  state.req.msg_data.clear();
+  std::io::Write::write_fmt(&mut state.req.msg_data.body, format_args!("{seen}"))?;
+  Ok(VerbatimParams(StatusCode::Ok))
+}
+
+// The bodies of four requests in a row to a worker whose handler counts, in its data, the requests
+// that saw it; `reuse`: what is asked of `set_reuse_data`, `None` for the default.
+fn visits_seen(reuse: Option<bool>) -> Vec<Vec<u8>> {
+  let signal = ShutdownSignal::new();
+  let (bound_tx, bound_rx) = mpsc::channel();
+  let mut fw = Http3ServerFramework::<(), fn(crate::Error), UringExecutor, _, _, _>::new(
+    UringExecutor::default(),
+    ChaCha20::from_std_random().unwrap(),
+    server_tls_config(),
+  )
+  .unwrap()
+  .set_data(Visits::default())
+  .set_local_runtimes(NonZeroUsize::new(1))
+  .set_pin_workers(false)
+  .set_shutdown(signal.clone(), Duration::from_millis(100))
+  .set_udp_params(UdpParams { reuseport: false, ..UdpParams::new() });
+  if let Some(elem) = reuse {
+    fw = fw.set_reuse_data(elem);
+  }
+  fw.test = TestHooks { bound: Some(bound_tx), ..TestHooks::default() };
+  let run = std::thread::spawn(move || {
+    let router = HttpRouter::paths(crate::paths!(("/visits", get(visits))))?;
+    fw.run_in_threads("127.0.0.1:0", router)
+  });
+  let addr = bound_rx.recv_timeout(TIMEOUT).expect("the server did not bind");
+  let mut client = Client::connect(addr);
+  let bodies = (0..4).map(|_| client.get("/visits", &[]).body).collect();
+  drop(client);
+  signal.trigger();
+  run.join().unwrap().unwrap();
+  bodies
+}
+
+// Ruling T16-e (spec section 5.10: the routes of HTTP/2 run on HTTP/3 unchanged): by default each
+// request gets a fresh clone of the data, as on HTTP/2, so what a handler changes in its data is
+// never seen by a later request; with `set_reuse_data(true)` the worker hands a clone that a
+// request used to the next one, and the change is seen (the documented hazard of the opt-in).
+#[cfg_attr(miri, ignore)]
+#[test]
+fn data_changes_stay_with_their_request_unless_reused() {
+  let fresh: Vec<Vec<u8>> = (0..4).map(|_| b"1".to_vec()).collect();
+  assert_eq!(visits_seen(None), fresh);
+  assert_eq!(visits_seen(Some(false)), fresh);
+  let reused: Vec<Vec<u8>> = (1..=4).map(|el: u8| vec![b'0' + el]).collect();
+  assert_eq!(visits_seen(Some(true)), reused);
 }

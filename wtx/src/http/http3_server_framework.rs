@@ -53,7 +53,8 @@ pub struct Http3WorkerStats {
   pub datagrams_in: u64,
   /// Datagrams sent.
   pub datagrams_out: u64,
-  /// Datagrams handed to another worker.
+  /// Datagrams handed to another worker: a datagram that the kernel coalesced (GRO) counts once
+  /// here, and arrives at that worker as its segments, one inbox entry each.
   pub forwarded: u64,
   /// Datagrams for another worker that its inbox could not take, dropped.
   pub forward_dropped: u64,
@@ -262,7 +263,7 @@ pub struct Http3ServerFramework<DA, EC, EX, RC, RNG, TCX> {
   date: bool,
   error_cb: EC,
   executor: EX,
-  fresh_data: bool,
+  reuse_data: bool,
   h3_params: H3Params,
   local_runtime_cb: RC,
   local_runtimes: Option<NonZeroUsize>,
@@ -302,7 +303,7 @@ where
       date: false,
       error_cb,
       executor,
-      fresh_data: false,
+      reuse_data: false,
       h3_params: H3Params::default(),
       local_runtime_cb,
       local_runtimes: None,
@@ -327,8 +328,8 @@ impl<DA, EC, EX, RC, RNG, TCX> Http3ServerFramework<DA, EC, EX, RC, RNG, TCX> {
     &mut self.rng
   }
 
-  /// Shared data that each request gets a clone of: by default one that an earlier request of the
-  /// same worker used, see [`Self::set_fresh_data`].
+  /// Shared data that each request gets a clone of: a fresh one by default, as on HTTP/2, or one
+  /// that an earlier request of the same worker used with [`Self::set_reuse_data`].
   #[inline]
   pub fn set_data<_DA>(self, value: _DA) -> Http3ServerFramework<_DA, EC, EX, RC, RNG, TCX> {
     Http3ServerFramework {
@@ -337,7 +338,7 @@ impl<DA, EC, EX, RC, RNG, TCX> Http3ServerFramework<DA, EC, EX, RC, RNG, TCX> {
       date: self.date,
       error_cb: self.error_cb,
       executor: self.executor,
-      fresh_data: self.fresh_data,
+      reuse_data: self.reuse_data,
       h3_params: self.h3_params,
       local_runtime_cb: self.local_runtime_cb,
       local_runtimes: self.local_runtimes,
@@ -384,7 +385,7 @@ impl<DA, EC, EX, RC, RNG, TCX> Http3ServerFramework<DA, EC, EX, RC, RNG, TCX> {
       date: self.date,
       error_cb: value,
       executor: self.executor,
-      fresh_data: self.fresh_data,
+      reuse_data: self.reuse_data,
       h3_params: self.h3_params,
       local_runtime_cb: self.local_runtime_cb,
       local_runtimes: self.local_runtimes,
@@ -400,17 +401,21 @@ impl<DA, EC, EX, RC, RNG, TCX> Http3ServerFramework<DA, EC, EX, RC, RNG, TCX> {
     }
   }
 
-  /// If each request clones the data of [`Self::set_data`], as HTTP/2 does. By default a worker
-  /// keeps the clones that its requests used and hands them to its next requests: a request then
-  /// clones nothing in the steady state (with data that holds an `Arc`, a clone and a drop per
-  /// request are two atomic operations on a counter that every worker shares). A clone that is
-  /// handed on keeps what an earlier request of the worker changed in it (`State::data` is
-  /// `&mut`): turn this on for data whose handlers change it and must each start from the
-  /// original. Defaults to `false`.
+  /// If a worker hands the clones of the data of [`Self::set_data`] that its requests used to its
+  /// next requests, instead of a fresh clone per request (the default, as HTTP/2 does). With data
+  /// that holds an `Arc` shared by every worker, a clone and a drop per request are two atomic
+  /// operations on one shared counter, which reuse saves (7 % of the cycles of HttpArena's
+  /// baseline-h3 on 48 workers).
+  ///
+  /// **Hazard:** a reused clone keeps what earlier requests of the same worker, of any client,
+  /// changed in it (`State::data` is `&mut`): when the `Clone` of the data makes an independent
+  /// copy, one client's change reaches another client's request. Turn this on only for data that
+  /// handlers do not change, or whose changes may be seen by later requests. Defaults to `false`
+  /// (ruling T16-e).
   #[inline]
   #[must_use = must_use_itself_doc!()]
-  pub const fn set_fresh_data(mut self, value: bool) -> Self {
-    self.fresh_data = value;
+  pub const fn set_reuse_data(mut self, value: bool) -> Self {
+    self.reuse_data = value;
     self
   }
 
@@ -448,7 +453,7 @@ impl<DA, EC, EX, RC, RNG, TCX> Http3ServerFramework<DA, EC, EX, RC, RNG, TCX> {
       date: self.date,
       error_cb: self.error_cb,
       executor: self.executor,
-      fresh_data: self.fresh_data,
+      reuse_data: self.reuse_data,
       h3_params: self.h3_params,
       local_runtime_cb: value,
       local_runtimes: self.local_runtimes,
@@ -610,7 +615,7 @@ mod uring {
           cpu: cpus.get(usize::from(worker) % cpus.len().max(1)).copied(),
           data: self.data.clone(),
           content_length: self.content_length,
-          fresh_data: self.fresh_data,
+          reuse_data: self.reuse_data,
           date: self.date,
           epoch,
           error_cb: self.error_cb.clone(),
@@ -678,7 +683,7 @@ mod uring {
       let params = WorkerParams {
         addr: endpoint_task::resolve(addr)?,
         content_length: self.content_length,
-        fresh_data: self.fresh_data,
+        reuse_data: self.reuse_data,
         cpu: None,
         data: self.data,
         date: self.date,

@@ -84,7 +84,7 @@ pub(crate) struct WorkerParams<DA, EC, EN, ER, M, RNG, TCX> {
   /// The clock of the process, which every worker reads its time from.
   pub(crate) epoch: Instant,
   pub(crate) error_cb: EC,
-  pub(crate) fresh_data: bool,
+  pub(crate) reuse_data: bool,
   pub(crate) h3_params: H3Params,
   pub(crate) keys: Arc<EndpointKeys>,
   pub(crate) loads: Arc<WorkerLoads>,
@@ -241,7 +241,7 @@ where
     date,
     epoch,
     error_cb,
-    fresh_data,
+    reuse_data,
     h3_params,
     keys,
     loads,
@@ -306,7 +306,7 @@ where
     keys,
   )?;
   let handler = RouterHandler::new(
-    (data, fresh_data),
+    (data, reuse_data),
     (content_length, date),
     FwRouter::new(router),
     error_cb.clone(),

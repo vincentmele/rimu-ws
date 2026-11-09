@@ -20,7 +20,7 @@
 //! | variable | values | default | maps to |
 //! |---|---|---|---|
 //! | `ARENA_H3_HEADERS` | `min`, `full` | `min` | `min`: `content-type` only, no middleware (like cnetmod and zix, not RFC 9110-compliant; decision Q2); `full`: `Http3ServerFramework::set_rfc9110_headers(true)` and the `server` middleware, as on h2 |
-//! | `ARENA_H3_DATA` | `reuse`, `fresh` | `reuse` | `Http3ServerFramework::set_fresh_data` (`fresh`: a clone of the data per request) |
+//! | `ARENA_H3_DATA` | `reuse`, `fresh` | `reuse` | `Http3ServerFramework::set_reuse_data` (`reuse`: the opt-in, the library default is `fresh`; the data, an `Arc` of the dataset, is never changed by the handlers) |
 //! | `ARENA_H3_GRO` | `0`, `1` | `0` | `UdpParams::gro` (on: receive buffers of 64 KiB) |
 //! | `ARENA_H3_RECV_BUFFERS` | 1 to 32768 | 256 | `UdpParams::recv_buffers` |
 //! | `ARENA_H3_TX_ARENA` | bytes, 65536 or more | 768000 | `UdpParams::tx_arena_bytes` |
@@ -151,7 +151,7 @@ fn spawn_h3(
   )?
   .set_data(data)
   .set_error_cb(error_cb)
-  .set_fresh_data(knobs.data == knobs::Data::Fresh)
+  .set_reuse_data(knobs.data == knobs::Data::Reuse)
   .set_local_runtime_cb(runtime)
   .set_pin_workers(knobs.pin_workers)
   .set_quic_params(knobs.quic)

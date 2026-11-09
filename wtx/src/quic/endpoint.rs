@@ -139,7 +139,8 @@ pub(crate) struct EndpointStats {
   pub(crate) frames_resent: u64,
   /// Retry packets sent.
   pub(crate) retries: u64,
-  /// Datagrams handed to another worker.
+  /// Datagrams handed to another worker: a datagram that the kernel coalesced (GRO) counts once
+  /// here, and arrives at that worker as its segments, one inbox entry each.
   pub(crate) forwarded: u64,
   /// Stateless resets sent.
   pub(crate) resets: u64,

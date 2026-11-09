@@ -2,9 +2,9 @@
 //! [`H3Handler`] that runs the router of the HTTP/2 framework, its middlewares and endpoints.
 //!
 //! A complete request is copied into a pooled request buffer, the one an [`AutoStream`] holds,
-//! with a clone of the data of the server that an earlier request of the worker used (or a new
-//! clone, with `fresh_data`): a request clones no shared counter in the steady state (ruling
-//! T16-a), and its route looked up once. The URI is put together from the pseudo-header fields
+//! with a fresh clone of the data of the server, as on HTTP/2, or, with `reuse_data` (an opt-in,
+//! ruling T16-e), one that an earlier request of the worker used, so that a request clones no
+//! shared counter in the steady state (ruling T16-a); its route is looked up once. The URI is put together from the pseudo-header fields
 //! with the offsets that parsing it would find, without parsing it. The future of the router (middlewares around the endpoint) is
 //! pinned into a pooled slot and polled once, inline, in the turn that completed the request,
 //! inside `catch_unwind`: a panic answers 500 on that stream only (spec section 5.12). A future
@@ -153,10 +153,10 @@ where
   content_length: bool,
   counters: HandlerCounters,
   data: D::Data,
-  // Clones of `data` that requests used, for the next ones, unless `fresh_data`
+  // Clones of `data` that requests used, for the next ones, with `reuse_data`
   datas: VectorUsize<D::Data>,
   date: Option<DateLine>,
-  fresh_data: bool,
+  reuse_data: bool,
   dispatch: D,
   error_cb: EC,
   head: ResponseHead,
@@ -175,7 +175,7 @@ where
   /// `content_length`, responses with content carry `content-length`, and with `date` a `date`
   /// header.
   pub(crate) fn new(
-    (data, fresh_data): (D::Data, bool),
+    (data, reuse_data): (D::Data, bool),
     (content_length, date): (bool, bool),
     dispatch: D,
     error_cb: EC,
@@ -186,7 +186,7 @@ where
       data,
       datas: VectorUsize::new(),
       date: if date { Some(DateLine::new()?) } else { None },
-      fresh_data,
+      reuse_data,
       dispatch,
       error_cb,
       head: ResponseHead::new(),
@@ -305,7 +305,7 @@ where
       }
       SlotPoll::Done((auto_stream, rslt)) => {
         let AutoStream { data, req, shared_body, .. } = auto_stream;
-        if !self.fresh_data && self.datas.len() < MAX_MSGS {
+        if self.reuse_data && self.datas.len() < MAX_MSGS {
           let _rslt = self.datas.push(data);
         }
         let head = req.method == Method::Head;
