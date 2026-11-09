@@ -37,13 +37,14 @@ use crate::quic::{
   ConnParams, QuicError, TransportErrorCode, TransportParams,
   flow::{ConnFlow, NOT_BLOCKED},
   limits::{RESET_WINDOW_US, RateBudget},
-  pools::QuicPools,
+  pools::{FrameRefQueue, FreeList, QuicPools},
 };
 use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 use core::hint::cold_path;
-use recv::{Held, RecvPart, RxState};
-pub(crate) use send::Source;
+pub(crate) use recv::OooBlock;
+use recv::{Held, RecvPart, RxPools, RxState};
 use send::{Ready, SendPart};
+pub(crate) use send::{Seg, Source};
 pub(crate) use table::StreamSlots;
 use table::{IMPLICIT, NO_SLOT, Table};
 
@@ -65,8 +66,13 @@ const OWED_DATA_BLOCKED: u8 = 1 << 0;
 const OWED_MAX_DATA: u8 = 1 << 1;
 const OWED_MAX_STREAMS_BIDI: u8 = 1 << 2;
 const OWED_MAX_STREAMS_UNI: u8 = 1 << 3;
+// The frame that carried the current limit was lost: it is sent again even if the limit did not
+// move
+const OWED_MAX_DATA_LOST: u8 = 1 << 4;
+const OWED_MAX_STREAMS_BIDI_LOST: u8 = 1 << 5;
+const OWED_MAX_STREAMS_UNI_LOST: u8 = 1 << 6;
 // Segments of the send queue of a slot reserved when the slot is made: headers, a body, trailers
-const RESERVED_SEGMENTS: usize = 4;
+pub(super) const RESERVED_SEGMENTS: usize = 4;
 // The window of our unidirectional streams (HTTP/3 opens three)
 const UNI_LOCAL_WINDOW: usize = 4;
 
@@ -106,21 +112,33 @@ impl StreamId {
   }
 }
 
-/// Ranges of offsets from the lowest, at most `N` separate ones. Ranges that touch or overlap
-/// are joined and gaps are never filled: the ranges are exact. A range that does not fit is an
-/// error, which leaves the ranges as they were.
-#[derive(Clone, Copy, Debug)]
+/// The separate ranges that a [`RangeSet`] holds at most, once it spilled into a block.
+pub(crate) const SPILL_RANGES: usize = 256;
+
+/// What a [`RangeSet`] spills into once its inline array is full: 4 KiB of ranges, from the
+/// pools of the worker (ruling T9-d).
+pub(crate) type RangeBlock = [(u64, u64); SPILL_RANGES];
+
+/// Ranges of offsets from the lowest. Ranges that touch or overlap are joined and gaps are never
+/// filled: the ranges are exact.
+///
+/// `N` separate ranges fit inline. One more moves them all into a [`RangeBlock`] of the pools,
+/// which holds [`SPILL_RANGES`], and the block goes back once at most `N / 2` are left. A range
+/// that does not fit there either is an error, which leaves the ranges as they were.
+#[derive(Debug)]
 pub(crate) struct RangeSet<const N: usize> {
   len: usize,
   // From the lowest: start included, end excluded
   ranges: [(u64, u64); N],
+  // Holds every range instead of `ranges` once more than `N` were held
+  spill: Option<Box<RangeBlock>>,
 }
 
 impl<const N: usize> RangeSet<N> {
   /// No ranges.
   #[inline]
   pub(crate) const fn new() -> Self {
-    Self { len: 0, ranges: [(0, 0); N] }
+    Self { len: 0, ranges: [(0, 0); N], spill: None }
   }
 
   /// The lowest range.
@@ -129,10 +147,16 @@ impl<const N: usize> RangeSet<N> {
     self.held().first().copied()
   }
 
-  /// Adds the offsets from `start` to `end`, excluded. A new separate range when `N` are held is
-  /// a connection error (PROTOCOL_VIOLATION).
+  /// Adds the offsets from `start` to `end`, excluded, taking a block from `blocks` if a new
+  /// separate range does not fit inline. A new separate range when [`SPILL_RANGES`] are held is a
+  /// connection error (PROTOCOL_VIOLATION) that changes nothing.
   #[inline]
-  pub(crate) fn insert(&mut self, start: u64, end: u64) -> crate::Result<()> {
+  pub(crate) fn insert(
+    &mut self,
+    start: u64,
+    end: u64,
+    blocks: &mut FreeList<Box<RangeBlock>>,
+  ) -> crate::Result<()> {
     if start >= end {
       return Ok(());
     }
@@ -141,34 +165,44 @@ impl<const N: usize> RangeSet<N> {
     let lo = held.partition_point(|el| el.1 < start);
     let hi = held.partition_point(|el| el.0 <= end);
     if lo == hi {
-      if self.len >= N {
-        cold_path();
-        return Err(crate::Error::QuicClose(
-          TransportErrorCode::ProtocolViolation,
-          QuicError::RangeSetFull,
-        ));
+      if self.len >= self.capacity() {
+        if self.spill.is_some() || N >= SPILL_RANGES {
+          cold_path();
+          return Err(crate::Error::QuicClose(
+            TransportErrorCode::ProtocolViolation,
+            QuicError::RangeSetFull,
+          ));
+        }
+        let mut block = blocks.take().unwrap_or_else(|| Box::new([(0, 0); SPILL_RANGES]));
+        if let Some((dst, src)) = block.get_mut(..self.len).zip(self.ranges.get(..self.len)) {
+          dst.copy_from_slice(src);
+        }
+        self.spill = Some(block);
       }
-      if let Some(tail) = self.ranges.get_mut(lo..=self.len) {
+      let len = self.len;
+      if let Some(tail) = self.storage_mut().get_mut(lo..=len) {
         tail.rotate_right(1);
         if let Some(elem) = tail.first_mut() {
           *elem = (start, end);
         }
       }
-      self.len = self.len.wrapping_add(1);
+      self.len = len.wrapping_add(1);
       return Ok(());
     }
     let (Some(&(first, _)), Some(&(_, last))) = (held.get(lo), held.get(hi.wrapping_sub(1))) else {
       return Ok(());
     };
-    if let Some(elem) = self.ranges.get_mut(lo) {
+    let len = self.len;
+    let storage = self.storage_mut();
+    if let Some(elem) = storage.get_mut(lo) {
       *elem = (start.min(first), end.max(last));
     }
     let joined = hi.wrapping_sub(lo).wrapping_sub(1);
     if joined > 0 {
-      if let Some(tail) = self.ranges.get_mut(lo.wrapping_add(1)..self.len) {
+      if let Some(tail) = storage.get_mut(lo.wrapping_add(1)..len) {
         tail.rotate_left(joined);
       }
-      self.len = self.len.wrapping_sub(joined);
+      self.len = len.wrapping_sub(joined);
     }
     Ok(())
   }
@@ -177,6 +211,12 @@ impl<const N: usize> RangeSet<N> {
   #[inline]
   pub(crate) const fn is_empty(&self) -> bool {
     self.len == 0
+  }
+
+  /// If the ranges are in a block of the pools.
+  #[inline]
+  pub(crate) const fn is_spilled(&self) -> bool {
+    self.spill.is_some()
   }
 
   /// The ranges, from the lowest, as (start, end excluded).
@@ -191,25 +231,76 @@ impl<const N: usize> RangeSet<N> {
     self.len
   }
 
-  /// Forgets the offsets below `at`.
+  /// If a new separate range from `start` to `end`, excluded, would take a block.
   #[inline]
-  pub(crate) fn remove_below(&mut self, at: u64) {
+  pub(crate) fn needs_block(&self, start: u64, end: u64) -> bool {
+    if start >= end || self.spill.is_some() || self.len < N || N >= SPILL_RANGES {
+      return false;
+    }
+    let held = self.held();
+    held.partition_point(|el| el.1 < start) == held.partition_point(|el| el.0 <= end)
+  }
+
+  /// Forgets every range and gives the block back to `blocks`. Returns whether there was one.
+  #[inline]
+  pub(crate) fn release(&mut self, blocks: &mut FreeList<Box<RangeBlock>>) -> bool {
+    self.len = 0;
+    match self.spill.take() {
+      Some(block) => {
+        blocks.give(block);
+        true
+      }
+      None => false,
+    }
+  }
+
+  /// Forgets the offsets below `at`. Returns whether that gave the block back to `blocks`.
+  #[inline]
+  pub(crate) fn remove_below(&mut self, at: u64, blocks: &mut FreeList<Box<RangeBlock>>) -> bool {
     let gone = self.held().partition_point(|el| el.1 <= at);
+    let len = self.len;
     if gone > 0 {
-      if let Some(held) = self.ranges.get_mut(..self.len) {
+      if let Some(held) = self.storage_mut().get_mut(..len) {
         held.rotate_left(gone);
       }
-      self.len = self.len.wrapping_sub(gone);
+      self.len = len.wrapping_sub(gone);
     }
-    if let Some(first) = self.ranges.get_mut(..self.len).and_then(|el| el.first_mut())
+    let len = self.len;
+    if let Some(first) = self.storage_mut().get_mut(..len).and_then(|el| el.first_mut())
       && first.0 < at
     {
       first.0 = at;
     }
+    if self.len > N / 2 {
+      return false;
+    }
+    let Some(block) = self.spill.take() else {
+      return false;
+    };
+    if let Some((dst, src)) = self.ranges.get_mut(..self.len).zip(block.get(..self.len)) {
+      dst.copy_from_slice(src);
+    }
+    blocks.give(block);
+    true
+  }
+
+  fn capacity(&self) -> usize {
+    if self.spill.is_some() { SPILL_RANGES } else { N }
   }
 
   fn held(&self) -> &[(u64, u64)] {
-    self.ranges.get(..self.len).unwrap_or_default()
+    match &self.spill {
+      Some(block) => block.get(..self.len),
+      None => self.ranges.get(..self.len),
+    }
+    .unwrap_or_default()
+  }
+
+  fn storage_mut(&mut self) -> &mut [(u64, u64)] {
+    match &mut self.spill {
+      Some(block) => block.as_mut_slice(),
+      None => self.ranges.as_mut_slice(),
+    }
   }
 }
 
@@ -247,6 +338,7 @@ impl Stream {
         keep: 0,
         keep_block: None,
         max: 0,
+        max_lost: false,
         max_owed: false,
         ooo: RangeSet::new(),
         ooo_blocks: Vec::new(),
@@ -297,6 +389,7 @@ impl Stream {
     rx.high = 0;
     rx.keep = 0;
     rx.max = rx_max.unwrap_or(0);
+    rx.max_lost = false;
     rx.max_owed = false;
     rx.ooo = RangeSet::new();
     rx.read = 0;
@@ -399,7 +492,12 @@ pub(crate) struct StreamsCold {
   // unidirectional ones
   peer_bidi_credit: u64,
   peer_uni_credit: u64,
+  // Ranges of stream data sent again although they were acknowledged: none, unless a stream had
+  // more separate acknowledged ranges than it can remember
+  resent_acked: u64,
   resets: RateBudget,
+  // STREAM frames sent again
+  retransmitted: u64,
   /// If DATA_BLOCKED and STREAM_DATA_BLOCKED are sent, which tests turn off.
   #[cfg(test)]
   send_blocked_frames: bool,
@@ -420,7 +518,9 @@ impl StreamsCold {
       held: Held { blocks: 0, streams: 0 },
       peer_bidi_credit: 0,
       peer_uni_credit: 0,
+      resent_acked: 0,
       resets: RateBudget::default(),
+      retransmitted: 0,
       #[cfg(test)]
       send_blocked_frames: true,
       uni_local: Table::new(0, UNI_LOCAL_WINDOW as u64),
@@ -452,6 +552,8 @@ pub(crate) struct Streams {
   flow: ConnFlow,
   is_client: bool,
   large: List,
+  // The STREAM frames of lost packets, sent again before new data
+  lost: FrameRefQueue,
   owed: u8,
   small: List,
   unsent: u64,
@@ -476,6 +578,7 @@ impl Streams {
       flow: ConnFlow::new(params.conn_credit()),
       is_client,
       large: List::EMPTY,
+      lost: FrameRefQueue::EMPTY,
       owed: 0,
       small: List::EMPTY,
       unsent: 0,
@@ -522,6 +625,12 @@ impl Streams {
     }
   }
 
+  /// STREAM frames sent again, and ranges sent again although they were acknowledged.
+  #[inline]
+  pub(crate) fn retransmissions(&self) -> (u64, u64) {
+    self.cold.as_ref().map_or((0, 0), |el| (el.retransmitted, el.resent_acked))
+  }
+
   /// Receive blocks held by the streams.
   #[inline]
   pub(crate) fn held_blocks(&self) -> u32 {
@@ -557,7 +666,18 @@ impl Streams {
   #[inline]
   pub(crate) fn release(&mut self, pools: &mut QuicPools) {
     let cold = self.cold.take();
-    let QuicPools { rx_blocks, stream_slots, streams_cold, tx_blocks, .. } = pools;
+    let QuicPools {
+      frame_refs,
+      ooo_indexes,
+      range_blocks,
+      rx_blocks,
+      seg_queues,
+      stream_slots,
+      streams_cold,
+      tx_blocks,
+      ..
+    } = pools;
+    frame_refs.queue_clear(&mut self.lost);
     let uni = cold
       .as_deref()
       .into_iter()
@@ -567,8 +687,9 @@ impl Streams {
         continue;
       }
       if let Some(stream) = stream_slots.get_mut(slot) {
-        stream.rx.release(rx_blocks, &mut Held { blocks: 0, streams: 0 });
-        stream.tx.release(tx_blocks);
+        let rx_pools = RxPools { blocks: rx_blocks, indexes: ooo_indexes, range_blocks };
+        stream.rx.release(rx_pools, &mut Held { blocks: 0, streams: 0 });
+        stream.tx.release(tx_blocks, range_blocks, seg_queues);
       }
       stream_slots.free(slot);
     }
@@ -624,7 +745,9 @@ impl Streams {
 
   // Gives the stream in `slot` back: both parts are done
   fn close_stream(&mut self, pools: &mut QuicPools, slot: u32) {
-    let QuicPools { rx_blocks, stream_slots, tx_blocks, .. } = &mut *pools;
+    let QuicPools {
+      ooo_indexes, range_blocks, rx_blocks, seg_queues, stream_slots, tx_blocks, ..
+    } = &mut *pools;
     self.unlink_ready(stream_slots, slot);
     let in_ctrl = stream_slots.get(slot).is_some_and(|el| el.in_ctrl);
     if in_ctrl {
@@ -635,10 +758,11 @@ impl Streams {
     };
     let id = stream.id;
     if let Some(cold) = self.cold.as_deref_mut() {
-      stream.rx.release(rx_blocks, &mut cold.held);
+      let rx_pools = RxPools { blocks: rx_blocks, indexes: ooo_indexes, range_blocks };
+      stream.rx.release(rx_pools, &mut cold.held);
     }
     self.unsent = self.unsent.saturating_sub(stream.tx.end.saturating_sub(stream.tx.sent));
-    stream.tx.release(tx_blocks);
+    stream.tx.release(tx_blocks, range_blocks, seg_queues);
     stream_slots.free(slot);
     if let Some(kind) = self.kind(id) {
       if let Some(mut table) = self.table_mut(kind) {
@@ -721,7 +845,9 @@ mod tests {
   use crate::{
     quic::{
       BodyRef, ConnState, Frame, QuicError, StreamId, TransportErrorCode,
-      stream::{RangeSet, StreamSlots},
+      pools::FreeList,
+      sent::FrameRef,
+      stream::{RangeSet, SPILL_RANGES, StreamSlots},
       testing::{Behavior, Link, LinkOpts, TestApp, encode_frames},
     },
     sync::AtomicU64,
@@ -829,36 +955,60 @@ mod tests {
   }
 
   // Rule: the ranges are exact, and one more separate range than there is room for is an error
-  // that loses nothing of what is held.
+  // that loses nothing of what is held. Room is the inline array and then, once it is full, a
+  // block of the pools that holds 256 ranges and goes back once at most half the inline ones are
+  // left (ruling T9-d).
   #[test]
   fn range_set_overflow_is_error_not_loss() {
     let ranges = |set: &RangeSet<4>| set.iter().collect::<Vec<_>>();
+    let mut blocks = FreeList::new();
     let mut set = RangeSet::<4>::new();
     for nth in 0..4u64 {
-      set.insert(nth * 10, nth * 10 + 5).unwrap();
+      set.insert(nth * 10, nth * 10 + 5, &mut blocks).unwrap();
     }
+    assert!(!set.is_spilled() && !set.needs_block(0, 3) && set.needs_block(100, 105));
+    let before = ranges(&set);
+    // One more spills into a block, with every range kept
+    set.insert(100, 105, &mut blocks).unwrap();
+    assert!(set.is_spilled());
+    assert_eq!(ranges(&set), [before.as_slice(), &[(100, 105)]].concat());
+    for nth in 5..SPILL_RANGES as u64 {
+      set.insert(nth * 100, nth * 100 + 5, &mut blocks).unwrap();
+    }
+    assert_eq!(set.len(), SPILL_RANGES);
     let before = ranges(&set);
     assert!(matches!(
-      set.insert(100, 105),
+      set.insert(1_000_000, 1_000_005, &mut blocks),
       Err(crate::Error::QuicClose(TransportErrorCode::ProtocolViolation, QuicError::RangeSetFull))
     ));
     assert_eq!(ranges(&set), before);
+    // Back to a few ranges: the block goes back to the pool, the ranges inline
+    assert!(!set.remove_below(10_000, &mut blocks));
+    assert!(set.remove_below((SPILL_RANGES as u64 - 2) * 100, &mut blocks));
+    assert!(!set.is_spilled() && blocks.len() == 1);
+    assert_eq!(set.len(), 2);
+    assert!(!set.release(&mut blocks) && set.is_empty());
     // A range that touches or overlaps held ones joins them; no gap is ever filled
-    set.insert(5, 10).unwrap();
+    let mut set = RangeSet::<4>::new();
+    for nth in 0..4u64 {
+      set.insert(nth * 10, nth * 10 + 5, &mut blocks).unwrap();
+    }
+    set.insert(5, 10, &mut blocks).unwrap();
     assert_eq!(ranges(&set), [(0, 15), (20, 25), (30, 35)]);
-    set.insert(100, 105).unwrap();
-    set.insert(22, 33).unwrap();
+    set.insert(100, 105, &mut blocks).unwrap();
+    set.insert(22, 33, &mut blocks).unwrap();
     assert_eq!(ranges(&set), [(0, 15), (20, 35), (100, 105)]);
     // Held bytes and empty ranges change nothing, even when full
-    set.insert(200, 201).unwrap();
-    set.insert(1, 3).unwrap();
-    set.insert(50, 50).unwrap();
+    set.insert(200, 201, &mut blocks).unwrap();
+    set.insert(1, 3, &mut blocks).unwrap();
+    set.insert(50, 50, &mut blocks).unwrap();
     assert_eq!(ranges(&set), [(0, 15), (20, 35), (100, 105), (200, 201)]);
-    set.remove_below(12);
+    assert!(!set.is_spilled());
+    let _ = set.remove_below(12, &mut blocks);
     assert_eq!(ranges(&set), [(12, 15), (20, 35), (100, 105), (200, 201)]);
-    set.remove_below(101);
+    let _ = set.remove_below(101, &mut blocks);
     assert_eq!(ranges(&set), [(101, 105), (200, 201)]);
-    set.remove_below(300);
+    let _ = set.remove_below(300, &mut blocks);
     assert!(set.is_empty());
   }
 
@@ -1015,7 +1165,8 @@ mod tests {
       let logs = [&link.client.app.streams[&ids[0].0], &link.client.app.streams[&ids[1].0]];
       assert_eq!(logs[0].data, RESPONSE);
       assert_eq!(logs[1].data, *body);
-      assert!(logs[1].calls.len() >= 9, "{:?}", logs[1].calls);
+      // In datagrams of 1472 bytes once path MTU discovery is done: frames of 1440 bytes
+      assert!(logs[1].calls.len() >= 7, "{:?}", logs[1].calls);
       for log in logs {
         fin_on_the_last(&log.calls);
       }
@@ -1356,6 +1507,98 @@ mod tests {
       client_sends(&mut link, &[*last]);
       assert_eq!(server_close(&link), transport(code), "{last:?}");
     }
+  }
+
+  // Ruling T9-d: waiting data with more separate ranges than the 32 inline ones spills them into
+  // a block of the pools, which counts like a block of data and goes back once the gaps fill;
+  // past the 256 ranges of the block the peer is closed (PROTOCOL_VIOLATION).
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn receive_ranges_spill_into_a_block_and_past_it_close() {
+    let mut link = settled(&LinkOpts::new(None));
+    let id = open_bidi(&mut link).unwrap();
+    let data: Vec<u8> = (0..1024u32).map(|el| (el % 251) as u8).collect();
+    let piece = |nth: usize| Frame::Stream {
+      id: id.0,
+      offset: (nth * 4) as u64,
+      data: &data[nth * 4..nth * 4 + 4],
+      fin: false,
+    };
+    // Every other piece of 4 bytes after the first: 100 separate ranges, in one block of data
+    let odd: Vec<Frame<'_>> = (1..200).step_by(2).map(piece).collect();
+    for frames in odd.chunks(40) {
+      client_sends(&mut link, frames);
+    }
+    assert_eq!(link.server.conn.state(), ConnState::Confirmed);
+    let pools = &link.server.parts.pools;
+    let slot = link.server.conn.streams().app_slot(id).unwrap();
+    assert!(pools.stream_slots.get(slot).unwrap().rx.ooo.is_spilled());
+    // The block of data and the one of the ranges
+    assert_eq!(link.server.conn.streams().held_blocks(), 2);
+    let even: Vec<Frame<'_>> = (0..200).step_by(2).map(piece).collect();
+    for frames in even.chunks(40) {
+      client_sends(&mut link, frames);
+    }
+    assert_eq!(link.server.app.streams[&id.0].data, &data[..800]);
+    // The block of the ranges went back; the one of data until everything before its end is read
+    assert_eq!(link.server.conn.streams().held_blocks(), 1);
+    assert_eq!(link.server.parts.pools.range_blocks.len(), 1);
+    // 256 separate ranges are held, one more closes
+    let id = open_bidi(&mut link).unwrap();
+    let byte = |nth: u64| Frame::Stream { id: id.0, offset: 2 * nth + 1, data: b"x", fin: false };
+    let ranges: Vec<Frame<'_>> = (0..SPILL_RANGES as u64).map(byte).collect();
+    for frames in ranges.chunks(64) {
+      client_sends(&mut link, frames);
+      assert_eq!(link.server.conn.state(), ConnState::Confirmed);
+    }
+    client_sends(&mut link, &[byte(SPILL_RANGES as u64)]);
+    assert_eq!(server_close(&link), transport(TransportErrorCode::ProtocolViolation));
+  }
+
+  // Ruling T9-d: acknowledged ranges of a stream past its 16 inline ones spill into a block, which
+  // goes back once the gaps are acknowledged. Past the 256 ranges of the block, a range that is
+  // acknowledged apart from the others is forgotten and its bytes go again, counted, rather than
+  // failing: within the in-flight bound a stream does not get there (the lossy runs of
+  // `quic::recovery` count none).
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn acked_ranges_spill_into_a_block_and_past_it_go_again() {
+    let body: Rc<[u8]> = vec![5; 12_000].into();
+    let mut opts = LinkOpts::new(None);
+    let response = BodyRef::new(body, 0..12_000).unwrap();
+    opts.server_app = TestApp::new(Behavior::RespondBody(b"", response));
+    let mut link = settled(&opts);
+    let id = open_bidi(&mut link).unwrap();
+    write(&mut link, id, b"GET /", true);
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
+    // The response goes out and is lost on the way: only the acknowledgments below arrive
+    let _ = link.server.flush(link.now_us);
+    let _ = link.server.take_datagrams();
+    let server = &mut link.server;
+    let (streams, pools) = (server.conn.streams_mut(), &mut server.parts.pools);
+    let slot = streams.app_slot(id).unwrap();
+    let generation = pools.stream_slots.generation(slot);
+    let ack = |streams: &mut crate::quic::stream::Streams, pools: &mut _, offset: u64, len: u16| {
+      let frame = FrameRef::Stream { slot, generation, offset, len, fin: false };
+      streams.on_frame_acked(frame, pools).unwrap();
+    };
+    // Every other byte: 300 separate ranges after the first byte
+    for nth in 0..=300u64 {
+      ack(streams, pools, 2 * nth, 1);
+    }
+    let tx = &pools.stream_slots.get(slot).unwrap().tx;
+    assert!(tx.acked_ranges.is_spilled());
+    assert_eq!((tx.acked, tx.acked_ranges.len()), (1, SPILL_RANGES));
+    // The 44 that did not fit go again
+    assert_eq!(streams.retransmissions(), (0, 44));
+    assert_eq!(streams.lost.len(), 44);
+    // All of it acknowledged: the block goes back
+    ack(streams, pools, 0, 12_000);
+    let tx = &pools.stream_slots.get(slot).unwrap().tx;
+    assert!(!tx.acked_ranges.is_spilled() && tx.acked_ranges.is_empty());
+    assert_eq!(tx.acked, 12_000);
+    assert_eq!(pools.range_blocks.len(), 1);
   }
 
   // The server opens unidirectional streams as long as the client allows, which it then reads.

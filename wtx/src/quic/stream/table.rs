@@ -440,7 +440,7 @@ impl Streams {
   }
 
   // The table of `kind`, unless the streams were released
-  fn table(&self, kind: Kind) -> Option<TableRef<'_>> {
+  pub(super) fn table(&self, kind: Kind) -> Option<TableRef<'_>> {
     match kind {
       Kind::Bidi => Some(self.bidi.view_ref()),
       Kind::UniLocal => self.cold.as_deref().map(|el| el.uni_local.view_ref()),

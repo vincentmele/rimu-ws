@@ -6,6 +6,8 @@
 
 #[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
 mod app;
+#[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
+mod cc;
 mod cid;
 #[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
 mod conn;
@@ -25,8 +27,12 @@ mod packet;
 #[doc(hidden)]
 pub mod packet_check;
 #[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
+mod pmtud;
+#[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
 mod pools;
 mod quic_error;
+#[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
+mod recovery;
 #[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]
 mod recv_tracker;
 #[allow(dead_code, reason = "reached through the endpoint of the later QUIC tasks")]

@@ -23,25 +23,25 @@ pub struct QuicLimits {
   pub max_ack_ranges: usize,
   /// The most bytes of received stream data that a connection holds while they wait for earlier
   /// data or are retained by the application. The credit of the connection that is given to the
-  /// peer is at most this, so that a peer within its credit never goes past it. The data is held
-  /// in blocks of 4 KiB, which count whole: on top of this, each stream that holds blocks may take
-  /// three more, the blocks at the edges of its data and one for retained bytes. Going past that is
-  /// a connection error (PROTOCOL_VIOLATION).
+  /// peer is at most this, so that a peer within its credit never goes past it: going past the
+  /// credit is a FLOW_CONTROL_ERROR. The data is held in blocks of 4 KiB, which count whole: on
+  /// top of this, each stream that holds blocks may take four more, the blocks at the edges of its
+  /// data, one for retained bytes and one that the ranges of its waiting data spill into.
   ///
   /// Defaults to 16 MiB, the connection window.
   pub max_out_of_order_bytes_per_conn: u32,
   /// How far, in bytes, the received data of a stream can reach past the first byte that the
   /// application consumed, the bytes that wait for earlier data and the ones that it retains
   /// included. The credit of each stream that is given to the peer is at most this, so that a
-  /// peer within its credit never goes past it. Going past it is a connection error
-  /// (PROTOCOL_VIOLATION).
+  /// peer within its credit never goes past it: going past the credit is a FLOW_CONTROL_ERROR.
   ///
   /// Defaults to 1 MiB, the stream window.
   pub max_out_of_order_bytes_per_stream: u32,
   /// The most separate ranges of received data that a stream holds while it waits for the data
-  /// before them, at most 32. One more is a connection error (PROTOCOL_VIOLATION).
+  /// before them, at most 256: 32 inline, the others in a block of 4 KiB that counts like a block
+  /// of data. One more is a connection error (PROTOCOL_VIOLATION).
   ///
-  /// Defaults to 32.
+  /// Defaults to 256, so that a peer that loses many packets of one flight is never closed.
   pub max_out_of_order_ranges: u32,
   /// The most PING frames per second. Each one is acknowledged; one more closes the connection
   /// with [`Self::excessive_load_app_code`].
@@ -69,7 +69,7 @@ impl Default for QuicLimits {
       max_ack_ranges: 256,
       max_out_of_order_bytes_per_conn: 16 << 20,
       max_out_of_order_bytes_per_stream: 1 << 20,
-      max_out_of_order_ranges: 32,
+      max_out_of_order_ranges: 256,
       ping_budget: 64,
       path_challenge_budget: 16,
       reset_budget: 100,
@@ -120,7 +120,7 @@ mod tests {
     assert_eq!(limits.max_ack_ranges, 256);
     assert_eq!(limits.max_out_of_order_bytes_per_conn, 16 << 20);
     assert_eq!(limits.max_out_of_order_bytes_per_stream, 1 << 20);
-    assert_eq!(limits.max_out_of_order_ranges, 32);
+    assert_eq!(limits.max_out_of_order_ranges, 256);
     assert_eq!(limits.ping_budget, 64);
     assert_eq!(limits.path_challenge_budget, 16);
     assert_eq!(limits.reset_budget, 100);

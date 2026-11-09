@@ -7,12 +7,13 @@
 
 use crate::quic::{
   QuicError, TransportErrorCode,
-  conn::{ConnCold, HandshakeSpaces},
+  conn::{ConnCold, HandshakeSpaces, KeySlot},
+  recv_tracker::RecvSpill,
   sent::{FrameRef, FrameRefRange, SentPacket},
-  stream::{StreamSlots, StreamsCold},
+  stream::{OooBlock, RangeBlock, Seg, StreamSlots, StreamsCold},
   wipe,
 };
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 use core::hint::cold_path;
 
 /// The bytes of the out-of-order CRYPTO data that a level buffers, the minimum of RFC 9000
@@ -51,8 +52,21 @@ pub(crate) struct QuicPools {
   pub(crate) frame_refs: FrameRefPool,
   /// The Initial and Handshake spaces of a handshake, keys included (wiped when they come back).
   pub(crate) handshake_spaces: FreeList<Box<HandshakeSpaces>>,
+  /// The second slot of the keys that open 1-RTT packets, for key updates (emptied, and so wiped,
+  /// when it comes back).
+  pub(crate) key_slots: FreeList<Box<KeySlot>>,
+  /// The indexes of the receive blocks of the streams that hold data waiting for earlier data,
+  /// each with room for all that a stream can hold.
+  pub(crate) ooo_indexes: FreeList<Vec<OooBlock>>,
+  /// Ranges of a [`crate::quic::stream::RangeSet`] that outgrew its inline array.
+  pub(crate) range_blocks: FreeList<Box<RangeBlock>>,
+  /// Received packet numbers that slid off the window of a
+  /// [`crate::quic::recv_tracker::RecvTracker`] before an ACK reported them.
+  pub(crate) recv_spills: FreeList<Box<RecvSpill>>,
   /// Received stream data that does not fit in a stream slot.
   pub(crate) rx_blocks: FreeList<Box<RxBlock>>,
+  /// Send queues of streams that grew past the segments that a slot reserves.
+  pub(crate) seg_queues: FreeList<VecDeque<Seg>>,
   /// The records of sent packets of a packet number space.
   pub(crate) sent_rings: FreeList<Vec<Option<SentPacket>>>,
   /// The streams of every connection.
@@ -71,7 +85,12 @@ impl QuicPools {
       crypto_buffers: FreeList::new(),
       frame_refs: FrameRefPool::new(MAX_CHUNKS),
       handshake_spaces: FreeList::new(),
+      key_slots: FreeList::new(),
+      ooo_indexes: FreeList::new(),
+      range_blocks: FreeList::new(),
+      recv_spills: FreeList::new(),
       rx_blocks: FreeList::new(),
+      seg_queues: FreeList::new(),
       sent_rings: FreeList::new(),
       stream_slots: StreamSlots::new(),
       streams_cold: FreeList::new(),
@@ -87,7 +106,12 @@ impl QuicPools {
     self.crypto_buffers.trim(IDLE_KEEP);
     self.frame_refs.trim_idle(IDLE_KEEP_CHUNKS);
     self.handshake_spaces.trim(IDLE_KEEP);
+    self.key_slots.trim(IDLE_KEEP);
+    self.ooo_indexes.trim(IDLE_KEEP);
+    self.range_blocks.trim(IDLE_KEEP);
+    self.recv_spills.trim(IDLE_KEEP);
     self.rx_blocks.trim(IDLE_KEEP);
+    self.seg_queues.trim(IDLE_KEEP);
     self.sent_rings.trim(IDLE_KEEP);
     self.stream_slots.trim_idle(IDLE_KEEP_SLOTS);
     self.streams_cold.trim(IDLE_KEEP);
@@ -135,7 +159,8 @@ pub(crate) struct FreeList<T> {
 }
 
 impl<T> FreeList<T> {
-  const fn new() -> Self {
+  #[inline]
+  pub(crate) const fn new() -> Self {
     Self { items: Vec::new() }
   }
 
@@ -157,6 +182,14 @@ impl<T> FreeList<T> {
   #[inline]
   pub(crate) fn take(&mut self) -> Option<T> {
     self.items.pop()
+  }
+
+  /// The entry of the largest `size`, if that is above `than`.
+  #[inline]
+  pub(crate) fn take_largest(&mut self, size: impl Fn(&T) -> usize, than: usize) -> Option<T> {
+    let (idx, largest) =
+      self.items.iter().enumerate().map(|(idx, el)| (idx, size(el))).max_by_key(|el| el.1)?;
+    (largest > than).then(|| self.items.swap_remove(idx))
   }
 
   fn trim(&mut self, keep: usize) {
@@ -229,6 +262,70 @@ impl FrameRefPool {
     self.live
   }
 
+  /// Gives back the chunks of `queue`, which is empty afterwards.
+  #[inline]
+  pub(crate) fn queue_clear(&mut self, queue: &mut FrameRefQueue) {
+    self.free(queue.range);
+    *queue = FrameRefQueue::EMPTY;
+  }
+
+  /// The reference at the front of `queue`.
+  #[inline]
+  pub(crate) fn queue_front(&self, queue: &FrameRefQueue) -> Option<FrameRef> {
+    if queue.is_empty() {
+      return None;
+    }
+    let chunk = self.chunks.get(usize::try_from(queue.range.head).ok()?)?;
+    chunk.refs.get(usize::from(queue.skip)).copied()
+  }
+
+  /// Takes the reference at the front of `queue` out of it, giving back its chunk once every
+  /// reference of the chunk was taken.
+  #[inline]
+  pub(crate) fn queue_pop(&mut self, queue: &mut FrameRefQueue) {
+    if queue.is_empty() {
+      return;
+    }
+    queue.skip = queue.skip.wrapping_add(1);
+    let taken = usize::from(queue.skip);
+    if taken != CHUNK_REFS && taken != queue.range.len() {
+      return;
+    }
+    let head = queue.range.head;
+    let next = self.chunk_mut(head).map_or(NO_CHUNK, |el| el.next);
+    self.free(FrameRefRange { head, len: 1, tail: head });
+    if taken == queue.range.len() {
+      *queue = FrameRefQueue::EMPTY;
+    } else {
+      queue.range.head = next;
+      queue.range.len = queue.range.len.wrapping_sub(CHUNK_REFS as u16);
+      queue.skip = 0;
+    }
+  }
+
+  /// Appends `frame` to `queue`. Fails if the pool is at its cap, a connection error.
+  #[inline]
+  pub(crate) fn queue_push(
+    &mut self,
+    queue: &mut FrameRefQueue,
+    frame: FrameRef,
+  ) -> crate::Result<()> {
+    self.push(&mut queue.range, frame)
+  }
+
+  /// Replaces the reference at the front of `queue`, if there is one.
+  #[inline]
+  pub(crate) fn queue_set_front(&mut self, queue: &FrameRefQueue, frame: FrameRef) {
+    if queue.is_empty() {
+      return;
+    }
+    if let Some(elem) =
+      self.chunk_mut(queue.range.head).and_then(|el| el.refs.get_mut(usize::from(queue.skip)))
+    {
+      *elem = frame;
+    }
+  }
+
   /// Appends `frame` to `range`. Fails if the pool is at its cap, a connection error.
   #[inline]
   pub(crate) fn push(&mut self, range: &mut FrameRefRange, frame: FrameRef) -> crate::Result<()> {
@@ -290,6 +387,32 @@ impl FrameRefPool {
       chunk.next = self.free;
       self.free = u32::try_from(idx).unwrap_or(NO_CHUNK);
     }
+  }
+}
+
+/// References in line, first in first out, in the chunks of a [`FrameRefPool`]: the frames of lost
+/// packets that wait to be sent again. A chunk goes back once all of its references were taken.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FrameRefQueue {
+  // From the first reference of the first chunk, the first `skip` of which were taken
+  range: FrameRefRange,
+  skip: u8,
+}
+
+impl FrameRefQueue {
+  /// No references.
+  pub(crate) const EMPTY: Self = Self { range: FrameRefRange::EMPTY, skip: 0 };
+
+  /// If no reference waits.
+  #[inline]
+  pub(crate) const fn is_empty(&self) -> bool {
+    self.range.len() <= self.skip as usize
+  }
+
+  /// The number of references that wait.
+  #[inline]
+  pub(crate) const fn len(&self) -> usize {
+    self.range.len().saturating_sub(self.skip as usize)
   }
 }
 

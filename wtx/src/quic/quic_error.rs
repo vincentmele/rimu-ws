@@ -13,6 +13,10 @@ const _: () = {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum QuicError {
+  /// A key sealed as many packets as its AEAD allows and could not be updated in time, or packets
+  /// failed to open as many times as the AEAD allows over the connection (with
+  /// [`TransportErrorCode::AeadLimitReached`], RFC 9001 section 6.6).
+  AeadLimitReached,
   /// An ACK range reaches below packet number zero.
   AckRangeUnderflow,
   /// An ACK frame acknowledges a packet number that was not sent.

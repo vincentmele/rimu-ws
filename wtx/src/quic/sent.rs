@@ -5,6 +5,10 @@
 //! acknowledged ACK frame of ours lets the receiver forget ranges (RFC 9000 section 13.2.4). The
 //! frames of a packet are references into the worker-wide pool of frame references
 //! ([`QuicPools::frame_refs`]), so that a record stays small whatever the packet carried.
+//!
+//! A packet that is declared lost keeps its record, out of flight, until the ring needs its slot:
+//! an acknowledgment that comes late still tells which of its frames arrived, so that they are
+//! not sent again ([`crate::quic::recovery`]).
 
 use crate::quic::pools::QuicPools;
 use alloc::vec::Vec;
@@ -113,6 +117,20 @@ impl FrameRefRange {
   }
 }
 
+/// Where a sent packet is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SentKind {
+  /// Neither ack-eliciting nor padded: not in flight (RFC 9002 section 2).
+  NotInFlight,
+  /// In flight: ack-eliciting or padded, and counted by congestion control.
+  InFlight,
+  /// A probe of path MTU discovery: in flight until it is acknowledged or lost, but not counted
+  /// by congestion control, whose loss is no congestion signal (ruling T9-e).
+  MtuProbe,
+  /// Declared lost: out of flight, its frames queued again, kept for a late acknowledgment.
+  Lost,
+}
+
 /// The record of a sent packet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SentPacket {
@@ -122,11 +140,28 @@ pub(crate) struct SentPacket {
   pub(crate) size: u16,
   /// If it had frames other than ACK, PADDING and CONNECTION_CLOSE.
   pub(crate) ack_eliciting: bool,
-  /// If it counts towards the bytes in flight: if it is ack-eliciting or has PADDING.
-  pub(crate) in_flight: bool,
+  /// Where it is.
+  pub(crate) kind: SentKind,
   /// What it carried.
   pub(crate) frames: FrameRefRange,
 }
+
+impl SentPacket {
+  /// If it counts towards the bytes in flight of congestion control.
+  #[inline]
+  pub(crate) fn counts_for_congestion(&self) -> bool {
+    self.kind == SentKind::InFlight
+  }
+
+  /// If its fate is still unknown: in flight, a probe included.
+  #[inline]
+  pub(crate) fn in_flight(&self) -> bool {
+    matches!(self.kind, SentKind::InFlight | SentKind::MtuProbe)
+  }
+}
+
+// A record stays as small as before the kinds
+const _: () = assert!(size_of::<Option<SentPacket>>() <= 24);
 
 /// See the [module documentation](self).
 #[derive(Debug)]
@@ -142,6 +177,35 @@ impl SentRing {
   /// No packet sent.
   pub(crate) const fn new() -> Self {
     Self { base: 0, next_pn: 0, slots: Vec::new() }
+  }
+
+  /// The oldest packet number whose record may be held.
+  #[inline]
+  pub(crate) const fn base(&self) -> u64 {
+    self.base
+  }
+
+  /// The record of `pn`, if it is held.
+  #[inline]
+  pub(crate) fn get_mut(&mut self, pn: u64) -> Option<&mut SentPacket> {
+    if !self.holds(pn) {
+      return None;
+    }
+    self.slot_mut(pn)?.as_mut()
+  }
+
+  /// If every packet number that a record can be held for is used, and the oldest one is in
+  /// flight: a packet can only be sent once it is acknowledged or lost.
+  #[inline]
+  pub(crate) fn is_full(&self) -> bool {
+    self.next_pn.wrapping_sub(self.base) >= SENT_RING_LEN as u64
+      && self.slot(self.base).is_some_and(|el| el.is_some_and(|packet| packet.in_flight()))
+  }
+
+  /// The records that are held, in no order.
+  #[inline]
+  pub(crate) fn records(&self) -> impl Iterator<Item = &SentPacket> {
+    self.slots.iter().flatten()
   }
 
   /// The number of packets whose record is held.
@@ -199,7 +263,7 @@ impl SentRing {
         return false;
       };
       match *slot {
-        Some(packet) if packet.in_flight => return false,
+        Some(packet) if packet.in_flight() => return false,
         Some(packet) => {
           *slot = None;
           pools.frame_refs.free(packet.frames);
@@ -222,8 +286,7 @@ impl SentRing {
   /// Takes the record of `pn` out of the ring, if it is held.
   #[inline]
   pub(crate) fn take(&mut self, pn: u64) -> Option<SentPacket> {
-    // Records are only ever held for the `SENT_RING_LEN` packet numbers from the base
-    if pn < self.base || pn >= self.next_pn || pn.wrapping_sub(self.base) >= SENT_RING_LEN as u64 {
+    if !self.holds(pn) {
       return None;
     }
     let packet = self.slot_mut(pn)?.take();
@@ -238,6 +301,16 @@ impl SentRing {
   pub(crate) fn window(&self, start: u64, end: u64) -> core::ops::RangeInclusive<u64> {
     let last = end.min(self.next_pn.saturating_sub(1));
     start.max(self.base)..=last
+  }
+
+  // Records are only ever held for the `SENT_RING_LEN` packet numbers from the base
+  fn holds(&self, pn: u64) -> bool {
+    pn >= self.base && pn < self.next_pn && pn.wrapping_sub(self.base) < SENT_RING_LEN as u64
+  }
+
+  fn slot(&self, pn: u64) -> Option<&Option<SentPacket>> {
+    let idx = usize::try_from(pn % SENT_RING_LEN as u64).ok()?;
+    self.slots.get(idx)
   }
 
   fn advance_base(&mut self) {
@@ -256,11 +329,12 @@ impl SentRing {
 mod tests {
   use crate::quic::{
     pools::QuicPools,
-    sent::{FrameRef, FrameRefRange, SENT_RING_LEN, SentPacket, SentRing},
+    sent::{FrameRef, FrameRefRange, SENT_RING_LEN, SentKind, SentPacket, SentRing},
   };
 
   fn packet(in_flight: bool, frames: FrameRefRange) -> SentPacket {
-    SentPacket { time_us: 0, size: 1200, ack_eliciting: in_flight, in_flight, frames }
+    let kind = if in_flight { SentKind::InFlight } else { SentKind::NotInFlight };
+    SentPacket { time_us: 0, size: 1200, ack_eliciting: in_flight, kind, frames }
   }
 
   #[test]
@@ -334,6 +408,29 @@ mod tests {
     assert!(ring.reserve(&mut pools));
     ring.on_sent(packet(false, FrameRefRange::EMPTY));
     assert!(ring.take(SENT_RING_LEN as u64 + 1).is_some());
+  }
+
+  // Carried rule 3: a packet declared lost at the base of a ring is out of flight, and its slot is
+  // given up for the next packet once every other slot is used.
+  #[test]
+  fn a_lost_record_at_the_base_gives_its_slot() {
+    let mut pools = QuicPools::new();
+    let mut ring = SentRing::new();
+    for _ in 0..SENT_RING_LEN {
+      assert!(ring.reserve(&mut pools));
+      let mut frames = FrameRefRange::EMPTY;
+      pools.frame_refs.push(&mut frames, FrameRef::HandshakeDone).unwrap();
+      ring.on_sent(packet(true, frames));
+    }
+    assert!(ring.is_full() && !ring.reserve(&mut pools));
+    ring.get_mut(0).unwrap().kind = SentKind::Lost;
+    assert!(!ring.is_full());
+    let live = pools.frame_refs.live_chunks();
+    assert!(ring.reserve(&mut pools));
+    // Its frames went back with it
+    assert_eq!(pools.frame_refs.live_chunks(), live - 1);
+    assert!(ring.take(0).is_none());
+    ring.release(&mut pools);
   }
 
   #[test]

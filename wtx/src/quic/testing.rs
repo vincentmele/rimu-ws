@@ -4,6 +4,10 @@
 //! Datagrams go from the [`TxArena`] of one side to [`QuicConn::recv_datagram`] of the other,
 //! copied through a buffer that is allocated once. Each side has its own pools and arena, so that a
 //! test can watch the allocations of the server alone (see [`LinkOpts::counters`]).
+//!
+//! With an [`Impairment`], the link is a lossy network instead: datagrams take time to arrive and
+//! some are dropped, delivered out of order or twice ([`Link::step_impaired`]), and the clock moves
+//! to the next arrival or timer when nothing else happens ([`Link::advance_to_next_event`]).
 
 use crate::{
   quic::{
@@ -34,6 +38,30 @@ const MAX_STEPS: usize = 64;
 pub(crate) type ClientConn = QuicConn<TestApp, ChaCha20, UnverifiedCtx, true>;
 /// The connection of the server of a [`Link`].
 pub(crate) type ServerConn = QuicConn<TestApp, ChaCha20, SkCtx, false>;
+
+/// What a lossy [`Link`] does to the datagrams that it carries, in each direction, with random
+/// numbers from `seed`: each one takes `delay_us` to arrive, and is dropped, delivered after the
+/// ones sent after it or delivered twice with these probabilities.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Impairment {
+  /// The probability that a datagram is dropped.
+  pub(crate) drop: f32,
+  /// The probability that a datagram arrives after some sent after it.
+  pub(crate) reorder: f32,
+  /// The probability that a datagram arrives twice.
+  pub(crate) duplicate: f32,
+  /// The one-way delay.
+  pub(crate) delay_us: u64,
+  /// Seeds the random numbers.
+  pub(crate) seed: u64,
+}
+
+impl Impairment {
+  /// No faults, `delay_us` of one-way delay.
+  pub(crate) const fn delay(delay_us: u64) -> Self {
+    Self { drop: 0.0, reorder: 0.0, duplicate: 0.0, delay_us, seed: 1 }
+  }
+}
 
 /// What a [`TestApp`] does with the data that arrives on a stream.
 #[derive(Clone, Debug, Default)]
@@ -417,9 +445,18 @@ where
 pub(crate) struct Link {
   /// The client.
   pub(crate) client: Side<UnverifiedCtx, true>,
+  /// Drops the datagrams for which it returns `true`: (to the server, the datagram).
+  pub(crate) filter: Option<fn(bool, &[u8]) -> bool>,
+  // Datagrams on their way: (arrival, order of sending, to the server, the datagram)
+  flying: Vec<(u64, u64, bool, Vec<u8>)>,
+  // Buffers of datagrams that arrived, for the next ones
+  free: Vec<Vec<u8>>,
+  impairment: Option<Impairment>,
   /// The time of the fake clock.
   pub(crate) now_us: u64,
+  rng: u64,
   scratch: Vec<u8>,
+  sent: u64,
   /// The server.
   pub(crate) server: Side<SkCtx, false>,
 }
@@ -479,7 +516,129 @@ impl Link {
     let app = TestApp { is_server: true, ..opts.server_app.clone() };
     let mut server = Side { addr: SERVER_ADDR, app, conn, counters, parts: server_parts };
     server.recv(now_us, &mut first[0], CLIENT_ADDR);
-    Self { client, now_us, scratch: Vec::with_capacity(1 << 16), server }
+    Self {
+      client,
+      filter: None,
+      flying: Vec::new(),
+      free: Vec::new(),
+      impairment: None,
+      now_us,
+      rng: 0,
+      scratch: Vec::with_capacity(1 << 16),
+      sent: 0,
+      server,
+    }
+  }
+
+  /// Makes the link lossy from now on (see [`Self::step_impaired`]).
+  pub(crate) fn impair(&mut self, impairment: Impairment) {
+    self.impairment = Some(impairment);
+    self.rng = impairment.seed ^ 0x9e37_79b9_7f4a_7c15;
+  }
+
+  /// Moves the clock to the next arrival of a datagram or timer of a connection and runs the
+  /// timers that are due. Returns `false` if there is none.
+  pub(crate) fn advance_to_next_event(&mut self) -> bool {
+    let arrival = self.flying.iter().map(|el| el.0).min();
+    let timers = [self.client.conn.next_deadline(), self.server.conn.next_deadline()];
+    let Some(next) = timers.into_iter().flatten().chain(arrival).min() else {
+      return false;
+    };
+    self.now_us = self.now_us.max(next);
+    self.client.on_timeout(self.now_us);
+    self.server.on_timeout(self.now_us);
+    true
+  }
+
+  /// One round of a lossy link: both sides flush, what they sent goes on its way, impaired, and
+  /// what is due arrives. Returns `false` if nothing was sent and nothing arrived.
+  pub(crate) fn step_impaired(&mut self) -> bool {
+    let _ = self.client.flush(self.now_us);
+    let mut moved = self.send_impaired(true);
+    let _ = self.server.flush(self.now_us);
+    moved |= self.send_impaired(false);
+    loop {
+      let due = self
+        .flying
+        .iter()
+        .enumerate()
+        .filter(|(_, el)| el.0 <= self.now_us)
+        .min_by_key(|(_, el)| (el.0, el.1))
+        .map(|(idx, _)| idx);
+      let Some(idx) = due else {
+        break;
+      };
+      let (_, _, to_server, mut datagram) = self.flying.swap_remove(idx);
+      if to_server {
+        self.server.recv(self.now_us, &mut datagram, CLIENT_ADDR);
+      } else {
+        self.client.recv(self.now_us, &mut datagram, SERVER_ADDR);
+      }
+      self.free.push(datagram);
+      moved = true;
+    }
+    moved
+  }
+
+  /// The datagrams that are on their way.
+  pub(crate) fn flying(&self) -> usize {
+    self.flying.len()
+  }
+
+  fn random(&mut self) -> f32 {
+    // xorshift64*
+    self.rng ^= self.rng >> 12;
+    self.rng ^= self.rng << 25;
+    self.rng ^= self.rng >> 27;
+    let value = self.rng.wrapping_mul(0x2545_f491_4f6c_dd1d);
+    (value >> 40) as f32 / (1u64 << 24) as f32
+  }
+
+  // Puts what a side sent on its way
+  fn send_impaired(&mut self, from_client: bool) -> bool {
+    let Some(impairment) = self.impairment else {
+      return false;
+    };
+    let mut moved = false;
+    loop {
+      let side_tx = if from_client { &mut self.client.parts.tx } else { &mut self.server.parts.tx };
+      let next = side_tx.pending().next().map(|train| {
+        self.scratch.clear();
+        self.scratch.extend_from_slice(train.bytes);
+        (train.id, usize::from(train.segment_size))
+      });
+      let Some((id, segment_size)) = next else {
+        break;
+      };
+      side_tx.mark_submitted(id);
+      side_tx.release(id);
+      let mut at = 0;
+      while at < self.scratch.len() {
+        let end = (at + segment_size).min(self.scratch.len());
+        moved = true;
+        let filtered = self.filter.is_some_and(|el| el(from_client, &self.scratch[at..end]));
+        let copies = if filtered || self.random() < impairment.drop {
+          0
+        } else if self.random() < impairment.duplicate {
+          2
+        } else {
+          1
+        };
+        for _ in 0..copies {
+          let mut arrival = self.now_us + impairment.delay_us;
+          if self.random() < impairment.reorder {
+            arrival += 1 + (self.random() * (impairment.delay_us + 1) as f32) as u64;
+          }
+          let mut datagram = self.free.pop().unwrap_or_default();
+          datagram.clear();
+          datagram.extend_from_slice(&self.scratch[at..end]);
+          self.sent += 1;
+          self.flying.push((arrival, self.sent, from_client, datagram));
+        }
+        at = end;
+      }
+    }
+    moved
   }
 
   /// Moves the clock forward by `us` and runs the timers that are due.
@@ -647,6 +806,95 @@ where
     }
   }
   datagrams
+}
+
+/// What [`run_lossy_requests`] measured.
+#[derive(Debug)]
+pub(crate) struct LossyRun {
+  /// The datagrams that the link carried.
+  pub(crate) datagrams: u64,
+  /// The time on the clock that the requests took.
+  pub(crate) elapsed_us: u64,
+  /// The longest time on the clock in which no data reached the client.
+  pub(crate) longest_stall_us: u64,
+  /// The responses, in the order of the requests.
+  pub(crate) responses: Vec<Vec<u8>>,
+}
+
+/// Sends `requests` from the client of the lossy `link` (see [`Link::impair`]), at most
+/// `concurrent` at once, each with its FIN, until every response has its FIN. Panics if that takes
+/// more than `max_us` on the clock, or if nothing is left to happen before.
+pub(crate) fn run_lossy_requests(
+  link: &mut Link,
+  requests: &[Vec<u8>],
+  concurrent: usize,
+  max_us: u64,
+) -> LossyRun {
+  let start = link.now_us;
+  let sent_before = link.sent;
+  let mut pending: Vec<(usize, StreamId)> = Vec::new();
+  let mut responses = vec![Vec::new(); requests.len()];
+  let (mut opened, mut done) = (0, 0);
+  let (mut last_progress, mut calls, mut longest_stall_us) = (start, link.client.app.calls, 0);
+  loop {
+    let mut idx = 0;
+    while let Some(&(nth, id)) = pending.get(idx) {
+      if link.client.app.streams.get(&id.0).is_some_and(|el| el.fin) {
+        let log = link.client.app.streams.remove(&id.0).unwrap_or_default();
+        responses[nth] = log.data;
+        let _ = pending.swap_remove(idx);
+        done += 1;
+      } else {
+        idx += 1;
+      }
+    }
+    if done == requests.len() {
+      break;
+    }
+    while pending.len() < concurrent && opened < requests.len() {
+      let now_us = link.now_us;
+      let bytes = &requests[opened];
+      let rslt = link.client.with_ctx(now_us, |cx| {
+        let id = cx.open_bidi()?;
+        cx.write(id, bytes, true)?;
+        Ok::<_, crate::Error>(id)
+      });
+      match rslt {
+        Ok(id) => {
+          pending.push((opened, id));
+          opened += 1;
+        }
+        Err(crate::Error::Quic(QuicError::StreamsBlocked)) => break,
+        Err(err) => panic!("request {opened}: {err:?}"),
+      }
+    }
+    if !link.step_impaired() {
+      assert!(
+        link.advance_to_next_event(),
+        "{done} of {} requests done, then nothing",
+        requests.len()
+      );
+    }
+    if link.client.app.calls != calls {
+      calls = link.client.app.calls;
+      last_progress = link.now_us;
+    }
+    longest_stall_us = longest_stall_us.max(link.now_us - last_progress);
+    let elapsed = link.now_us - start;
+    assert!(elapsed <= max_us, "{done} of {} requests done in {elapsed} us", requests.len());
+    for conn in [link.client.conn.state(), link.server.conn.state()] {
+      assert!(
+        matches!(conn, crate::quic::ConnState::Handshake | crate::quic::ConnState::Confirmed),
+        "{conn:?} after {done} requests"
+      );
+    }
+  }
+  LossyRun {
+    datagrams: link.sent - sent_before,
+    elapsed_us: link.now_us - start,
+    longest_stall_us,
+    responses,
+  }
 }
 
 /// The frames, one after the other, as a packet carries them.

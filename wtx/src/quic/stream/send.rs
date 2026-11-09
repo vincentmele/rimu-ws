@@ -2,19 +2,21 @@
 //! the packing of STREAM frames and of the control frames of the streams.
 
 use crate::quic::{
-  BodyRef, ConnCtx, ConnParams, Frame, FrameWriter, QuicApp, QuicError, TransportErrorCode,
+  BodyRef, ConnCtx, ConnParams, Frame, FrameWriter, QuicApp,
+  flow::NOT_BLOCKED,
   pools::{FreeList, QuicPools, TX_BLOCK_LEN, TxBlock},
   sent::{FrameRef, FrameRefRange},
   stream::{
-    INLINE_LEN, NO_LINK, OWED_DATA_BLOCKED, OWED_MAX_DATA, OWED_MAX_STREAMS_BIDI,
-    OWED_MAX_STREAMS_UNI, RangeSet, StreamId, Streams, closed, excessive_load, exhausted,
+    INLINE_LEN, NO_LINK, OWED_DATA_BLOCKED, OWED_MAX_DATA, OWED_MAX_DATA_LOST,
+    OWED_MAX_STREAMS_BIDI, OWED_MAX_STREAMS_BIDI_LOST, OWED_MAX_STREAMS_UNI,
+    OWED_MAX_STREAMS_UNI_LOST, RESERVED_SEGMENTS, RangeBlock, RangeSet, StreamId, Streams, closed,
+    excessive_load, exhausted,
     recv::RxState,
     table::{Kind, StreamSlots},
   },
   varint::varint_len,
 };
 use alloc::{boxed::Box, collections::VecDeque};
-use core::hint::cold_path;
 
 pub(super) const TX_RANGES: usize = 16;
 
@@ -71,6 +73,7 @@ impl SendPart {
     &mut self,
     mut bytes: &[u8],
     blocks: &mut FreeList<Box<TxBlock>>,
+    queues: &mut FreeList<VecDeque<Seg>>,
   ) -> crate::Result<()> {
     let count = self.segs.len();
     if let Some(last) = self.segs.back_mut() {
@@ -125,7 +128,7 @@ impl SendPart {
         bytes = tail;
         Seg { data: SegData::Block(block), len: head.len() }
       };
-      self.push(seg)?;
+      self.push(seg, queues)?;
     }
     Ok(())
   }
@@ -151,6 +154,26 @@ impl SendPart {
     }
   }
 
+  // Writes the `len` bytes from `at`, which were sent and are not acknowledged, into `fw`
+  pub(super) fn copy_range(&self, mut at: u64, mut len: usize, fw: &mut FrameWriter<'_>) {
+    let mut pos = self.seg_base;
+    for seg in &self.segs {
+      if len == 0 {
+        break;
+      }
+      let seg_end = pos.wrapping_add(u64::try_from(seg.len).unwrap_or(u64::MAX));
+      if at < seg_end {
+        let from = usize::try_from(at.saturating_sub(pos)).unwrap_or(usize::MAX);
+        let bytes = seg.bytes(&self.inline).get(from..).unwrap_or_default();
+        let take = bytes.len().min(len);
+        let _written = fw.write_bytes(bytes.get(..take).unwrap_or_default());
+        len = len.wrapping_sub(take);
+        at = at.wrapping_add(u64::try_from(take).unwrap_or(u64::MAX));
+      }
+      pos = seg_end;
+    }
+  }
+
   // If nothing more is to be sent or acknowledged
   pub(super) fn is_done(&self) -> bool {
     !self.exists
@@ -163,27 +186,42 @@ impl SendPart {
     self.segs.get(self.cursor).is_some_and(|el| matches!(el.data, SegData::Body(_)))
   }
 
-  // Acknowledged: the bytes from `offset`, `len` of them, and the FIN if `fin`
+  // If acknowledged bytes are in the `len` bytes from `at`: a sent frame never carries any
+  pub(super) fn overlaps_acked(&self, at: u64, len: u64) -> bool {
+    let end = at.saturating_add(len);
+    len > 0
+      && (at < self.acked || self.acked_ranges.iter().any(|(start, stop)| start < end && stop > at))
+  }
+
+  // Acknowledged: the bytes from `offset`, `len` of them, and the FIN if `fin`. Returns `true` if
+  // there was no room to remember them, so that they must be sent again: the stream then has
+  // as many separate acknowledged ranges as a block holds, which a stream within the in-flight
+  // bound does not reach, and goes on rather than failing.
   pub(super) fn on_acked(
     &mut self,
     offset: u64,
     len: u64,
     fin: bool,
     blocks: &mut FreeList<Box<TxBlock>>,
-  ) -> crate::Result<()> {
+    range_blocks: &mut FreeList<Box<RangeBlock>>,
+  ) -> bool {
     if self.reset.is_some() {
-      return Ok(());
+      return false;
     }
     self.fin_acked |= fin;
-    self.acked_ranges.insert(offset, offset.saturating_add(len)).map_err(|_err| {
-      cold_path();
-      crate::Error::QuicClose(TransportErrorCode::InternalError, QuicError::RangeSetFull)
-    })?;
-    if let Some((start, end)) = self.acked_ranges.first()
+    let end = offset.saturating_add(len);
+    let mut forgotten = false;
+    if offset <= self.acked {
+      self.acked = self.acked.max(end);
+    } else if self.acked_ranges.insert(offset, end, range_blocks).is_err() {
+      forgotten = true;
+    }
+    let _gave_back = self.acked_ranges.remove_below(self.acked, range_blocks);
+    if let Some((start, stop)) = self.acked_ranges.first()
       && start <= self.acked
     {
-      self.acked = self.acked.max(end);
-      self.acked_ranges.remove_below(self.acked);
+      self.acked = self.acked.max(stop);
+      let _gave_back = self.acked_ranges.remove_below(self.acked, range_blocks);
     }
     while let Some(front) = self.segs.front() {
       let seg_end = self.seg_base.wrapping_add(u64::try_from(front.len).unwrap_or(u64::MAX));
@@ -197,25 +235,72 @@ impl SendPart {
       self.cursor = self.cursor.saturating_sub(1);
       self.release_seg(seg, blocks);
     }
-    Ok(())
+    forgotten
   }
 
-  pub(super) fn push(&mut self, seg: Seg) -> crate::Result<()> {
+  // A full send queue moves into the largest one of the pools, if that is larger, so that the room
+  // that streams with many segments need goes where it is needed, whatever the slot
+  pub(super) fn push(
+    &mut self,
+    seg: Seg,
+    queues: &mut FreeList<VecDeque<Seg>>,
+  ) -> crate::Result<()> {
+    if self.segs.len() == self.segs.capacity()
+      && let Some(mut larger) = queues.take_largest(VecDeque::capacity, self.segs.capacity())
+    {
+      larger.append(&mut self.segs);
+      queues.give(core::mem::replace(&mut self.segs, larger));
+    }
     self.segs.try_reserve(1).map_err(|_err| exhausted())?;
     self.segs.push_back(seg);
     Ok(())
   }
 
-  // Gives back every segment
-  pub(super) fn release(&mut self, blocks: &mut FreeList<Box<TxBlock>>) {
+  // Gives back every segment, the block of the acknowledged ranges and a send queue that grew
+  pub(super) fn release(
+    &mut self,
+    blocks: &mut FreeList<Box<TxBlock>>,
+    range_blocks: &mut FreeList<Box<RangeBlock>>,
+    queues: &mut FreeList<VecDeque<Seg>>,
+  ) {
     while let Some(seg) = self.segs.pop_front() {
       self.release_seg(seg, blocks);
     }
+    if self.segs.capacity() > RESERVED_SEGMENTS {
+      queues.give(core::mem::take(&mut self.segs));
+    }
+    let _gave_back = self.acked_ranges.release(range_blocks);
     self.cursor = 0;
     self.cursor_pos = 0;
     self.inline_live = 0;
     self.inline_used = 0;
     self.seg_base = self.end;
+  }
+
+  // The first part of the `len` bytes from `offset`, the FIN after them if `fin`, that is not
+  // acknowledged: (offset, length, FIN), or `None` if all of it is
+  pub(super) fn unacked_piece(&self, offset: u64, len: u64, fin: bool) -> Option<(u64, u64, bool)> {
+    let end = offset.saturating_add(len);
+    let fin = fin && !self.fin_acked;
+    let mut start = offset.max(self.acked);
+    for (ack_start, ack_end) in self.acked_ranges.iter() {
+      if start >= end {
+        break;
+      }
+      if ack_end <= start {
+        continue;
+      }
+      if ack_start <= start {
+        start = ack_end;
+        continue;
+      }
+      let stop = ack_start.min(end);
+      return Some((start, stop.wrapping_sub(start), fin && stop == end));
+    }
+    if start < end {
+      return Some((start, end.wrapping_sub(start), fin));
+    }
+    fin.then_some((end, 0, true))
   }
 
   pub(super) fn release_seg(&mut self, seg: Seg, blocks: &mut FreeList<Box<TxBlock>>) {
@@ -233,8 +318,9 @@ impl SendPart {
   }
 }
 
+/// A segment of the send queue of a stream.
 #[derive(Debug)]
-pub(super) struct Seg {
+pub(crate) struct Seg {
   pub(super) data: SegData,
   pub(super) len: usize,
 }
@@ -251,7 +337,7 @@ impl Seg {
 }
 
 #[derive(Debug)]
-pub(super) enum SegData {
+pub(crate) enum SegData {
   // Written by copy, alone in a block
   Block(Box<TxBlock>),
   // Written by reference
@@ -289,11 +375,18 @@ impl Streams {
   ) -> crate::Result<()> {
     let (slot, generation, done) = match frame {
       FrameRef::Stream { slot, generation, offset, len, fin } => {
-        let QuicPools { stream_slots, tx_blocks, .. } = &mut *pools;
+        let QuicPools { frame_refs, range_blocks, stream_slots, tx_blocks, .. } = &mut *pools;
         let Some(stream) = stream_slots.get_live(slot, generation) else {
           return Ok(());
         };
-        stream.tx.on_acked(offset, u64::from(len), fin, tx_blocks)?;
+        if stream.tx.on_acked(offset, u64::from(len), fin, tx_blocks, range_blocks) {
+          // Forgotten: the bytes go again, without the FIN, which is acknowledged
+          let again = FrameRef::Stream { slot, generation, offset, len, fin: false };
+          frame_refs.queue_push(&mut self.lost, again)?;
+          if let Some(cold) = self.cold.as_deref_mut() {
+            cold.resent_acked = cold.resent_acked.wrapping_add(1);
+          }
+        }
         (slot, generation, stream.tx.is_done())
       }
       FrameRef::ResetStream { slot, generation } => {
@@ -315,6 +408,89 @@ impl Streams {
     };
     if done && pools.stream_slots.generation(slot) == generation {
       self.maybe_close(pools, slot);
+    }
+    Ok(())
+  }
+
+  /// A frame of a packet that was declared lost: data that goes again, a control frame that is
+  /// owed again if what it said still holds, with the current values (RFC 9000 section 13.3).
+  #[inline]
+  pub(crate) fn on_frame_lost(
+    &mut self,
+    frame: FrameRef,
+    pools: &mut QuicPools,
+  ) -> crate::Result<()> {
+    let QuicPools { frame_refs, stream_slots, .. } = &mut *pools;
+    match frame {
+      FrameRef::Stream { slot, generation, .. } => {
+        let wanted = stream_slots
+          .get_live(slot, generation)
+          .is_some_and(|el| el.tx.reset.is_none() && !el.tx.is_done());
+        if wanted {
+          frame_refs.queue_push(&mut self.lost, frame)?;
+        }
+      }
+      FrameRef::ResetStream { slot, generation } => {
+        if let Some(stream) = stream_slots.get_live(slot, generation)
+          && !stream.tx.reset_acked
+        {
+          stream.tx.reset_owed = true;
+          self.ctrl_add(stream_slots, slot);
+        }
+      }
+      FrameRef::StopSending { slot, generation } => {
+        // Until the final size is known (RFC 9000 section 3.5)
+        if let Some(stream) = stream_slots.get_live(slot, generation)
+          && stream.rx.state == RxState::Discard
+          && stream.rx.final_size.is_none()
+        {
+          stream.rx.stop_owed = true;
+          self.ctrl_add(stream_slots, slot);
+        }
+      }
+      FrameRef::MaxStreamData { slot, generation } => {
+        if let Some(stream) = stream_slots.get_live(slot, generation)
+          && stream.rx.state == RxState::Recv
+          && stream.rx.final_size.is_none()
+        {
+          stream.rx.max_owed = true;
+          stream.rx.max_lost = true;
+          self.ctrl_add(stream_slots, slot);
+        }
+      }
+      FrameRef::StreamDataBlocked { slot, generation } => {
+        if let Some(stream) = stream_slots.get_live(slot, generation) {
+          let tx = &mut stream.tx;
+          if tx.blocked_at == tx.max && tx.sent >= tx.max && tx.sent < tx.end {
+            tx.blocked_at = NOT_BLOCKED;
+            tx.blocked_owed = true;
+            self.ctrl_add(stream_slots, slot);
+          }
+        }
+      }
+      FrameRef::MaxData { max } => {
+        if max == self.flow.rx_max {
+          self.owed |= OWED_MAX_DATA | OWED_MAX_DATA_LOST;
+        }
+      }
+      FrameRef::MaxStreams { bidi, max } => {
+        let (kind, flags) = if bidi {
+          (Kind::Bidi, OWED_MAX_STREAMS_BIDI | OWED_MAX_STREAMS_BIDI_LOST)
+        } else {
+          (Kind::UniRemote, OWED_MAX_STREAMS_UNI | OWED_MAX_STREAMS_UNI_LOST)
+        };
+        if self.table(kind).is_some_and(|el| el.meta.limit == max) {
+          self.owed |= flags;
+        }
+      }
+      FrameRef::DataBlocked { max } => {
+        let flow = &mut self.flow;
+        if flow.tx_blocked_at == max && flow.tx_max == max && flow.tx_room() == 0 {
+          flow.tx_blocked_at = NOT_BLOCKED;
+          self.owe_data_blocked();
+        }
+      }
+      FrameRef::Ack { .. } | FrameRef::Crypto { .. } | FrameRef::HandshakeDone => {}
     }
     Ok(())
   }
@@ -394,6 +570,7 @@ impl Streams {
   pub(crate) const fn wants_send(&self) -> bool {
     let ready = self.small.head != NO_LINK || self.large.head != NO_LINK;
     self.owed != 0
+      || !self.lost.is_empty()
       || self.ctrl.head != NO_LINK
       || (ready && self.flow.tx_room() > 0)
       || self.fin_only > 0
@@ -409,20 +586,20 @@ impl Streams {
     fin: bool,
   ) -> crate::Result<()> {
     let slot = self.app_slot(id).filter(|_| !self.closed).ok_or_else(closed)?;
-    let QuicPools { stream_slots, tx_blocks, .. } = &mut *pools;
+    let QuicPools { seg_queues, stream_slots, tx_blocks, .. } = &mut *pools;
     let tx = &mut stream_slots.get_mut(slot).ok_or_else(closed)?.tx;
     if !tx.exists || tx.fin || tx.reset.is_some() {
       return Err(closed());
     }
     let len = match source {
       Source::Bytes(bytes) => {
-        tx.append_bytes(bytes, tx_blocks)?;
+        tx.append_bytes(bytes, tx_blocks, seg_queues)?;
         bytes.len()
       }
       Source::Body(body) => {
         let len = usize::try_from(body.len()).unwrap_or(usize::MAX);
         if len > 0 {
-          tx.push(Seg { data: SegData::Body(body), len })?;
+          tx.push(Seg { data: SegData::Body(body), len }, seg_queues)?;
         }
         len
       }
@@ -449,6 +626,7 @@ impl Streams {
     let mut wrote = false;
     if self.write_conn_control(fw, frames, pools, params, &mut wrote)?
       && self.write_stream_control(fw, frames, pools, params, &mut wrote)?
+      && self.write_lost(fw, frames, pools, &mut wrote)?
     {
       self.write_stream_data(fw, frames, pools, &mut wrote)?;
     }
@@ -457,7 +635,7 @@ impl Streams {
 
   // Resets the sending part of the stream in `slot` with `code`, if it is not done
   fn reset_send(&mut self, pools: &mut QuicPools, slot: u32, code: u64) {
-    let QuicPools { stream_slots, tx_blocks, .. } = &mut *pools;
+    let QuicPools { range_blocks, seg_queues, stream_slots, tx_blocks, .. } = &mut *pools;
     let Some(stream) = stream_slots.get_mut(slot) else {
       return;
     };
@@ -471,7 +649,7 @@ impl Streams {
     tx.reset = Some(code);
     tx.reset_owed = true;
     tx.blocked_owed = false;
-    tx.release(tx_blocks);
+    tx.release(tx_blocks, range_blocks, seg_queues);
     self.ctrl_add(stream_slots, slot);
     self.schedule(pools, slot);
   }
@@ -555,8 +733,11 @@ impl Streams {
     wrote: &mut bool,
   ) -> crate::Result<bool> {
     if self.owed & OWED_MAX_DATA != 0 {
+      // A lost frame goes again with the current limit, even if it did not move
+      let lost = self.owed & OWED_MAX_DATA_LOST != 0;
       let max = self.flow.rx_consumed.saturating_add(params.conn_credit());
-      if max > self.flow.rx_max {
+      if max > self.flow.rx_max || lost {
+        let max = max.max(self.flow.rx_max);
         if !fw.write_max_data(max) {
           return Ok(false);
         }
@@ -564,17 +745,23 @@ impl Streams {
         self.flow.rx_max = max;
         *wrote = true;
       }
-      self.owed &= !OWED_MAX_DATA;
+      self.owed &= !(OWED_MAX_DATA | OWED_MAX_DATA_LOST);
     }
-    for (flag, bidi) in [(OWED_MAX_STREAMS_BIDI, true), (OWED_MAX_STREAMS_UNI, false)] {
+    let streams_flags = [
+      (OWED_MAX_STREAMS_BIDI, OWED_MAX_STREAMS_BIDI_LOST, true),
+      (OWED_MAX_STREAMS_UNI, OWED_MAX_STREAMS_UNI_LOST, false),
+    ];
+    for (flag, lost_flag, bidi) in streams_flags {
       if self.owed & flag == 0 {
         continue;
       }
+      let lost = self.owed & lost_flag != 0;
       let kind = if bidi { Kind::Bidi } else { Kind::UniRemote };
       if let Some(table) = self.table_mut(kind) {
         let meta = table.meta;
         let max = meta.base.saturating_add(meta.window);
-        if max > meta.limit {
+        if max > meta.limit || lost {
+          let max = max.max(meta.limit);
           if !fw.write_max_streams(bidi, max) {
             return Ok(false);
           }
@@ -583,7 +770,7 @@ impl Streams {
           *wrote = true;
         }
       }
-      self.owed &= !flag;
+      self.owed &= !(flag | lost_flag);
     }
     if self.owed & OWED_DATA_BLOCKED != 0 {
       let max = self.flow.tx_max;
@@ -709,7 +896,9 @@ impl Streams {
       }
       if rx.max_owed {
         let max = rx.consumed.saturating_add(params.stream_credit());
-        if rx.state == RxState::Recv && rx.final_size.is_none() && max > rx.max {
+        let open = rx.state == RxState::Recv && rx.final_size.is_none();
+        if open && (max > rx.max || rx.max_lost) {
+          let max = max.max(rx.max);
           if !fw.write_max_stream_data(id, max) {
             return Ok(false);
           }
@@ -718,6 +907,7 @@ impl Streams {
           *wrote = true;
         }
         rx.max_owed = false;
+        rx.max_lost = false;
       }
       if tx.blocked_owed {
         let max = tx.max;
@@ -739,6 +929,76 @@ impl Streams {
       self.ctrl.unlink(stream_slots, slot, true);
       // A part that this ended, such as a STOP_SENDING once the final size is known
       self.maybe_close(pools, slot);
+    }
+  }
+
+  // Sends again the parts of the lost STREAM frames that are not acknowledged, before any new
+  // data. Returns `false` if the packet is full.
+  fn write_lost(
+    &mut self,
+    fw: &mut FrameWriter<'_>,
+    frames: &mut FrameRefRange,
+    pools: &mut QuicPools,
+    wrote: &mut bool,
+  ) -> crate::Result<bool> {
+    loop {
+      let QuicPools { frame_refs, stream_slots, .. } = &mut *pools;
+      let Some(front) = frame_refs.queue_front(&self.lost) else {
+        return Ok(true);
+      };
+      let FrameRef::Stream { slot, generation, offset, len, fin } = front else {
+        frame_refs.queue_pop(&mut self.lost);
+        continue;
+      };
+      let live = stream_slots.get_live(slot, generation).filter(|el| el.tx.reset.is_none());
+      let Some(stream) = live else {
+        frame_refs.queue_pop(&mut self.lost);
+        continue;
+      };
+      let id = stream.id.0;
+      let tx = &mut stream.tx;
+      let end = offset.saturating_add(u64::from(len));
+      let Some((start, piece, piece_fin)) = tx.unacked_piece(offset, u64::from(len), fin) else {
+        frame_refs.queue_pop(&mut self.lost);
+        continue;
+      };
+      let room = fw.remaining();
+      let longest = usize::try_from(piece).unwrap_or(usize::MAX).min(room);
+      let offset_len = if start == 0 { 0 } else { varint_len(start) };
+      let header = 1usize
+        .wrapping_add(varint_len(id))
+        .wrapping_add(offset_len)
+        .wrapping_add(varint_len(u64::try_from(longest).unwrap_or(u64::MAX)));
+      let Some(data_len) = room.checked_sub(header).map(|el| el.min(longest)) else {
+        return Ok(false);
+      };
+      if data_len == 0 && piece > 0 {
+        return Ok(false);
+      }
+      let sent = u64::try_from(data_len).unwrap_or(u64::MAX);
+      let frame_fin = piece_fin && sent == piece;
+      if !fw.write_stream_header(id, start, data_len, frame_fin) {
+        return Ok(false);
+      }
+      let resent_acked = tx.overlaps_acked(start, sent);
+      tx.copy_range(start, data_len, fw);
+      let frame_len = u16::try_from(data_len).unwrap_or(u16::MAX);
+      let again =
+        FrameRef::Stream { slot, generation, offset: start, len: frame_len, fin: frame_fin };
+      frame_refs.push(frames, again)?;
+      *wrote = true;
+      let done = start.wrapping_add(sent);
+      if done >= end && (frame_fin || !piece_fin) {
+        frame_refs.queue_pop(&mut self.lost);
+      } else {
+        let rest = u16::try_from(end.saturating_sub(done)).unwrap_or(u16::MAX);
+        let rest = FrameRef::Stream { slot, generation, offset: done, len: rest, fin };
+        frame_refs.queue_set_front(&self.lost, rest);
+      }
+      if let Some(cold) = self.cold.as_deref_mut() {
+        cold.retransmitted = cold.retransmitted.wrapping_add(1);
+        cold.resent_acked = cold.resent_acked.wrapping_add(u64::from(resent_acked));
+      }
     }
   }
 

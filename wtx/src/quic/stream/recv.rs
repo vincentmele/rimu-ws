@@ -6,8 +6,8 @@ use crate::quic::{
   flow::{flow_control_error, top_up},
   pools::{FreeList, QuicPools, RX_BLOCK_LEN, RxBlock},
   stream::{
-    INLINE_LEN, OWED_MAX_DATA, RangeSet, StreamId, Streams, closed, excessive_load, exhausted,
-    final_size_error, out_of_order_limit, table::StreamSlots,
+    INLINE_LEN, OWED_MAX_DATA, RangeBlock, RangeSet, StreamId, Streams, closed, excessive_load,
+    exhausted, final_size_error, out_of_order_limit, table::StreamSlots,
   },
 };
 use alloc::{boxed::Box, vec::Vec};
@@ -46,8 +46,11 @@ pub(super) struct RecvPart {
   pub(super) keep_block: Option<Box<RxBlock>>,
   // The credit given to the peer
   pub(super) max: u64,
+  // The MAX_STREAM_DATA that carried `max` was lost: it is sent again even if `max` did not move
+  pub(super) max_lost: bool,
   pub(super) max_owed: bool,
-  // Data after `read` that waits for earlier data, and the blocks that hold it by number
+  // Data after `read` that waits for earlier data, and the blocks that hold it by number: an
+  // index from the pools while there are some, with room for every block that a stream can hold
   pub(super) ooo: RangeSet<RX_RANGES>,
   pub(super) ooo_blocks: Vec<OooBlock>,
   // The first byte that the application was not given
@@ -83,8 +86,11 @@ impl RecvPart {
   }
 
   // Forgets the waiting data that the application was given, and the blocks that held only that
-  pub(super) fn drop_below_read(&mut self, blocks: &mut FreeList<Box<RxBlock>>, held: &mut Held) {
-    self.ooo.remove_below(self.read);
+  pub(super) fn drop_below_read(&mut self, pools: RxPools<'_>, held: &mut Held) {
+    let RxPools { blocks, indexes, range_blocks } = pools;
+    if self.ooo.remove_below(self.read, range_blocks) {
+      held.refund(&mut self.blocks);
+    }
     let gone = self
       .ooo_blocks
       .partition_point(|el| el.no.wrapping_add(1).wrapping_mul(RX_BLOCK) <= self.read);
@@ -93,10 +99,19 @@ impl RecvPart {
         held.give(blocks, &mut self.blocks, block);
       }
     }
+    self.give_index(indexes);
+  }
+
+  // The index of the blocks goes back to the pools once it is empty
+  fn give_index(&mut self, indexes: &mut FreeList<Vec<OooBlock>>) {
+    if self.ooo_blocks.is_empty() && self.ooo_blocks.capacity() > 0 {
+      indexes.give(core::mem::take(&mut self.ooo_blocks));
+    }
   }
 
   // Gives back the blocks that are here, not one that is out for a call of the application
-  pub(super) fn release(&mut self, blocks: &mut FreeList<Box<RxBlock>>, held: &mut Held) {
+  pub(super) fn release(&mut self, pools: RxPools<'_>, held: &mut Held) {
+    let RxPools { blocks, indexes, range_blocks } = pools;
     if let Some(block) = self.keep_block.take() {
       held.give(blocks, &mut self.blocks, block);
     }
@@ -105,7 +120,10 @@ impl RecvPart {
         held.give(blocks, &mut self.blocks, block);
       }
     }
-    self.ooo = RangeSet::new();
+    self.give_index(indexes);
+    if self.ooo.release(range_blocks) {
+      held.refund(&mut self.blocks);
+    }
     self.keep = 0;
   }
 
@@ -141,36 +159,17 @@ pub(super) struct Held {
 }
 
 impl Held {
-  // `block` goes back from a part that holds `own` blocks
-  pub(super) fn give(
-    &mut self,
-    blocks: &mut FreeList<Box<RxBlock>>,
-    own: &mut u32,
-    block: Box<RxBlock>,
-  ) {
-    blocks.give(block);
-    self.blocks = self.blocks.saturating_sub(1);
-    if *own == 1 {
-      self.streams = self.streams.saturating_sub(1);
-    }
-    *own = own.saturating_sub(1);
-  }
-
-  // A block for a part that holds `own` blocks. The cap of the connection is the bytes that its
-  // credit allows and, as blocks count whole, three blocks for each stream that holds some: a
-  // stream holds data within the bytes of its credit that it did not consume, whose first and
-  // last blocks may hold little of it, and the bytes that it retains in a block of their own. A
-  // peer within its credit never goes past it (ruling T8-g).
-  pub(super) fn take(
-    &mut self,
-    blocks: &mut FreeList<Box<RxBlock>>,
-    own: &mut u32,
-    limits: &QuicLimits,
-  ) -> crate::Result<Box<RxBlock>> {
+  // Counts a block of 4 KiB more for a part that holds `own` blocks. The cap of the connection is
+  // the bytes that its credit allows and, as blocks count whole, four blocks for each stream that
+  // holds some: a stream holds data within the bytes of its credit that it did not consume, whose
+  // first and last blocks may hold little of it, the bytes that it retains in a block of their
+  // own and the block that the ranges of its waiting data spill into (ruling T9-d). A peer within
+  // its credit never goes past it (ruling T8-g).
+  pub(super) fn charge(&mut self, own: &mut u32, limits: &QuicLimits) -> crate::Result<()> {
     let streams = u64::from(self.streams).wrapping_add(u64::from(*own == 0));
     let max = u64::from(limits.max_out_of_order_bytes_per_conn)
       .div_ceil(RX_BLOCK)
-      .saturating_add(streams.saturating_mul(3));
+      .saturating_add(streams.saturating_mul(4));
     if u64::from(self.blocks) >= max {
       return Err(out_of_order_limit());
     }
@@ -179,12 +178,51 @@ impl Held {
     }
     self.blocks = self.blocks.wrapping_add(1);
     *own = own.wrapping_add(1);
+    Ok(())
+  }
+
+  // `block` goes back from a part that holds `own` blocks
+  pub(super) fn give(
+    &mut self,
+    blocks: &mut FreeList<Box<RxBlock>>,
+    own: &mut u32,
+    block: Box<RxBlock>,
+  ) {
+    blocks.give(block);
+    self.refund(own);
+  }
+
+  // A block of a part that holds `own` blocks went back
+  pub(super) fn refund(&mut self, own: &mut u32) {
+    self.blocks = self.blocks.saturating_sub(1);
+    if *own == 1 {
+      self.streams = self.streams.saturating_sub(1);
+    }
+    *own = own.saturating_sub(1);
+  }
+
+  // A block for a part that holds `own` blocks (see [`Self::charge`])
+  pub(super) fn take(
+    &mut self,
+    blocks: &mut FreeList<Box<RxBlock>>,
+    own: &mut u32,
+    limits: &QuicLimits,
+  ) -> crate::Result<Box<RxBlock>> {
+    self.charge(own, limits)?;
     Ok(blocks.take().unwrap_or_else(|| Box::new([0; RX_BLOCK_LEN])))
   }
 }
 
+/// The pools that the receiving part of a stream gives back to.
+pub(super) struct RxPools<'pools> {
+  pub(super) blocks: &'pools mut FreeList<Box<RxBlock>>,
+  pub(super) indexes: &'pools mut FreeList<Vec<OooBlock>>,
+  pub(super) range_blocks: &'pools mut FreeList<Box<RangeBlock>>,
+}
+
+/// A receive block of waiting data of a stream, by number.
 #[derive(Debug)]
-pub(super) struct OooBlock {
+pub(crate) struct OooBlock {
   // Out of the vector while its bytes are with the application
   pub(super) data: Option<Box<RxBlock>>,
   // The offsets of the block are from `no * 4096`
@@ -289,7 +327,7 @@ impl Streams {
     let Some(slot) = self.frame_slot(pools, params, id, true)? else {
       return Ok(());
     };
-    let QuicPools { stream_slots, rx_blocks, .. } = &mut *pools;
+    let QuicPools { ooo_indexes, range_blocks, stream_slots, rx_blocks, .. } = &mut *pools;
     let Some(stream) = stream_slots.get_mut(slot) else {
       return Ok(());
     };
@@ -310,7 +348,8 @@ impl Streams {
       RxState::Done | RxState::None => return Ok(()),
     };
     if let Some(cold) = self.cold.as_deref_mut() {
-      rx.release(rx_blocks, &mut cold.held);
+      let pools = RxPools { blocks: rx_blocks, indexes: ooo_indexes, range_blocks };
+      rx.release(pools, &mut cold.held);
     }
     self.flow.on_consumed(final_size.saturating_sub(rx.consumed));
     rx.consumed = final_size;
@@ -425,7 +464,7 @@ impl Streams {
     let Some(slot) = self.app_slot(id) else {
       return;
     };
-    let QuicPools { rx_blocks, stream_slots, .. } = &mut *pools;
+    let QuicPools { ooo_indexes, range_blocks, rx_blocks, stream_slots, .. } = &mut *pools;
     let Some(stream) = stream_slots.get_mut(slot) else {
       return;
     };
@@ -434,7 +473,8 @@ impl Streams {
       return;
     }
     if let Some(cold) = self.cold.as_deref_mut() {
-      rx.release(rx_blocks, &mut cold.held);
+      let pools = RxPools { blocks: rx_blocks, indexes: ooo_indexes, range_blocks };
+      rx.release(pools, &mut cold.held);
     }
     // What arrived is consumed
     self.flow.on_consumed(rx.high.saturating_sub(rx.consumed));
@@ -470,7 +510,7 @@ impl Streams {
       if self.cold.as_ref().is_none_or(|el| el.close_request.is_some()) {
         break;
       }
-      let QuicPools { rx_blocks, stream_slots, .. } = &mut *pools;
+      let QuicPools { ooo_indexes, range_blocks, rx_blocks, stream_slots, .. } = &mut *pools;
       let Some(stream) = stream_slots.get_mut(slot) else {
         break;
       };
@@ -483,7 +523,7 @@ impl Streams {
         break;
       };
       let held = &mut cold.held;
-      rx.drop_below_read(rx_blocks, held);
+      rx.drop_below_read(RxPools { blocks: rx_blocks, indexes: ooo_indexes, range_blocks }, held);
       let next = rx.next_run(direct);
       let (piece, len) = if rx.keep > 0 {
         let added = if next > 0 {
@@ -541,7 +581,7 @@ impl Streams {
       let rslt = app.on_stream_data(&mut cx, id, bytes, fin);
       let retained = cx.retained.min(len);
       let tail = len.wrapping_sub(retained);
-      let QuicPools { rx_blocks, stream_slots, .. } = &mut *pools;
+      let QuicPools { ooo_indexes, range_blocks, rx_blocks, stream_slots, .. } = &mut *pools;
       let (Some(stream), Some(cold)) = (stream_slots.get_mut(slot), self.cold.as_deref_mut())
       else {
         rslt?;
@@ -602,7 +642,7 @@ impl Streams {
       kept?;
       if live && fin {
         rx.state = RxState::Done;
-        rx.release(rx_blocks, held);
+        rx.release(RxPools { blocks: rx_blocks, indexes: ooo_indexes, range_blocks }, held);
       }
       if live {
         self.on_read(stream_slots, params, slot);
@@ -655,7 +695,7 @@ impl Streams {
       return Ok(());
     }
     let limits = &params.limits;
-    let QuicPools { rx_blocks, stream_slots, .. } = &mut *pools;
+    let QuicPools { ooo_indexes, range_blocks, rx_blocks, stream_slots, .. } = &mut *pools;
     let Some(stream) = stream_slots.get_mut(slot) else {
       return Ok(());
     };
@@ -666,7 +706,12 @@ impl Streams {
     if reach > u64::from(limits.max_out_of_order_bytes_per_stream) {
       return Err(out_of_order_limit());
     }
-    rx.ooo.insert(offset, end)?;
+    if rx.ooo.needs_block(offset, end) {
+      // The block of the ranges counts like a block of data
+      let held = self.cold.as_deref_mut().map(|el| &mut el.held).ok_or_else(closed)?;
+      held.charge(&mut rx.blocks, limits)?;
+    }
+    rx.ooo.insert(offset, end, range_blocks)?;
     if rx.ooo.len() > usize::try_from(limits.max_out_of_order_ranges).unwrap_or(usize::MAX) {
       return Err(out_of_order_limit());
     }
@@ -679,6 +724,12 @@ impl Streams {
         Err(idx) => {
           let held = self.cold.as_deref_mut().map(|el| &mut el.held).ok_or_else(closed)?;
           let block = held.take(rx_blocks, &mut rx.blocks, limits)?;
+          if rx.ooo_blocks.capacity() == 0 {
+            // Room for every block that the data of a stream spans, so that the index never grows
+            let len = u64::from(limits.max_out_of_order_bytes_per_stream).div_ceil(RX_BLOCK);
+            let len = usize::try_from(len).unwrap_or(usize::MAX).saturating_add(2);
+            rx.ooo_blocks = ooo_indexes.take().unwrap_or_else(|| Vec::with_capacity(len));
+          }
           rx.ooo_blocks.try_reserve(1).map_err(|_err| exhausted())?;
           rx.ooo_blocks.insert(idx, OooBlock { data: Some(block), no });
           idx

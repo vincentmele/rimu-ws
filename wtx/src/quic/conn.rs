@@ -23,26 +23,47 @@
 //! Initial keys are dropped once a Handshake packet is processed (server) or sent (client), and
 //! Handshake keys once the handshake is confirmed (RFC 9001 section 4.9), when the TLS state goes
 //! back, zeroed, to the thread's pools. Keys are dropped in their slot.
+//!
+//! The 1-RTT keys are updated (RFC 9001 section 6) when the peer flips the key phase, and by this
+//! endpoint before a key seals as many packets as its cipher suite allows. The key generation that
+//! opens a packet is chosen from its key phase and packet number before it is decrypted, once
+//! (ruling T9-a); the generation before or after the current one lives in a second slot from the
+//! pools, and which slot is current alternates with the phase, so that no key moves (ruling
+//! T9-b). The previous generation stays three PTOs after a flip for packets that arrive late.
+//!
+//! # Loss recovery
+//!
+//! Acknowledgments feed the RTT estimator and loss detection ([`crate::quic::recovery`]); lost
+//! frames are queued again; a probe timeout sends one or two ack-eliciting packets. Packets in
+//! flight are bound by the congestion window ([`crate::quic::cc`]), at most
+//! [`ConnParams::max_in_flight`], and paced; ACK-only packets, probes and CONNECTION_CLOSE are not.
+//! Once the handshake is confirmed, path MTU discovery ([`crate::quic::pmtud`]) sends one probe
+//! and adopts its size if it is acknowledged.
 
 use crate::{
   crypto::AEAD_TAG_LEN,
   quic::{
-    AckFrame, Cid, ConnCtx, DatagramMeta, Frame, FrameReader, FrameWriter, PacketKeys, PacketTy,
-    QUIC_V1, QuicApp, QuicError, Space, TransportErrorCode, TransportParams, TxArena, initial_keys,
-    keys_from_secret,
+    AckFrame, Cid, ConnCtx, DatagramMeta, DirectionalKeys, Frame, FrameReader, FrameWriter,
+    PacketKeys, PacketTy, QUIC_V1, QuicApp, QuicError, Space, TransportErrorCode, TransportParams,
+    TxArena,
+    cc::CongestionControl as _,
+    initial_keys, keys_from_secret,
     limits::{QuicLimits, RateBudget},
-    open_payload, parse_header, pn_len_for,
-    pools::{CRYPTO_BUFFER_LEN, CryptoBuffer, FrameRefPool, QuicPools},
+    open_payload, parse_header,
+    pmtud::Pmtud,
+    pn_len_for,
+    pools::{CRYPTO_BUFFER_LEN, CryptoBuffer, FrameRefPool, FrameRefQueue, QuicPools},
     protect,
-    recv_tracker::RecvTracker,
+    recovery::{self, Recovery},
+    recv_tracker::{AckWritten, RecvTracker},
     remove_header_protection,
-    sent::{FrameRef, FrameRefRange, SentPacket, SentRing},
+    sent::{FrameRef, FrameRefRange, SentKind, SentPacket, SentRing},
     stream::{BIDI_WINDOW, Streams, UNI_REMOTE_WINDOW},
     varint::varint_len,
     writer::Writer,
   },
   rng::CryptoRng,
-  tls::{AlertDescription, QuicTls, TlsCtxSk},
+  tls::{AlertDescription, CipherSuite, QuicTls, TlsCtxSk},
 };
 use alloc::boxed::Box;
 use core::{
@@ -51,14 +72,17 @@ use core::{
   net::{IpAddr, SocketAddr},
 };
 
+// The confidentiality limit of AES-GCM, in packets sealed with one key (RFC 9001 section 6.6)
+const AES_GCM_CONFIDENTIALITY_LIMIT: u64 = 1 << 23;
+// The integrity limits, in packets that fail to open over the connection (RFC 9001 section 6.6)
+const AES_GCM_INTEGRITY_LIMIT: u64 = 1 << 52;
+const CHACHA20_INTEGRITY_LIMIT: u64 = 1 << 36;
 // RFC 9000 section 8.1
 const AMPLIFICATION_FACTOR: u64 = 3;
-// RFC 9002 section 6.1.2
-const GRANULARITY_US: u64 = 1_000;
 // The datagram size until path MTU discovery finds a larger one
 const INITIAL_MAX_DATAGRAM: usize = 1200;
-// RFC 9002 section 6.2.2
-const INITIAL_RTT_US: u64 = 333_000;
+// The bit of the first byte of a short header that carries the key phase
+const KEY_PHASE_BIT: u8 = 0x04;
 // The Length field of a long header always takes two bytes, so that it can be written last
 const LENGTH_FIELD_LEN: usize = 2;
 const LONG_HEADER_BIT: u8 = 0x80;
@@ -69,6 +93,10 @@ const MIN_DATAGRAM_LEN: usize = 1200;
 // The packet number and the payload together have at least four bytes, so that the header
 // protection sample, which starts four bytes after the packet number, is within the packet
 const MIN_PN_AND_PAYLOAD_LEN: usize = 4;
+// The PING frame
+const PING_FRAME: [u8; 1] = [0x01];
+// Probes sent after a probe timeout (RFC 9002 section 6.2.4)
+const PTO_PROBES: u8 = 2;
 const SHORT_RESERVED_BITS: u8 = 0x18;
 const SPACES: [Space; 3] = [Space::Initial, Space::Handshake, Space::Data];
 
@@ -118,11 +146,12 @@ pub(crate) struct ConnParams {
   /// The largest UDP payload that is received.
   pub(crate) max_udp_payload_size: u64,
   /// If sending is paced.
-  #[allow(dead_code, reason = "read by the pacer")]
   pub(crate) pacing: bool,
-  /// The most bytes in flight.
-  #[allow(dead_code, reason = "read by congestion control")]
+  /// The most bytes in flight, whatever the congestion window.
   pub(crate) max_in_flight: usize,
+  /// The packets sealed with one key of 1-RTT packets after which a key update starts, if it is
+  /// below the threshold of the cipher suite.
+  pub(crate) key_update_threshold: u64,
   /// Abuse limits.
   pub(crate) limits: QuicLimits,
 }
@@ -188,12 +217,13 @@ impl Default for ConnParams {
       max_udp_payload_size: 1472,
       pacing: true,
       max_in_flight: 256 << 10,
+      key_update_threshold: u64::MAX,
       limits: QuicLimits::default(),
     }
   }
 }
 
-/// Counters of a connection.
+/// Counters of a connection, kept with its seldom used state while it is open.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ConnStats {
   /// Bytes of the datagrams received.
@@ -214,6 +244,36 @@ pub(crate) struct ConnStats {
   pub(crate) packets_out: u64,
   /// Packets sent that were not ack-eliciting, other than CONNECTION_CLOSE.
   pub(crate) ack_only_out: u64,
+  /// Updates of the keys of the 1-RTT packets that are sent, started here or by the peer.
+  pub(crate) key_updates: u64,
+  /// Packets that were declared lost and acknowledged after that.
+  pub(crate) late_acks: u64,
+  /// Path MTU probes sent.
+  pub(crate) mtu_probes: u64,
+  /// Packets declared lost.
+  pub(crate) packets_lost: u64,
+  /// Probe timeouts that fired.
+  pub(crate) pto_probes: u64,
+}
+
+impl ConnStats {
+  /// Nothing counted.
+  pub(crate) const EMPTY: Self = Self {
+    bytes_in: 0,
+    bytes_out: 0,
+    datagrams_in: 0,
+    datagrams_out: 0,
+    duplicates: 0,
+    packets_in: 0,
+    packets_dropped: 0,
+    packets_out: 0,
+    ack_only_out: 0,
+    key_updates: 0,
+    late_acks: 0,
+    mtu_probes: 0,
+    packets_lost: 0,
+    pto_probes: 0,
+  };
 }
 
 /// A QUIC connection of a server or, in tests, of a client (`IS_CLIENT`). See the
@@ -239,10 +299,14 @@ where
   // the next one, which doubles each time
   closing_datagrams: u32,
   closing_threshold: u32,
+  // A client got an acknowledgment of a Handshake packet: the server validated its address
+  handshake_acked: bool,
   handshake_complete: bool,
   handshake_done_owed: bool,
   has_peer_params: bool,
   idle_restart_on_send: bool,
+  // Key updates of the 1-RTT keys
+  key: KeyPhase,
   last_activity_us: u64,
   local: Option<IpAddr>,
   local_cid: Cid,
@@ -252,14 +316,17 @@ where
   peer: SocketAddr,
   peer_cid: Cid,
   peer_cid_known: bool,
+  peer_ack_delay_exponent: u8,
   peer_idle_timeout_ms: u64,
   peer_max_ack_delay_ms: u64,
+  pmtud: Pmtud,
+  // Loss detection, congestion control and pacing
+  recovery: Recovery,
   // The 1-RTT space
   data: PacketSpace,
   // The Initial and Handshake spaces, from the worker's pool until the handshake is confirmed
   handshake: Option<Box<HandshakeSpaces>>,
   state: ConnState,
-  stats: ConnStats,
   streams: Streams,
   tls: Option<QuicTls<IS_CLIENT, RNG, TCX>>,
   // Raw frames for the next 1-RTT packet, boxed so that tests measure about the size of the
@@ -345,7 +412,8 @@ where
     self.enter_closing(now_us, CloseFrame { app: true, code, requested: false });
   }
 
-  /// Writes the packets that are due into `tx`, as many datagrams as needed.
+  /// Writes the packets that are due into `tx`, as many datagrams as needed. Packets in flight wait
+  /// for room in the congestion window, or for the pacer ([`Self::next_deadline`]).
   #[inline]
   pub(crate) fn flush(
     &mut self,
@@ -354,9 +422,41 @@ where
     _app: &mut A,
     pools: &mut QuicPools,
   ) -> FlushOutcome {
+    let rslt = self.flush_datagrams(now_us, tx, pools);
+    if self.recovery.timer_stale {
+      self.set_loss_timer(now_us);
+    }
+    rslt
+  }
+
+  fn flush_datagrams(
+    &mut self,
+    now_us: u64,
+    tx: &mut TxArena,
+    pools: &mut QuicPools,
+  ) -> FlushOutcome {
     loop {
       if !self.wants_send() {
         return FlushOutcome::Done;
+      }
+      // A probe of path MTU discovery goes alone, in a datagram of its size
+      if let Some(size) = self.mtu_probe_due()
+        && let Some(buffer) = tx.begin(self.peer, self.local, size)
+        && buffer.len() >= size
+      {
+        match self.write_mtu_probe(now_us, buffer, size, pools) {
+          // Not now: the other packets go
+          Ok(0) => {}
+          Ok(len) => {
+            self.on_datagram_sent(tx, len);
+            continue;
+          }
+          Err(err) => {
+            cold_path();
+            self.close_on_error(now_us, &err);
+            continue;
+          }
+        }
       }
       let max_len = self.max_datagram.min(self.amplification_budget());
       if max_len == 0 {
@@ -374,13 +474,7 @@ where
       match self.write_datagram(now_us, buffer, pools) {
         Ok(0) if short => return FlushOutcome::ArenaFull,
         Ok(0) => return FlushOutcome::Done,
-        Ok(len) => {
-          tx.commit(len);
-          let len = u64::try_from(len).unwrap_or(u64::MAX);
-          self.bytes_sent = self.bytes_sent.saturating_add(len);
-          self.stats.bytes_out = self.stats.bytes_out.wrapping_add(len);
-          self.stats.datagrams_out = self.stats.datagrams_out.wrapping_add(1);
-        }
+        Ok(len) => self.on_datagram_sent(tx, len),
         Err(err) => {
           cold_path();
           if self.state == ConnState::Closing {
@@ -409,17 +503,26 @@ where
     rslt
   }
 
-  /// When [`Self::on_timeout`] is due, if ever.
+  /// When [`Self::on_timeout`] is due, if ever: the idle timeout, the loss detection timer, the
+  /// release of a packet that the pacer holds back, the end of the previous 1-RTT keys or of the
+  /// closing period. A flush is due after it.
   #[inline]
   pub(crate) fn next_deadline(&self) -> Option<u64> {
     match self.state {
-      ConnState::Handshake | ConnState::Confirmed => self.idle_deadline(),
+      ConnState::Handshake | ConnState::Confirmed => {
+        let paced = self.recovery.pacer_release_us.filter(|_| self.wants_send());
+        [self.idle_deadline(), self.recovery.loss_timer_us, paced, self.key.discard_deadline()]
+          .into_iter()
+          .flatten()
+          .min()
+      }
       ConnState::Closing | ConnState::Draining => Some(self.close_deadline_us),
       ConnState::Closed => None,
     }
   }
 
-  /// Runs what is due at `now_us`: the end of the closing or draining period, the idle timeout.
+  /// Runs what is due at `now_us`: the end of the closing or draining period, the idle timeout,
+  /// loss detection and probe timeouts, the end of the previous 1-RTT keys.
   #[inline]
   pub(crate) fn on_timeout(&mut self, now_us: u64, app: &mut A, pools: &mut QuicPools) {
     let expired = match self.state {
@@ -432,6 +535,24 @@ where
     };
     if expired {
       self.enter_closed(app, pools);
+      return;
+    }
+    if !matches!(self.state, ConnState::Handshake | ConnState::Confirmed) {
+      return;
+    }
+    if self.recovery.pacer_release_us.is_some_and(|elem| now_us >= elem) {
+      self.recovery.pacer_release_us = None;
+    }
+    let mut rslt = Ok(());
+    if self.key.discard_deadline().is_some_and(|elem| now_us >= elem) {
+      rslt = self.key.discard_previous(self.data.keys.as_mut(), pools);
+    }
+    if rslt.is_ok() && self.recovery.loss_timer_us.is_some_and(|elem| now_us >= elem) {
+      rslt = self.on_loss_timer(now_us, pools);
+    }
+    if let Err(err) = rslt {
+      cold_path();
+      self.close_on_error(now_us, &err);
     }
   }
 
@@ -454,8 +575,10 @@ where
     let _meta = meta;
     let datagram_len = datagram.len();
     let len = u64::try_from(datagram_len).unwrap_or(u64::MAX);
-    self.stats.datagrams_in = self.stats.datagrams_in.wrapping_add(1);
-    self.stats.bytes_in = self.stats.bytes_in.wrapping_add(len);
+    self.count(|el| {
+      el.datagrams_in = el.datagrams_in.wrapping_add(1);
+      el.bytes_in = el.bytes_in.wrapping_add(len);
+    });
     match self.state {
       ConnState::Handshake | ConnState::Confirmed => {}
       ConnState::Closing => {
@@ -467,6 +590,28 @@ where
       ConnState::Draining | ConnState::Closed => return Ok(()),
     }
     self.bytes_received = self.bytes_received.saturating_add(len);
+    if !IS_CLIENT && !self.address_validated {
+      // More room under the amplification limit, which may let the timer be armed
+      self.recovery.timer_stale = true;
+    }
+    let rslt = self.recv_packets(now_us, datagram, app, pools);
+    if self.recovery.timer_stale
+      && matches!(self.state, ConnState::Handshake | ConnState::Confirmed)
+    {
+      self.set_loss_timer(now_us);
+    }
+    rslt
+  }
+
+  // The packets of a datagram, coalesced or not.
+  fn recv_packets(
+    &mut self,
+    now_us: u64,
+    datagram: &mut [u8],
+    app: &mut A,
+    pools: &mut QuicPools,
+  ) -> crate::Result<()> {
+    let datagram_len = datagram.len();
     let mut first_dcid = None;
     let mut rest = datagram;
     while !rest.is_empty() {
@@ -527,10 +672,347 @@ where
     self.state
   }
 
-  /// The counters of the connection.
+  /// The counters of the connection, all zero once it is closed.
   #[inline]
-  pub(crate) const fn stats(&self) -> &ConnStats {
-    &self.stats
+  pub(crate) fn stats(&self) -> &ConnStats {
+    self.cold.as_deref().map_or(&ConnStats::EMPTY, |el| &el.stats)
+  }
+
+  // Counts something, while the connection is open
+  fn count(&mut self, f: impl FnOnce(&mut ConnStats)) {
+    if let Some(elem) = self.cold.as_deref_mut() {
+      f(&mut elem.stats);
+    }
+  }
+
+  // If any packet number space has an ack-eliciting packet in flight.
+  fn any_ack_eliciting_in_flight(&self) -> bool {
+    SPACES.into_iter().any(|space| {
+      space_ref(&self.data, &self.handshake, space).is_some_and(|el| el.ack_eliciting_in_flight > 0)
+    })
+  }
+
+  // Declares lost the packets of `space` that are (RFC 9002 appendix A.10): their frames are
+  // queued again, and the window shrinks, to the minimum for persistent congestion.
+  fn detect_lost(&mut self, space: Space, now_us: u64, pools: &mut QuicPools) -> crate::Result<()> {
+    let max_ack_delay = if space == Space::Data { self.peer_max_ack_delay_us() } else { 0 };
+    let Self {
+      cold,
+      data,
+      handshake,
+      handshake_done_owed,
+      max_datagram,
+      pmtud,
+      recovery,
+      streams,
+      ..
+    } = self;
+    let Some(sp) = space_mut(data, handshake, space) else {
+      return Ok(());
+    };
+    let Some(largest) = sp.largest_acked else {
+      return Ok(());
+    };
+    let rtt = recovery.rtt;
+    let persistent =
+      rtt.first_sample_us.map(|first| (first, rtt.persistent_congestion_us(max_ack_delay)));
+    let PacketSpace { ack_eliciting_in_flight, crypto_lost, loss_time_us, sent, .. } = sp;
+    let mut lost_count = 0u64;
+    let mut rslt = Ok(());
+    let mut lost = LostCtx {
+      ack_eliciting_in_flight,
+      crypto_lost,
+      handshake_done_owed,
+      max_datagram: *max_datagram,
+      pmtud,
+      recovery,
+      streams,
+    };
+    let losses = recovery::detect_lost(
+      sent,
+      largest,
+      now_us,
+      rtt.loss_delay_us(),
+      persistent,
+      |pn, packet| {
+        lost_count = lost_count.wrapping_add(1);
+        let requeued = lost.on_lost(pn, &packet, pools);
+        if rslt.is_ok() {
+          rslt = requeued;
+        }
+      },
+    );
+    *loss_time_us = losses.loss_time_us;
+    if let Some(sent_us) = losses.newest_lost_us {
+      recovery.cc.on_congestion_event(sent_us, now_us);
+    }
+    if losses.persistent {
+      recovery.cc.on_persistent_congestion();
+    }
+    if lost_count > 0 {
+      recovery.timer_stale = true;
+    }
+    if let Some(elem) = cold.as_deref_mut() {
+      elem.stats.packets_lost = elem.stats.packets_lost.wrapping_add(lost_count);
+    }
+    rslt
+  }
+
+  // The earliest time of the packet number spaces at which a packet becomes lost by the time
+  // threshold, and its space.
+  fn earliest_loss_time(&self) -> Option<(u64, Space)> {
+    SPACES
+      .into_iter()
+      .filter_map(|space| {
+        space_ref(&self.data, &self.handshake, space)
+          .and_then(|el| el.loss_time_us)
+          .map(|el| (el, space))
+      })
+      .min_by_key(|el| el.0)
+  }
+
+  // If the next ack-eliciting Initial packet of a server needs a datagram of 1200 bytes: it has
+  // CRYPTO data to send, new or lost, if `allow_ae`, or is a probe.
+  fn initial_elicits(&self, allow_ae: bool) -> bool {
+    let probe = self.recovery.probes > 0 && self.recovery.probe_space == Space::Initial;
+    let crypto = !self.crypto_unsent(Space::Initial).is_empty()
+      || self.handshake.as_deref().is_some_and(|el| !el.initial.crypto_lost.is_empty());
+    probe || (allow_ae && crypto)
+  }
+
+  // The size of the path MTU probe that is due, once the handshake is confirmed.
+  fn mtu_probe_due(&self) -> Option<usize> {
+    let ready = self.state == ConnState::Confirmed && self.data.keys.is_some();
+    self.pmtud.probe_due().filter(|_| ready)
+  }
+
+  // The datagram of `len` bytes that the arena handed out was written.
+  fn on_datagram_sent(&mut self, tx: &mut TxArena, len: usize) {
+    tx.commit(len);
+    let len = u64::try_from(len).unwrap_or(u64::MAX);
+    self.bytes_sent = self.bytes_sent.saturating_add(len);
+    self.count(|el| {
+      el.bytes_out = el.bytes_out.wrapping_add(len);
+      el.datagrams_out = el.datagrams_out.wrapping_add(1);
+    });
+  }
+
+  // The loss detection timer fired: packets became lost by the time threshold, or it is a probe
+  // timeout, which owes probes and backs off (RFC 9002 appendix A.9).
+  fn on_loss_timer(&mut self, now_us: u64, pools: &mut QuicPools) -> crate::Result<()> {
+    if let Some((_, space)) = self.earliest_loss_time() {
+      self.detect_lost(space, now_us, pools)?;
+      self.set_loss_timer(now_us);
+      return Ok(());
+    }
+    let space = if self.any_ack_eliciting_in_flight() {
+      self.pto_time_and_space(now_us).map(|el| el.1)
+    } else {
+      // A client that the server may not have validated sends to unblock it
+      Some(self.anti_deadlock_space())
+    };
+    if let Some(space) = space {
+      self.recovery.probes = PTO_PROBES;
+      self.recovery.probe_space = space;
+      self.count(|el| el.pto_probes = el.pto_probes.wrapping_add(1));
+      self.prepare_probe(space, pools)?;
+    }
+    self.recovery.pto_count = self.recovery.pto_count.saturating_add(1);
+    self.set_loss_timer(now_us);
+    Ok(())
+  }
+
+  // A packet failed to open with keys of `suite`: past the integrity limit of its AEAD, across
+  // all keys of the connection, the connection closes (RFC 9001 section 6.6).
+  fn on_open_failure(&mut self, suite: CipherSuite) -> crate::Result<()> {
+    let Some(cold) = self.cold.as_deref_mut() else {
+      return Ok(());
+    };
+    cold.open_failures = cold.open_failures.wrapping_add(1);
+    if cold.open_failures >= integrity_limit(suite) {
+      cold_path();
+      return Err(crate::Error::QuicClose(
+        TransportErrorCode::AeadLimitReached,
+        QuicError::AeadLimitReached,
+      ));
+    }
+    Ok(())
+  }
+
+  // If the peer completed address validation: always for a server, which the handshake validates
+  // to the client; for a client once a Handshake packet of it was acknowledged or the handshake is
+  // confirmed (RFC 9002 appendix A.6).
+  fn peer_validated_address(&self) -> bool {
+    !IS_CLIENT || self.handshake_acked || self.state == ConnState::Confirmed
+  }
+
+  // The space of the probes of a client that has nothing in flight but is not sure that the server
+  // validated its address: a Handshake packet proves it, a padded Initial one earns credit.
+  fn anti_deadlock_space(&self) -> Space {
+    let handshake = self.handshake.as_deref().is_some_and(|el| el.handshake.keys.is_some());
+    if handshake { Space::Handshake } else { Space::Initial }
+  }
+
+  // Readies the probes of `space`: the CRYPTO data in flight of the handshake spaces goes again,
+  // coalesced (RFC 9002 section 6.2.4), and a ring with no room for a probe gives up its oldest
+  // packet as lost.
+  fn prepare_probe(&mut self, space: Space, pools: &mut QuicPools) -> crate::Result<()> {
+    if space != Space::Data
+      && let Some(hs) = self.handshake.as_deref_mut()
+    {
+      requeue_crypto_in_flight(&mut hs.initial, pools)?;
+      requeue_crypto_in_flight(&mut hs.handshake, pools)?;
+    }
+    let Self {
+      data, handshake, handshake_done_owed, max_datagram, pmtud, recovery, streams, ..
+    } = self;
+    let Some(sp) = space_mut(data, handshake, space) else {
+      return Ok(());
+    };
+    if !sp.sent.is_full() {
+      return Ok(());
+    }
+    // Every packet number of the ring is used and the oldest packet is in flight: a probe can not
+    // go without its slot, so it counts as lost
+    let base = sp.sent.base();
+    let Some(record) = sp.sent.get_mut(base) else {
+      return Ok(());
+    };
+    let packet = *record;
+    record.kind = SentKind::Lost;
+    let PacketSpace { ack_eliciting_in_flight, crypto_lost, .. } = sp;
+    let mut lost = LostCtx {
+      ack_eliciting_in_flight,
+      crypto_lost,
+      handshake_done_owed,
+      max_datagram: *max_datagram,
+      pmtud,
+      recovery,
+      streams,
+    };
+    lost.on_lost(base, &packet, pools)
+  }
+
+  // When the probe timeout fires and in which space (RFC 9002 appendix A.8): the earliest of the
+  // spaces with ack-eliciting packets in flight, 1-RTT packets only once the handshake is
+  // confirmed, with the `max_ack_delay` of the peer for them only (carried rule 2).
+  fn pto_time_and_space(&self, now_us: u64) -> Option<(u64, Space)> {
+    let backoff = 1u64.checked_shl(self.recovery.pto_count.min(30)).unwrap_or(u64::MAX);
+    let mut duration = self.recovery.rtt.pto_base_us().saturating_mul(backoff);
+    if !self.any_ack_eliciting_in_flight() {
+      return Some((now_us.saturating_add(duration), self.anti_deadlock_space()));
+    }
+    let mut rslt: Option<(u64, Space)> = None;
+    for space in SPACES {
+      let Some(sp) = space_ref(&self.data, &self.handshake, space) else {
+        continue;
+      };
+      if sp.ack_eliciting_in_flight == 0 {
+        continue;
+      }
+      if space == Space::Data {
+        if self.state != ConnState::Confirmed {
+          break;
+        }
+        duration = duration.saturating_add(self.peer_max_ack_delay_us().saturating_mul(backoff));
+      }
+      let at = sp.last_ack_eliciting_us.saturating_add(duration);
+      if rslt.is_none_or(|elem| at < elem.0) {
+        rslt = Some((at, space));
+      }
+    }
+    rslt
+  }
+
+  // Arms the loss detection timer (RFC 9002 appendix A.8): for the earliest time at which a packet
+  // becomes lost, else for the probe timeout, unless nothing is in flight that needs one or a
+  // server is held by the amplification limit (carried rule 2).
+  fn set_loss_timer(&mut self, now_us: u64) {
+    self.recovery.timer_stale = false;
+    let blocked = !IS_CLIENT && self.amplification_budget() == 0;
+    let idle = !self.any_ack_eliciting_in_flight() && self.peer_validated_address();
+    self.recovery.loss_timer_us = if let Some((at, _)) = self.earliest_loss_time() {
+      Some(at)
+    } else if blocked || idle {
+      None
+    } else {
+      self.pto_time_and_space(now_us).map(|el| el.0)
+    };
+  }
+
+  // If the window and the pacer let a datagram of up to `len` bytes in flight go at `now_us`. The
+  // pacer gives the time at which it will, which [`Self::next_deadline`] reports.
+  fn window_allows(&mut self, now_us: u64, len: usize) -> bool {
+    let max_in_flight = self.params.max_in_flight;
+    self.recovery.pacer_release_us = None;
+    if !self.recovery.can_send(max_in_flight, self.max_datagram) {
+      return false;
+    }
+    if !self.params.pacing {
+      return true;
+    }
+    let window = self.recovery.window(max_in_flight);
+    let srtt = self.recovery.rtt.smoothed_us;
+    let release = self.recovery.pacer.release_time(now_us, len, window, srtt, self.max_datagram);
+    self.recovery.pacer_release_us = release;
+    release.is_none()
+  }
+
+  // A 1-RTT packet of a PING and PADDING that fills a datagram of `size` bytes, ack-eliciting and
+  // not counted by congestion control (ruling T9-e). Returns its length, zero if it can not go
+  // now.
+  fn write_mtu_probe(
+    &mut self,
+    now_us: u64,
+    buffer: &mut [u8],
+    size: usize,
+    pools: &mut QuicPools,
+  ) -> crate::Result<usize> {
+    let (dcid, scid, key_phase) = (self.peer_cid, self.local_cid, self.key.local_phase);
+    let sp = &mut self.data;
+    if sp.keys.is_none() || !sp.sent.reserve(pools) {
+      return Ok(0);
+    }
+    let pn = sp.sent.next_pn();
+    let pn_len = pn_len_for(pn, sp.largest_acked);
+    let Some(buffer) = buffer.get_mut(..size) else {
+      return Ok(0);
+    };
+    let Some((header_len, pn_offset, _)) =
+      write_header(buffer, Space::Data, &dcid, &scid, pn, pn_len, key_phase)
+    else {
+      return Ok(0);
+    };
+    let payload_len = size.saturating_sub(header_len).saturating_sub(AEAD_TAG_LEN);
+    let Some(payload) = buffer.get_mut(header_len..header_len.wrapping_add(payload_len)) else {
+      return Ok(0);
+    };
+    if payload.len() < MIN_PN_AND_PAYLOAD_LEN {
+      return Ok(0);
+    }
+    payload.fill(0);
+    if let Some(first) = payload.first_mut() {
+      *first = PING_FRAME[0];
+    }
+    let packet = OpenPacket {
+      ack_eliciting: true,
+      frames: FrameRefRange::EMPTY,
+      full_datagram: false,
+      header_len,
+      length_at: None,
+      mtu_probe: true,
+      padded: true,
+      payload_len,
+      pn,
+      pn_len,
+      pn_offset,
+      space: Space::Data,
+      start: 0,
+    };
+    let len = self.seal(now_us, buffer, &packet)?;
+    self.pmtud.on_probe_sent(pn);
+    self.count(|el| el.mtu_probes = el.mtu_probes.wrapping_add(1));
+    Ok(len)
   }
 
   fn accepts_dcid(&self, dcid: &Cid) -> bool {
@@ -543,7 +1025,7 @@ where
 
   // Records the processing of a packet of `space`.
   fn after_packet(&mut self, now_us: u64, space: Space, pools: &mut QuicPools) {
-    self.stats.packets_in = self.stats.packets_in.wrapping_add(1);
+    self.count(|el| el.packets_in = el.packets_in.wrapping_add(1));
     self.last_activity_us = now_us;
     self.idle_restart_on_send = true;
     if !matches!(self.state, ConnState::Handshake | ConnState::Confirmed) {
@@ -554,7 +1036,7 @@ where
       // 8.1), whose keys are not needed anymore (RFC 9001 section 4.9.1)
       self.address_validated = true;
       if let Some(elem) = &mut self.handshake {
-        elem.discard_initial(pools);
+        elem.discard_initial(&mut self.recovery, pools);
       }
     }
     if !IS_CLIENT && self.handshake_complete && self.state == ConnState::Handshake {
@@ -609,10 +1091,11 @@ where
     self.release_handshake(pools);
   }
 
-  // The Initial and Handshake spaces, wiped, and the TLS state go back to their pools.
+  // The Initial and Handshake spaces, wiped, and the TLS state go back to their pools; their
+  // packets leave the bytes in flight (RFC 9002 section 6.4).
   fn release_handshake(&mut self, pools: &mut QuicPools) {
     if let Some(elem) = self.handshake.take() {
-      HandshakeSpaces::give(elem, pools);
+      HandshakeSpaces::give(elem, &mut self.recovery, pools);
     }
     // Back to the thread's pools, zeroed
     self.tls = None;
@@ -630,7 +1113,7 @@ where
   }
 
   fn drop_packet(&mut self) {
-    self.stats.packets_dropped = self.stats.packets_dropped.wrapping_add(1);
+    self.count(|el| el.packets_dropped = el.packets_dropped.wrapping_add(1));
   }
 
   fn enter_closing(&mut self, now_us: u64, close: CloseFrame) {
@@ -642,6 +1125,8 @@ where
     self.close_owed = true;
     self.streams.on_closing();
     self.close_deadline_us = now_us.saturating_add(self.pto_us().saturating_mul(3));
+    self.recovery.loss_timer_us = None;
+    self.recovery.probes = 0;
     self.closing_datagrams = 0;
     self.closing_threshold = 1;
   }
@@ -650,6 +1135,8 @@ where
     match self.state {
       ConnState::Handshake | ConnState::Confirmed => {
         self.close_deadline_us = now_us.saturating_add(self.pto_us().saturating_mul(3));
+        self.recovery.loss_timer_us = None;
+        self.recovery.probes = 0;
       }
       // What is left of the closing period
       ConnState::Closing => {}
@@ -686,8 +1173,8 @@ where
     if self.state == ConnState::Closing {
       return IS_CLIENT && has_keys(Space::Initial);
     }
-    let initial = self.space_wants_send(Space::Initial)
-      && (IS_CLIENT || !self.crypto_unsent(Space::Initial).is_empty());
+    let initial =
+      self.space_wants_send(Space::Initial) && (IS_CLIENT || self.initial_elicits(true));
     initial || (self.path_response.is_some() && has_keys(Space::Data))
   }
 
@@ -704,14 +1191,19 @@ where
     Some(self.last_activity_us.saturating_add(timeout))
   }
 
+  // An ACK frame of `space` (RFC 9002 section 6 and appendix A.7): the frames of the packets that
+  // it acknowledges go back, an RTT sample is taken, losses are detected.
   fn on_ack(
     &mut self,
+    now_us: u64,
     space: Space,
     ack: &AckFrame<'_>,
     pools: &mut QuicPools,
   ) -> crate::Result<()> {
     let max_ranges = self.params.limits.max_ack_ranges;
-    let Some(sp) = space_mut(&mut self.data, &mut self.handshake, space) else {
+    let max_in_flight = self.params.max_in_flight;
+    let Self { data, handshake, key, max_datagram, pmtud, recovery, streams, .. } = self;
+    let Some(sp) = space_mut(data, handshake, space) else {
       return Ok(());
     };
     if ack.largest >= sp.sent.next_pn() {
@@ -720,30 +1212,98 @@ where
     if sp.largest_acked.is_none_or(|elem| ack.largest > elem) {
       sp.largest_acked = Some(ack.largest);
     }
+    let PacketSpace { ack_eliciting_in_flight, crypto_lost, recv, sent, .. } = sp;
     let mut our_ack = None;
+    let (mut largest_sent_us, mut ack_eliciting, mut late, mut newly) = (None, false, 0u64, false);
     // The frames of every acknowledged packet go back, even after an error
     let mut rslt = Ok(());
     for range in ack.ranges().take(max_ranges) {
       let range = range?;
-      for pn in sp.sent.window(*range.start(), *range.end()) {
-        let Some(packet) = sp.sent.take(pn) else {
+      for pn in sent.window(*range.start(), *range.end()) {
+        let Some(packet) = sent.take(pn) else {
           continue;
         };
+        newly = true;
+        ack_eliciting |= packet.ack_eliciting;
+        if pn == ack.largest {
+          largest_sent_us = Some(packet.time_us);
+        }
+        match packet.kind {
+          SentKind::InFlight | SentKind::MtuProbe => {
+            recovery.on_acked(&packet, now_us, max_in_flight);
+            if packet.ack_eliciting {
+              *ack_eliciting_in_flight = ack_eliciting_in_flight.saturating_sub(1);
+            }
+            if let Some(size) = pmtud.on_probe_acked(pn) {
+              *max_datagram = size;
+              recovery.cc.set_max_datagram(size);
+            }
+          }
+          SentKind::Lost => late = late.wrapping_add(1),
+          SentKind::NotInFlight => {}
+        }
+        if space == Space::Data && pn >= key.local_first_pn {
+          key.local_acked = true;
+        }
         let mut cursor = FrameRefPool::cursor(packet.frames);
         while let Some(frame) = cursor.next(&pools.frame_refs) {
-          if let FrameRef::Ack { largest } = frame {
-            our_ack = our_ack.max(Some(largest));
-          } else if rslt.is_ok() {
-            rslt = self.streams.on_frame_acked(frame, pools);
+          match frame {
+            FrameRef::Ack { largest } => our_ack = our_ack.max(Some(largest)),
+            FrameRef::Crypto { offset, len } => {
+              if rslt.is_ok() {
+                rslt = trim_acked_crypto(crypto_lost, offset, len, &mut pools.frame_refs);
+              }
+            }
+            FrameRef::HandshakeDone => {}
+            _ => {
+              if rslt.is_ok() {
+                rslt = streams.on_frame_acked(frame, pools);
+              }
+            }
           }
         }
         pools.frame_refs.free(packet.frames);
       }
     }
     if let Some(elem) = our_ack {
-      sp.recv.on_ack_of_our_ack(elem);
+      recv.on_ack_of_our_ack(elem, pools);
     }
-    rslt
+    if !newly {
+      return rslt;
+    }
+    // A sample of the largest packet acknowledged, if the frame acknowledged one that elicited it
+    if let Some(sent_us) = largest_sent_us
+      && ack_eliciting
+    {
+      // The ACK Delay of Initial and Handshake packets is meaningless (RFC 9002 section 5.3)
+      let ack_delay = if space == Space::Data {
+        ack.delay.checked_shl(u32::from(self.peer_ack_delay_exponent)).unwrap_or(u64::MAX)
+      } else {
+        0
+      };
+      let confirmed = self.state == ConnState::Confirmed;
+      let max_ack_delay = self.peer_max_ack_delay_us();
+      self.recovery.rtt.update(
+        now_us.saturating_sub(sent_us),
+        ack_delay,
+        max_ack_delay,
+        confirmed,
+        now_us,
+      );
+    }
+    self.count(|el| el.late_acks = el.late_acks.wrapping_add(late));
+    if IS_CLIENT && space == Space::Handshake {
+      self.handshake_acked = true;
+    }
+    rslt?;
+    self.detect_lost(space, now_us, pools)?;
+    // RFC 9002 appendix A.7: a client that is not sure that the server validated its address
+    // keeps backing off
+    if self.peer_validated_address() {
+      self.recovery.pto_count = 0;
+    }
+    self.recovery.on_ack_done();
+    Ok(())
   }
 
   // CRYPTO data, in order to TLS, what comes early buffered.
@@ -826,9 +1386,12 @@ where
     if let Some(elem) = peer_params {
       self.check_peer_params(&elem)?;
       self.has_peer_params = true;
+      self.peer_ack_delay_exponent = elem.ack_delay_exponent;
       self.peer_idle_timeout_ms = elem.max_idle_timeout_ms;
       self.peer_max_ack_delay_ms = elem.max_ack_delay_ms;
       self.streams.on_peer_params(&elem);
+      // The probes wait for the confirmation of the handshake
+      self.pmtud.start(elem.max_udp_payload_size, &self.peer, self.max_datagram);
     }
     if is_complete && !self.handshake_complete {
       self.handshake_complete = true;
@@ -840,13 +1403,15 @@ where
     Ok(())
   }
 
-  // The probe timeout of RFC 9002 section 6.2.1 with the initial RTT, until an RTT is measured.
+  // The `max_ack_delay` of the peer.
+  const fn peer_max_ack_delay_us(&self) -> u64 {
+    self.peer_max_ack_delay_ms.saturating_mul(1_000)
+  }
+
+  // The current probe timeout of the 1-RTT space without backoff (RFC 9002 section 6.2.1), for the
+  // timers of RFC 9000 that count in PTOs.
   const fn pto_us(&self) -> u64 {
-    let rttvar = INITIAL_RTT_US / 2;
-    let variance = if 4 * rttvar > GRANULARITY_US { 4 * rttvar } else { GRANULARITY_US };
-    INITIAL_RTT_US
-      .saturating_add(variance)
-      .saturating_add(self.peer_max_ack_delay_ms.saturating_mul(1_000))
+    self.recovery.rtt.pto_base_us().saturating_add(self.peer_max_ack_delay_us())
   }
 
   // The frames of a decrypted packet, in one walk. Returns whether the packet was ack-eliciting.
@@ -865,7 +1430,7 @@ where
       is_empty = false;
       match frame {
         Frame::Padding(_) => {}
-        Frame::Ack(ack) => self.on_ack(space, &ack, pools)?,
+        Frame::Ack(ack) => self.on_ack(now_us, space, &ack, pools)?,
         Frame::ConnectionClose { .. } => {
           self.enter_draining(now_us);
           return Ok(ack_eliciting);
@@ -999,14 +1564,16 @@ where
     app: &mut A,
     pools: &mut QuicPools,
   ) -> crate::Result<()> {
+    let pto_us = self.pto_us();
     let Some(sp) = space_mut(&mut self.data, &mut self.handshake, space) else {
       self.drop_packet();
       return Ok(());
     };
-    let Some(keys) = &sp.keys else {
+    let Some(keys) = sp.keys.as_mut() else {
       self.drop_packet();
       return Ok(());
     };
+    // Every generation of the 1-RTT keys has the same header protection key (RFC 9001 section 6)
     let Ok((pn, pn_len, first)) =
       remove_header_protection(keys.remote.hp(), packet, pn_offset, sp.recv.largest())
     else {
@@ -1014,16 +1581,39 @@ where
       return Ok(());
     };
     if sp.recv.is_duplicate(pn) {
-      self.stats.duplicates = self.stats.duplicates.wrapping_add(1);
+      self.count(|el| el.duplicates = el.duplicates.wrapping_add(1));
       return Ok(());
     }
+    // The generation that opens the packet, chosen before it is decrypted: a failure loses the
+    // buffer (ruling T9-a)
+    let generation = if space == Space::Data {
+      let Some(elem) = self.key.choose(first & KEY_PHASE_BIT != 0, pn, sp.recv.largest()) else {
+        self.drop_packet();
+        return Ok(());
+      };
+      elem
+    } else {
+      Generation::Current
+    };
+    if generation == Generation::Next {
+      self.key.prepare_next(keys, pools)?;
+    }
     let header_len = pn_offset.wrapping_add(pn_len);
-    let Ok(payload) = open_payload(keys.remote.aead(), keys.remote.iv(), packet, header_len, pn)
-    else {
+    let suite = keys.remote.suite();
+    let opened = self
+      .key
+      .remote(generation, keys)
+      .and_then(|el| open_payload(el.aead(), el.iv(), packet, header_len, pn).ok());
+    let Some(payload) = opened else {
       // Forged, corrupted or for other keys: the buffer is lost (RFC 9001 section 5.3)
       self.drop_packet();
-      return Ok(());
+      return self.on_open_failure(suite);
     };
+    if generation == Generation::Next {
+      let next_pn = sp.sent.next_pn();
+      let followed = self.key.on_peer_update(pn, now_us, pto_us, keys, next_pn)?;
+      self.count(|el| el.key_updates = el.key_updates.wrapping_add(u64::from(followed)));
+    }
     let reserved = if first & LONG_HEADER_BIT == 0 {
       first & SHORT_RESERVED_BITS
     } else {
@@ -1039,7 +1629,7 @@ where
     }
     let ack_eliciting = self.recv_frames(now_us, space, payload, app, pools)?;
     if let Some(sp) = space_mut(&mut self.data, &mut self.handshake, space) {
-      let _is_new = sp.recv.on_packet(pn, ack_eliciting, now_us);
+      let _is_new = sp.recv.on_packet(pn, ack_eliciting, now_us, pools);
     }
     self.after_packet(now_us, space, pools);
     Ok(())
@@ -1068,18 +1658,32 @@ where
     if self.state == ConnState::Closing {
       sp.sent.skip();
     } else {
-      sp.sent.on_sent(SentPacket {
+      let kind = if packet.mtu_probe {
+        SentKind::MtuProbe
+      } else if packet.ack_eliciting || packet.padded {
+        SentKind::InFlight
+      } else {
+        SentKind::NotInFlight
+      };
+      let record = SentPacket {
         time_us: now_us,
         size: u16::try_from(len).unwrap_or(u16::MAX),
         ack_eliciting: packet.ack_eliciting,
-        in_flight: packet.ack_eliciting || packet.padded,
+        kind,
         frames: packet.frames,
-      });
+      };
+      sp.sent.on_sent(record);
+      if packet.ack_eliciting {
+        sp.ack_eliciting_in_flight = sp.ack_eliciting_in_flight.saturating_add(1);
+        sp.last_ack_eliciting_us = now_us;
+      }
+      self.recovery.on_sent(&record);
     }
-    self.stats.packets_out = self.stats.packets_out.wrapping_add(1);
-    if !packet.ack_eliciting && self.state != ConnState::Closing {
-      self.stats.ack_only_out = self.stats.ack_only_out.wrapping_add(1);
-    }
+    let ack_only = !packet.ack_eliciting && self.state != ConnState::Closing;
+    self.count(|el| {
+      el.packets_out = el.packets_out.wrapping_add(1);
+      el.ack_only_out = el.ack_only_out.wrapping_add(u64::from(ack_only));
+    });
     Ok(len)
   }
 
@@ -1090,7 +1694,11 @@ where
     if sp.keys.is_none() {
       return false;
     }
-    let mut wants = sp.recv.ack_pending() || !self.crypto_unsent(space).is_empty();
+    let probe = self.recovery.probes > 0 && self.recovery.probe_space == space;
+    let mut wants = sp.recv.ack_pending()
+      || !self.crypto_unsent(space).is_empty()
+      || !sp.crypto_lost.is_empty()
+      || probe;
     if space == Space::Data {
       wants |=
         self.handshake_done_owed || self.path_response.is_some() || self.streams.wants_send();
@@ -1105,6 +1713,7 @@ where
   fn enter_closed(&mut self, app: &mut A, pools: &mut QuicPools) {
     self.state = ConnState::Closed;
     self.release_handshake(pools);
+    self.key.release(pools);
     self.data.clear(pools);
     self.streams.release(pools);
     if let Some(elem) = self.cold.take() {
@@ -1120,6 +1729,7 @@ where
     match self.state {
       ConnState::Handshake | ConnState::Confirmed => {
         SPACES.into_iter().any(|space| self.space_wants_send(space))
+          || self.mtu_probe_due().is_some()
       }
       ConnState::Closing => self.close_owed,
       ConnState::Draining | ConnState::Closed => false,
@@ -1147,10 +1757,12 @@ where
       close_owed: false,
       closing_datagrams: 0,
       closing_threshold: 1,
+      handshake_acked: false,
       handshake_complete: false,
       handshake_done_owed: false,
       has_peer_params: false,
       idle_restart_on_send: true,
+      key: KeyPhase::new(),
       last_activity_us: now_us,
       local: meta.local,
       local_cid,
@@ -1160,12 +1772,14 @@ where
       peer: meta.peer,
       peer_cid,
       peer_cid_known: false,
+      peer_ack_delay_exponent: TransportParams::default().ack_delay_exponent,
       peer_idle_timeout_ms: 0,
       peer_max_ack_delay_ms: TransportParams::default().max_ack_delay_ms,
+      pmtud: Pmtud::new(),
+      recovery: Recovery::new(INITIAL_MAX_DATAGRAM),
       data: PacketSpace::new(),
       handshake: Some(handshake),
       state: ConnState::Handshake,
-      stats: ConnStats::default(),
       streams: Streams::new(params, IS_CLIENT, pools),
       tls: Some(tls),
       #[cfg(test)]
@@ -1182,6 +1796,14 @@ where
     pools: &mut QuicPools,
   ) -> crate::Result<usize> {
     let closing = self.state == ConnState::Closing;
+    // Probes owed in a space whose keys are gone are not owed anymore
+    let probe_space = self.recovery.probe_space;
+    if !space_ref(&self.data, &self.handshake, probe_space).is_some_and(|el| el.keys.is_some()) {
+      self.recovery.probes = 0;
+    }
+    // Probes, CONNECTION_CLOSE and ACK-only packets are not held back by the window or the pacer
+    let probing = !closing && self.recovery.probes > 0;
+    let allow_ae = closing || probing || self.window_allows(now_us, buffer.len());
     let mut packets = [None, None, None];
     let mut pos = 0usize;
     for (space, slot) in SPACES.into_iter().zip(&mut packets) {
@@ -1190,20 +1812,22 @@ where
       } else {
         self.space_wants_send(space)
       };
-      // An ack-eliciting Initial packet of a server needs a datagram of 1200 bytes, which the
-      // amplification limit may not leave
+      // An ack-eliciting Initial packet of a server, a probe included, needs a datagram of 1200
+      // bytes, which the amplification limit may not leave (carried rule 1)
       let initial_too_short = !IS_CLIENT
         && !closing
         && space == Space::Initial
         && buffer.len() < MIN_DATAGRAM_LEN
-        && !self.crypto_unsent(space).is_empty();
+        && self.initial_elicits(allow_ae);
       if !wanted || initial_too_short {
         continue;
       }
       let Some(out) = buffer.get_mut(pos..) else {
         break;
       };
-      if let Some(mut packet) = self.write_packet(now_us, space, out, closing, pools)? {
+      let probe = probing && self.recovery.probe_space == space;
+      let written = self.write_packet(now_us, space, out, closing, allow_ae, probe, pools)?;
+      if let Some(mut packet) = written {
         packet.start = pos;
         pos = pos.wrapping_add(packet.len());
         *slot = Some(packet);
@@ -1228,10 +1852,18 @@ where
     }
     let mut sent_handshake = false;
     let mut ack_eliciting = false;
+    let mut in_flight = false;
     for packet in packets.iter().flatten() {
       let _len = self.seal(now_us, buffer, packet)?;
       sent_handshake |= packet.space == Space::Handshake;
       ack_eliciting |= packet.ack_eliciting;
+      in_flight |= packet.ack_eliciting || packet.padded;
+      if probing && packet.ack_eliciting && packet.space == self.recovery.probe_space {
+        self.recovery.probes = self.recovery.probes.saturating_sub(1);
+      }
+    }
+    if in_flight && !closing {
+      self.recovery.pacer.on_sent(pos);
     }
     if closing {
       self.close_owed = false;
@@ -1244,22 +1876,27 @@ where
     if IS_CLIENT && sent_handshake {
       // RFC 9001 section 4.9.1
       if let Some(elem) = &mut self.handshake {
-        elem.discard_initial(pools);
+        elem.discard_initial(&mut self.recovery, pools);
       }
     }
     Ok(pos)
   }
 
-  // A packet of `space` at the start of `out`, not sealed yet, or `None` if nothing fit.
+  // A packet of `space` at the start of `out`, not sealed yet, or `None` if nothing fit. Only an
+  // ACK goes unless `allow_ae`; a `probe` is ack-eliciting, a PING if nothing else is.
   fn write_packet(
     &mut self,
     now_us: u64,
     space: Space,
     out: &mut [u8],
     closing: bool,
+    allow_ae: bool,
+    probe: bool,
     pools: &mut QuicPools,
   ) -> crate::Result<Option<OpenPacket>> {
     let (dcid, scid) = (self.peer_cid, self.local_cid);
+    let confirmed = self.state == ConnState::Confirmed;
+    let key_update_after = self.params.key_update_threshold;
     let Some(sp) = space_mut(&mut self.data, &mut self.handshake, space) else {
       return Ok(None);
     };
@@ -1269,9 +1906,32 @@ where
       return Ok(None);
     }
     let pn = sp.sent.next_pn();
+    let mut key_phase = false;
+    if space == Space::Data
+      && let Some(keys) = sp.keys.as_mut()
+    {
+      let suite = keys.local.suite();
+      if !closing && keys.local.packets_sealed() >= confidentiality_limit(suite).saturating_sub(1) {
+        // No update could come in time (RFC 9001 section 6.6)
+        cold_path();
+        return Err(crate::Error::QuicClose(
+          TransportErrorCode::AeadLimitReached,
+          QuicError::AeadLimitReached,
+        ));
+      }
+      if !closing && confirmed {
+        let threshold = key_update_threshold(suite, key_update_after);
+        if self.key.maybe_initiate(keys, threshold, pn)?
+          && let Some(cold) = self.cold.as_deref_mut()
+        {
+          cold.stats.key_updates = cold.stats.key_updates.wrapping_add(1);
+        }
+      }
+      key_phase = self.key.local_phase;
+    }
     let pn_len = pn_len_for(pn, sp.largest_acked);
     let Some((header_len, pn_offset, length_at)) =
-      write_header(out, space, &dcid, &scid, pn, pn_len)
+      write_header(out, space, &dcid, &scid, pn, pn_len, key_phase)
     else {
       return Ok(None);
     };
@@ -1301,12 +1961,15 @@ where
     } else {
       if sp.recv.ack_pending()
         && let Some(largest) = sp.recv.largest()
-        && sp.recv.write_ack(&mut fw, self.params.ack_delay_exponent, now_us)
+        && let Some(written) = sp.recv.write_ack(&mut fw, self.params.ack_delay_exponent, now_us)
       {
         pools.frame_refs.push(&mut frames, FrameRef::Ack { largest })?;
-        sp.recv.on_ack_sent();
+        // A frame with its first range only leaves the others owed (carried rule 4)
+        if written == AckWritten::All {
+          sp.recv.on_ack_sent(pools);
+        }
       }
-      if space == Space::Data {
+      if space == Space::Data && allow_ae {
         if self.handshake_done_owed && fw.write_handshake_done() {
           pools.frame_refs.push(&mut frames, FrameRef::HandshakeDone)?;
           self.handshake_done_owed = false;
@@ -1319,38 +1982,26 @@ where
           ack_eliciting = true;
           full_datagram = true;
         }
-        #[cfg(test)]
-        if let Some(elem) = self.test_frames.as_deref_mut()
-          && !elem.is_empty()
-          && fw.write_bytes(elem)
-        {
-          elem.clear();
-          ack_eliciting = true;
+      }
+      // Raw frames of a test go whatever the window, as a peer that injects them would
+      #[cfg(test)]
+      if space == Space::Data
+        && let Some(elem) = self.test_frames.as_deref_mut()
+        && !elem.is_empty()
+        && fw.write_bytes(elem)
+      {
+        elem.clear();
+        ack_eliciting = true;
+      }
+      if allow_ae {
+        let output = self.tls.as_ref().map_or(&[][..], |el| el.output(space));
+        ack_eliciting |= write_crypto(output, sp, &mut fw, &mut frames, pools)?;
+        if space == Space::Data {
+          ack_eliciting |= self.streams.write_frames(&mut fw, &mut frames, pools, &self.params)?;
         }
       }
-      if let Some(tls) = &self.tls {
-        let sent = usize::try_from(sp.crypto_tx).unwrap_or(usize::MAX);
-        let unsent = tls.output(space).get(sent..).unwrap_or_default();
-        let offset = sp.crypto_tx;
-        // The header and the data must fit together
-        let room = fw.remaining();
-        let longest = unsent.len().min(room);
-        let header = 1usize
-          .wrapping_add(varint_len(offset))
-          .wrapping_add(varint_len(u64::try_from(longest).unwrap_or(u64::MAX)));
-        let data_len = longest.min(room.saturating_sub(header));
-        if let Some(data) = unsent.get(..data_len).filter(|elem| !elem.is_empty())
-          && fw.write_crypto_header(offset, data_len)
-          && fw.write_bytes(data)
-        {
-          let len = u32::try_from(data_len).unwrap_or(u32::MAX);
-          pools.frame_refs.push(&mut frames, FrameRef::Crypto { offset, len })?;
-          sp.crypto_tx = sp.crypto_tx.wrapping_add(u64::from(len));
-          ack_eliciting = true;
-        }
-      }
-      if space == Space::Data {
-        ack_eliciting |= self.streams.write_frames(&mut fw, &mut frames, pools, &self.params)?;
+      if probe && !ack_eliciting && fw.write_bytes(&PING_FRAME) {
+        ack_eliciting = true;
       }
     }
     let mut payload_len = fw.len();
@@ -1374,6 +2025,7 @@ where
       full_datagram,
       header_len,
       length_at,
+      mtu_probe: false,
       padded,
       payload_len,
       pn,
@@ -1396,6 +2048,65 @@ where
       ConnState::Closing => Some((self.close.app, self.close.code)),
       _ => None,
     }
+  }
+
+  /// Declares lost every 1-RTT packet in flight, as loss detection would.
+  pub(crate) fn declare_in_flight_lost(&mut self, pools: &mut QuicPools) {
+    let Self { data, handshake_done_owed, max_datagram, pmtud, recovery, streams, .. } = self;
+    let PacketSpace { ack_eliciting_in_flight, crypto_lost, sent, .. } = data;
+    let mut lost = LostCtx {
+      ack_eliciting_in_flight,
+      crypto_lost,
+      handshake_done_owed,
+      max_datagram: *max_datagram,
+      pmtud,
+      recovery,
+      streams,
+    };
+    let (base, next) = (sent.base(), sent.next_pn());
+    for pn in base..next {
+      if let Some(record) = sent.get_mut(pn).filter(|el| el.in_flight()) {
+        let packet = *record;
+        record.kind = SentKind::Lost;
+        lost.on_lost(pn, &packet, pools).unwrap();
+      }
+    }
+  }
+
+  /// The bytes of the packets in flight that congestion control counts.
+  pub(crate) const fn bytes_in_flight(&self) -> u64 {
+    self.recovery.bytes_in_flight
+  }
+
+  /// The congestion window.
+  pub(crate) fn cwnd(&self) -> usize {
+    use crate::quic::cc::CongestionControl as _;
+    self.recovery.cc.window()
+  }
+
+  /// The key phases of the 1-RTT packets that are sent and of those that arrive.
+  pub(crate) const fn key_phases(&self) -> (bool, bool) {
+    (self.key.local_phase, self.key.remote_phase)
+  }
+
+  /// If the keys of the previous key phase still open packets that arrive late.
+  pub(crate) fn keeps_previous_keys(&self) -> bool {
+    self.key.other == OtherKeys::Previous
+  }
+
+  /// The size of the datagrams.
+  pub(crate) const fn max_datagram(&self) -> usize {
+    self.max_datagram
+  }
+
+  /// The probe timeout of the 1-RTT space, without backoff.
+  pub(crate) const fn current_pto_us(&self) -> u64 {
+    self.recovery.rtt.pto_base_us().saturating_add(self.peer_max_ack_delay_ms.saturating_mul(1_000))
+  }
+
+  /// Probe timeouts in a row.
+  pub(crate) const fn pto_count(&self) -> u32 {
+    self.recovery.pto_count
   }
 
   /// Sends `frames`, raw, in the next 1-RTT packet.
@@ -1445,25 +2156,34 @@ where
       .field("local_cid", &self.local_cid)
       .field("peer", &self.peer)
       .field("state", &self.state)
-      .field("stats", &self.stats)
+      .field("stats", &self.cold.as_deref().map(|el| el.stats))
       .finish_non_exhaustive()
   }
 }
 
 /// The state of a connection that is seldom used: the budgets of the frames of the peer that a
-/// flood would abuse. It comes from the pools of the worker and goes back once the connection is
-/// closed, which keeps the connection small (spec section 5.4, ruling T8-c). Without it, once the
-/// connection is closed, no frame is processed and no budget is spent.
+/// flood would abuse, the packets that failed to open and the counters. It comes from the pools of
+/// the worker and goes back once the connection is closed, which keeps the connection small (spec
+/// section 5.4, rulings T8-c and T9-c). Without it, once the connection is closed, no frame is
+/// processed, no budget is spent and nothing is counted.
 #[derive(Debug)]
 pub(crate) struct ConnCold {
+  // Packets that failed to open, for the integrity limit
+  open_failures: u64,
   path_challenges: RateBudget,
   pings: RateBudget,
+  stats: ConnStats,
 }
 
 impl ConnCold {
   // From the pool, or new
   fn take(pools: &mut QuicPools) -> Box<Self> {
-    let fresh = Self { path_challenges: RateBudget::default(), pings: RateBudget::default() };
+    let fresh = Self {
+      open_failures: 0,
+      path_challenges: RateBudget::default(),
+      pings: RateBudget::default(),
+      stats: ConnStats::EMPTY,
+    };
     match pools.conn_cold.take() {
       Some(mut elem) => {
         *elem = fresh;
@@ -1471,6 +2191,241 @@ impl ConnCold {
       }
       None => Box::new(fresh),
     }
+  }
+}
+
+/// The second slot of the keys that open 1-RTT packets: the generation before or after the one
+/// of the slot of the space during a key update (RFC 9001 section 6, ruling T9-b). It comes from
+/// the pools of the worker and goes back, emptied, once the connection is closed.
+#[derive(Debug)]
+pub(crate) struct KeySlot {
+  remote: Option<DirectionalKeys>,
+}
+
+// The generation of the 1-RTT keys that opens a packet
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Generation {
+  Current,
+  Previous,
+  Next,
+}
+
+// What the slot that does not hold the current keys that open packets holds
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OtherKeys {
+  // Nothing, before the first key update
+  None,
+  // The previous generation, until `KeyPhase::previous_until_us`
+  Previous,
+  // The next generation, made before it is needed
+  Next,
+}
+
+// Key updates of the 1-RTT keys (RFC 9001 section 6). The keys that open packets are in two slots,
+// the one of the space and a box from the pools, and which one is current alternates with the key
+// phase, so that a flip moves no key (ruling T9-b). The keys that seal packets advance in place.
+#[derive(Debug)]
+struct KeyPhase {
+  // If the current keys that open packets are in `slot`, not in the slot of the space
+  current_in_slot: bool,
+  // A packet sealed with the current keys was acknowledged: a new update can start
+  local_acked: bool,
+  // The first packet number sealed with the current keys
+  local_first_pn: u64,
+  // The key phase of the packets that are sent
+  local_phase: bool,
+  other: OtherKeys,
+  previous_until_us: u64,
+  // The first packet number that the current keys opened
+  remote_first_pn: u64,
+  // The key phase of the packets that the current keys open
+  remote_phase: bool,
+  slot: Option<Box<KeySlot>>,
+}
+
+impl KeyPhase {
+  const fn new() -> Self {
+    Self {
+      current_in_slot: false,
+      local_acked: false,
+      local_first_pn: 0,
+      local_phase: false,
+      other: OtherKeys::None,
+      previous_until_us: 0,
+      remote_first_pn: 0,
+      remote_phase: false,
+      slot: None,
+    }
+  }
+
+  // The generation that opens a packet of key phase `phase` and number `pn`, before it is
+  // decrypted (RFC 9001 section 6.3, ruling T9-a): the current one for its phase; for the other
+  // phase, the previous one below the first packet number of the current phase, if it is still
+  // kept, and the next one above the largest packet number received. Anything else is dropped.
+  fn choose(&self, phase: bool, pn: u64, largest: Option<u64>) -> Option<Generation> {
+    if phase == self.remote_phase {
+      return Some(Generation::Current);
+    }
+    if pn < self.remote_first_pn {
+      return (self.other == OtherKeys::Previous).then_some(Generation::Previous);
+    }
+    largest.is_none_or(|elem| pn > elem).then_some(Generation::Next)
+  }
+
+  // When the previous keys that open packets go, if they are kept.
+  fn discard_deadline(&self) -> Option<u64> {
+    (self.other == OtherKeys::Previous).then_some(self.previous_until_us)
+  }
+
+  // Three PTOs after a flip: the previous keys are dropped in their slot, where the next ones are
+  // made (RFC 9001 section 6.5).
+  fn discard_previous(
+    &mut self,
+    keys: Option<&mut PacketKeys>,
+    pools: &mut QuicPools,
+  ) -> crate::Result<()> {
+    match keys {
+      Some(elem) if self.other == OtherKeys::Previous => self.prepare_next(elem, pools),
+      _ => Ok(()),
+    }
+  }
+
+  // Updates the keys that seal packets if `keys` sealed `threshold` packets, the peer follows
+  // the current phase and a packet sealed with the current keys was acknowledged (RFC 9001
+  // sections 6.1 and 6.5): the next packet, `next_pn`, has the new phase. Returns whether it did.
+  fn maybe_initiate(
+    &mut self,
+    keys: &mut PacketKeys,
+    threshold: u64,
+    next_pn: u64,
+  ) -> crate::Result<bool> {
+    if !self.local_acked
+      || self.local_phase != self.remote_phase
+      || keys.local.packets_sealed() < threshold
+    {
+      return Ok(false);
+    }
+    self.update_local(keys, next_pn)?;
+    Ok(true)
+  }
+
+  // A packet opened with the next keys: the peer updated its keys (RFC 9001 section 6.2). The
+  // previous ones stay three PTOs, and ours follow if they did not lead. Returns whether they
+  // followed.
+  fn on_peer_update(
+    &mut self,
+    pn: u64,
+    now_us: u64,
+    pto_us: u64,
+    keys: &mut PacketKeys,
+    next_pn: u64,
+  ) -> crate::Result<bool> {
+    self.current_in_slot = !self.current_in_slot;
+    self.remote_phase = !self.remote_phase;
+    self.remote_first_pn = pn;
+    self.other = OtherKeys::Previous;
+    self.previous_until_us = now_us.saturating_add(pto_us.saturating_mul(3));
+    if self.local_phase == self.remote_phase {
+      return Ok(false);
+    }
+    self.update_local(keys, next_pn)?;
+    Ok(true)
+  }
+
+  // Makes the next generation of the keys that open packets in the slot that does not hold the
+  // current ones, which drops what it held in place.
+  fn prepare_next(&mut self, keys: &mut PacketKeys, pools: &mut QuicPools) -> crate::Result<()> {
+    if self.other == OtherKeys::Next {
+      return Ok(());
+    }
+    if self.current_in_slot {
+      let current = self.slot.as_deref().and_then(|el| el.remote.as_ref());
+      let Some(current) = current else {
+        return Err(crate::Error::ProgrammingError);
+      };
+      keys.remote = current.next_generation()?;
+    } else {
+      let next = keys.remote.next_generation()?;
+      let slot = self.slot.get_or_insert_with(|| {
+        pools.key_slots.take().unwrap_or_else(|| Box::new(KeySlot { remote: None }))
+      });
+      slot.remote = Some(next);
+    }
+    self.other = OtherKeys::Next;
+    Ok(())
+  }
+
+  // Gives the box back, its keys wiped in place, and starts over.
+  fn release(&mut self, pools: &mut QuicPools) {
+    if let Some(mut elem) = self.slot.take() {
+      elem.remote = None;
+      pools.key_slots.give(elem);
+    }
+    *self = Self::new();
+  }
+
+  // The keys of `generation` that open packets.
+  fn remote<'keys>(
+    &'keys self,
+    generation: Generation,
+    keys: &'keys PacketKeys,
+  ) -> Option<&'keys DirectionalKeys> {
+    let in_slot = match generation {
+      Generation::Current => self.current_in_slot,
+      Generation::Previous | Generation::Next => !self.current_in_slot,
+    };
+    if in_slot { self.slot.as_deref()?.remote.as_ref() } else { Some(&keys.remote) }
+  }
+
+  fn update_local(&mut self, keys: &mut PacketKeys, next_pn: u64) -> crate::Result<()> {
+    keys.local.advance()?;
+    self.local_phase = !self.local_phase;
+    self.local_first_pn = next_pn;
+    self.local_acked = false;
+    Ok(())
+  }
+}
+
+// What a lost packet changes: the space it was in, the frames that it owes again, the bytes in
+// flight, path MTU discovery.
+struct LostCtx<'any> {
+  ack_eliciting_in_flight: &'any mut u32,
+  crypto_lost: &'any mut FrameRefQueue,
+  handshake_done_owed: &'any mut bool,
+  max_datagram: usize,
+  pmtud: &'any mut Pmtud,
+  recovery: &'any mut Recovery,
+  streams: &'any mut Streams,
+}
+
+impl LostCtx<'_> {
+  // `packet`, `pn`, was declared lost: its frames are owed again, CRYPTO and STREAM data by
+  // range, control frames with their current values (carried rule 5).
+  fn on_lost(&mut self, pn: u64, packet: &SentPacket, pools: &mut QuicPools) -> crate::Result<()> {
+    self.recovery.on_gone(packet);
+    if packet.ack_eliciting && packet.in_flight() {
+      *self.ack_eliciting_in_flight = self.ack_eliciting_in_flight.saturating_sub(1);
+    }
+    if packet.kind == SentKind::MtuProbe {
+      self.pmtud.on_probe_lost(pn, self.max_datagram);
+    }
+    let mut rslt = Ok(());
+    let mut cursor = FrameRefPool::cursor(packet.frames);
+    while let Some(frame) = cursor.next(&pools.frame_refs) {
+      let requeued = match frame {
+        FrameRef::Ack { .. } => Ok(()),
+        FrameRef::Crypto { .. } => pools.frame_refs.queue_push(self.crypto_lost, frame),
+        FrameRef::HandshakeDone => {
+          *self.handshake_done_owed = true;
+          Ok(())
+        }
+        _ => self.streams.on_frame_lost(frame, pools),
+      };
+      if rslt.is_ok() {
+        rslt = requeued;
+      }
+    }
+    rslt
   }
 }
 
@@ -1595,6 +2550,8 @@ struct OpenPacket {
   header_len: usize,
   // Where the Length field of a long header is
   length_at: Option<usize>,
+  // A probe of path MTU discovery
+  mtu_probe: bool,
   padded: bool,
   payload_len: usize,
   pn: u64,
@@ -1615,11 +2572,19 @@ impl OpenPacket {
 // The state of one packet number space.
 #[derive(Debug)]
 struct PacketSpace {
+  // The ack-eliciting packets in flight
+  ack_eliciting_in_flight: u32,
+  // The CRYPTO data of lost packets, sent again before new data
+  crypto_lost: FrameRefQueue,
   // The bytes of the TLS output of the level that were sent
   crypto_tx: u64,
   keys: Option<PacketKeys>,
   // The largest of our packet numbers that the peer acknowledged
   largest_acked: Option<u64>,
+  // When the last ack-eliciting packet was sent
+  last_ack_eliciting_us: u64,
+  // When the oldest packet in flight that is not lost yet becomes lost by the time threshold
+  loss_time_us: Option<u64>,
   recv: RecvTracker,
   sent: SentRing,
 }
@@ -1627,9 +2592,13 @@ struct PacketSpace {
 impl PacketSpace {
   const fn new() -> Self {
     Self {
+      ack_eliciting_in_flight: 0,
+      crypto_lost: FrameRefQueue::EMPTY,
       crypto_tx: 0,
       keys: None,
       largest_acked: None,
+      last_ack_eliciting_us: 0,
+      loss_time_us: None,
       recv: RecvTracker::new(),
       sent: SentRing::new(),
     }
@@ -1639,7 +2608,22 @@ impl PacketSpace {
   fn clear(&mut self, pools: &mut QuicPools) {
     self.keys = None;
     self.sent.release(pools);
+    self.recv.release(pools);
+    pools.frame_refs.queue_clear(&mut self.crypto_lost);
     *self = Self::new();
+  }
+
+  // The keys of the space are discarded: its packets leave the bytes in flight and the timers of
+  // loss detection start over (RFC 9002 appendix A.11).
+  fn discard(&mut self, recovery: &mut Recovery, pools: &mut QuicPools) {
+    for packet in self.sent.records() {
+      recovery.on_gone(packet);
+    }
+    if self.keys.is_some() {
+      recovery.pto_count = 0;
+      recovery.timer_stale = true;
+    }
+    self.clear(pools);
   }
 }
 
@@ -1675,15 +2659,15 @@ impl HandshakeSpaces {
   }
 
   // The Initial keys, wiped, and what was buffered at that level are not needed anymore.
-  fn discard_initial(&mut self, pools: &mut QuicPools) {
-    self.initial.clear(pools);
+  fn discard_initial(&mut self, recovery: &mut Recovery, pools: &mut QuicPools) {
+    self.initial.discard(recovery, pools);
     self.initial_rx.reset(pools);
   }
 
   // Wipes the keys where they are and gives the spaces back.
-  fn give(mut this: Box<Self>, pools: &mut QuicPools) {
-    this.discard_initial(pools);
-    this.handshake.clear(pools);
+  fn give(mut this: Box<Self>, recovery: &mut Recovery, pools: &mut QuicPools) {
+    this.discard_initial(recovery, pools);
+    this.handshake.discard(recovery, pools);
     this.handshake_rx.reset(pools);
     pools.handshake_spaces.give(this);
   }
@@ -1720,6 +2704,149 @@ where
     *slot = Some(PacketKeys { local, remote });
   }
   Ok(())
+}
+
+// The packets that one key of `suite` seals at most (RFC 9001 section 6.6). ChaCha20 has no
+// limit in practice.
+const fn confidentiality_limit(suite: CipherSuite) -> u64 {
+  match suite {
+    CipherSuite::Aes128GcmSha256 | CipherSuite::Aes256GcmSha384 => AES_GCM_CONFIDENTIALITY_LIMIT,
+    CipherSuite::Chacha20Poly1305Sha256 => u64::MAX,
+  }
+}
+
+// The packets that may fail to open over a connection of `suite` (RFC 9001 section 6.6).
+const fn integrity_limit(suite: CipherSuite) -> u64 {
+  match suite {
+    CipherSuite::Aes128GcmSha256 | CipherSuite::Aes256GcmSha384 => AES_GCM_INTEGRITY_LIMIT,
+    CipherSuite::Chacha20Poly1305Sha256 => CHACHA20_INTEGRITY_LIMIT,
+  }
+}
+
+/// The packets that one key of 1-RTT packets of `suite` seals before an update starts:
+/// `configured`, at most half the confidentiality limit of the suite (2^23 packets for AES-GCM,
+/// RFC 9001 section 6.6), which leaves time for the acknowledgment that an update waits for.
+pub(crate) const fn key_update_threshold(suite: CipherSuite, configured: u64) -> u64 {
+  let half = confidentiality_limit(suite);
+  let half = if half == u64::MAX { half } else { half / 2 };
+  if configured < half { configured } else { half }
+}
+
+// The CRYPTO data of the packets of `sp` in flight goes again, unless lost data waits already.
+fn requeue_crypto_in_flight(sp: &mut PacketSpace, pools: &mut QuicPools) -> crate::Result<()> {
+  if sp.keys.is_none() || !sp.crypto_lost.is_empty() {
+    return Ok(());
+  }
+  for packet in sp.sent.records().filter(|el| el.in_flight()) {
+    let mut cursor = FrameRefPool::cursor(packet.frames);
+    while let Some(frame) = cursor.next(&pools.frame_refs) {
+      if let FrameRef::Crypto { .. } = frame {
+        pools.frame_refs.queue_push(&mut sp.crypto_lost, frame)?;
+      }
+    }
+  }
+  Ok(())
+}
+
+// Takes the bytes of an acknowledged CRYPTO frame, `len` from `offset`, out of the lost ranges that
+// wait in `queue`: those that it splits leave two pieces at the end of the queue.
+fn trim_acked_crypto(
+  queue: &mut FrameRefQueue,
+  offset: u64,
+  len: u32,
+  refs: &mut FrameRefPool,
+) -> crate::Result<()> {
+  let acked_end = offset.saturating_add(u64::from(len));
+  for _ in 0..queue.len() {
+    let Some(front) = refs.queue_front(queue) else {
+      break;
+    };
+    refs.queue_pop(queue);
+    let FrameRef::Crypto { offset: start, len: piece } = front else {
+      continue;
+    };
+    let end = start.saturating_add(u64::from(piece));
+    if start < offset {
+      let len = u32::try_from(end.min(offset).wrapping_sub(start)).unwrap_or(u32::MAX);
+      refs.queue_push(queue, FrameRef::Crypto { offset: start, len })?;
+    }
+    if end > acked_end {
+      let from = start.max(acked_end);
+      let len = u32::try_from(end.wrapping_sub(from)).unwrap_or(u32::MAX);
+      refs.queue_push(queue, FrameRef::Crypto { offset: from, len })?;
+    }
+  }
+  Ok(())
+}
+
+// CRYPTO frames of the TLS output `output` of the space of `sp`: the ranges of lost packets first,
+// then what was never sent. Returns whether it wrote any.
+fn write_crypto(
+  output: &[u8],
+  sp: &mut PacketSpace,
+  fw: &mut FrameWriter<'_>,
+  frames: &mut FrameRefRange,
+  pools: &mut QuicPools,
+) -> crate::Result<bool> {
+  let mut wrote = false;
+  while let Some(front) = pools.frame_refs.queue_front(&sp.crypto_lost) {
+    let FrameRef::Crypto { offset, len } = front else {
+      pools.frame_refs.queue_pop(&mut sp.crypto_lost);
+      continue;
+    };
+    let start = usize::try_from(offset).unwrap_or(usize::MAX);
+    let end = start.saturating_add(usize::try_from(len).unwrap_or(usize::MAX));
+    let Some(data) = output.get(start..end).filter(|el| !el.is_empty()) else {
+      pools.frame_refs.queue_pop(&mut sp.crypto_lost);
+      continue;
+    };
+    let written = write_crypto_frame(fw, offset, data);
+    if written == 0 {
+      return Ok(wrote);
+    }
+    let written_u32 = u32::try_from(written).unwrap_or(u32::MAX);
+    pools.frame_refs.push(frames, FrameRef::Crypto { offset, len: written_u32 })?;
+    wrote = true;
+    if written < data.len() {
+      let rest = FrameRef::Crypto {
+        offset: offset.wrapping_add(u64::from(written_u32)),
+        len: len.wrapping_sub(written_u32),
+      };
+      pools.frame_refs.queue_set_front(&sp.crypto_lost, rest);
+      return Ok(wrote);
+    }
+    pools.frame_refs.queue_pop(&mut sp.crypto_lost);
+  }
+  let sent = usize::try_from(sp.crypto_tx).unwrap_or(usize::MAX);
+  let unsent = output.get(sent..).unwrap_or_default();
+  let offset = sp.crypto_tx;
+  let written = write_crypto_frame(fw, offset, unsent);
+  if written > 0 {
+    let len = u32::try_from(written).unwrap_or(u32::MAX);
+    pools.frame_refs.push(frames, FrameRef::Crypto { offset, len })?;
+    sp.crypto_tx = sp.crypto_tx.wrapping_add(u64::from(len));
+    wrote = true;
+  }
+  Ok(wrote)
+}
+
+// A CRYPTO frame at `offset` with as much of `data` as fits. Returns how many bytes it has.
+fn write_crypto_frame(fw: &mut FrameWriter<'_>, offset: u64, data: &[u8]) -> usize {
+  // The header and the data must fit together
+  let room = fw.remaining();
+  let longest = data.len().min(room);
+  let header = 1usize
+    .wrapping_add(varint_len(offset))
+    .wrapping_add(varint_len(u64::try_from(longest).unwrap_or(u64::MAX)));
+  let data_len = longest.min(room.saturating_sub(header));
+  match data.get(..data_len) {
+    Some(bytes)
+      if data_len > 0 && fw.write_crypto_header(offset, data_len) && fw.write_bytes(bytes) =>
+    {
+      data_len
+    }
+    _ => 0,
+  }
 }
 
 const fn ring_pos(offset: u64) -> usize {
@@ -1805,12 +2932,14 @@ fn write_header(
   scid: &Cid,
   pn: u64,
   pn_len: usize,
+  key_phase: bool,
 ) -> Option<(usize, usize, Option<usize>)> {
   let pn_bits = u8::try_from(pn_len.wrapping_sub(1)).ok()? & 0b11;
   let mut w = Writer::new(out);
   let length_at = if space == Space::Data {
-    // No spin bit and key phase zero
-    w.put_u8(0x40 | pn_bits).ok()?;
+    // No spin bit
+    let phase = if key_phase { KEY_PHASE_BIT } else { 0 };
+    w.put_u8(0x40 | phase | pn_bits).ok()?;
     w.put(dcid.as_slice()).ok()?;
     None
   } else {
@@ -1844,7 +2973,8 @@ mod tests {
       pools::{CRYPTO_BUFFER_LEN, QuicPools, RX_BLOCK_LEN, TX_BLOCK_LEN},
       protect,
       testing::{
-        Behavior, CLIENT_ADDR, Link, LinkOpts, Parts, SERVER_ADDR, TestApp, encode_frames,
+        Behavior, CLIENT_ADDR, Impairment, Link, LinkOpts, Parts, SERVER_ADDR, TestApp,
+        encode_frames, run_lossy_requests,
       },
     },
     sync::AtomicU64,
@@ -1894,7 +3024,7 @@ mod tests {
     sp.sent.skip();
     let mut out = vec![0; 2048];
     let (header_len, pn_offset, length_at) =
-      super::write_header(&mut out, space, &dcid, &scid, pn, 4).unwrap();
+      super::write_header(&mut out, space, &dcid, &scid, pn, 4, false).unwrap();
     out[0] |= reserved;
     out[header_len..header_len + payload.len()].copy_from_slice(payload);
     if let Some(at) = length_at {
@@ -2120,17 +3250,18 @@ mod tests {
   }
 
   // Without traffic both sides close, silently, at the smaller of the two timeouts, or at three
-  // PTOs if that is longer.
+  // PTOs if that is longer. The PTO is the one of the measured RTT, zero on the fake clock.
   #[cfg_attr(miri, ignore)]
   #[test]
   fn idle_timeout_closes() {
-    for (client_ms, server_ms, expected_us) in
-      [(5_000, 10_000, 5_000_000), (1_000, 1_000, 3 * PTO_US)]
-    {
+    for (client_ms, server_ms, three_ptos) in [(5_000, 10_000, false), (10, 10, true)] {
       let mut opts = LinkOpts::new(None);
       opts.client.max_idle_timeout_ms = client_ms;
       opts.server.max_idle_timeout_ms = server_ms;
       let mut link = settled(&opts);
+      let pto_us = link.server.conn.current_pto_us();
+      let expected_us = if three_ptos { 3 * pto_us } else { 5_000_000 };
+      assert!(!three_ptos || 3 * pto_us > 10_000, "{pto_us}");
       let deadline = link.server.conn.next_deadline().unwrap();
       assert_eq!(deadline - link.now_us, expected_us);
       assert_eq!(link.client.conn.next_deadline(), Some(deadline));
@@ -2184,9 +3315,11 @@ mod tests {
     }
     assert_eq!(answers, [1, 0, 1, 0]);
     let deadline = link.server.conn.next_deadline().unwrap();
-    assert_eq!(deadline - link.now_us, 3 * PTO_US);
+    // Three PTOs of the measured RTT, which is zero on the fake clock
+    let pto_us = link.server.conn.current_pto_us();
+    assert_eq!(deadline - link.now_us, 3 * pto_us);
     assert_eq!(link.client.conn.next_deadline(), Some(deadline));
-    link.advance(3 * PTO_US - 1);
+    link.advance(3 * pto_us - 1);
     assert_eq!(link.server.conn.state(), ConnState::Closing);
     link.advance(1);
     assert_eq!(link.server.conn.state(), ConnState::Closed);
@@ -2431,6 +3564,8 @@ mod tests {
   fn excessive_load_is_a_connection_error() {
     let mut opts = LinkOpts::new(None);
     opts.server.limits.ping_budget = 1;
+    // No path MTU probe from the client, whose PING the budget would count
+    opts.server.max_udp_payload_size = 1200;
     let mut link = settled(&opts);
     let mut pings = Vec::new();
     for _ in 0..2 {
@@ -2478,6 +3613,8 @@ mod tests {
   fn ping_flood_over_budget_closes_with_excessive_load() {
     let mut opts = LinkOpts::new(None);
     opts.server.limits.ping_budget = 4;
+    // No path MTU probe from the client, whose PING the budget would count
+    opts.server.max_udp_payload_size = 1200;
     let mut link = settled(&opts);
     for _ in 0..4 {
       link.client.conn.queue_test_frames(&PING);
@@ -2819,5 +3956,294 @@ mod tests {
         QuicError::CryptoDataTooFarAhead
       ))
     ));
+  }
+
+  // Requests of 3000 bytes that the server echoes, over a link with 5 ms of delay that reorders
+  // `reorder` of the datagrams
+  fn echo_run(opts: &mut LinkOpts, reorder: f32, count: usize) -> Link {
+    opts.server_app = TestApp::new(Behavior::Echo);
+    let mut link = Link::new(opts);
+    link.impair(Impairment { reorder, ..Impairment::delay(5_000) });
+    let requests: Vec<Vec<u8>> = (0..count).map(|nth| vec![nth as u8; 3000]).collect();
+    let run = run_lossy_requests(&mut link, &requests, 16, 60_000_000);
+    assert_eq!(run.responses, requests);
+    link
+  }
+
+  // Review focus 5: the client updates its keys in the middle of a transfer, again and again. The
+  // server follows each flip of the key phase (RFC 9001 section 6), answers with new keys of its
+  // own, keeps serving, opens the packets of the old phase that arrive late, and lets the old keys
+  // go three PTOs later.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn peer_key_update_mid_transfer() {
+    let mut opts = LinkOpts::new(None);
+    opts.client.key_update_threshold = 150;
+    let mut link = echo_run(&mut opts, 0.1, 200);
+    let (client, server) = (*link.client.conn.stats(), *link.server.conn.stats());
+    assert!(client.key_updates >= 3, "{client:?}");
+    // The server started none: each of its updates followed one of the client
+    assert_eq!(server.key_updates, client.key_updates);
+    assert_eq!(link.server.conn.key_phases(), link.client.conn.key_phases());
+    // Nothing was dropped for want of keys, the packets of the previous phase included
+    assert_eq!((server.packets_dropped, client.packets_dropped), (0, 0));
+    assert!(link.server.conn.keeps_previous_keys());
+    let pto = link.server.conn.current_pto_us();
+    link.advance(3 * pto + 1);
+    assert!(!link.server.conn.keeps_previous_keys());
+    assert_eq!(link.server.conn.state(), ConnState::Confirmed);
+    // And it goes on
+    link.client.conn.queue_test_frames(&PING);
+    link.run();
+    assert_eq!(link.server.conn.stats().packets_dropped, 0);
+  }
+
+  // The server updates its keys once a key sealed as many packets as its threshold allows, but
+  // never before the handshake is confirmed or before a packet sent with the current keys was
+  // acknowledged; the client follows. AES-GCM keys update before the 2^23 packets of their
+  // confidentiality limit, ChaCha20 ones need not.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn local_key_update_at_threshold() {
+    use crate::tls::CipherSuite;
+    assert_eq!(super::key_update_threshold(CipherSuite::Aes128GcmSha256, u64::MAX), 1 << 22);
+    assert_eq!(super::key_update_threshold(CipherSuite::Aes256GcmSha384, u64::MAX), 1 << 22);
+    assert_eq!(
+      super::key_update_threshold(CipherSuite::Chacha20Poly1305Sha256, u64::MAX),
+      u64::MAX
+    );
+    assert_eq!(super::key_update_threshold(CipherSuite::Aes128GcmSha256, 64), 64);
+    // A threshold of one packet: an update as soon as the rules allow, once per round trip
+    let mut opts = LinkOpts::new(None);
+    opts.server.key_update_threshold = 1;
+    let mut link = Link::new(&opts);
+    link.impair(Impairment::delay(5_000));
+    while link.server.conn.state() != ConnState::Confirmed {
+      assert_eq!(link.server.conn.key_phases(), (false, false));
+      if !link.step_impaired() {
+        assert!(link.advance_to_next_event());
+      }
+    }
+    let start = link.now_us;
+    for _ in 0..50 {
+      link.server.conn.queue_test_frames(&PING);
+      link.client.conn.queue_test_frames(&PING);
+      for _ in 0..4 {
+        if !link.step_impaired() {
+          assert!(link.advance_to_next_event());
+        }
+      }
+    }
+    let rounds = (link.now_us - start) / 10_000 + 1;
+    let server = *link.server.conn.stats();
+    assert!(server.key_updates >= 3 && server.key_updates <= rounds, "{server:?} in {rounds}");
+    // A threshold of 64 packets, with traffic
+    let mut opts = LinkOpts::new(None);
+    opts.server.key_update_threshold = 64;
+    let link = echo_run(&mut opts, 0.0, 100);
+    let (client, server) = (*link.client.conn.stats(), *link.server.conn.stats());
+    assert!(server.key_updates >= 3, "{server:?}");
+    assert!(server.key_updates <= server.packets_out / 64, "{server:?}");
+    assert_eq!(client.key_updates, server.key_updates);
+    assert_eq!(link.server.conn.key_phases(), link.client.conn.key_phases());
+    assert_eq!((server.packets_dropped, client.packets_dropped), (0, 0));
+  }
+
+  // The bytes in flight of the records that congestion control counts, over the spaces that are
+  // left
+  fn in_flight_of_records<const IS_CLIENT: bool, TCX>(
+    conn: &crate::quic::QuicConn<TestApp, crate::rng::ChaCha20, TCX, IS_CLIENT>,
+  ) -> u64 {
+    let mut rslt = 0;
+    for space in super::SPACES {
+      if let Some(sp) = super::space_ref(&conn.data, &conn.handshake, space) {
+        let sizes = sp.sent.records().filter(|el| el.counts_for_congestion()).map(|el| el.size);
+        rslt += sizes.map(u64::from).sum::<u64>();
+      }
+    }
+    rslt
+  }
+
+  // Carried rules 1 and 2: a lost first flight of the server is probed after a PTO of the initial
+  // RTT without the max_ack_delay of the peer, with its CRYPTO data again in Initial and
+  // Handshake packets coalesced in a datagram padded to 1200 bytes, which completes the handshake.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn server_initial_pto_probe_is_padded_without_ack_delay() {
+    let mut link = Link::new(&LinkOpts::new(None));
+    let _ = link.server.flush(link.now_us);
+    assert_eq!(link.server.take_datagrams().len(), 1);
+    let deadline = link.server.conn.next_deadline().unwrap();
+    assert_eq!(deadline - link.now_us, 333_000 + 4 * 166_500);
+    link.advance(deadline - link.now_us);
+    assert_eq!(link.server.conn.pto_count(), 1);
+    let _ = link.server.flush(link.now_us);
+    let probes = link.server.take_datagrams();
+    let types = packet_types(&probes[0]);
+    assert!(
+      types.contains(&PacketTy::Initial) && types.contains(&PacketTy::Handshake),
+      "{types:?}"
+    );
+    assert!(probes.iter().all(|el| el.len() >= 1200), "{:?}", probes.iter().map(Vec::len));
+    for mut datagram in probes {
+      link.client.recv(link.now_us, &mut datagram, SERVER_ADDR);
+    }
+    link.run();
+    assert_eq!(link.server.conn.state(), ConnState::Confirmed);
+    assert_eq!(link.client.conn.state(), ConnState::Confirmed);
+    assert_eq!(link.server.conn.stats().pto_probes, 1);
+  }
+
+  // Carried rule 2: a server that the amplification limit holds has no probe timeout armed, until
+  // more of the client arrives and it can send again.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn amplification_limited_server_arms_no_pto() {
+    let mut opts = LinkOpts::new(None);
+    opts.server_tp_padding = 6000;
+    let mut link = Link::new(&opts);
+    let _ = link.server.flush(link.now_us);
+    let flight = link.server.take_datagrams();
+    assert_eq!(flight.iter().map(Vec::len).sum::<usize>(), 3 * 1200);
+    assert_eq!(link.server.conn.recovery.loss_timer_us, None);
+    assert_eq!(link.server.conn.next_deadline(), link.server.conn.idle_deadline());
+    for mut datagram in flight {
+      link.client.recv(link.now_us, &mut datagram, SERVER_ADDR);
+    }
+    let _ = link.client.flush(link.now_us);
+    assert!(link.deliver_to_server() > 0);
+    let _ = link.server.flush(link.now_us);
+    assert!(link.server.conn.handshake.as_deref().unwrap().handshake.ack_eliciting_in_flight > 0);
+    assert!(link.server.conn.recovery.loss_timer_us.is_some());
+  }
+
+  // Carried rule 2: discarded Initial and Handshake keys take their packets out of the bytes in
+  // flight, which match the records left at every step of a lossy handshake and transfer.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn bytes_in_flight_match_the_records_through_discards() {
+    let mut opts = LinkOpts::new(None);
+    opts.server_app = TestApp::new(Behavior::Echo);
+    let mut link = Link::new(&opts);
+    link.impair(Impairment { drop: 0.2, ..Impairment::delay(2_000) });
+    let mut discarded = false;
+    for _ in 0..4000 {
+      if !link.step_impaired() {
+        assert!(link.advance_to_next_event());
+      }
+      assert_eq!(link.server.conn.bytes_in_flight(), in_flight_of_records(&link.server.conn));
+      assert_eq!(link.client.conn.bytes_in_flight(), in_flight_of_records(&link.client.conn));
+      discarded |= link.server.conn.handshake.is_none();
+      if discarded && link.client.conn.state() == ConnState::Confirmed {
+        let now_us = link.now_us;
+        let _ = link.client.with_ctx(now_us, |cx| {
+          let id = cx.open_bidi()?;
+          cx.write(id, &[7; 3000], true)
+        });
+      }
+    }
+    assert!(discarded);
+    assert!(link.server.app.fins > 10, "{}", link.server.app.fins);
+  }
+
+  // Carried rule 4: an ACK frame cut to its first range for want of room leaves the other ranges
+  // owed, and the next flush reports them.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn first_range_only_ack_leaves_the_rest_owed() {
+    let mut link = settled(&LinkOpts::new(None));
+    for _ in 0..6 {
+      // A packet number skipped before each one: separate ranges
+      link.client.conn.data.sent.skip();
+      link.client.conn.queue_test_frames(&PING);
+      let _ = link.client.flush(link.now_us);
+      assert_eq!(link.deliver_to_server(), 1);
+    }
+    let ranges = server_data_ranges(&link);
+    assert!(ranges.len() >= 6, "{ranges:?}");
+    fill_descriptors(&mut link.server.parts.tx, 38);
+    assert_eq!(link.server.flush(link.now_us), FlushOutcome::ArenaFull);
+    let partial = link.server.take_datagrams().last().map_or(0, Vec::len);
+    assert!(link.server.conn.data.recv.ack_pending());
+    assert_eq!(server_data_ranges(&link), ranges);
+    assert_eq!(link.server.flush(link.now_us), FlushOutcome::Done);
+    let mut full = link.server.take_datagrams();
+    assert_eq!(full.len(), 1);
+    // The second one has every range
+    assert!(partial <= 38 && full[0].len() > partial + 6, "{partial} {}", full[0].len());
+    assert!(!link.server.conn.data.recv.ack_pending());
+    link.client.recv(link.now_us, &mut full[0], SERVER_ADDR);
+    assert_eq!(link.client.conn.state(), ConnState::Confirmed);
+  }
+
+  // Carried rule 5: the frames of lost packets go again: HANDSHAKE_DONE, RESET_STREAM and
+  // STOP_SENDING while their stream needs them, MAX_STREAM_DATA and MAX_DATA with the current
+  // limits even when they did not move.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn lost_control_frames_are_sent_again() {
+    // HANDSHAKE_DONE
+    let mut link = Link::new(&LinkOpts::new(None));
+    while link.server.conn.state() != ConnState::Confirmed {
+      let _ = link.server.flush(link.now_us);
+      let _ = link.deliver_to_client();
+      let _ = link.client.flush(link.now_us);
+      assert!(link.deliver_to_server() > 0);
+    }
+    let _ = link.server.flush(link.now_us);
+    assert!(!link.server.take_datagrams().is_empty() && !link.server.conn.handshake_done_owed);
+    link.server.conn.declare_in_flight_lost(&mut link.server.parts.pools);
+    assert!(link.server.conn.handshake_done_owed);
+    link.run();
+    assert_eq!(link.client.conn.state(), ConnState::Confirmed);
+    // RESET_STREAM and STOP_SENDING
+    let mut link = settled(&LinkOpts::new(None));
+    let now_us = link.now_us;
+    let id = link
+      .client
+      .with_ctx(now_us, |cx| {
+        let id = cx.open_bidi()?;
+        cx.write(id, b"abc", false)?;
+        Ok::<_, crate::Error>(id)
+      })
+      .unwrap();
+    link.run();
+    link.server.with_ctx(now_us, |cx| {
+      cx.write(id, b"partial", false).unwrap();
+      cx.reset(id, 0x11);
+      cx.stop_sending(id, 0x12);
+    });
+    let _ = link.server.flush(link.now_us);
+    assert_eq!(link.server.take_datagrams().len(), 1);
+    link.server.conn.declare_in_flight_lost(&mut link.server.parts.pools);
+    link.run();
+    assert_eq!(link.client.app.resets, [(id, 0x11)]);
+    assert_eq!(link.client.app.stops, [(id, 0x12)]);
+    // MAX_STREAM_DATA and MAX_DATA
+    let mut opts = LinkOpts::new(None);
+    opts.server.stream_window = 4096;
+    opts.server.conn_window = 8192;
+    let mut link = settled(&opts);
+    let now_us = link.now_us;
+    let id = link
+      .client
+      .with_ctx(now_us, |cx| {
+        let id = cx.open_bidi()?;
+        cx.write(id, &[1; 4096], false)?;
+        Ok::<_, crate::Error>(id)
+      })
+      .unwrap();
+    let _ = link.client.flush(link.now_us);
+    assert!(link.deliver_to_server() > 0);
+    let _ = link.server.flush(link.now_us);
+    assert!(!link.server.take_datagrams().is_empty());
+    let (server_max, ..) = link.server.conn.streams().conn_credit();
+    assert!(server_max > 8192);
+    link.server.conn.declare_in_flight_lost(&mut link.server.parts.pools);
+    let _ = link.server.flush(link.now_us);
+    assert!(link.deliver_to_client() > 0);
+    let pools = &link.client.parts.pools;
+    assert_eq!(link.client.conn.streams().send_credit(&pools.stream_slots, id), Some(4096 + 4096));
+    assert_eq!(link.client.conn.streams().conn_credit().2, server_max);
   }
 }
