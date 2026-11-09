@@ -1082,6 +1082,32 @@ mod tests {
     assert!(client.poll_secrets().is_none() && server.poll_secrets().is_none());
   }
 
+  // The ClientHello of h3spec (Haskell quic): SNI of an IP address, five groups, version
+  // information and a draft-era list of four protocols, of which `hq-interop` does not fit the
+  // 8 bytes of a name. A protocol that is not served is skipped, it does not fail the handshake
+  // (RFC 7301 section 3.1).
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn alpn_with_names_that_do_not_fit_negotiates_h3() {
+    let hex = concat!(
+      "010001350303f52f5e599fefa5046445a0af3bf4e4fb2de5dcdc9af2510892772114afb9044900000613031302130101",
+      "00010600390047010480007530030248000404810000000504800400000604800400000704800400000802404009010a",
+      "0e01050f08b28bd8de7eacc4ba6ab200110c000000016b3343cf000000010000000e000c0000093132372e302e302e31",
+      "000a000c000a001d001e001700180019000b00020100000d002800260906090509040808080706030503040308060805",
+      "0804080b080a0809060105010401020102030010001c001a0268330568332d32390a68712d696e7465726f700568712d",
+      "3239001b000302000100230000002b0003020304002d00020101003300260024001d0020713db740f7bd606d3fb0a85e",
+      "437fae674ce92bbfe1f4a6693a4c36b630448c1bff01000100",
+    );
+    let ch: Vec<u8> = (0..hex.len() / 2)
+      .map(|idx| u8::from_str_radix(&hex[idx * 2..idx * 2 + 2], 16).unwrap())
+      .collect();
+    let mut server = server();
+    server.feed(Space::Initial, &ch).unwrap();
+    assert_eq!(server.alpn(), b"h3");
+    assert_eq!(messages(server.output(Space::Initial)).iter().map(|el| el.0).collect::<Vec<_>>(), [2]);
+    assert!(server.peer_transport_params().is_some());
+  }
+
   // QUIC carries bare handshake messages: no record header, no ChangeCipherSpec.
   #[cfg_attr(miri, ignore)]
   #[test]

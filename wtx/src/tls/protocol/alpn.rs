@@ -29,7 +29,12 @@ impl<'de> Decode<'de, TlsCc> for Alpn {
     u16_chunk(dw, err, |local_dw| {
       while !local_dw.bytes().is_empty() {
         u8_chunk(local_dw, err, |local_local_dw| {
-          protocol_name_list.push(local_local_dw.bytes().try_into()?)?;
+          // RFC 7301 section 3.1: the server picks among the protocols it supports, so an offered
+          // name that does not fit (more than 8 bytes, as "hq-interop", or beyond the fourth)
+          // is not an error, it is a protocol that is not served
+          if let Ok(name) = local_local_dw.bytes().try_into() {
+            let _rslt = protocol_name_list.push(name);
+          }
           Ok(())
         })?;
       }

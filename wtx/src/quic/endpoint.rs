@@ -639,7 +639,10 @@ where
       return;
     };
     let _rslt = conn.recv_datagram(now_us, chunk, meta, app, pools);
-    if fresh && conn.stats().packets_in == 0 {
+    // A packet that opened but whose handshake data was refused (a transport parameter, a TLS
+    // alert) is not counted, and the connection that closed on it has a CONNECTION_CLOSE to send
+    // (RFC 9000 section 10.2.3, RFC 9001 section 4.8): it stays until it has drained
+    if fresh && conn.stats().packets_in == 0 && conn.state() != ConnState::Closing {
       // The application never saw it (review L7)
       conn.discard(pools);
       self.release_slot(idx);

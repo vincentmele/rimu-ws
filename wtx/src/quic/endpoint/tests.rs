@@ -1142,3 +1142,26 @@ fn slot_table_grows_a_chunk_at_a_time_and_clear_keeps_handles_stale() {
   // No handle of before names a slot made after: its generation was 7 + SLOT_CHUNK at most
   assert_eq!(table.generation_floor, 8 + SLOT_CHUNK as u32);
 }
+
+// Rule (RFC 9000 section 10.2.3, RFC 9001 section 4.8; h3spec): the first Initial packet of a client
+// whose transport parameters are rejected (a failure of the handshake while the connection has no
+// processed packet yet) is answered with a CONNECTION_CLOSE, in an Initial packet, and not dropped
+// without a word. The connection then drains like any other that closed.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn rejected_first_initial_is_answered_with_connection_close() {
+  let mut net = net(1, QuicParams::default());
+  // The server requires the CID of the Initial packets in the parameters (RFC 9000 section 7.3)
+  net.client_tp = |el| el.initial_source_connection_id = None;
+  let client = net.add_client();
+  let mut first = net.client_datagrams(client);
+  let _ = net.deliver_to_server(client, &mut first[0]);
+  let out = net.server_datagrams(0);
+  assert_eq!(out.len(), 1);
+  assert_eq!(parse_header(&out[0].1, 8).unwrap().ty, PacketTy::Initial);
+  assert_eq!(net.servers[0].endpoint.stats().conns, 1);
+  net.deliver_to_client(client, &mut out[0].1.clone());
+  assert_eq!(net.clients[client].conn.state(), ConnState::Draining);
+  net.advance(CLOSING_US);
+  assert_eq!(net.servers[0].endpoint.stats().conns, 0);
+}
