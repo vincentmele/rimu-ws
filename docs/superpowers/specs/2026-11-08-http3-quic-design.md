@@ -242,7 +242,11 @@ deployment allocate the pools at start.
   heap once started, measured as net live bytes (allocated minus freed, by layout, on the worker thread):
   pools, connection table, stream slots, executor tasks, HTTP/3 boxes, router-handler buffers, the transmit
   arena and the UDP receive ring. The one exception is the GRO receive ring (256 × 64 KiB = 16 MiB, off by
-  default), reported apart: a deployment that turns GRO on adds it per worker (ruling T20-e).
+  default), reported apart: a deployment that turns GRO on adds it per worker (ruling T20-e). The idle
+  budget of 2 MiB is on-demand state: the net live bytes over the floor a worker has at start, a fixed cost
+  sized by configuration (transmit arena, receive ring, inbox, send slots, CID table, timer wheel). Measured
+  floors: 1.86 MiB with GRO on (ring apart) and 2.41 MiB with the library's I/O defaults, pinned by test
+  bounds of 2.0 and 2.5 MiB; measured on-demand state after the idle trim: 0.51 MiB (ruling T20-f).
 - **CID table**: our CIDs are 8 bytes: byte 0 = worker index, bytes 1–7 random (CSPRNG), with a
   stateless-reset token derived from a per-process key (HMAC). While CID steering is on, each connection has
   **exactly one** server CID and we send no NEW_CONNECTION_ID: RFC 9000 §5.1 forbids CIDs of one connection

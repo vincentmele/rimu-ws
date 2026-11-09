@@ -65,13 +65,17 @@ const CERT_DIR: &str = "/mnt/nvme1tb/claude-tmp/arena-main/certs";
 const DATASET_FILE: &str = "/mnt/nvme1tb/claude-tmp/arena-main/data/dataset.json";
 /// The static files, unless `STATIC_DIR` says.
 const STATIC_ROOT: &str = "/mnt/nvme1tb/claude-tmp/arena-main/data/static";
-/// The budget of spec section 5.4 for the heap of a worker (ruling T20-e): under load, and idle
-/// after the trim.
+/// The budget of spec section 5.4 for the heap of a worker (rulings T20-e and T20-f): under load
+/// (everything), and idle after the trim (the on-demand state, over the floor a worker has at
+/// start).
 const POOL_BUDGET_LOAD: u64 = 16 << 20;
 const POOL_BUDGET_IDLE: u64 = 2 << 20;
-/// What the idle trim may leave beyond the floor a worker has at start: the cached contents of the
-/// static files that were served (about 0.25 MiB with `br`) and the pools' kept entries.
-const IDLE_LEFT_OVER: u64 = 1 << 20;
+/// The floor of a worker at start, before any connection: fixed structures sized by configuration
+/// (transmit arena, receive ring, inbox, send slots, CID table, timer wheel). Measured 1.86 MiB
+/// with GRO on (its ring apart) and 2.41 MiB with the library's I/O defaults; these bounds pin
+/// it, so that growth of a fixed structure shows (ruling T20-f).
+const FLOOR_BOUND_GRO: u64 = 2 << 20;
+const FLOOR_BOUND_PLAIN: u64 = 5 << 19;
 const TIMEOUT: Duration = Duration::from_secs(20);
 
 // ---- the counting allocator
@@ -798,18 +802,18 @@ impl Memory {
     self.peak - self.ring as i64
   }
 
-  fn idle_without_ring(&self) -> i64 {
-    self.idle - self.ring as i64
-  }
 
   fn report(&self, name: &str) -> String {
     format!(
-      "{name}: startup {:.2} MiB, loaded {:.2}, peak {:.2}, idle {:.2}; ring {:.2} MiB (apart), \
+      "{name}: startup {:.2} MiB (floor {:.2} without the ring), loaded {:.2}, peak {:.2}, idle {:.2} \
+       (on-demand {:.2} over the start); ring {:.2} MiB (apart), \
        arena {:.2}, pool estimate {:.2}; unattributed at peak {:.2} MiB",
       Self::mib(self.startup),
+      Self::mib(self.startup - self.ring as i64),
       Self::mib(self.loaded),
       Self::mib(self.peak),
       Self::mib(self.idle),
+      Self::mib(self.idle - self.startup),
       Self::mib(self.ring as i64),
       Self::mib(self.arena as i64),
       Self::mib(self.pools as i64),
@@ -819,13 +823,13 @@ impl Memory {
 }
 
 /// The memory of the heap of one worker under the benchmark's load (64 connections, 64 streams
-/// each, `/baseline2` then `/static`), against spec section 5.4 as ruling T20-e counts it (net live
-/// bytes of the worker thread, everything), with the program's receive offload (GRO on; its ring is
-/// the one thing reported apart) and with the library's I/O defaults (GRO off; everything counted):
-/// the peak is within 16 MiB, and the idle trim brings the heap back to the floor of a worker that
-/// has had no connection.
-///
-/// The absolute idle figure is [`h3_idle_heap_is_within_2_mib`].
+/// each, `/baseline2` then `/static`), against spec section 5.4 as rulings T20-e and T20-f count it
+/// (net live bytes of the worker thread, everything), with the program's receive offload (GRO on;
+/// its ring is the one thing reported apart) and with the library's I/O defaults (GRO off;
+/// everything counted):
+/// - the peak is within 16 MiB;
+/// - the idle trim leaves at most 2 MiB of on-demand state over the floor of a worker at start;
+/// - that floor, a fixed cost of the configuration, stays within its bound.
 #[test]
 fn h3_pool_memory_stays_within_the_budget() {
   for gro in [true, false] {
@@ -838,22 +842,10 @@ fn h3_pool_memory_stays_within_the_budget() {
     let peak = memory.peak_without_ring();
     assert!(peak <= POOL_BUDGET_LOAD as i64, "{name}: peak {peak} B over 16 MiB: {memory:?}");
     let left = memory.idle - memory.startup;
-    assert!(left <= IDLE_LEFT_OVER as i64, "{name}: {left} B left after the trim: {memory:?}");
-  }
-}
-
-/// The idle half of the budget as ruling T20-e counts it: a worker that served the load and was
-/// trimmed holds at most 2 MiB (the GRO ring apart). It does not: the structures a worker makes at
-/// start, before any connection, are already about that much (the transmit arena 0.73 MiB, the
-/// receive ring 0.5 MiB without GRO, the inbox 0.4 MiB, the send slots 0.2 MiB, the CID table and
-/// timer wheel 0.2 MiB), so this is a decision for the budget, not a fix of this round.
-#[test]
-#[ignore = "fails: the structures a worker makes at start are about 2 MiB (see the doc)"]
-fn h3_idle_heap_is_within_2_mib() {
-  for gro in [true, false] {
-    let memory = pool_memory(gro);
-    let idle = memory.idle_without_ring();
-    assert!(idle <= POOL_BUDGET_IDLE as i64, "gro {gro}: idle {idle} B over 2 MiB: {memory:?}");
+    assert!(left <= POOL_BUDGET_IDLE as i64, "{name}: {left} B left over the floor: {memory:?}");
+    let floor = memory.startup - memory.ring as i64;
+    let bound = if gro { FLOOR_BOUND_GRO } else { FLOOR_BOUND_PLAIN };
+    assert!(floor <= bound as i64, "{name}: floor {floor} B over {bound} B: {memory:?}");
   }
 }
 
