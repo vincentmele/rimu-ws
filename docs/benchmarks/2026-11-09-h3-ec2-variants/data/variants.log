@@ -1,0 +1,81 @@
+== variants: base prev gro-on steer-kernel data-fresh ring512 flush-slot balance-off pin-off arena-x2 inflight128k inflight512k pacing-off pmtu-rtt train32 bodies-rr  (reference: zix) x baseline-h3 static-h3 x 3 passes = 66 starts, 3 x 5s per start; then profiles of base prev; server 0,48,1,49,2,50,3,51,4,52,5,53,6,54,7,55,8,56,9,57,10,58,11,59,12,60,13,61,14,62,15,63,16,64,17,65,18,66,19,67,20,68,21,69,22,70,23,71, generator 24,72,25,73,26,74,27,75,28,76,29,77,30,78,31,79,32,80,33,81,34,82,35,83,36,84,37,85,38,86,39,87,40,88,41,89,42,90,43,91,44,92,45,93,46,94,47,95 (-t 48); 16:14:40
+vbench p1 baseline-h3 v-base    rps  5786512 | srv 2.100 us/req gen 7.020 | errors 0 | runs 5786512,5761339,5709566
+vbench p1 baseline-h3 v-prev    rps  5680584 | srv 2.513 us/req gen 6.916 | errors 0 | runs 5649914,5680584,5606158
+vbench p1 baseline-h3 v-gro-on  rps  5824051 | srv 2.038 us/req gen 6.896 | errors 0 | runs 5824051,5762468,5788405
+vbench p1 baseline-h3 v-steer-kernel rps  5766715 | srv 2.007 us/req gen 6.911 | errors 0 | runs 5710604,5766715,5666776
+vbench p1 baseline-h3 v-data-fresh rps  5741699 | srv 2.323 us/req gen 6.960 | errors 0 | runs 5718288,5724931,5741699
+vbench p1 baseline-h3 v-ring512 rps  5737730 | srv 2.088 us/req gen 7.031 | errors 0 | runs 5729546,5737730,5735689
+vbench p1 baseline-h3 v-flush-slot rps  5767865 | srv 2.115 us/req gen 7.039 | errors 0 | runs 5745745,5743451,5767865
+vbench p1 baseline-h3 v-balance-off rps  5795936 | srv 1.927 us/req gen 7.026 | errors 0 | runs 5736522,5744291,5795936
+vbench p1 baseline-h3 v-pin-off rps  5777690 | srv 2.129 us/req gen 6.959 | errors 0 | runs 5775940,5741992,5777690
+vbench p1 baseline-h3 zix       rps  5942980 | srv 1.398 us/req gen 6.800 | errors 0 | runs 5892957,5847847,5942980
+vbench p1 static-h3   v-base    rps  1013175 | srv 30.123 us/req gen 39.666 | errors 0 | runs 1002640,1001709,1013175
+vbench p1 static-h3   v-prev    rps  1010730 | srv 31.719 us/req gen 39.424 | errors 0 | runs 995562,1010730,1006038
+vbench p1 static-h3   v-gro-on  rps  1009919 | srv 31.977 us/req gen 39.360 | errors 0 | runs 994563,1000159,1009919
+vbench p1 static-h3   v-steer-kernel rps   989234 | srv 28.681 us/req gen 37.464 | errors 0 | runs 945413,989234,948063
+vbench p1 static-h3   v-arena-x2 rps  1019704 | srv 28.299 us/req gen 39.812 | errors 0 | runs 998627,1019704,991419
+vbench p1 static-h3   v-inflight128k rps   938696 | srv 28.225 us/req gen 39.311 | errors 0 | runs 938696,938559,920496
+vbench p1 static-h3   v-inflight512k rps  1038129 | srv 30.532 us/req gen 40.587 | errors 0 | runs 981609,1001712,1038129
+vbench p1 static-h3   v-pacing-off rps   964443 | srv 24.580 us/req gen 34.539 | errors 0 | runs 960557,964443,958884
+vbench p1 static-h3   v-pmtu-rtt rps   994301 | srv 36.114 us/req gen 38.987 | errors 0 | runs 941398,955042,994301
+vbench p1 static-h3   v-train32 rps  1009560 | srv 30.527 us/req gen 39.921 | errors 0 | runs 978687,1009560,993308
+vbench p1 static-h3   v-bodies-rr rps  1011003 | srv 31.413 us/req gen 40.262 | errors 0 | runs 1011003,994430,990114
+vbench p1 static-h3   zix       rps   575374 | srv 47.023 us/req gen 54.447 | errors 0 | runs 575374,531405,502978
+== pass 1 done 16:25:32 (652 s)
+vbench p2 baseline-h3 v-prev    rps  5669200 | srv 2.479 us/req gen 6.848 | errors 0 | runs 5668283,5647573,5669200
+vbench p2 baseline-h3 v-gro-on  rps  5833039 | srv 2.041 us/req gen 6.983 | errors 0 | runs 5826881,5789659,5833039
+vbench p2 baseline-h3 v-steer-kernel rps  5786717 | srv 2.026 us/req gen 6.924 | errors 0 | runs 5734008,5786717,5764064
+vbench p2 baseline-h3 v-data-fresh rps  5736462 | srv 2.299 us/req gen 6.951 | errors 0 | runs 5663878,5736462,5729151
+vbench p2 baseline-h3 v-ring512 rps  5803745 | srv 2.105 us/req gen 6.951 | errors 0 | runs 5724830,5803745,5709114
+vbench p2 baseline-h3 v-flush-slot rps  5747107 | srv 2.082 us/req gen 6.880 | errors 0 | runs 5644083,5747107,5691829
+vbench p2 baseline-h3 v-balance-off rps  5820962 | srv 1.901 us/req gen 6.990 | errors 0 | runs 5698820,5743281,5820962
+vbench p2 baseline-h3 v-pin-off rps  5796635 | srv 2.107 us/req gen 6.936 | errors 0 | runs 5765748,5748682,5796635
+vbench p2 baseline-h3 zix       rps  5941014 | srv 1.386 us/req gen 6.927 | errors 0 | runs 5796280,5932499,5941014
+vbench p2 baseline-h3 v-base    rps  5788402 | srv 2.099 us/req gen 6.935 | errors 0 | runs 5747731,5700076,5788402
+vbench p2 static-h3   v-prev    rps  1023075 | srv 31.302 us/req gen 38.843 | errors 0 | runs 983731,1015288,1023075
+vbench p2 static-h3   v-gro-on  rps  1034183 | srv 29.197 us/req gen 39.522 | errors 0 | runs 1034183,1030918,1030342
+vbench p2 static-h3   v-steer-kernel rps  1009389 | srv 26.373 us/req gen 37.753 | errors 0 | runs 980902,1009389,983422
+vbench p2 static-h3   v-arena-x2 rps  1021443 | srv 29.360 us/req gen 39.545 | errors 0 | runs 1018691,1020336,1021443
+vbench p2 static-h3   v-inflight128k rps   952136 | srv 27.288 us/req gen 39.424 | errors 0 | runs 927803,931810,952136
+vbench p2 static-h3   v-inflight512k rps  1012062 | srv 33.768 us/req gen 39.856 | errors 0 | runs 1010012,986895,1012062
+vbench p2 static-h3   v-pacing-off rps   963843 | srv 24.189 us/req gen 34.712 | errors 0 | runs 957299,963843,960972
+vbench p2 static-h3   v-pmtu-rtt rps  1038557 | srv 26.493 us/req gen 39.935 | errors 0 | runs 1012694,1038557,1002804
+vbench p2 static-h3   v-train32 rps  1003391 | srv 33.266 us/req gen 39.642 | errors 0 | runs 995008,1003391,945565
+vbench p2 static-h3   v-bodies-rr rps   994631 | srv 32.345 us/req gen 39.751 | errors 0 | runs 976118,965142,994631
+vbench p2 static-h3   zix       rps   584884 | srv 49.221 us/req gen 57.749 | errors 0 | runs 574312,584884,582128
+vbench p2 static-h3   v-base    rps  1023163 | srv 30.737 us/req gen 39.776 | errors 0 | runs 1006484,1023163,997086
+== pass 2 done 16:36:22 (1302 s)
+vbench p3 baseline-h3 v-gro-on  rps  5833352 | srv 2.044 us/req gen 6.866 | errors 0 | runs 5833352,5831405,5819959
+vbench p3 baseline-h3 v-steer-kernel rps  5790073 | srv 1.934 us/req gen 6.993 | errors 0 | runs 5712616,5790073,5745183
+vbench p3 baseline-h3 v-data-fresh rps  5709663 | srv 2.296 us/req gen 6.923 | errors 0 | runs 5640282,5662296,5709663
+vbench p3 baseline-h3 v-ring512 rps  5755032 | srv 2.105 us/req gen 6.892 | errors 0 | runs 5755032,5753211,5743090
+vbench p3 baseline-h3 v-flush-slot rps  5769951 | srv 2.143 us/req gen 7.003 | errors 0 | runs 5733219,5769951,5756966
+vbench p3 baseline-h3 v-balance-off rps  5751364 | srv 1.950 us/req gen 6.967 | errors 0 | runs 5751364,5693692,5748604
+vbench p3 baseline-h3 v-pin-off rps  5760079 | srv 2.109 us/req gen 7.010 | errors 0 | runs 5680358,5760079,5743735
+vbench p3 baseline-h3 zix       rps  5964546 | srv 1.372 us/req gen 7.012 | errors 0 | runs 5862069,5961040,5964546
+vbench p3 baseline-h3 v-base    rps  5793327 | srv 2.127 us/req gen 6.968 | errors 0 | runs 5739375,5793327,5739012
+vbench p3 baseline-h3 v-prev    rps  5704265 | srv 2.514 us/req gen 6.839 | errors 0 | runs 5675189,5704265,5693038
+vbench p3 static-h3   v-gro-on  rps  1007679 | srv 31.205 us/req gen 39.185 | errors 0 | runs 1007679,979225,974166
+vbench p3 static-h3   v-steer-kernel rps   953169 | srv 28.122 us/req gen 36.368 | errors 0 | runs 931404,953169,920599
+vbench p3 static-h3   v-arena-x2 rps  1006631 | srv 35.502 us/req gen 39.334 | errors 0 | runs 978898,1006631,994574
+vbench p3 static-h3   v-inflight128k rps   926227 | srv 30.447 us/req gen 38.616 | errors 0 | runs 907579,926165,926227
+vbench p3 static-h3   v-inflight512k rps  1030723 | srv 31.482 us/req gen 40.341 | errors 0 | runs 1030723,1006643,1028387
+vbench p3 static-h3   v-pacing-off rps   963584 | srv 24.705 us/req gen 34.748 | errors 0 | runs 963584,960172,959549
+vbench p3 static-h3   v-pmtu-rtt rps  1025242 | srv 31.795 us/req gen 39.495 | errors 0 | runs 976882,1001839,1025242
+vbench p3 static-h3   v-train32 rps  1019294 | srv 28.301 us/req gen 39.715 | errors 0 | runs 1019294,988576,1009590
+vbench p3 static-h3   v-bodies-rr rps  1017203 | srv 29.762 us/req gen 39.720 | errors 0 | runs 1017203,1003550,1015875
+vbench p3 static-h3   zix       rps   614133 | srv 48.003 us/req gen 56.279 | errors 0 | runs 561092,565745,614133
+vbench p3 static-h3   v-base    rps  1031765 | srv 28.547 us/req gen 39.854 | errors 0 | runs 998138,1012525,1031765
+vbench p3 static-h3   v-prev    rps  1008762 | srv 30.279 us/req gen 39.669 | errors 0 | runs 1008762,1005585,1004498
+== pass 3 done 16:47:12 (1952 s)
+perf=/usr/bin/perf (perf version 7.0.14)
+pmu=yes sw_event=cycles record_z=1 lbr_cg=fp cm_event=cache-misses
+topdown_args=none
+hw_events=cycles,instructions,branches,branch-misses,cache-references,cache-misses,L1-dcache-loads,L1-dcache-load-misses,dTLB-load-misses,iTLB-load-misses
+tracepoints=syscalls:sys_enter_io_uring_enter,syscalls:sys_enter_sendmsg,syscalls:sys_enter_recvmsg,syscalls:sys_enter_sendmmsg,syscalls:sys_enter_recvmmsg,syscalls:sys_enter_sendto,syscalls:sys_enter_recvfrom,syscalls:sys_enter_epoll_wait,syscalls:sys_enter_epoll_pwait,syscalls:sys_enter_epoll_pwait2,syscalls:sys_enter_futex,syscalls:sys_enter_read,syscalls:sys_enter_write,syscalls:sys_enter_writev,io_uring:io_uring_submit_req,io_uring:io_uring_complete,io_uring:io_uring_task_add,net:net_dev_xmit,net:netif_receive_skb,net:netif_rx,skb:kfree_skb,udp:udp_fail_queue_rcv_skb
+== variant profiles: base prev x baseline-h3 static-h3, 12s runs, window +3s for 6s, -F 499; pmu=yes; 16:47:18
+vprofile p1 baseline-h3 v-base    rps  5708289 | srv 2.254 us/req gen 7.020 | errors 0 | runs 5708289,5599697
+vprofile p1 static-h3   v-base    rps  1003324 | srv 30.400 us/req gen 40.110 | errors 0 | runs 1003324,970979
+vprofile p1 baseline-h3 v-prev    rps  5647348 | srv 2.604 us/req gen 6.867 | errors 0 | runs 5647348,5423483
+vprofile p1 static-h3   v-prev    rps   990006 | srv 31.910 us/req gen 39.977 | errors 0 | runs 990006,909574
+== variants done 16:50:07 (2127 s)

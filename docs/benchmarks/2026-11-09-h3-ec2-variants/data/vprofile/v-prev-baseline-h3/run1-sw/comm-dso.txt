@@ -1,0 +1,22 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 97K of event 'cycles'
+# Event count (approx.): 330522351478
+#
+# Overhead  Command          Shared Object                                 
+# ........  ...............  ..............................................
+#
+    68.95%  arena-h2         arena-h2                                      
+    15.60%  arena-h2         [kernel.kallsyms]                             
+     7.42%  swapper          [kernel.kallsyms]                             
+     6.29%  arena-h2         libc.so.6                                     
+     1.00%  sleep            [kernel.kallsyms]                             
+     0.33%  bash             [kernel.kallsyms]                             
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

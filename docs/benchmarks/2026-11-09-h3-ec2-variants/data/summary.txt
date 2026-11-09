@@ -1,0 +1,164 @@
+imds instance-type: m6a.24xlarge
+imds placement/availability-zone: sa-east-1b
+uname -r: 7.0.0-1016-aws
+server cpus 0,48,1,49,2,50,3,51,4,52,5,53,6,54,7,55,8,56,9,57,10,58,11,59,12,60,13,61,14,62,15,63,16,64,17,65,18,66,19,67,20,68,21,69,22,70,23,71 | generator cpus 24,72,25,73,26,74,27,75,28,76,29,77,30,78,31,79,32,80,33,81,34,82,35,83,36,84,37,85,38,86,39,87,40,88,41,89,42,90,43,91,44,92,45,93,46,94,47,95 | h2load -t 48
+pmu=yes
+
+## variants (phase V)
+
+### baseline-h3 (median of 3 passes; base 5,788,402 req/s, 2.10 us/req)
+
+| variant | req/s | vs base | srv us/req | vs base | spread | verdict | resp/pkt | ACK-only | flushes w/ ACK | blocked in (streams/data/stream) | lost | PTO | resent | starts |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| base | 5,788,402 | +0.0% | 2.10 | +0.0% | 0.1% | - | 62.0 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 3 |
+| prev | 5,680,584 | -1.9% | 2.51 | +19.7% | 0.6% | loss | - | 0.0% | - | -/-/- | - | - | - | 3 |
+| gro-on | 5,833,039 | +0.8% | 2.04 | -2.8% | 0.2% | WIN | 64.0 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 3 |
+| steer-kernel | 5,786,717 | -0.0% | 2.01 | -4.4% | 0.4% | WIN (within spread) | 62.2 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 3 |
+| data-fresh | 5,736,462 | -0.9% | 2.30 | +9.5% | 0.6% | loss | 61.6 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 3 |
+| ring512 | 5,755,032 | -0.6% | 2.10 | +0.2% | 1.1% | = | 62.1 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 3 |
+| flush-slot | 5,767,865 | -0.4% | 2.12 | +0.7% | 0.4% | = | 62.0 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 3 |
+| balance-off | 5,795,936 | +0.1% | 1.93 | -8.2% | 1.2% | WIN (within spread) | 62.2 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 3 |
+| pin-off | 5,777,690 | -0.2% | 2.11 | +0.4% | 0.6% | = | 62.0 | 0.0% | 100.0% | 0/0/0 | 0 | 0 | 0 | 3 |
+| zix | 5,942,980 | +2.7% | 1.39 | -34.0% | 0.4% | - | - | - | - | -/-/- | - | - | - | 3 |
+
+rps by pass (k = 1000; ! = errors):
+
+| variant | pass 1 | pass 2 | pass 3 |
+|---|---|---|---|
+| base | 5787k | 5788k | 5793k |
+| prev | 5681k | 5669k | 5704k |
+| gro-on | 5824k | 5833k | 5833k |
+| steer-kernel | 5767k | 5787k | 5790k |
+| data-fresh | 5742k | 5736k | 5710k |
+| ring512 | 5738k | 5804k | 5755k |
+| flush-slot | 5768k | 5747k | 5770k |
+| balance-off | 5796k | 5821k | 5751k |
+| pin-off | 5778k | 5797k | 5760k |
+| zix | 5943k | 5941k | 5965k |
+
+### static-h3 (median of 3 passes; base 1,023,163 req/s, 30.12 us/req)
+
+| variant | req/s | vs base | srv us/req | vs base | spread | verdict | resp/pkt | ACK-only | flushes w/ ACK | blocked in (streams/data/stream) | lost | PTO | resent | starts |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| base | 1,023,163 | +0.0% | 30.12 | +0.0% | 1.8% | - | 0.1 | 0.0% | 63.9% | 0/0/0 | 58196 | 0 | 111527 | 3 |
+| prev | 1,010,730 | -1.2% | 31.30 | +3.9% | 1.4% | loss (within spread) | - | 0.0% | - | -/-/- | - | - | - | 3 |
+| gro-on | 1,009,919 | -1.3% | 31.20 | +3.6% | 2.6% | loss (within spread) | 0.1 | 0.0% | 64.3% | 0/0/0 | 56109 | 0 | 105211 | 3 |
+| steer-kernel | 989,234 | -3.3% | 28.12 | -6.6% | 5.7% | loss (within spread) | 0.1 | 0.0% | 69.3% | 0/0/0 | 28255 | 0 | 52646 | 3 |
+| arena-x2 | 1,019,704 | -0.3% | 29.36 | -2.5% | 1.5% | WIN (within spread) | 0.1 | 0.0% | 63.7% | 0/0/0 | 60391 | 0 | 115035 | 3 |
+| inflight128k | 938,696 | -8.3% | 28.23 | -6.3% | 2.8% | loss | 0.1 | 0.0% | 67.4% | 0/0/0 | 0 | 0 | 0 | 3 |
+| inflight512k | 1,030,723 | +0.7% | 31.48 | +4.5% | 2.5% | loss (within spread) | 0.1 | 0.0% | 61.9% | 0/0/0 | 72874 | 0 | 144084 | 3 |
+| pacing-off | 963,843 | -5.8% | 24.58 | -18.4% | 0.1% | loss | 0.1 | 0.0% | 99.7% | 0/0/0 | 87920 | 0 | 180960 | 3 |
+| pmtu-rtt | 1,025,242 | +0.2% | 31.80 | +5.6% | 4.3% | loss (within spread) | 0.1 | 0.0% | 64.0% | 0/0/0 | 49176 | 0 | 89430 | 3 |
+| train32 | 1,009,560 | -1.3% | 30.53 | +1.3% | 1.6% | loss (within spread) | 0.1 | 0.0% | 64.4% | 0/0/0 | 74452 | 0 | 146484 | 3 |
+| bodies-rr | 1,011,003 | -1.2% | 31.41 | +4.3% | 2.2% | loss (within spread) | 0.1 | 0.0% | 62.3% | 0/0/0 | 51992 | 0 | 100102 | 3 |
+| zix | 584,884 | -42.8% | 48.00 | +59.4% | 6.6% | - | - | - | - | -/-/- | - | - | - | 3 |
+
+rps by pass (k = 1000; ! = errors):
+
+| variant | pass 1 | pass 2 | pass 3 |
+|---|---|---|---|
+| base | 1013k | 1023k | 1032k |
+| prev | 1011k | 1023k | 1009k |
+| gro-on | 1010k | 1034k | 1008k |
+| steer-kernel | 989k | 1009k | 953k |
+| arena-x2 | 1020k | 1021k | 1007k |
+| inflight128k | 939k | 952k | 926k |
+| inflight512k | 1038k | 1012k | 1031k |
+| pacing-off | 964k | 964k | 964k |
+| pmtu-rtt | 994k | 1039k | 1025k |
+| train32 | 1010k | 1003k | 1019k |
+| bodies-rr | 1011k | 995k | 1017k |
+| zix | 575k | 585k | 614k |
+
+knobs each variant ran with (first start; the server's own line):
+
+- base: headers=min data=reuse gro=0 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete
+- prev: (build before task 16: prints no knobs line)
+- gro-on: headers=min data=reuse gro=1 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete
+- steer-kernel: headers=min data=reuse gro=0 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=kernel balance=0 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete
+- data-fresh: headers=min data=fresh gro=0 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete
+- ring512: headers=min data=reuse gro=0 recv_buffers=512 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete
+- flush-slot: headers=min data=reuse gro=0 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=slot steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete
+- balance-off: headers=min data=reuse gro=0 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=0 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete
+- pin-off: headers=min data=reuse gro=0 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=0 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete
+- arena-x2: headers=min data=reuse gro=0 recv_buffers=256 tx_arena=1536000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete
+- inflight128k: headers=min data=reuse gro=0 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=131072 pacing=1 pmtu_probe=now bodies=complete
+- inflight512k: headers=min data=reuse gro=0 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=524288 pacing=1 pmtu_probe=now bodies=complete
+- pacing-off: headers=min data=reuse gro=0 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=0 pmtu_probe=now bodies=complete
+- pmtu-rtt: headers=min data=reuse gro=0 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=rtt bodies=complete
+- train32: headers=min data=reuse gro=0 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=32 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete
+- bodies-rr: headers=min data=reuse gro=0 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=round-robin
+
+## vprofile: software profile windows
+
+| profile | server | req/s | srv us/req | user % | softirq % cores | UDP in/req | UDP out/req | rcvbuf/sndbuf/in err | ctx-sw/req | syscalls/req (top) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| baseline-h3 | v-base | 5,700,938 | 2.32 | 83 | 0.9 | 0.063 | 0.032 | 0/0/0 | 0.029 | io_uring_enter 0.03, read 0.00, write 0.00, epoll_pwait 0.00 |
+| static-h3 | v-base | 994,133 | 31.34 | 54 | 5.7 | 0.506 | 0.505 | 1988/0/1988 | 0.183 | io_uring_enter 0.25, read 0.00, write 0.00, epoll_pwait 0.00 |
+| baseline-h3 | v-prev | 5,625,902 | 2.67 | 85 | 0.9 | 0.063 | 0.032 | 0/0/0 | 0.028 | io_uring_enter 0.03, read 0.00, write 0.00, futex 0.00 |
+| static-h3 | v-prev | 982,103 | 32.76 | 54 | 5.6 | 0.508 | 0.507 | 1905/0/1905 | 0.174 | io_uring_enter 0.25, read 0.00, write 0.00, epoll_pwait 0.00 |
+
+~ = request rate from the run's h2load rps (rivals); rimu's comes from its own counters over the window.
+UDP counters are host-wide: both the server's and the generator's datagrams on the loopback.
+
+### baseline-h3 v-base  (vprofile/v-base-baseline-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.063/req, io_uring:io_uring_submit_req 0.016/req, io_uring:io_uring_task_add 0.001/req, net:net_dev_xmit 0.016/req, net:netif_receive_skb 0.016/req, net:netif_rx 0.016/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  4.80% <rimu_ws::http3::request::RequestHead>::push (arena-h2)
+  3.35% <rimu_ws::http::http3_server_framework::router_handler::Rout (arena-h2)
+  3.09% <rimu_ws::http3::h3_app::H3App<rimu_ws::http::http3_server_f (arena-h2)
+  1.99% <(rimu_ws::http::http2_server_framework::path_params::PathPa (arena-h2)
+  1.92% rimu_ws::http::http3_server_framework::router_handler::fill_ (arena-h2)
+  1.86% memcpy (libc.so.6)
+  1.69% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  1.66% <rimu_ws::http::http3_server_framework::router_handler::Rout (arena-h2)
+  1.64% <rimu_ws::quic::stream::Streams>::deliver::<rimu_ws::http3:: (arena-h2)
+  1.47% <rimu_ws::quic::stream::Streams>::create (arena-h2)
+
+### static-h3 v-base  (vprofile/v-base-static-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.697/req, io_uring:io_uring_submit_req 0.618/req, io_uring:io_uring_task_add 0.004/req, net:net_dev_xmit 0.375/req, net:netif_receive_skb 0.375/req, net:netif_rx 0.375/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  15.00% kernel_init_pages ([kernel.kallsyms])
+  9.16% ring_core_0_17_14__aes_gcm_enc_update_vaes_avx2 (arena-h2)
+  3.28% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  2.61% ring::aead::aes_gcm::seal (arena-h2)
+  2.34% rep_movs_alternative ([kernel.kallsyms])
+  2.04% <rimu_ws::quic::stream::Streams>::write_stream_frame (arena-h2)
+  1.58% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  1.50% asm_sysvec_apic_timer_interrupt ([kernel.kallsyms])
+  1.21% rimu_ws::http::huffman::huffman_decode::<rimu_ws::http3::qpa (arena-h2)
+  1.19% ring_core_0_17_14__aes_hw_ctr32_encrypt_blocks (arena-h2)
+
+### baseline-h3 v-prev  (vprofile/v-prev-baseline-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.063/req, io_uring:io_uring_submit_req 0.016/req, io_uring:io_uring_task_add 0.001/req, net:net_dev_xmit 0.016/req, net:netif_receive_skb 0.016/req, net:netif_rx 0.016/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  6.54% <rimu_ws::http::http3_server_framework::router_handler::Rout (arena-h2)
+  6.32% <rimu_ws::http3::h3_app::H3App<rimu_ws::http::http3_server_f (arena-h2)
+  5.07% <rimu_ws::http3::request::RequestHead>::push (arena-h2)
+  1.97% <rimu_ws::http::http3_server_framework::router_handler::Resp (arena-h2)
+  1.92% rimu_ws::http::http3_server_framework::router_handler::fill_ (arena-h2)
+  1.82% memcpy (libc.so.6)
+  1.80% <rimu_ws::net::uri::Uri<alloc::string::String>>::process (arena-h2)
+  1.74% rimu_ws::http3::request::check_field (arena-h2)
+  1.74% <(rimu_ws::http::http2_server_framework::path_params::PathPa (arena-h2)
+  1.59% rimu_ws::http::http3_server_framework::router_handler::known (arena-h2)
+
+### static-h3 v-prev  (vprofile/v-prev-static-h3/run1-sw)
+tracepoints: io_uring:io_uring_complete 0.702/req, io_uring:io_uring_submit_req 0.617/req, io_uring:io_uring_task_add 0.004/req, net:net_dev_xmit 0.375/req, net:netif_receive_skb 0.375/req, net:netif_rx 0.375/req, skb:kfree_skb 0.000/req, udp:udp_fail_queue_rcv_skb 0.000/req
+  15.29% kernel_init_pages ([kernel.kallsyms])
+  8.97% ring_core_0_17_14__aes_gcm_enc_update_vaes_avx2 (arena-h2)
+  3.33% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  2.52% ring::aead::aes_gcm::seal (arena-h2)
+  2.30% rep_movs_alternative ([kernel.kallsyms])
+  1.93% <rimu_ws::quic::stream::Streams>::write_stream_frame (arena-h2)
+  1.54% asm_sysvec_apic_timer_interrupt ([kernel.kallsyms])
+  1.52% <rimu_ws::quic::conn::QuicConn<rimu_ws::http3::h3_app::H3App (arena-h2)
+  1.21% rimu_ws::http::huffman::huffman_decode::<rimu_ws::http3::qpa (arena-h2)
+  1.16% ring_core_0_17_14__gcm_ghash_vpclmulqdq_avx2_1 (arena-h2)
+
+## vprofile: hardware counter windows
+
+| profile | server | req/s | cycles/req | instr/req | IPC | branch-miss % | L1d miss % | LLC miss % | dTLB miss/req | iTLB miss/req |
+|---|---|---|---|---|---|---|---|---|---|---|
+| baseline-h3 | v-base | 5,452,202 | 6,789 | 8,913 | 1.31 | 1.47 | 2.97 | - | 0.58 | 0.52 |
+| static-h3 | v-base | 931,613 | 82,424 | 75,367 | 0.91 | 2.48 | 6.82 | - | 5.18 | 3.65 |
+| baseline-h3 | v-prev | 5,199,301 | 8,174 | 10,197 | 1.25 | 1.20 | 2.95 | - | 0.63 | 0.29 |
+| static-h3 | v-prev | 864,247 | 109,296 | 76,561 | 0.70 | 2.25 | 7.04 | - | 5.14 | 2.65 |
+
