@@ -92,8 +92,8 @@ pub struct UdpParams {
   /// buffers are then 64 KiB each (256 of them: 256 x 65,536 B, exactly 16 MiB or 16.8 MB, per
   /// socket). Defaults to `false` (ruling T16-h): on, it measured 2.8 % less server CPU per request
   /// at 0.8 % more requests per second on HttpArena baseline-h3 (task 16, EC2; static-h3 unchanged
-  /// within the spread), but its ring alone equals the 16 MiB pool budget of a worker (spec section
-  /// 5.4) by itself, leaving nothing for the other pools (48 workers: 768 MiB). Turn it on where
+  /// within the spread), but its ring equals the 16 MiB pool budget of a worker (spec section 5.4)
+  /// by itself, leaving nothing for the other pools (48 workers: 768 MiB). Turn it on where
   /// the memory is there, with fewer [`Self::recv_buffers`] to keep the ring small.
   pub gro: bool,
   /// The `SO_RCVBUF` asked for. The kernel caps it at `net.core.rmem_max`, which is never raised
@@ -1585,9 +1585,9 @@ mod tests {
 
   // Brief step 3 of task 16 (EC2 variant batch of 9 Nov 2026) and ruling T16-h: generic receive
   // offload stays off by default, although it won on baseline-h3 (-2.8 % server CPU per request at
-  // +0.8 % requests per second): its 64 KiB receive buffers make one socket's ring about 16.8 MiB,
-  // past the 16 MiB pool budget of a worker (spec section 5.4). The other defaults are the
-  // measured ones too.
+  // +0.8 % requests per second): its 256 receive buffers of 64 KiB make one socket's ring exactly
+  // 16 MiB, which equals the 16 MiB pool budget of a worker (spec section 5.4), leaving nothing for
+  // the other pools. The other defaults are the measured ones too.
   #[test]
   fn defaults_are_the_measured_ones() {
     let params = UdpParams::new();

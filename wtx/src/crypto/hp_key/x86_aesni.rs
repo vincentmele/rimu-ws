@@ -274,6 +274,9 @@ mod tests {
   #[test]
   fn aesni_masks_match_known_answers_in_every_lane() {
     if !has_aes_ni() {
+      std::eprintln!(
+        "aesni_masks_match_known_answers_in_every_lane: skipped, the CPU has no AES-NI"
+      );
       assert!(Aes128HpAesNi::new(&FIPS_128_KEY).is_err());
       return;
     }
@@ -306,44 +309,49 @@ mod tests {
     }
   }
 
-  // Ruling T18-b's correctness gate: 10,000 random samples under random keys of both sizes, in
-  // batches of random lengths, give the masks that the backend computes one at a time.
+  // Ruling T18-b's correctness gate: 10,000 random samples under random keys of both sizes (at
+  // least 3,000 each), in batches of random lengths, give the masks that the backend computes one
+  // at a time.
   #[cfg(all(feature = "crypto-ring", not(miri)))]
   #[test]
   fn batched_masks_equal_single_masks() {
     use crate::crypto::{Aes128HpRing, Aes256HpRing};
     if !has_aes_ni() {
+      std::eprintln!("batched_masks_equal_single_masks: skipped, the CPU has no AES-NI");
       return;
     }
     let mut rng = Xorshift64::new(0x5eed_1e55_c0ff_ee01);
     let mut samples = [[0u8; 16]; 64];
     let mut out = [[0u8; 5]; 64];
-    let mut done = 0usize;
-    while done < 10_000 {
+    // Samples checked under AES-128 and under AES-256 keys
+    let mut done = [0usize; 2];
+    let mut batches = 0usize;
+    while done[0] + done[1] < 10_000 {
       let mut key = [0u8; 32];
       fill(&mut rng, &mut key);
       let len = usize::try_from(rng.next_value() % 65).unwrap();
       for sample in &mut samples[..len] {
         fill(&mut rng, sample);
       }
-      let (batched, single): (Vec<[u8; 5]>, Vec<[u8; 5]>) = if done.is_multiple_of(2) {
+      let aes128 = batches.is_multiple_of(2);
+      batches += 1;
+      let single: Vec<[u8; 5]> = if aes128 {
         let ring = Aes128HpRing::new(&key[..16]).unwrap();
         let ni = Aes128HpAesNi::new(&key[..16]).unwrap();
         ni.masks(&samples[..len], &mut out[..len]).unwrap();
-        let single = samples[..len].iter().map(|el| ring.mask(el).unwrap()).collect();
         assert!(samples[..len].iter().all(|el| ni.mask(el).unwrap() == ring.mask(el).unwrap()));
-        (out[..len].to_vec(), single)
+        samples[..len].iter().map(|el| ring.mask(el).unwrap()).collect()
       } else {
         let ring = Aes256HpRing::new(&key).unwrap();
         let ni = Aes256HpAesNi::new(&key).unwrap();
         ni.masks(&samples[..len], &mut out[..len]).unwrap();
-        let single = samples[..len].iter().map(|el| ring.mask(el).unwrap()).collect();
         assert!(samples[..len].iter().all(|el| ni.mask(el).unwrap() == ring.mask(el).unwrap()));
-        (out[..len].to_vec(), single)
+        samples[..len].iter().map(|el| ring.mask(el).unwrap()).collect()
       };
-      assert_eq!(batched, single, "after {done} samples, batch of {len}");
-      done = done.wrapping_add(len.max(1));
+      assert_eq!(out[..len], single[..], "after {done:?} samples, batch of {len}");
+      done[usize::from(!aes128)] += len;
     }
+    assert!(done.iter().all(|el| *el >= 3_000), "samples per key size: {done:?}");
   }
 
   // The round keys are wiped when the key is dropped, checked without reading freed memory: the
@@ -352,6 +360,7 @@ mod tests {
   fn aesni_key_is_wiped_on_drop() {
     use core::{mem::MaybeUninit, ptr, slice};
     if !has_aes_ni() {
+      std::eprintln!("aesni_key_is_wiped_on_drop: skipped, the CPU has no AES-NI");
       return;
     }
     let mut slot = MaybeUninit::<Aes256HpAesNi>::uninit();
@@ -371,6 +380,7 @@ mod tests {
     assert!(Aes128HpAesNi::new(&[0; 32]).is_err());
     assert!(Aes256HpAesNi::new(&[0; 16]).is_err());
     if !has_aes_ni() {
+      std::eprintln!("aesni_lengths_are_checked: batch part skipped, the CPU has no AES-NI");
       return;
     }
     let hp = Aes128HpAesNi::new(&[0; 16]).unwrap();

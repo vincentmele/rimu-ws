@@ -603,9 +603,13 @@ where
     if pools.hp_batch.len() == 0 {
       return;
     }
+    // The 1-RTT keys are made before the first deferred packet and dropped only when the
+    // connection is released, which is never during a flush: `None` is a programming error, and
+    // `HpBatch::apply` protects every packet that it can before it reports one
     let rslt = match self.data.keys.as_ref() {
       Some(keys) => pools.hp_batch.apply(keys.local.hp(), tx.buffer_mut()),
       None => {
+        cold_path();
         pools.hp_batch.truncate(0);
         Err(crate::Error::ProgrammingError)
       }

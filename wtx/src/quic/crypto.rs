@@ -225,6 +225,13 @@ impl HpBatch {
 
   /// Protects the waiting packets, which `bytes` holds at the offsets they were given with, with
   /// `hp`, and empties the batch whatever happens.
+  ///
+  /// Every packet that can be protected is, even if another one fails, so that a failure leaves no
+  /// more unprotected headers than it must: if the batch of masks fails, each packet gets its own
+  /// mask ([`QuicHp`]'s single mask). What can still fail is a programming error: an offset outside
+  /// `bytes` (the offsets come from the arena that `bytes` is), or a header protection that has no
+  /// masks at all, which no key of a connection has (keys without header protection fail to be
+  /// made, and the handshake with them). The first error is returned, and the connection closes.
   #[inline]
   pub(crate) fn apply(&mut self, hp: &QuicHp, bytes: &mut [u8]) -> crate::Result<()> {
     let len = self.len();
@@ -238,19 +245,35 @@ impl HpBatch {
     else {
       return Err(programming_error());
     };
-    hp.masks(samples, out)?;
+    let batched = hp.masks(samples, out).is_ok();
     #[cfg(test)]
-    {
+    if batched {
       self.masked = self.masked.wrapping_add(u64::try_from(len).unwrap_or(u64::MAX));
       self.largest = self.largest.max(len);
     }
-    for ((start, pn_offset, pn_len), mask) in packets.iter().zip(masks) {
-      let Some(packet) = bytes.get_mut(*start..) else {
-        return Err(programming_error());
+    let mut rslt = Ok(());
+    for (((start, pn_offset, pn_len), mask), sample) in packets.iter().zip(masks).zip(samples) {
+      let mask = if batched {
+        mask
+      } else {
+        cold_path();
+        match hp.mask(sample) {
+          Ok(elem) => elem,
+          Err(err) => {
+            rslt = rslt.and(Err(err));
+            continue;
+          }
+        }
       };
-      apply_mask(packet, usize::from(*pn_offset), usize::from(*pn_len), mask)?;
+      let Some(packet) = bytes.get_mut(*start..) else {
+        rslt = rslt.and(Err(programming_error()));
+        continue;
+      };
+      if let Err(err) = apply_mask(packet, usize::from(*pn_offset), usize::from(*pn_len), mask) {
+        rslt = rslt.and(Err(err));
+      }
     }
-    Ok(())
+    rslt
   }
 
   // Adds the packet at `start` of the arena, sealed by [`seal_packet`]; `false` if full.
@@ -744,8 +767,8 @@ mod tests {
       quic::{
         QuicError,
         crypto::{
-          DirectionalKeys, QuicAead, QuicHp, initial_keys, keys_from_secret, open_payload, protect,
-          remove_header_protection,
+          DirectionalKeys, HpBatch, QuicAead, QuicHp, initial_keys, keys_from_secret,
+          keys_from_secret_with, open_payload, protect, protect_deferred, remove_header_protection,
         },
       },
       tls::CipherSuite,
@@ -1299,6 +1322,49 @@ mod tests {
       assert_eq!(allocations(CipherSuite::Aes128GcmSha256, &AES128), 0, "AES-128-GCM");
       assert_eq!(allocations(CipherSuite::Aes256GcmSha384, &AES256), 0, "AES-256-GCM");
       assert_eq!(allocations(CipherSuite::Chacha20Poly1305Sha256, &CHACHA), 0, "ChaCha20-Poly1305");
+    }
+
+    // Ruling T18-e (review): a batch whose middle entry points outside the buffer still protects the
+    // packets before and after it, exactly as `protect` would, and reports the error. So does a
+    // batch protected by a backend key, which falls back to a mask each where it has no batches.
+    #[test]
+    fn hp_batch_protects_every_packet_it_can() {
+      const PACKET: usize = 9 + 4 + 30 + AEAD_TAG_LEN;
+      for (suite, batched) in [
+        (CipherSuite::Aes128GcmSha256, true),
+        (CipherSuite::Aes256GcmSha384, true),
+        (CipherSuite::Chacha20Poly1305Sha256, false),
+      ] {
+        let secret = secret_of(suite, 9);
+        let deferred = keys_from_secret_with(suite, &secret, batched).unwrap();
+        let direct = keys_from_secret(suite, &secret).unwrap();
+        // Two short-header packets, 4-byte packet numbers 7 and 8, after a header and an 8-byte CID
+        let plain = |pn: u8| {
+          let mut packet = vec![0u8; PACKET];
+          packet[0] = 0x43;
+          packet[1..9].copy_from_slice(&[0x11; 8]);
+          packet[12] = pn;
+          packet[13..43].fill(pn);
+          packet
+        };
+        let mut expected = Vec::new();
+        for pn in [7u8, 8] {
+          let mut packet = plain(pn);
+          protect(&direct, &mut packet, 9, u64::from(pn), 4, 30).unwrap();
+          expected.extend_from_slice(&packet);
+        }
+        let mut buffer = [plain(7), plain(8)].concat();
+        let mut batch = HpBatch::new();
+        let (first, second) = buffer.split_at_mut(PACKET);
+        let fields = |pn: u8| (9, u64::from(pn), 4, 30);
+        protect_deferred(&deferred, first, fields(7), 0, &mut batch).unwrap();
+        assert!(batch.push(1 << 20, 9, 4, [0; 16]));
+        protect_deferred(&deferred, second, fields(8), PACKET, &mut batch).unwrap();
+        assert_eq!(batch.len(), 3);
+        assert!(matches!(batch.apply(deferred.hp(), &mut buffer), Err(Error::ProgrammingError)));
+        assert_eq!(batch.len(), 0);
+        assert_eq!(buffer, expected, "{suite:?}");
+      }
     }
   }
 }
