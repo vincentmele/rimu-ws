@@ -46,9 +46,9 @@ impl rustls::client::danger::ServerCertVerifier for TrustAny {
   }
 }
 
-/// A client config that speaks HTTP/3 (ALPN `h3`), trusts any certificate, and keeps connections
-/// alive under the server's idle timeout so idle scenarios can hold them.
-pub fn client_config(keep_alive: Option<Duration>, idle: Duration) -> ClientConfig {
+/// The bare `rustls` TLS 1.3 client config (ALPN `h3`, trust-any verifier) that both the `quinn`
+/// clients and the raw 1-RTT client ([`super::onertt`]) build on. Loopback only.
+pub(crate) fn rustls_config() -> rustls::ClientConfig {
   let provider = Arc::new(rustls::crypto::ring::default_provider());
   let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
     .with_protocol_versions(&[&rustls::version::TLS13])
@@ -57,6 +57,13 @@ pub fn client_config(keep_alive: Option<Duration>, idle: Duration) -> ClientConf
     .with_custom_certificate_verifier(Arc::new(TrustAny(provider)))
     .with_no_client_auth();
   tls.alpn_protocols = vec![b"h3".to_vec()];
+  tls
+}
+
+/// A client config that speaks HTTP/3 (ALPN `h3`), trusts any certificate, and keeps connections
+/// alive under the server's idle timeout so idle scenarios can hold them.
+pub fn client_config(keep_alive: Option<Duration>, idle: Duration) -> ClientConfig {
+  let tls = rustls_config();
   let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic client config");
   let mut cfg = ClientConfig::new(Arc::new(qcc));
   let mut transport = TransportConfig::default();

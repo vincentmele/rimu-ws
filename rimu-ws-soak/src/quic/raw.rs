@@ -106,7 +106,7 @@ impl InitialKeys {
 }
 
 /// Reads a QUIC varint at the start of `bytes`, returning (value, bytes consumed).
-fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
+pub fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
   let first = *bytes.first()?;
   let len = 1usize << (first >> 6);
   let mut value = u64::from(first & 0x3f);

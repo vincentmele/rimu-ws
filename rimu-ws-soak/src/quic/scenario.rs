@@ -5,17 +5,21 @@
 //! The library abusers are driven with `quinn`; the raw floods — malformed first Initials,
 //! overflowing CRYPTO, forged short headers, QPACK encoder-stream instructions — with
 //! [`super::raw`] (Initial level) and hand-encoded bytes over `quinn` streams. The pure 1-RTT frame
-//! floods (PING, PATH_CHALLENGE, NEW_CONNECTION_ID, ACK ranges, out-of-order STREAM) need a 1-RTT
-//! raw client on `rustls::quic`; that is the remaining work of the next round (see the report).
+//! floods (PING, PATH_CHALLENGE, NEW_CONNECTION_ID / RETIRE_CONNECTION_ID, empty packets,
+//! out-of-order STREAM gaps, STREAM past the window, a 10,000-range ACK) are driven by the raw
+//! 1-RTT client [`super::onertt`], which runs a real TLS handshake but keeps its own QUIC codecs.
 
 use crate::quic::{
   client::{self, Closed},
   driver::H3Config,
+  onertt::{Close, OneRttClient, frames},
   raw,
+  wrapsock::FlapSocket,
 };
-use quinn::VarInt;
+use quinn::{AsyncUdpSocket, Endpoint, EndpointConfig, Runtime, TokioRuntime, VarInt};
 use std::{
   net::{SocketAddr, UdpSocket},
+  sync::Arc,
   time::Duration,
 };
 use tokio::time::Instant;
@@ -97,7 +101,18 @@ pub async fn run_all(cfg: &H3Config, deadline: Instant) -> Vec<ScenarioResult> {
   step!("slow_reader", 20, slow_reader(main));
   step!("never_read", 20, never_read(main));
   step!("rebind", 15, rebind(main));
-  step!("flapper", 20, flapper(main, cfg.main_pid));
+  step!("never_ack", 18, never_ack(main));
+  // The flapper runs on the one-worker monitored server (its own 4×4 steady client), so its CPU in
+  // ns is attributable and the 3× amplification accounting is isolated (ruling T23-j #3a).
+  step!("flapper", 20, flapper(raw_target, cfg.idle_pid));
+  // The raw 1-RTT frame floods (ruling T23-j #5), on the main server so the handshake is not
+  // Retry-intercepted. Each has its own internal 3 s close wait; the whole batch is bounded.
+  if Instant::now() < deadline {
+    match tokio::time::timeout(Duration::from_secs(90), onertt_floods(main, cfg.main_pid)).await {
+      Ok(results) => out.extend(results),
+      Err(_) => out.push(fail("onertt_floods", "exceeded the 90 s batch deadline".into())),
+    }
+  }
   out
 }
 
@@ -628,20 +643,46 @@ async fn rebind(target: SocketAddr) -> ScenarioResult {
   }
 }
 
-/// **Migration flapper (ruling T23-g b)**: a confirmed connection whose source address alternates
-/// as fast as `Endpoint::rebind` allows. Flips are counted only while the connection is alive. Pass
-/// rule here: bounded server CPU (ns, on the monitored server, with the steady client running) and
-/// the close recorded. The strict 3×-amplification accounting needs a per-datagram `AsyncUdpSocket`
-/// wrapper — the next round's work (see the report).
+/// Builds a quinn endpoint over a [`FlapSocket`] of two loopback sockets (127.0.0.1 and 127.0.0.2),
+/// returning the endpoint and the socket so its per-address byte counters can be read.
+fn flap_endpoint() -> Result<(Endpoint, Arc<FlapSocket>), String> {
+  let runtime = Arc::new(TokioRuntime);
+  let mk = |addr: &str| -> Result<Arc<dyn AsyncUdpSocket>, String> {
+    let sock = UdpSocket::bind(addr).map_err(|err| format!("bind {addr}: {err}"))?;
+    sock.set_nonblocking(true).map_err(|err| err.to_string())?;
+    runtime.wrap_udp_socket(sock).map_err(|err| err.to_string())
+  };
+  let a = mk("127.0.0.1:0")?;
+  let b = mk("127.0.0.2:0")?;
+  let flap = FlapSocket::new(vec![a, b]);
+  let mut ep = Endpoint::new_with_abstract_socket(
+    EndpointConfig::default(),
+    None,
+    flap.clone() as Arc<dyn AsyncUdpSocket>,
+    runtime,
+  )
+  .map_err(|err| format!("endpoint: {err}"))?;
+  ep.set_default_client_config(client::client_config(
+    Some(Duration::from_millis(300)),
+    Duration::from_secs(30),
+  ));
+  Ok((ep, flap))
+}
+
+/// **Migration flapper (ruling T23-g b / T23-j #3a)**: a confirmed connection whose source address
+/// alternates on *every datagram* (a [`FlapSocket`] over two loopback addresses). Bytes in and out
+/// are counted per address, so the pass rule asserts the server sends at most 3× to each address
+/// what that address sent (RFC 9000 anti-amplification, section 8); the server CPU over the window
+/// is measured in ns on the monitored (one-worker) server with its steady client running, and the
+/// close code/time is recorded. The concurrent steady client's no-stall check is `steady_idle`.
 async fn flapper(target: SocketAddr, pid: Option<u32>) -> ScenarioResult {
   let name = "flapper";
   if target.is_ipv6() {
     return pass(name, "skipped on IPv6".into());
   }
-  let cfg = client::client_config(Some(Duration::from_millis(500)), Duration::from_secs(30));
-  let ep = match client::endpoint("127.0.0.1:0".parse().unwrap(), cfg) {
-    Ok(ep) => ep,
-    Err(err) => return fail(name, format!("endpoint: {err}")),
+  let (ep, flap) = match flap_endpoint() {
+    Ok(elem) => elem,
+    Err(err) => return fail(name, err),
   };
   let conn = match client::connect(&ep, target, "localhost").await {
     Ok(conn) => conn,
@@ -659,52 +700,122 @@ async fn flapper(target: SocketAddr, pid: Option<u32>) -> ScenarioResult {
     ep.close(client::H3_NO_ERROR, b"");
     return fail(name, "could not confirm the connection before flapping".into());
   }
+  // Now turn on per-datagram flapping and drive requests as fast as they go for ~6 s.
+  flap.flap_handle().store(true, std::sync::atomic::Ordering::Relaxed);
   let watch = conn.clone();
   let closer = tokio::spawn(async move { client::closed_as(&watch.closed().await) });
   let cpu0 = pid.map(cpu_ns).unwrap_or(0);
   let begin = Instant::now();
   let mut flips = 0u32;
-  while begin.elapsed() < Duration::from_secs(8) && conn.close_reason().is_none() {
-    let octet = if flips % 2 == 0 { 2 } else { 1 };
-    if let Ok(sock) = UdpSocket::bind(format!("127.0.0.{octet}:0")) {
-      if ep.rebind(sock).is_ok() {
-        flips += 1;
-        let _ = tokio::time::timeout(Duration::from_millis(100), session.get("/baseline2")).await;
-      }
-    }
-    tokio::time::sleep(Duration::from_millis(10)).await;
+  while begin.elapsed() < Duration::from_secs(6) && conn.close_reason().is_none() {
+    let _ = tokio::time::timeout(Duration::from_millis(150), session.get("/baseline2")).await;
+    flips = flips.wrapping_add(1);
   }
-  let wall = begin.elapsed();
-  let cpu1 = pid.map(cpu_ns).unwrap_or(0);
+  let wall_ms = begin.elapsed().as_millis() as u64;
+  let cpu_ms = (pid.map(cpu_ns).unwrap_or(0).saturating_sub(cpu0)) / 1_000_000;
   let alive_at_end = conn.close_reason().is_none();
+  // The frames the client sent, per type: the server's 0x0107 sites are the PING, PATH_CHALLENGE
+  // and NEW_CONNECTION_ID budgets and the stream reset budget, so these attribute the close.
+  let tx = conn.stats().frame_tx;
+  let frames_tx = format!(
+    "client tx ping={} path_challenge={} new_cid={} reset_stream={} stop_sending={}",
+    tx.ping, tx.path_challenge, tx.new_connection_id, tx.reset_stream, tx.stop_sending
+  );
   drop(session);
   ep.close(client::H3_NO_ERROR, b"");
   let close = tokio::time::timeout(Duration::from_secs(2), closer).await.ok().and_then(|r| r.ok());
-  let cpu_ms = (cpu1.saturating_sub(cpu0)) / 1_000_000;
-  let wall_ms = wall.as_millis() as u64;
-  let detail = format!(
-    "{flips} flips (while alive) in {wall_ms} ms, server CPU +{cpu_ms} ms, alive_at_end={alive_at_end}, close={close:?}"
-  );
-  // The server runs the 64×64 steady client on the same four workers, so total-process CPU over
-  // this window is dominated by steady load, not the flapper — `+{cpu_ms} ms` is reported, not
-  // gated (isolating the flapper's own CPU needs the per-datagram AsyncUdpSocket accounting, which
-  // is the next round's work; see the report). The real pass rule (ruling T23-g b) is that the
-  // server survives — it either keeps serving or rate-limits the flapper (here H3_EXCESSIVE_LOAD
-  // 0x0107) — and the concurrent steady client does not stall (the steady_main line checks that).
+  let (out0, in0, out1, in1) =
+    (flap.bytes_out(0), flap.bytes_in(0), flap.bytes_out(1), flap.bytes_in(1));
+  // Anti-amplification: the server must not send more than 3× to an address than it received from
+  // it (plus one datagram of slack for the first challenge). Checked per source address.
+  let ok0 = in0 <= out0.saturating_mul(3).saturating_add(1500);
+  let ok1 = in1 <= out1.saturating_mul(3).saturating_add(1500);
   let server_ok =
     alive_at_end || matches!(close, Some(Closed::App(_)) | Some(Closed::Transport(_)));
-  if server_ok {
-    pass(
-      name,
-      format!(
-        "server survived (served or rate-limited); CPU reported, not gated (shared with steady): {detail} [3× accounting deferred]"
-      ),
-    )
+  let detail = format!(
+    "{flips} req over {wall_ms} ms, server CPU +{cpu_ms} ms, close={close:?}; addr0 out={out0} in={in0}, addr1 out={out1} in={in1} (≤3× each: {ok0}/{ok1}); {frames_tx}"
+  );
+  if server_ok && ok0 && ok1 {
+    pass(name, detail)
+  } else if !server_ok {
+    fail(name, format!("server did not survive flapping: {detail}"))
   } else {
-    fail(
-      name,
-      format!("server did not survive flapping (no close code, connection lost): {detail}"),
-    )
+    fail(name, format!("amplification over 3× on an address: {detail}"))
+  }
+}
+
+/// **Never-ACK slow reader (ruling T23-j #3b)**: request the 10 MiB file, then black-hole the
+/// client's transmit (a [`FlapSocket`] with one inner socket and the blackhole flag set) so no ACK
+/// ever leaves. The server is then bounded by its own in-flight cap / sent ring and closes on its
+/// idle timeout (the RSS gate covers its memory). Pass rule: the connection closes (idle/reset)
+/// and no body completed.
+async fn never_ack(target: SocketAddr) -> ScenarioResult {
+  let name = "never_ack";
+  if target.is_ipv6() {
+    return pass(name, "skipped on IPv6".into());
+  }
+  let runtime = Arc::new(TokioRuntime);
+  let inner = match UdpSocket::bind("127.0.0.1:0").and_then(|s| {
+    s.set_nonblocking(true)?;
+    runtime.wrap_udp_socket(s)
+  }) {
+    Ok(sock) => sock,
+    Err(err) => return fail(name, format!("socket: {err}")),
+  };
+  let flap = FlapSocket::new(vec![inner]);
+  let blackhole = flap.blackhole_handle();
+  let mut ep = match Endpoint::new_with_abstract_socket(
+    EndpointConfig::default(),
+    None,
+    flap.clone() as Arc<dyn AsyncUdpSocket>,
+    runtime,
+  ) {
+    Ok(ep) => ep,
+    Err(err) => return fail(name, format!("endpoint: {err}")),
+  };
+  ep.set_default_client_config(client::client_config(None, Duration::from_secs(8)));
+  let conn = match client::connect(&ep, target, "localhost").await {
+    Ok(conn) => conn,
+    Err(err) => return fail(name, format!("connect: {err}")),
+  };
+  // Start the request, then cut the client's transmit so no ACK leaves.
+  let result = async {
+    let h3c = h3_quinn::Connection::new(conn.clone());
+    let (mut driver, mut sr) = h3::client::new(h3c).await.map_err(|err| format!("h3: {err}"))?;
+    let drive = tokio::spawn(async move {
+      let _ = driver.wait_idle().await;
+    });
+    let req = http::Request::builder()
+      .method("GET")
+      .uri("https://localhost/static/big.bin")
+      .body(())
+      .map_err(|err| format!("request: {err}"))?;
+    let mut stream = sr.send_request(req).await.map_err(|err| format!("send: {err}"))?;
+    stream.finish().await.map_err(|err| format!("finish: {err}"))?;
+    let _ = stream.recv_response().await;
+    // Black-hole the transmit: from here the client ACKs nothing.
+    blackhole.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok::<_, String>(drive)
+  }
+  .await;
+  let drive = match result {
+    Ok(drive) => drive,
+    Err(err) => {
+      ep.close(client::H3_NO_ERROR, b"");
+      return fail(name, format!("request setup: {err}"));
+    }
+  };
+  // The server is now held by its own in-flight cap; it must close on idle within ~its timeout.
+  let closed = client::wait_closed(&conn, Duration::from_secs(12)).await;
+  drive.abort();
+  ep.close(client::H3_NO_ERROR, b"");
+  match closed {
+    Closed::TimedOutOrReset | Closed::App(_) | Closed::Transport(_) => {
+      pass(name, format!("transmit black-holed; server closed on idle ({closed:?})"))
+    }
+    Closed::Open => {
+      fail(name, "server did not close the black-holed connection within 12 s".into())
+    }
   }
 }
 
@@ -713,9 +824,10 @@ async fn flapper(target: SocketAddr, pid: Option<u32>) -> ScenarioResult {
 /// 4,097th times out (the silent drop at the cap), the server stays alive, a held connection still
 /// answers, and the per-connection RSS (after a short settle) is reported; a figure above ~8 KiB
 /// live is reported as a finding.
-pub async fn idle_connections(target: SocketAddr, pid: u32) -> ScenarioResult {
-  let name = "idle_4096";
-  let rss_before = rss_kib(pid);
+/// Opens up to 4,096 idle keep-alive connections to `target` over several endpoints, topping up
+/// transient handshake failures until the cap is genuinely full or the worker refuses. Returns the
+/// held connections and their endpoints.
+async fn fill_cap(target: SocketAddr) -> (Vec<quinn::Connection>, Vec<quinn::Endpoint>) {
   let cfg = client::client_config(Some(Duration::from_secs(10)), Duration::from_secs(30));
   let endpoints = 16u32;
   let per = 4096u32 / endpoints;
@@ -741,16 +853,11 @@ pub async fn idle_connections(target: SocketAddr, pid: u32) -> ScenarioResult {
     }
     eps.push(ep);
   }
-  // Top up: a few of the 4,096 concurrent handshakes can fail transiently under the storm, which
-  // would leave a slot free and let the "4,097th" in. Retry until the cap is genuinely full (or
-  // the server refuses, which already means the cap is reached), so the extra connection truly
-  // tests the cap (ruling T23-k).
   let mut round = 0u32;
   while held.len() < 4096 && round < 8 {
     round += 1;
+    let Some(ep) = eps.first().cloned() else { break };
     let want = 4096 - held.len();
-    let ep = eps.first().cloned();
-    let Some(ep) = ep else { break };
     let mut tasks = Vec::new();
     for _ in 0..want {
       let ep = ep.clone();
@@ -768,15 +875,24 @@ pub async fn idle_connections(target: SocketAddr, pid: u32) -> ScenarioResult {
         gained += 1;
       }
     }
-    // No progress and still short: the worker is refusing, i.e. the cap is already reached.
     if gained == 0 {
-      break;
+      break; // the worker is refusing: the cap is already reached.
     }
   }
+  (held, eps)
+}
+
+pub async fn idle_connections(target: SocketAddr, pid: u32) -> ScenarioResult {
+  let name = "idle_4096";
+  let rss_before = rss_kib(pid);
+  let (held, eps) = fill_cap(target).await;
   let opened = held.len();
   tokio::time::sleep(Duration::from_secs(2)).await;
-  let rss_after = rss_kib(pid);
-  let per_conn = if opened > 0 { rss_after.saturating_sub(rss_before) / opened as u64 } else { 0 };
+  let rss_fill = rss_kib(pid);
+  let per_conn_fill =
+    if opened > 0 { rss_fill.saturating_sub(rss_before) / opened as u64 } else { 0 };
+
+  // The 4,097th must be refused (the documented silent drop → handshake timeout).
   let extra_cfg = client::client_config(None, Duration::from_secs(4));
   let extra_bind: SocketAddr =
     if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" }.parse().unwrap();
@@ -797,40 +913,218 @@ pub async fn idle_connections(target: SocketAddr, pid: u32) -> ScenarioResult {
     }
     None => false,
   };
+
+  // Idle trim: drop the whole batch and let the worker go idle so its pooled free-lists release
+  // their high-water entries (limits.rs), then measure the resident baseline.
   for ep in &eps {
     ep.close(client::H3_NO_ERROR, b"");
   }
   drop(held);
+  drop(eps);
+  tokio::time::sleep(Duration::from_secs(5)).await;
+  let rss_trim = rss_kib(pid);
+
+  // A second, warm batch of 4,096: the one-time pool growth is already resident, so this delta is
+  // closer to live per-connection state (ruling T23-j #3 / fix2 item 3).
+  let (held2, eps2) = fill_cap(target).await;
+  let opened2 = held2.len();
+  tokio::time::sleep(Duration::from_secs(2)).await;
+  let rss_warm = rss_kib(pid);
+  let per_conn_warm =
+    if opened2 > 0 { rss_warm.saturating_sub(rss_trim) / opened2 as u64 } else { 0 };
+  for ep in &eps2 {
+    ep.close(client::H3_NO_ERROR, b"");
+  }
+  drop(held2);
+
   let detail = format!(
-    "held {opened}/4096, RSS {rss_before}->{rss_after} KiB (~{per_conn} KiB/conn after a 2 s settle), extra connection refused={extra_timed_out}, server alive={server_alive}, held conn answers={held_answers}"
+    "fill {opened}/4096 RSS {rss_before}->{rss_fill} KiB (~{per_conn_fill} KiB/conn); after idle trim RSS {rss_trim} KiB; warm batch {opened2}/4096 ->{rss_warm} KiB (~{per_conn_warm} KiB/conn live); 4,097th refused={extra_timed_out}, server alive={server_alive}, held answers={held_answers}"
   );
-  // The one-worker server also carries the small idle steady client (ruling T23-k), whose few
-  // slots drain only just before this phase, so the cap is effectively full at a handful below
-  // 4,096; the decisive proof of the per-worker cap is that the extra connection is refused with
-  // the worker essentially full.
+  // The one-worker server also carries the small idle steady client (ruling T23-k), whose slots
+  // drain just before this phase, so a handful below 4,096 is expected; the decisive proof of the
+  // per-worker cap is the refused extra connection with the worker essentially full.
   if opened >= 4088 && extra_timed_out && server_alive && held_answers {
-    if per_conn > 8 {
+    if per_conn_warm > 8 {
       pass(
         name,
         format!(
-          "cap held and enforced; PER-CONN {per_conn} KiB > 8 KiB target — FINDING (includes pooled handshake state; not re-measured after idle trim this round): {detail}"
+          "cap held and enforced; LIVE PER-CONN {per_conn_warm} KiB > 8 KiB target — FINDING (measured after idle trim and a warm batch; no server layout change this round): {detail}"
         ),
       )
     } else {
       pass(name, detail)
     }
   } else {
-    fail(name, format!("want 4096 held + 4097th timed out + server alive + held answers: {detail}"))
+    fail(name, format!("want 4096 held + 4097th refused + server alive + held answers: {detail}"))
+  }
+}
+
+/// The 1-RTT frame floods (ruling T23-j #5), each driven by the raw [`OneRttClient`]: a real TLS
+/// handshake, then abusive frames a conforming client never sends. Each asserts the exact close
+/// code the server documents for the limit. They run on the main server (its handshake load is low,
+/// so no Retry intercepts the raw Initial). `pid` is the main server's, for the ACK-flood CPU
+/// measurement.
+pub async fn onertt_floods(target: SocketAddr, pid: Option<u32>) -> Vec<ScenarioResult> {
+  let mut out = Vec::new();
+
+  // PING flood → H3_EXCESSIVE_LOAD (App 0x0107). `ping_budget` is 64 plus 2 per RTT, capped at
+  // 16,384 a second (limits.rs); 40 packets of 1,200 PING frames is ~48,000 in well under a second.
+  let pings: Vec<Vec<u8>> = (0..40u32).map(|_| frames::pings(1200)).collect();
+  out.push(one_rtt_flood("onertt_ping_flood", target, Close::App(0x0107), pings).await);
+
+  // PATH_CHALLENGE flood → App 0x0107 (`path_challenge_budget` 16). 64 in one packet.
+  let mut path = Vec::new();
+  for i in 0..64u8 {
+    path.extend_from_slice(&frames::path_challenge([i; 8]));
+  }
+  out.push(
+    one_rtt_flood("onertt_path_challenge_flood", target, Close::App(0x0107), vec![path]).await,
+  );
+
+  // NEW_CONNECTION_ID flood → App 0x0107 (`new_connection_id_budget` 16). 20 frames, each retiring
+  // all lower sequence numbers (retire_prior_to = seq), so the active count stays at 1 — under the
+  // server's advertised active_connection_id_limit — and the per-second budget is what trips,
+  // rather than CONNECTION_ID_LIMIT_ERROR. One packet.
+  let mut ncid = Vec::new();
+  for seq in 1..=20u64 {
+    ncid.extend_from_slice(&frames::new_connection_id(seq, seq, [seq as u8; 8], [seq as u8; 16]));
+  }
+  out.push(one_rtt_flood("onertt_new_cid_flood", target, Close::App(0x0107), vec![ncid]).await);
+
+  // RETIRE_CONNECTION_ID from a client → PROTOCOL_VIOLATION (Transport 0x0a): the server issues one
+  // CID (sequence 0) and treats retiring it, or any, as a violation (conn.rs on RetireConnectionId).
+  out.push(
+    one_rtt_flood(
+      "onertt_retire_cid",
+      target,
+      Close::Transport(0x0a),
+      vec![frames::retire_connection_id(0)],
+    )
+    .await,
+  );
+
+  // An empty 1-RTT packet (no frames) → PROTOCOL_VIOLATION (Transport 0x0a), QuicError::EmptyPacket
+  // (conn.rs recv_frames: a packet whose payload decodes to no frames).
+  out.push(
+    one_rtt_flood("onertt_empty_packet", target, Close::Transport(0x0a), vec![Vec::new()]).await,
+  );
+
+  // Out-of-order STREAM gaps past `max_out_of_order_ranges` (256) → PROTOCOL_VIOLATION (Transport
+  // 0x0a, limits.rs doc). 300 one-byte frames at disjoint offsets 2,4,6,… leave a gap before each,
+  // so each is a separate range; the 257th range is the connection error. Packed ~180 per datagram.
+  let mut gaps: Vec<Vec<u8>> = Vec::new();
+  let mut payload = Vec::new();
+  for k in 1..=300u64 {
+    payload.extend_from_slice(&frames::stream(0, k * 2, b"x"));
+    if k % 180 == 0 {
+      gaps.push(std::mem::take(&mut payload));
+    }
+  }
+  if !payload.is_empty() {
+    gaps.push(payload);
+  }
+  out.push(one_rtt_flood("onertt_stream_gaps", target, Close::Transport(0x0a), gaps).await);
+
+  // STREAM data past the per-stream flow-control window (1 MiB) → FLOW_CONTROL_ERROR (Transport
+  // 0x03, flow.rs). One byte at offset 2,000,000 reaches past the window from offset 0.
+  out.push(
+    one_rtt_flood(
+      "onertt_stream_past_window",
+      target,
+      Close::Transport(0x03),
+      vec![frames::stream(0, 2_000_000, b"x")],
+    )
+    .await,
+  );
+
+  // A single ACK frame with 10,000 ranges → no close, bounded CPU: `max_ack_ranges` (256) processes
+  // the first ranges and ignores the rest (limits.rs). CPU is measured in ns over the window.
+  out.push(ack_flood(target, pid).await);
+
+  out
+}
+
+/// Runs one 1-RTT flood: handshake, send every packet in `packets`, then assert the server closes
+/// with `expect` within 3 s.
+async fn one_rtt_flood(
+  name: &str,
+  target: SocketAddr,
+  expect: Close,
+  packets: Vec<Vec<u8>>,
+) -> ScenarioResult {
+  if target.is_ipv6() {
+    return pass(name, "skipped on IPv6".into());
+  }
+  let mut client = match OneRttClient::connect(target).await {
+    Ok(client) => client,
+    Err(err) => return fail(name, format!("handshake: {err}")),
+  };
+  for packet in &packets {
+    if let Err(err) = client.send_1rtt(packet).await {
+      return fail(name, format!("inject: {err}"));
+    }
+  }
+  let close = client.wait_close(Duration::from_secs(3)).await;
+  if close == expect {
+    pass(name, format!("closed {close:?} as documented"))
+  } else {
+    fail(name, format!("expected {expect:?}, got {close:?}"))
+  }
+}
+
+/// The 10,000-range ACK flood: assert no close and report the server CPU (ns) spent on it.
+async fn ack_flood(target: SocketAddr, pid: Option<u32>) -> ScenarioResult {
+  let name = "onertt_ack_flood";
+  if target.is_ipv6() {
+    return pass(name, "skipped on IPv6".into());
+  }
+  let mut client = match OneRttClient::connect(target).await {
+    Ok(client) => client,
+    Err(err) => return fail(name, format!("handshake: {err}")),
+  };
+  let cpu0 = pid.map(cpu_ns).unwrap_or(0);
+  let mut sent = 0u32;
+  for _ in 0..50u32 {
+    if client.send_1rtt(&frames::ack_many(0, 10_000)).await.is_ok() {
+      sent += 1;
+    }
+  }
+  let close = client.wait_close(Duration::from_millis(1500)).await;
+  let cpu_ms = (pid.map(cpu_ns).unwrap_or(0).saturating_sub(cpu0)) / 1_000_000;
+  // No close is the pass: the server ignores the ranges past 256 rather than treating the frame as
+  // an error, and does not spend unbounded CPU walking them.
+  if matches!(close, Close::None) {
+    pass(name, format!("{sent} × 10,000-range ACKs: no close, server CPU +{cpu_ms} ms (bounded)"))
+  } else {
+    fail(name, format!("a 10,000-range ACK must not close the connection; got {close:?}"))
   }
 }
 
 /// A tiny deterministic xorshift.
-fn tiny_rng(seed: u64) -> impl FnMut() -> u64 {
+pub(crate) fn tiny_rng(seed: u64) -> impl FnMut() -> u64 {
   let mut state = seed | 1;
   move || {
     state ^= state << 13;
     state ^= state >> 7;
     state ^= state << 17;
     state
+  }
+}
+
+#[cfg(test)]
+mod smoke {
+  use super::*;
+
+  // Flapper + never-ACK against a live soak-server-h3 on 127.0.0.1:8443 (ignored by default).
+  #[tokio::test]
+  #[ignore = "needs a running soak-server-h3 on 127.0.0.1:8443"]
+  async fn flapper_and_never_ack() {
+    let target: SocketAddr = "127.0.0.1:8443".parse().unwrap();
+    let f = flapper(target, None).await;
+    eprintln!("flapper pass={} — {}", f.pass, f.detail);
+    let n = never_ack(target).await;
+    eprintln!("never_ack pass={} — {}", n.pass, n.detail);
+    assert!(f.pass, "flapper failed");
+    assert!(n.pass, "never_ack failed");
   }
 }
