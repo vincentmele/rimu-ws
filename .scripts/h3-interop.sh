@@ -7,7 +7,7 @@
 #
 #   -b          build the client images first (needs network; otherwise they must exist)
 #   -c CLIENTS  comma list of curl, ngtcp2, quic-go (default: all three)
-#   -p PATHS    comma list of direct, loss1, loss5 (default: all three)
+#   -p PATHS    comma list of direct, loss1, loss5, rebind (default: direct, loss1, loss5)
 #   -f FAMILIES comma list of v4, v6 (default: both)
 #
 # Clients (built from pinned sources by .scripts/h3-interop/Dockerfile.*; the versions below are the
@@ -22,6 +22,13 @@
 #   direct    no proxy
 #   loss1     udp-impair: 1% of the datagrams dropped, 0.5 ms each way
 #   loss5     udp-impair: 5% dropped, 5% reordered (held 1 to 5 ms more), 5% duplicated, 0.5 ms
+#   rebind    udp-impair as a NAT that rebinds every REBIND (200) datagrams of a client towards the
+#             server, 0.5 ms each way: a new source port each time, and from the second rebinding on
+#             the source address 127.0.0.2 instead of 127.0.0.1 (v4 only; ::1 only changes its port).
+#             The server must follow the client to its new address (RFC 9000 section 9.3, task 22b);
+#             the cell fails if no rebinding happened, or, on v4, none to 127.0.0.2. The rebindings
+#             are reported as rebinds=N, those to 127.0.0.2 as address_rebinds=N, and the proxy's
+#             log is kept as last-CLIENT-FAMILY-rebind.impair
 #
 # Scenarios per cell: GET /baseline2; GET of every file under /static with Accept-Encoding br, gzip
 # and identity (bytes and content-encoding checked against the file or its twin); POST of 1 MiB to
@@ -47,6 +54,7 @@
 #              second, plus 2 per smoothed RTT, ruling T21-g). Before T21-g the ngtcp2 example client
 #              was closed with H3_EXCESSIVE_LOAD under loss5 at the flat 64
 #   SEQ, PAR   sequential requests (1000) and parallel connections (64)
+#   REBIND     datagrams of a client between two rebindings on the rebind path (200)
 #   CELL_LIMIT seconds a cell may take before it is stopped and failed (default 240)
 
 set -euo pipefail
@@ -59,6 +67,7 @@ seed=${SEED:-1}
 seq_n=${SEQ:-1000}
 par_n=${PAR:-64}
 cell_limit=${CELL_LIMIT:-240}
+rebind_n=${REBIND:-200}
 port=8443
 dir=$(cd "$(dirname "$0")" && pwd)
 work=${TMPDIR:-/mnt/nvme1tb/claude-tmp}/h3-interop
@@ -177,6 +186,7 @@ start_path() {
 		;;
 	loss1) params=(--drop 0.01 --delay-us 500) ;;
 	loss5) params=(--drop 0.05 --reorder 0.05 --dup 0.05 --delay-us 500) ;;
+	rebind) params=(--rebind "$rebind_n" --delay-us 500) ;;
 	*) echo "unknown path $1" >&2; exit 2 ;;
 	esac
 	: >"$work/impair.out"
@@ -240,6 +250,21 @@ for client in "${client_list[@]}"; do
 			fi
 			elapsed=$((SECONDS - start))
 			stop_impair
+			rebinds=""
+			if [ "$path" = rebind ]; then
+				cp "$work/impair.err" "$work/last-$client-$family-$path.impair"
+				rebinds=$(grep -c '^rebind ' "$work/impair.err" || true)
+				address_rebinds=$(grep -c '^rebind .* 127\.0\.0\.2:' "$work/impair.err" || true)
+				if [ "$rebinds" -eq 0 ]; then
+					status=FAIL
+					echo "FAIL proxy: no rebinding happened" >>"$work/cell.out"
+				fi
+				if [ "$family" = v4 ] && [ "$address_rebinds" -eq 0 ]; then
+					status=FAIL
+					echo "FAIL proxy: no rebinding to 127.0.0.2 happened" >>"$work/cell.out"
+				fi
+				rebinds="$rebinds address_rebinds=$address_rebinds"
+			fi
 			if ! kill -0 "$server_pid" 2>/dev/null; then
 				echo "cell $client $family $path FAIL ${elapsed}s the server died; log in $log"
 				exit 1
@@ -268,6 +293,7 @@ for client in "${client_list[@]}"; do
 				status=FAIL
 				echo "FAIL server: no h3-stats line" >>"$work/cell.out"
 			fi
+			[ -z "$rebinds" ] || detail="$detail rebinds=$rebinds"
 			echo "cell $client $family $path $status ${elapsed}s$detail"
 			if [ "$status" = FAIL ]; then
 				failed=$((failed + 1))

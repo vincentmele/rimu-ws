@@ -87,6 +87,23 @@ impl Pmtud {
     self.state = due(peer_max.min(path_ceiling(peer)), current);
   }
 
+  /// The peer moved to another IP address (RFC 9000 section 9.4): the datagrams start over at
+  /// `current` bytes and the discovery of the new path from the largest size, unless it did not
+  /// start yet. A probe of the old path that is acknowledged or lost later changes nothing.
+  #[inline]
+  pub(crate) fn restart(
+    &mut self,
+    peer_max_udp_payload_size: u64,
+    peer: &SocketAddr,
+    current: usize,
+  ) {
+    if self.state == State::Idle {
+      return;
+    }
+    let peer_max = usize::try_from(peer_max_udp_payload_size).unwrap_or(usize::MAX);
+    self.state = due(peer_max.min(path_ceiling(peer)), current);
+  }
+
   /// The size of the probe that is due, if one is and it is not held.
   #[inline]
   pub(crate) const fn probe_due(&self) -> Option<usize> {

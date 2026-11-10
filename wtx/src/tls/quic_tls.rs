@@ -308,6 +308,15 @@ where
     Ok(())
   }
 
+  /// A seed for the random numbers that the connection needs once the state of the handshake is
+  /// gone (the data of its PATH_CHALLENGE frames): the first bytes of a generator made from the
+  /// seed of the state, which moves on as for any other use.
+  #[inline]
+  pub(crate) fn connection_seed(&mut self) -> crate::Result<[u8; RNG_SEED_LEN]> {
+    let mut rng = next_rng::<RNG>(&mut self.state.rng_seed)?;
+    Ok(rng.u8_32())
+  }
+
   /// If the handshake is over: for a server, once the Finished of the client is verified.
   #[inline]
   pub(crate) fn is_complete(&self) -> bool {
@@ -811,9 +820,9 @@ impl Stage {
   }
 }
 
-// A generator made from `seed`, which takes as the next seed the first bytes that the generator
-// gives: no two generators give the same numbers.
-fn next_rng<RNG>(seed: &mut [u8; RNG_SEED_LEN]) -> crate::Result<RNG>
+/// A generator made from `seed`, which takes as the next seed the first bytes that the generator
+/// gives: no two generators give the same numbers.
+pub(crate) fn next_rng<RNG>(seed: &mut [u8; RNG_SEED_LEN]) -> crate::Result<RNG>
 where
   RNG: CryptoRng + CryptoSeedableRng,
 {

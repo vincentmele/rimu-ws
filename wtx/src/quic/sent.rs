@@ -53,6 +53,9 @@ pub(crate) enum FrameRef {
     /// The limit that the frame gave.
     max: u64,
   },
+  /// PATH_CHALLENGE of the validation of the current path, owed again if it is lost while the
+  /// validation lasts.
+  PathChallenge,
   /// MAX_STREAMS, of bidirectional or unidirectional streams.
   MaxStreams {
     /// If the frame was for bidirectional streams.
@@ -147,6 +150,10 @@ pub(crate) enum SentKind {
   MtuProbe,
   /// Declared lost: out of flight, its frames queued again, kept for a late acknowledgment.
   Lost,
+  /// In flight on a path other than the one that packets go on now: sent before the peer moved to
+  /// another address, or a probe of another path. Not counted by congestion control and no RTT
+  /// sample of the current path (RFC 9000 section 9.4).
+  OffPath,
 }
 
 /// The record of a sent packet.
@@ -174,7 +181,10 @@ impl SentPacket {
   /// If its fate is still unknown: in flight, a probe included.
   #[inline]
   pub(crate) fn in_flight(&self) -> bool {
-    matches!(self.kind, SentKind::InFlight | SentKind::MtuProbe | SentKind::Probed)
+    matches!(
+      self.kind,
+      SentKind::InFlight | SentKind::MtuProbe | SentKind::OffPath | SentKind::Probed
+    )
   }
 }
 

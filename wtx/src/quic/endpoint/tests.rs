@@ -1209,3 +1209,58 @@ fn refused_initials_count_as_half_open_until_they_drain() {
   let stats = net.servers[0].endpoint.stats();
   assert_eq!((stats.half_open, stats.conns), (0, 0));
 }
+
+// Rule (spec sections 5.4 and 5.11, RFC 9000 section 9.3): a NAT that gives a client another
+// address keeps its connection on the worker that its CID names, with CID steering on: the
+// packets that come from the new address reach that worker, nothing is forwarded, the worker
+// sends to the new address once it is validated and the requests go on.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn rebinding_stays_on_the_same_worker_with_cid_steering() {
+  let mut net = net(4, QuicParams::default());
+  let client = net.add_client();
+  net.run();
+  assert!(confirmed(&net, client));
+  assert_eq!(net.run_requests(10, 4, b"GET /"), 10);
+  let cid = server_cid(&net, client);
+  let worker = usize::from(cid[0]);
+  let forwarded: u64 = net.servers.iter().map(|el| el.endpoint.stats().forwarded).sum();
+  let moved = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 41_000);
+  net.clients[client].addr = moved;
+  assert_eq!(net.run_requests(100, 4, b"GET /"), 100);
+  for (idx, server) in net.servers.iter().enumerate() {
+    assert_eq!(server.endpoint.stats().conns, u32::from(idx == worker), "worker {idx}");
+  }
+  let now: u64 = net.servers.iter().map(|el| el.endpoint.stats().forwarded).sum();
+  assert_eq!(now, forwarded);
+  let conn = net.servers[worker].endpoint.conn(&cid).unwrap();
+  assert_eq!(conn.peer_addr(), moved);
+  assert!(conn.address_validated());
+}
+
+// Rule (review of task 22, deferred minor): a connection that closes while its handshake lasts
+// keeps its deadline for the count of half-open handshakes, but its timer is not armed at that
+// deadline once it passed: it fires at the end of the closing period, not at every tick.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn past_handshake_deadline_is_not_rearmed_while_closing() {
+  let mut net = net(1, QuicParams::default().set_handshake_timeout_ms(100));
+  net.client_alpn = b"h2";
+  let client = net.add_client();
+  let mut first = net.client_datagrams(client);
+  let _ = net.deliver_to_server(client, &mut first[0]);
+  assert_eq!(net.server_datagrams(0).len(), 1);
+  assert_eq!(net.servers[0].endpoint.stats().half_open, 1);
+  net.advance(200_000);
+  let stats = net.servers[0].endpoint.stats();
+  assert_eq!((stats.conns, stats.half_open), (1, 1));
+  // The end of the closing period, about three PTOs of the initial RTT after the close, and not
+  // the next tick of the wheel
+  let next = net.servers[0].endpoint.next_deadline().unwrap();
+  assert!(next > net.now_us + 1_000_000, "the timer fires at {next}, at {}", net.now_us);
+  net.advance(250);
+  assert_eq!(net.servers[0].endpoint.next_deadline(), Some(next));
+  net.advance(CLOSING_US);
+  let stats = net.servers[0].endpoint.stats();
+  assert_eq!((stats.conns, stats.half_open), (0, 0));
+}

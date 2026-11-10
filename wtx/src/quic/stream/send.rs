@@ -450,6 +450,7 @@ impl Streams {
       | FrameRef::Crypto { .. }
       | FrameRef::DataBlocked { .. }
       | FrameRef::HandshakeDone
+      | FrameRef::PathChallenge
       | FrameRef::RetireConnectionId { .. }
       | FrameRef::StopSending { .. }
       | FrameRef::StreamDataBlocked { .. } => return Ok(()),
@@ -544,6 +545,7 @@ impl Streams {
       FrameRef::Ack { .. }
       | FrameRef::Crypto { .. }
       | FrameRef::HandshakeDone
+      | FrameRef::PathChallenge
       | FrameRef::RetireConnectionId { .. } => {}
     }
     Ok(())

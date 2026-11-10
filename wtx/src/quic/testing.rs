@@ -423,10 +423,18 @@ where
 
   /// The datagrams that the arena holds, taken out of it.
   pub(crate) fn take_datagrams(&mut self) -> Vec<Vec<u8>> {
+    self.take_datagrams_to().into_iter().map(|el| el.1).collect()
+  }
+
+  /// [`Self::take_datagrams`] with the address that each one goes to.
+  pub(crate) fn take_datagrams_to(&mut self) -> Vec<(SocketAddr, Vec<u8>)> {
     let mut rslt = Vec::new();
     loop {
       let next = self.parts.tx.pending().next().map(|train| {
-        rslt.extend(train.bytes.chunks(usize::from(train.segment_size)).map(<[u8]>::to_vec));
+        let peer = train.peer;
+        rslt.extend(
+          train.bytes.chunks(usize::from(train.segment_size)).map(|el| (peer, el.to_vec())),
+        );
         train.id
       });
       let Some(id) = next else {
@@ -457,8 +465,9 @@ pub(crate) struct Link {
   pub(crate) client: Side<UnverifiedCtx, true>,
   /// Drops the datagrams for which it returns `true`: (to the server, the datagram).
   pub(crate) filter: Option<fn(bool, &[u8]) -> bool>,
-  // Datagrams on their way: (arrival, order of sending, to the server, the datagram)
-  flying: Vec<(u64, u64, bool, Vec<u8>)>,
+  // Datagrams on their way: (arrival, order of sending, to the server, the address that sent it,
+  // the datagram)
+  flying: Vec<(u64, u64, bool, SocketAddr, Vec<u8>)>,
   // Buffers of datagrams that arrived, for the next ones
   free: Vec<Vec<u8>>,
   impairment: Option<Impairment>,
@@ -578,11 +587,11 @@ impl Link {
       let Some(idx) = due else {
         break;
       };
-      let (_, _, to_server, mut datagram) = self.flying.swap_remove(idx);
+      let (_, _, to_server, from, mut datagram) = self.flying.swap_remove(idx);
       if to_server {
-        self.server.recv(self.now_us, &mut datagram, CLIENT_ADDR);
+        self.server.recv(self.now_us, &mut datagram, from);
       } else {
-        self.client.recv(self.now_us, &mut datagram, SERVER_ADDR);
+        self.client.recv(self.now_us, &mut datagram, from);
       }
       self.free.push(datagram);
       moved = true;
@@ -604,10 +613,16 @@ impl Link {
     (value >> 40) as f32 / (1u64 << 24) as f32
   }
 
-  // Puts what a side sent on its way
+  // Puts what a side sent on its way: what goes to an address that the other side does not have
+  // is lost, and what arrives comes from the address that the side has when it sends.
   fn send_impaired(&mut self, from_client: bool) -> bool {
     let Some(impairment) = self.impairment else {
       return false;
+    };
+    let (from, to) = if from_client {
+      (self.client.addr, self.server.addr)
+    } else {
+      (self.server.addr, self.client.addr)
     };
     let mut moved = false;
     loop {
@@ -615,13 +630,17 @@ impl Link {
       let next = side_tx.pending().next().map(|train| {
         self.scratch.clear();
         self.scratch.extend_from_slice(train.bytes);
-        (train.id, usize::from(train.segment_size))
+        (train.id, usize::from(train.segment_size), train.peer)
       });
-      let Some((id, segment_size)) = next else {
+      let Some((id, segment_size, peer)) = next else {
         break;
       };
       side_tx.mark_submitted(id);
       side_tx.release(id);
+      if peer != to {
+        moved = true;
+        continue;
+      }
       let mut at = 0;
       while at < self.scratch.len() {
         let end = (at + segment_size).min(self.scratch.len());
@@ -643,7 +662,7 @@ impl Link {
           datagram.clear();
           datagram.extend_from_slice(&self.scratch[at..end]);
           self.sent += 1;
-          self.flying.push((arrival, self.sent, from_client, datagram));
+          self.flying.push((arrival, self.sent, from_client, from, datagram));
         }
         at = end;
       }
@@ -809,7 +828,8 @@ fn server_conn(
   .unwrap()
 }
 
-// Moves the trains of `from` into `to`, one datagram at a time.
+// Moves the trains of `from` into `to`, one datagram at a time; those that go to another address
+// than the one of `to` are lost.
 fn transfer<A, const AC: bool, B, const BC: bool>(
   now_us: u64,
   scratch: &mut Vec<u8>,
@@ -825,13 +845,16 @@ where
     let next = from.parts.tx.pending().next().map(|train| {
       scratch.clear();
       scratch.extend_from_slice(train.bytes);
-      (train.id, usize::from(train.segment_size))
+      (train.id, usize::from(train.segment_size), train.peer)
     });
-    let Some((id, segment_size)) = next else {
+    let Some((id, segment_size, peer)) = next else {
       break;
     };
     from.parts.tx.mark_submitted(id);
     from.parts.tx.release(id);
+    if peer != to.addr {
+      continue;
+    }
     for datagram in scratch.chunks_mut(segment_size) {
       to.recv(now_us, datagram, from.addr);
       datagrams += 1;
@@ -1355,8 +1378,8 @@ impl<SA: QuicApp> Net<SA> {
         tx.mark_submitted(id);
         tx.release(id);
         moved = true;
-        let idx = usize::from(peer.port().wrapping_sub(50_000));
-        let Some(client) = self.clients.get_mut(idx).filter(|el| !el.deaf) else {
+        // What goes to an address that no client has anymore is lost
+        let Some(client) = self.clients.iter_mut().find(|el| el.addr == peer && !el.deaf) else {
           continue;
         };
         let meta = DatagramMeta { peer: SERVER_ADDR, local: None, segment_size: None };

@@ -5,15 +5,18 @@
 //! ClientHello, in new flows and as the answer to a Retry, repeated and coalesced, 1-RTT packets
 //! to the CIDs of the server and to CIDs that are not its own, packets of unknown versions, and
 //! any bytes; from eight addresses, two of which are real client connections that complete their
-//! handshakes if nothing stops them. Retry is on for part of the scripts (the limits on handshakes
-//! are small ones). The script also lets time pass and shuts the server down.
+//! handshakes if nothing stops them, and that a NAT moves to another port or IP address now and
+//! then (RFC 9000 section 9.3): a real client gets what is sent to its current address only. Retry
+//! is on for part of the scripts (the limits on handshakes are small ones). The script also lets
+//! time pass and shuts the server down.
 //!
 //! Whatever the script is, the endpoints must hold these:
 //!
 //! - they never panic;
-//! - before an address is validated (a Retry token of it came back, or its handshake completed)
-//!   the server sends it at most three times the bytes it received from it (RFC 9000 section 8.1),
-//!   counted on the datagrams that leave;
+//! - before an address is validated (a Retry token of it came back, its handshake completed, or the
+//!   server validated the new address of a real client) the server sends it at most three times
+//!   the bytes it received from it (RFC 9000 sections 8.1 and 9.3.1), counted on the datagrams that
+//!   leave;
 //! - the handshakes under way and the connections stay within the limits, and the first never
 //!   exceed the second;
 //! - a CONNECTION_CLOSE that a connection owes has an error code of RFC 9000 section 20.1 or one
@@ -45,6 +48,17 @@ const PEERS: u8 = 8;
 type Server = Endpoint<FuzzApp, ChaCha20, SkCtx>;
 type Client = QuicConn<FuzzApp, ChaCha20, UnverifiedCtx, true>;
 
+/// The address that a NAT gives real client `idx` for `nth` 1 (another port) or 2 (another IP
+/// address), or the one of its handshake for 0.
+fn rebound(idx: u8, nth: u8) -> SocketAddr {
+  let first = peer(idx);
+  match nth % 3 {
+    0 => first,
+    1 => SocketAddr::new(first.ip(), first.port().wrapping_add(1_000)),
+    _ => SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, idx)), first.port()),
+  }
+}
+
 fn peer(idx: u8) -> SocketAddr {
   let idx = idx % PEERS;
   let ip = if idx % 3 == 2 {
@@ -73,6 +87,8 @@ struct RetryOf {
 }
 
 struct Harness {
+  // The addresses of the two real clients now
+  client_addrs: [SocketAddr; 2],
   clients: Vec<(u8, Client, FuzzApp)>,
   client_pools: crate::quic::pools::QuicPools,
   client_tx: TxArena,
@@ -181,6 +197,7 @@ impl Harness {
       hellos.push((cid.to_vec(), hello));
     }
     Self {
+      client_addrs: [peer(0), peer(1)],
       clients: Vec::new(),
       client_pools: crate::quic::pools::QuicPools::new(),
       client_tx: TxArena::new(64 * 1500).unwrap(),
@@ -278,10 +295,11 @@ impl Harness {
         _ => {}
       }
     }
-    // The real clients get what is theirs
+    // The real clients get what is theirs, at their address now
     let now_us = self.now_us;
+    let addrs = self.client_addrs;
     for (idx, client, app) in &mut self.clients {
-      if peer(*idx) == to {
+      if addrs.get(usize::from(*idx)) == Some(&to) {
         let meta = DatagramMeta { peer: SERVER_ADDR, local: None, segment_size: None };
         let _rslt =
           client.recv_datagram(now_us, datagram, meta, app, &mut self.client_pools);
@@ -326,6 +344,12 @@ impl Harness {
           }
         });
       }
+      // A NAT rebinding now and then
+      if input.byte().is_multiple_of(8)
+        && let Some(addr) = self.client_addrs.get_mut(usize::from(which))
+      {
+        *addr = rebound(which, input.byte());
+      }
       let _rslt = client.flush(now_us, &mut self.client_tx, app, &mut self.client_pools);
       loop {
         let next = self.client_tx.pending().next().map(|train| {
@@ -341,9 +365,28 @@ impl Harness {
         self.client_tx.release(id);
       }
     }
+    let from = self.client_addrs.get(usize::from(which)).copied().unwrap_or_else(|| peer(which));
     for mut datagram in out {
-      // A real client completes its handshake: its address is validated
-      self.deliver(&mut datagram, peer(which), true);
+      // A real client completes its handshake: the address of it is validated, another one once
+      // the server validated it
+      self.deliver(&mut datagram, from, from == peer(which));
+      self.note_validated();
+    }
+  }
+
+  // The addresses of the real clients that the server validated: that of the path of a connection
+  // if it is, and the last validated one while it is not.
+  fn note_validated(&mut self) {
+    for (_, client, _) in &self.clients {
+      for (server, _, _) in &self.servers {
+        let Some(conn) = server.conn(client.peer_cid().as_slice()) else {
+          continue;
+        };
+        let current = conn.address_validated().then(|| conn.peer_addr());
+        for addr in current.into_iter().chain(conn.last_valid_peer()) {
+          self.flows.entry(addr).or_default().validated = true;
+        }
+      }
     }
   }
 
@@ -473,7 +516,8 @@ impl Harness {
     }
   }
 
-  fn check(&self) {
+  fn check(&mut self) {
+    self.note_validated();
     for (server, _, _) in &self.servers {
       let stats = server.stats();
       assert!(stats.half_open <= stats.conns, "{stats:?}");

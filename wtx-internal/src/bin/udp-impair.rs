@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! udp-impair --server-port 8443 [--listen-port 0] [--drop P] [--reorder P] [--dup P]
-//!            [--delay-us N] [--seed S]
+//!            [--delay-us N] [--seed S] [--rebind N]
 //! ```
 //!
 //! * `--listen-port` (default 0: any) is where clients send; the proxy binds `[::]` (dual-stack)
@@ -15,6 +15,14 @@
 //!   its own turn. `--delay-us` delays every datagram.
 //! * `--seed` makes the decisions repeatable: a flow's decisions depend on the seed and on the
 //!   order in which flows appeared, not on timing.
+//! * `--rebind N` plays a NAT that rebinds every N datagrams of a flow towards the server: the
+//!   flow's socket towards the server is replaced by a new one before the Nth datagram leaves, so
+//!   that the server sees the client come from another source port, and, at the second rebinding of an IPv4 flow and after it, from
+//!   127.0.0.2 instead of 127.0.0.1 (RFC 9000 section 9.3). What the server sends to an old socket
+//!   is lost, as with a NAT whose mapping is gone; a datagram that waits in the queue still leaves
+//!   from the socket it was queued for. Each rebinding is reported on the standard error as
+//!   `rebind CLIENT LOCAL-ADDRESS`. IPv6 flows only change their port: `::1` is the only loopback
+//!   address.
 //!
 //! Each client (address and port) gets a socket of its own towards the server, so the server sees
 //! one stable source per client, and its replies go back to that client from the proxy's port. Both
@@ -27,8 +35,12 @@ use rimu_ws::sync::Arc;
 use std::{
   cmp::Reverse,
   collections::{BTreeMap, BinaryHeap},
+  io::ErrorKind,
   net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
-  sync::{Condvar, Mutex},
+  sync::{
+    Condvar, Mutex,
+    atomic::{AtomicBool, Ordering},
+  },
   time::{Duration, Instant},
 };
 
@@ -60,6 +72,14 @@ fn main() -> Result<(), String> {
       let _prev = flows.insert(client, flow);
     }
     if let Some(flow) = flows.get_mut(&client) {
+      // A NAT rebinds when the client sends: this datagram is the first from the new mapping, so
+      // that the server learns of it before it has to answer (a rebinding while the client is
+      // silent would leave the server sending to the old mapping, which a NAT keeps until it
+      // expires)
+      flow.sent = flow.sent.wrapping_add(1);
+      if opts.rebind > 0 && flow.sent % opts.rebind == 0 {
+        flow.rebind(&opts, &listen, &queue)?;
+      }
       let fate = flow.up.fate();
       send_copies(&fate, datagram, &queue, || To::Server(flow.upstream.clone()));
     }
@@ -68,6 +88,18 @@ fn main() -> Result<(), String> {
 
 /// A client of the proxy.
 struct Flow {
+  /// The client.
+  client: SocketAddr,
+  /// The order in which the flow appeared.
+  index: u64,
+  /// The socket towards the server is still the flow's: what arrives on it goes to the client.
+  live: Arc<AtomicBool>,
+  /// The rebindings so far.
+  rebinds: u64,
+  /// Where the replies go: the client, in the form that the dual-stack socket gave.
+  reply_to: SocketAddr,
+  /// The datagrams sent towards the server.
+  sent: u64,
   /// The decisions for the datagrams towards the server.
   up: Impair,
   /// The socket towards the server.
@@ -83,30 +115,103 @@ impl Flow {
     listen: &Arc<UdpSocket>,
     queue: &Arc<Queue>,
   ) -> Result<Self, String> {
-    let (local, server) = if client.is_ipv4() {
-      (Ipv4Addr::LOCALHOST.into(), IpAddr::from(Ipv4Addr::LOCALHOST))
-    } else {
-      (Ipv6Addr::LOCALHOST.into(), IpAddr::from(Ipv6Addr::LOCALHOST))
-    };
-    let upstream = UdpSocket::bind(SocketAddr::new(local, 0)).map_err(|err| err.to_string())?;
-    upstream.connect(SocketAddr::new(server, opts.server_port)).map_err(|err| err.to_string())?;
-    let upstream = Arc::new(upstream);
-    {
-      let (upstream, listen, queue) = (upstream.clone(), listen.clone(), queue.clone());
-      let mut down = Impair::new(opts.params, opts.seed, index.wrapping_mul(2).wrapping_add(1));
-      let _jh = std::thread::spawn(move || {
-        let mut buffer = vec![0u8; 1 << 16];
-        while let Ok(len) = upstream.recv(&mut buffer) {
-          let Some(datagram) = buffer.get(..len) else {
-            continue;
-          };
-          let fate = down.fate();
-          send_copies(&fate, datagram, &queue, || To::Client(listen.clone(), reply_to));
-        }
-      });
-    }
-    Ok(Self { up: Impair::new(opts.params, opts.seed, index.wrapping_mul(2)), upstream })
+    let local =
+      if client.is_ipv4() { Ipv4Addr::LOCALHOST.into() } else { Ipv6Addr::LOCALHOST.into() };
+    let stream = index.wrapping_mul(2).wrapping_add(1);
+    let (upstream, live) = open_upstream(local, client, reply_to, stream, opts, listen, queue)?;
+    Ok(Self {
+      client,
+      index,
+      live,
+      rebinds: 0,
+      reply_to,
+      sent: 0,
+      up: Impair::new(opts.params, opts.seed, index.wrapping_mul(2)),
+      upstream,
+    })
   }
+
+  /// A NAT rebinding: a new socket towards the server, from another port and, for an IPv4 flow
+  /// from its second rebinding on, from 127.0.0.2. The old socket's replies are dropped.
+  fn rebind(
+    &mut self,
+    opts: &Opts,
+    listen: &Arc<UdpSocket>,
+    queue: &Arc<Queue>,
+  ) -> Result<(), String> {
+    self.rebinds = self.rebinds.wrapping_add(1);
+    let local: IpAddr = if self.client.is_ipv4() {
+      if self.rebinds >= 2 {
+        Ipv4Addr::new(127, 0, 0, 2).into()
+      } else {
+        Ipv4Addr::LOCALHOST.into()
+      }
+    } else {
+      Ipv6Addr::LOCALHOST.into()
+    };
+    // Another sequence of decisions for the replies on the new socket
+    let stream =
+      self.index.wrapping_mul(2).wrapping_add(1).wrapping_add(self.rebinds.wrapping_mul(1 << 32));
+    let (upstream, live) =
+      open_upstream(local, self.client, self.reply_to, stream, opts, listen, queue)?;
+    self.live.store(false, Ordering::Relaxed);
+    self.upstream = upstream;
+    self.live = live;
+    let from = self.upstream.local_addr().map_err(|err| err.to_string())?;
+    eprintln!("rebind {} {from}", self.client);
+    Ok(())
+  }
+}
+
+/// A socket from `local` towards the server, connected, whose replies a thread of its own sends
+/// to `reply_to` through `listen`, with the decisions of `stream`, while the returned flag is set.
+fn open_upstream(
+  local: IpAddr,
+  client: SocketAddr,
+  reply_to: SocketAddr,
+  stream: u64,
+  opts: &Opts,
+  listen: &Arc<UdpSocket>,
+  queue: &Arc<Queue>,
+) -> Result<(Arc<UdpSocket>, Arc<AtomicBool>), String> {
+  let server = if client.is_ipv4() {
+    IpAddr::from(Ipv4Addr::LOCALHOST)
+  } else {
+    IpAddr::from(Ipv6Addr::LOCALHOST)
+  };
+  let upstream =
+    UdpSocket::bind(SocketAddr::new(local, 0)).map_err(|err| format!("binding {local}: {err}"))?;
+  upstream.connect(SocketAddr::new(server, opts.server_port)).map_err(|err| err.to_string())?;
+  // So that the thread of a socket that a rebinding replaced ends
+  upstream.set_read_timeout(Some(Duration::from_millis(500))).map_err(|err| err.to_string())?;
+  let upstream = Arc::new(upstream);
+  let live = Arc::new(AtomicBool::new(true));
+  {
+    let (upstream, live, listen, queue) =
+      (upstream.clone(), live.clone(), listen.clone(), queue.clone());
+    let mut down = Impair::new(opts.params, opts.seed, stream);
+    let _jh = std::thread::spawn(move || {
+      let mut buffer = vec![0u8; 1 << 16];
+      loop {
+        let rslt = upstream.recv(&mut buffer);
+        if !live.load(Ordering::Relaxed) {
+          // The NAT forgot this mapping: what the server still sends to it is lost
+          break;
+        }
+        let len = match rslt {
+          Ok(len) => len,
+          Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => continue,
+          Err(_) => break,
+        };
+        let Some(datagram) = buffer.get(..len) else {
+          continue;
+        };
+        let fate = down.fate();
+        send_copies(&fate, datagram, &queue, || To::Client(listen.clone(), reply_to));
+      }
+    });
+  }
+  Ok((upstream, live))
 }
 
 /// Sends the copies of `fate` now or when their time comes.
@@ -136,13 +241,15 @@ fn unmap(addr: SocketAddr) -> SocketAddr {
 struct Opts {
   listen_port: u16,
   params: Params,
+  rebind: u64,
   seed: u64,
   server_port: u16,
 }
 
 impl Opts {
   fn parse(mut args: impl Iterator<Item = String>) -> Result<Self, String> {
-    let mut opts = Self { listen_port: 0, params: Params::default(), seed: 1, server_port: 0 };
+    let mut opts =
+      Self { listen_port: 0, params: Params::default(), rebind: 0, seed: 1, server_port: 0 };
     while let Some(name) = args.next() {
       let mut value = || args.next().ok_or_else(|| format!("{name} needs a value"));
       match name.as_str() {
@@ -153,6 +260,7 @@ impl Opts {
         "--dup" => opts.params.dup = probability(&name, &value()?)?,
         "--delay-us" => opts.params.delay_us = number(&name, &value()?)?,
         "--seed" => opts.seed = number(&name, &value()?)?,
+        "--rebind" => opts.rebind = number(&name, &value()?)?,
         _ => return Err(format!("unknown argument {name}")),
       }
     }
@@ -401,7 +509,9 @@ mod tests {
   fn arguments() {
     let args = ["--server-port", "8443", "--drop", "0.05", "--seed", "9", "--delay-us", "100"];
     let opts = Opts::parse(args.iter().map(|el| el.to_string())).unwrap();
-    assert_eq!((opts.server_port, opts.listen_port, opts.seed), (8443, 0, 9));
+    assert_eq!((opts.server_port, opts.listen_port, opts.seed, opts.rebind), (8443, 0, 9, 0));
+    let args = ["--server-port", "8443", "--rebind", "400"];
+    assert_eq!(Opts::parse(args.iter().map(|el| el.to_string())).unwrap().rebind, 400);
     assert_eq!((opts.params.drop, opts.params.delay_us), (0.05, 100));
     for bad in [&["--drop", "2"][..], &["--server-port", "1", "--nope", "1"], &[]] {
       assert!(Opts::parse(bad.iter().map(|el| el.to_string())).is_err());

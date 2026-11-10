@@ -4,13 +4,18 @@
 //! connection, delivered as they are or damaged, Initial packets that are made here (their keys
 //! come from the destination CID, so the server opens them) with frames and ClientHello pieces,
 //! 1-RTT and Handshake packets made with the keys of the client, with any frame, operations of the
-//! application of the client (open, write, reset, stop sending, close) and the passage of time.
+//! application of the client (open, write, reset, stop sending, close), the passage of time, and
+//! NAT rebindings: the client's address changes among four (two IP addresses, two ports), it gets
+//! what the server sends to its current address only, and copies of its datagrams arrive first from
+//! another address, as an on-path attacker sends them (RFC 9000 section 9.3.2).
 //!
 //! Whatever the script is, the server connection must hold these:
 //!
 //! - it never panics;
 //! - it never sends more than three times the bytes it received before the address of the client
-//!   is validated (RFC 9000 section 8.1);
+//!   is validated (RFC 9000 section 8.1), on its current path, and to every address, counted on the
+//!   datagrams that leave until the server validated that address (sections 8.2.2, 9.3.1 and
+//!   21.1.1.2);
 //! - a CONNECTION_CLOSE of the transport that it owes has an error code of RFC 9000 section 20.1,
 //!   which includes the TLS alerts of RFC 9001 section 4.8;
 //! - the application is told once that the connection is established and once that it is closed;
@@ -37,6 +42,14 @@ use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 const CERT: &[u8] = include_bytes!("../../../../.certs/cert.pem");
 const KEY: &[u8] = include_bytes!("../../../../.certs/key.pem");
 const CLIENT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 50_000);
+/// The addresses that a NAT gives the client: the first one, another port, another IP address and
+/// both.
+const CLIENT_ADDRS: [SocketAddr; 4] = [
+  CLIENT_ADDR,
+  SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 50_001),
+  SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 50_000),
+  SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 50_001),
+];
 const SERVER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8443);
 const ARENA_BYTES: usize = 64 * 1500;
 /// The actions of a script, at most.
@@ -255,7 +268,11 @@ where
 {
   pub(crate) c_app: FuzzApp,
   pub(crate) client: QuicConn<FuzzApp, ChaCha20, UnverifiedCtx, true>,
+  // The address of the client now
+  client_addr: SocketAddr,
   c_pools: QuicPools,
+  // What the server and each address exchanged: (received, sent, validated)
+  flows: BTreeMap<SocketAddr, (u64, u64, bool)>,
   c_tx: TxArena,
   hello: Vec<u8>,
   pub(crate) now_us: u64,
@@ -358,7 +375,9 @@ where
     Self {
       c_app: FuzzApp::default(),
       client,
+      client_addr: CLIENT_ADDR,
       c_pools,
+      flows: BTreeMap::new(),
       c_tx: TxArena::new(ARENA_BYTES).unwrap(),
       hello,
       now_us,
@@ -373,11 +392,13 @@ where
     }
   }
 
-  fn take(tx: &mut TxArena) -> Vec<Vec<u8>> {
+  fn take(tx: &mut TxArena) -> Vec<(SocketAddr, Vec<u8>)> {
     let mut rslt = Vec::new();
     loop {
       let next = tx.pending().next().map(|train| {
-        rslt.extend(train.bytes.chunks(usize::from(train.segment_size).max(1)).map(<[u8]>::to_vec));
+        let peer = train.peer;
+        let segment = usize::from(train.segment_size).max(1);
+        rslt.extend(train.bytes.chunks(segment).map(|el| (peer, el.to_vec())));
         train.id
       });
       let Some(id) = next else {
@@ -394,7 +415,7 @@ where
     for _ in 0..4 {
       let outcome =
         self.client.flush(self.now_us, &mut self.c_tx, &mut self.c_app, &mut self.c_pools);
-      rslt.extend(Self::take(&mut self.c_tx));
+      rslt.extend(Self::take(&mut self.c_tx).into_iter().map(|el| el.1));
       if outcome == FlushOutcome::Done {
         break;
       }
@@ -402,13 +423,17 @@ where
     rslt
   }
 
-  /// The datagrams that the server has to send.
-  pub(crate) fn flush_server(&mut self) -> Vec<Vec<u8>> {
+  /// The datagrams that the server has to send, with the addresses that they go to.
+  pub(crate) fn flush_server(&mut self) -> Vec<(SocketAddr, Vec<u8>)> {
     let mut rslt = Vec::new();
     for _ in 0..4 {
       let outcome =
         self.server.flush(self.now_us, &mut self.s_tx, &mut self.s_app, &mut self.s_pools);
-      rslt.extend(Self::take(&mut self.s_tx));
+      for (to, datagram) in Self::take(&mut self.s_tx) {
+        let flow = self.flows.entry(to).or_default();
+        flow.1 = flow.1.saturating_add(datagram.len() as u64);
+        rslt.push((to, datagram));
+      }
       if outcome == FlushOutcome::Done {
         break;
       }
@@ -439,15 +464,37 @@ where
       .then_some((self.server.close.app, self.server.close.code))
   }
 
-  /// Gives `datagram` to the server.
+  /// Gives `datagram` to the server, from the address of the client.
   pub(crate) fn to_server(&mut self, datagram: &mut [u8]) {
-    let meta = DatagramMeta { peer: CLIENT_ADDR, local: None, segment_size: None };
-    let _rslt =
-      self.server.recv_datagram(self.now_us, datagram, meta, &mut self.s_app, &mut self.s_pools);
+    self.to_server_from(datagram, self.client_addr);
   }
 
-  /// Gives `datagram` to the client.
-  pub(crate) fn to_client(&mut self, datagram: &mut [u8]) {
+  /// Gives `datagram` to the server, from `from`.
+  fn to_server_from(&mut self, datagram: &mut [u8], from: SocketAddr) {
+    let flow = self.flows.entry(from).or_default();
+    flow.0 = flow.0.saturating_add(datagram.len() as u64);
+    let meta = DatagramMeta { peer: from, local: None, segment_size: None };
+    let _rslt =
+      self.server.recv_datagram(self.now_us, datagram, meta, &mut self.s_app, &mut self.s_pools);
+    self.note_validated();
+  }
+
+  // The addresses that the server validated so far: that of its path if it is, and the last
+  // validated one while it is not.
+  fn note_validated(&mut self) {
+    let server = &self.server;
+    let current = server.address_validated.then_some(server.peer);
+    let last = server.last_valid_peer();
+    for addr in current.into_iter().chain(last) {
+      self.flows.entry(addr).or_default().2 = true;
+    }
+  }
+
+  /// Gives `datagram`, which the server sent to `to`, to the client, if that is its address now.
+  pub(crate) fn to_client(&mut self, to: SocketAddr, datagram: &mut [u8]) {
+    if to != self.client_addr {
+      return;
+    }
     let meta = DatagramMeta { peer: SERVER_ADDR, local: None, segment_size: None };
     let _rslt =
       self.client.recv_datagram(self.now_us, datagram, meta, &mut self.c_app, &mut self.c_pools);
@@ -472,8 +519,8 @@ where
       for datagram in &mut to_server {
         self.to_server(datagram);
       }
-      for datagram in &mut to_client {
-        self.to_client(datagram);
+      for (to, datagram) in &mut to_client {
+        self.to_client(*to, datagram);
       }
     }
   }
@@ -496,8 +543,8 @@ where
       for datagram in &mut to_server {
         self.to_server(datagram);
       }
-      for datagram in &mut to_client {
-        self.to_client(datagram);
+      for (to, datagram) in &mut to_client {
+        self.to_client(*to, datagram);
       }
     }
   }
@@ -734,15 +781,24 @@ where
   pub(crate) fn action(&mut self, input: &mut Input<'_>) {
     match input.byte() % 14 {
       // The datagrams of the client, as they are
-      0 | 1 => {
+      0 => {
+        for mut datagram in self.flush_client() {
+          self.to_server(&mut datagram);
+        }
+      }
+      // The same after a NAT rebinding of the client, which a correct client goes through
+      1 => {
+        if let Some(addr) = CLIENT_ADDRS.get(usize::from(input.byte() % 4)) {
+          self.client_addr = *addr;
+        }
         for mut datagram in self.flush_client() {
           self.to_server(&mut datagram);
         }
       }
       // The datagrams of the server, as they are
       2 | 3 => {
-        for mut datagram in self.flush_server() {
-          self.to_client(&mut datagram);
+        for (to, mut datagram) in self.flush_server() {
+          self.to_client(to, &mut datagram);
         }
       }
       // The datagrams of the client, damaged, repeated or lost
@@ -752,9 +808,11 @@ where
           match input.byte() % 4 {
             0 => {}
             1 => Self::damage(input, &mut datagram),
+            // A copy first, from the same address or from another one (RFC 9000 section 9.3.2)
             2 => {
               let mut twice = datagram.clone();
-              self.to_server(&mut twice);
+              let from = CLIENT_ADDRS.get(usize::from(input.byte() % 4)).copied();
+              self.to_server_from(&mut twice, from.unwrap_or(self.client_addr));
             }
             _ => continue,
           }
@@ -899,6 +957,14 @@ where
         server.bytes_received
       );
     }
+    // An address that the server validated takes anything from then on
+    self.note_validated();
+    for (addr, (received, sent, validated)) in &self.flows {
+      assert!(
+        *validated || *sent <= received.saturating_mul(3),
+        "{sent} bytes sent to {addr} for {received} received"
+      );
+    }
     assert!(self.c_app.closed <= 1 && self.c_app.established <= 1);
   }
 
@@ -997,7 +1063,7 @@ mod tests {
       duo.to_server(&mut datagram);
       if offset != 0 {
         // Nothing but an acknowledgment
-        let sent: usize = duo.flush_server().iter().map(Vec::len).sum();
+        let sent: usize = duo.flush_server().iter().map(|el| el.1.len()).sum();
         assert!(sent < 100, "the second half alone gives {sent} bytes");
       }
     }

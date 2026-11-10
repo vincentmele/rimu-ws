@@ -610,19 +610,20 @@ where
   }
 
   // Arms the timer of the connection of slot `idx` with its next deadline, or the end of its
-  // handshake if that comes first.
+  // handshake if that comes first while the handshake lasts. A connection that closed before its
+  // handshake ended keeps that deadline for the count of half-open handshakes, but not for its
+  // timer: once past, it would fire at every tick of the closing period.
   fn arm(&mut self, idx: u32) {
     let Some(slot) = self.slots.get(usize::try_from(idx).unwrap_or(usize::MAX)) else {
       return;
     };
     let deadline = slot.conn.as_ref().and_then(QuicConn::next_deadline);
+    let state = slot.conn.as_ref().map(QuicConn::state);
     // A connection that drains itself after a shutdown is closed at the end of the grace period
-    let open = slot
-      .conn
-      .as_ref()
-      .is_some_and(|el| matches!(el.state(), ConnState::Handshake | ConnState::Confirmed));
+    let open = matches!(state, Some(ConnState::Handshake | ConnState::Confirmed));
     let grace = self.shutdown_deadline_us.filter(|_| open);
-    let deadline = deadline.into_iter().chain(slot.handshake_deadline_us).chain(grace).min();
+    let handshake = slot.handshake_deadline_us.filter(|_| state == Some(ConnState::Handshake));
+    let deadline = deadline.into_iter().chain(handshake).chain(grace).min();
     self.timers.arm(idx, deadline);
   }
 

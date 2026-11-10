@@ -39,6 +39,12 @@
 //! [`ConnParams::max_in_flight`], and paced; ACK-only packets, probes and CONNECTION_CLOSE are not.
 //! Once the handshake is confirmed, path MTU discovery ([`crate::quic::pmtud`]) sends one probe
 //! and adopts its size if it is acknowledged.
+//!
+//! # Paths
+//!
+//! A server follows its client to a new address after the confirmation, as a NAT rebinding moves
+//! it, and validates that address (RFC 9000 sections 8.2 and 9); probing packets from elsewhere are
+//! answered where they came from. See [`path`].
 
 use crate::{
   crypto::AEAD_TAG_LEN,
@@ -74,6 +80,7 @@ use core::{
   hint::cold_path,
   net::{IpAddr, Ipv4Addr, SocketAddr},
 };
+use path::{Paths, RxPath};
 
 /// The connection IDs of the peer that a connection stores, the `active_connection_id_limit`
 /// that it sends.
@@ -229,6 +236,11 @@ impl ConnParams {
       initial_max_streams_uni: self.max_streams_uni.min(UNI_REMOTE_WINDOW as u64),
       ack_delay_exponent: self.ack_delay_exponent,
       max_ack_delay_ms: self.max_ack_delay_ms,
+      // Not sent (task 22b): a server follows a client to any new address once the handshake is
+      // confirmed, as it does for a NAT rebinding, with the same validation ([`path`]). It gives
+      // one CID only, so a client can not migrate on purpose anyway (RFC 9000 section 9.5), and the
+      // parameter would only claim a restriction that the server does not apply (section 9 lets
+      // it validate and follow a peer that ignores it)
       disable_active_migration: false,
       active_connection_id_limit: ACTIVE_CID_LIMIT as u64,
       initial_source_connection_id: Some(local_cid),
@@ -341,6 +353,14 @@ pub(crate) struct ConnStats {
   pub(crate) stream_data_blocked_in: u64,
   /// STREAMS_BLOCKED frames received.
   pub(crate) streams_blocked_in: u64,
+  /// Changes of the address of the peer that packets go to (RFC 9000 section 9.3).
+  pub(crate) migrations: u64,
+  /// New paths that were validated, their path MTU included (RFC 9000 section 8.2).
+  pub(crate) paths_validated: u64,
+  /// Validations of a path that were abandoned (RFC 9000 section 8.2.4).
+  pub(crate) path_validation_failures: u64,
+  /// PATH_CHALLENGE frames sent.
+  pub(crate) path_challenges_out: u64,
 }
 
 impl ConnStats {
@@ -369,6 +389,10 @@ impl ConnStats {
     data_blocked_in: 0,
     stream_data_blocked_in: 0,
     streams_blocked_in: 0,
+    migrations: 0,
+    paths_validated: 0,
+    path_validation_failures: 0,
+    path_challenges_out: 0,
   };
 }
 
@@ -411,6 +435,9 @@ where
   max_datagram: usize,
   params: ConnParams,
   path_response: Option<[u8; 8]>,
+  // The PATH_RESPONSE goes to the address of the latest probe from elsewhere ([`path`]), not to
+  // the peer
+  path_response_off: bool,
   peer: SocketAddr,
   peer_cid: Cid,
   peer_cid_known: bool,
@@ -660,6 +687,10 @@ where
       if !self.wants_send() {
         return FlushOutcome::Done;
       }
+      // A datagram to another address than the one of the path goes alone
+      if self.flush_off_path(now_us, tx, pools, batched) {
+        continue;
+      }
       // A probe of path MTU discovery goes alone, in a datagram of its size
       if let Some(size) = self.mtu_probe_due()
         && let Some((start, buffer)) = tx.begin_at(self.peer, self.local, size)
@@ -768,6 +799,7 @@ where
           paced,
           self.key.discard_deadline(),
           self.pmtud.hold_deadline(),
+          self.path_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -795,6 +827,9 @@ where
       return;
     }
     if !matches!(self.state, ConnState::Handshake | ConnState::Confirmed) {
+      return;
+    }
+    if self.path_deadline().is_some_and(|elem| now_us >= elem) && self.on_path_timeout(app, pools) {
       return;
     }
     if self.recovery.pacer_release_us.is_some_and(|elem| now_us >= elem) {
@@ -829,13 +864,13 @@ where
     app: &mut A,
     pools: &mut QuicPools,
   ) -> crate::Result<()> {
-    // Connection migration and path validation are the endpoint's. What the server may send to
-    // an address that is not validated is a multiple of what that address sent (RFC 9000
-    // section 8.1): the bytes that come from another address do not count
-    let from_peer = IS_CLIENT || (meta.peer.ip() == self.peer.ip() && meta.peer.port() == self.peer.port());
+    // What the server may send to an address that is not validated is a multiple of what that
+    // address sent (RFC 9000 section 8.1): the bytes that come from another address do not count
+    // for the current path, but for that address, which may become the path ([`path`])
+    let mut rx = self.rx_path(&meta);
     let datagram_len = datagram.len();
     let len = u64::try_from(datagram_len).unwrap_or(u64::MAX);
-    let counted = if from_peer { len } else { 0 };
+    let counted = if rx.from_peer { len } else { 0 };
     self.count(|el| {
       el.datagrams_in = el.datagrams_in.wrapping_add(1);
       el.bytes_in = el.bytes_in.wrapping_add(len);
@@ -858,7 +893,7 @@ where
     // A packet that fails to open loses its bytes (RFC 9001 section 5.3)
     let tail = datagram.last_chunk::<RESET_TOKEN_LEN>().copied();
     let processed = self.stats().packets_in;
-    let rslt = self.recv_packets(now_us, datagram, app, pools);
+    let rslt = self.recv_packets(now_us, datagram, &mut rx, app, pools);
     if rslt.is_ok()
       && self.stats().packets_in == processed
       && matches!(self.state, ConnState::Handshake | ConnState::Confirmed)
@@ -867,6 +902,15 @@ where
       // A stateless reset of the peer (RFC 9000 section 10.3.1)
       self.enter_draining(now_us);
       return Ok(());
+    }
+    if rslt.is_ok()
+      && !rx.from_peer
+      && matches!(self.state, ConnState::Handshake | ConnState::Confirmed)
+      && let Err(err) = self.after_other_address(now_us, &rx, &meta, len)
+    {
+      cold_path();
+      self.close_on_error(now_us, &err);
+      return Err(err);
     }
     if self.recovery.timer_stale
       && matches!(self.state, ConnState::Handshake | ConnState::Confirmed)
@@ -881,6 +925,7 @@ where
     &mut self,
     now_us: u64,
     datagram: &mut [u8],
+    rx: &mut RxPath,
     app: &mut A,
     pools: &mut QuicPools,
   ) -> crate::Result<()> {
@@ -934,7 +979,7 @@ where
         self.drop_packet();
         continue;
       }
-      if let Err(err) = self.recv_packet(now_us, space, packet, pn_offset, scid, app, pools) {
+      if let Err(err) = self.recv_packet(now_us, space, packet, pn_offset, scid, rx, app, pools) {
         cold_path();
         self.close_on_error(now_us, &err);
         return Err(err);
@@ -1084,9 +1129,12 @@ where
     probe || (allow_ae && crypto)
   }
 
-  // The size of the path MTU probe that is due, once the handshake is confirmed.
+  // The size of the path MTU probe that is due, once the handshake is confirmed and while the
+  // address of the path is validated: the probe does not wait for the amplification limit.
   fn mtu_probe_due(&self) -> Option<usize> {
-    let ready = self.state == ConnState::Confirmed && self.data.keys.is_some();
+    let ready = self.state == ConnState::Confirmed
+      && self.data.keys.is_some()
+      && (IS_CLIENT || self.address_validated);
     self.pmtud.probe_due().filter(|_| ready)
   }
 
@@ -1401,11 +1449,13 @@ where
     }
     let packet = OpenPacket {
       ack_eliciting: true,
+      challenge: false,
       frames: FrameRefRange::EMPTY,
       full_datagram: false,
       header_len,
       length_at: None,
       mtu_probe: true,
+      off_path: false,
       padded: true,
       payload_len,
       pn,
@@ -1509,6 +1559,13 @@ where
     if self.params.pmtu_probe_after_rtt {
       self.pmtud.hold_until(now_us.saturating_add(self.recovery.rtt.smoothed_us));
     }
+    // The generator of the handshake leaves a seed for the challenges of path validation
+    if !IS_CLIENT
+      && let Some(tls) = self.tls.as_mut()
+      && let Some(cold) = self.cold.as_deref_mut()
+    {
+      cold.paths.set_seed(tls.connection_seed()?);
+    }
     self.release_handshake(pools);
     match self.data.keys.as_mut() {
       Some(keys) => self.key.prepare_next(keys, pools),
@@ -1603,7 +1660,9 @@ where
     }
     let initial =
       self.space_wants_send(Space::Initial) && (IS_CLIENT || self.initial_elicits(true));
-    initial || (self.path_response.is_some() && has_keys(Space::Data))
+    let path = (self.path_response.is_some() && !self.path_response_off)
+      || self.cold.as_deref().is_some_and(|el| el.paths.challenge_owed().is_some());
+    initial || (path && has_keys(Space::Data))
   }
 
   fn idle_deadline(&self) -> Option<u64> {
@@ -1667,11 +1726,12 @@ where
         };
         newly = true;
         ack_eliciting |= packet.ack_eliciting;
-        if pn == ack.largest {
+        // A packet of another path gives no sample of this one (RFC 9000 section 9.4)
+        if pn == ack.largest && packet.kind != SentKind::OffPath {
           largest_sent_us = Some(packet.time_us);
         }
         match packet.kind {
-          SentKind::InFlight | SentKind::MtuProbe | SentKind::Probed => {
+          SentKind::InFlight | SentKind::MtuProbe | SentKind::OffPath | SentKind::Probed => {
             recovery.on_acked(&packet);
             if packet.counts_for_congestion() {
               let size = usize::from(packet.size);
@@ -1707,7 +1767,7 @@ where
             }
             // Also late, before a copy owed for its loss went (review J8)
             FrameRef::HandshakeDone => *handshake_done_owed = false,
-            FrameRef::RetireConnectionId { .. } => {}
+            FrameRef::PathChallenge | FrameRef::RetireConnectionId { .. } => {}
             _ => {
               if rslt.is_ok() {
                 rslt = streams.on_frame_acked(frame, pools);
@@ -1851,6 +1911,9 @@ where
       self.streams.on_peer_params(&elem);
       // The probes wait for the confirmation of the handshake
       self.pmtud.start(elem.max_udp_payload_size, &self.peer, self.max_datagram);
+      if let Some(cold) = self.cold.as_deref_mut() {
+        cold.paths.set_peer_max_udp_payload_size(elem.max_udp_payload_size);
+      }
     }
     if is_complete && !self.handshake_complete {
       self.handshake_complete = true;
@@ -1879,14 +1942,24 @@ where
     now_us: u64,
     space: Space,
     payload: &[u8],
+    rx: &mut RxPath,
     app: &mut A,
     pools: &mut QuicPools,
   ) -> crate::Result<bool> {
     let mut ack_eliciting = false;
     let mut is_empty = true;
+    rx.non_probing = false;
     for frame in FrameReader::new(payload, space) {
       let frame = frame?;
       is_empty = false;
+      // RFC 9000 section 9.1
+      rx.non_probing |= !matches!(
+        frame,
+        Frame::Padding(_)
+          | Frame::PathChallenge(_)
+          | Frame::PathResponse(_)
+          | Frame::NewConnectionId { .. }
+      );
       match frame {
         Frame::Padding(_) => {}
         Frame::Ack(ack) => self.on_ack(now_us, space, &ack, pools)?,
@@ -1923,9 +1996,12 @@ where
           }
         }
         Frame::PathChallenge(data) => {
-          // Answered, always (RFC 9000 section 8.2.2), and the latest one only
+          // Answered, always (RFC 9000 section 8.2.2), and the latest one only, on the path where
+          // it came from
           ack_eliciting = true;
           self.path_response = Some(data);
+          self.path_response_off = !rx.from_peer;
+          rx.challenged = true;
           let budget = self.params.limits.path_challenge_budget;
           if !self.cold.as_deref_mut().is_none_or(|el| el.path_challenges.take(budget, now_us)) {
             return Err(self.excessive_load(now_us));
@@ -2025,9 +2101,11 @@ where
             return Err(violation(QuicError::ConnectionIdInvalid));
           }
         }
-        // Path validation is the endpoint's
-        Frame::PathResponse(_) => {
+        Frame::PathResponse(data) => {
           ack_eliciting = true;
+          if !IS_CLIENT {
+            self.on_path_response(now_us, data)?;
+          }
         }
       }
     }
@@ -2046,6 +2124,7 @@ where
     packet: &mut [u8],
     pn_offset: usize,
     scid: Cid,
+    rx: &mut RxPath,
     app: &mut A,
     pools: &mut QuicPools,
   ) -> crate::Result<()> {
@@ -2069,6 +2148,7 @@ where
       self.count(|el| el.duplicates = el.duplicates.wrapping_add(1));
       return Ok(());
     }
+    let largest = sp.recv.largest();
     // The generation that opens the packet, chosen before it is decrypted: a failure loses the
     // buffer (ruling T9-a)
     let generation = if space == Space::Data {
@@ -2109,7 +2189,15 @@ where
       self.peer_cid = scid;
       self.peer_cid_known = true;
     }
-    let ack_eliciting = self.recv_frames(now_us, space, payload, app, pools)?;
+    let ack_eliciting = self.recv_frames(now_us, space, payload, rx, app, pools)?;
+    // The address changes only for the highest-numbered non-probing packet (RFC 9000 section 9.3)
+    if space == Space::Data
+      && !rx.from_peer
+      && rx.non_probing
+      && largest.is_none_or(|elem| pn > elem)
+    {
+      rx.migrate = true;
+    }
     if let Some(sp) = space_mut(&mut self.data, &mut self.handshake, space) {
       let _is_new = sp.recv.on_packet(pn, ack_eliciting, now_us, pools);
     }
@@ -2154,6 +2242,8 @@ where
     } else {
       let kind = if packet.mtu_probe {
         SentKind::MtuProbe
+      } else if packet.off_path {
+        SentKind::OffPath
       } else if packet.ack_eliciting || packet.padded {
         SentKind::InFlight
       } else {
@@ -2195,9 +2285,11 @@ where
       || probe;
     if space == Space::Data {
       wants |= self.handshake_done_owed
-        || self.path_response.is_some()
+        || (self.path_response.is_some() && !self.path_response_off)
         || self.streams.wants_send()
-        || self.cold.as_deref().is_some_and(|el| el.retire_next < el.retire_prior_to);
+        || self.cold.as_deref().is_some_and(|el| {
+          el.retire_next < el.retire_prior_to || el.paths.challenge_owed().is_some()
+        });
       #[cfg(test)]
       {
         wants |= self.test_client.as_ref().is_some_and(|el| !el.frames.is_empty());
@@ -2216,6 +2308,7 @@ where
       ConnState::Handshake | ConnState::Confirmed => {
         SPACES.into_iter().any(|space| self.space_wants_send(space))
           || self.mtu_probe_due().is_some()
+          || self.off_path_due().is_some()
       }
       ConnState::Closing => self.close_owed,
       ConnState::Draining | ConnState::Closed => false,
@@ -2256,6 +2349,7 @@ where
       max_datagram: INITIAL_MAX_DATAGRAM,
       params: ConnParams { peer: meta.peer.ip(), ..*params },
       path_response: None,
+      path_response_off: false,
       peer: meta.peer,
       peer_cid,
       peer_cid_known: false,
@@ -2338,6 +2432,11 @@ where
         last.padded = true;
         pos = pos.wrapping_add(padding);
       }
+    }
+    if packets.iter().flatten().any(|el| el.challenge)
+      && let Some(cold) = self.cold.as_deref_mut()
+    {
+      cold.paths.on_challenge_datagram(pos);
     }
     let mut sent_handshake = false;
     let mut ack_eliciting = false;
@@ -2447,6 +2546,7 @@ where
     let mut fw = FrameWriter::new(payload);
     let mut frames = FrameRefRange::EMPTY;
     let mut ack_eliciting = false;
+    let mut challenge = false;
     let mut full_datagram = false;
     if closing {
       // An application close is a transport one with APPLICATION_ERROR before 1-RTT (RFC 9000
@@ -2494,10 +2594,24 @@ where
           ack_eliciting = true;
         }
         if let Some(data) = self.path_response
+          && !self.path_response_off
           && fw.write_path_response(data)
         {
           self.path_response = None;
           ack_eliciting = true;
+          full_datagram = true;
+        }
+        // The validation of a new path (RFC 9000 sections 8.2.1 and 9.3), in a datagram of 1200
+        // bytes if the amplification limit lets it be that large
+        if let Some(cold) = self.cold.as_deref_mut()
+          && let Some(data) = cold.paths.challenge_owed()
+          && fw.write_frame(&Frame::PathChallenge(data))
+        {
+          pools.frame_refs.push(&mut frames, FrameRef::PathChallenge)?;
+          cold.paths.on_challenge_written();
+          cold.stats.path_challenges_out = cold.stats.path_challenges_out.wrapping_add(1);
+          ack_eliciting = true;
+          challenge = true;
           full_datagram = true;
         }
         if let Some(cold) = self.cold.as_deref_mut() {
@@ -2561,11 +2675,13 @@ where
     full_datagram |= space == Space::Initial && (IS_CLIENT || ack_eliciting);
     Ok(Some(OpenPacket {
       ack_eliciting,
+      challenge,
       frames,
       full_datagram,
       header_len,
       length_at,
       mtu_probe: false,
+      off_path: false,
       padded,
       payload_len,
       pn,
@@ -2603,6 +2719,7 @@ where
     self.close_owed = false;
     self.handshake_done_owed = false;
     self.path_response = None;
+    self.path_response_off = false;
   }
 
   // The Initial and Handshake spaces, wiped, and the TLS state go back to their pools; their
@@ -2767,16 +2884,6 @@ where
     self.test_client.as_deref()
   }
 
-  /// The CID that the packets of the connection are sent to.
-  pub(crate) const fn peer_cid(&self) -> &Cid {
-    &self.peer_cid
-  }
-
-  /// If the address of the peer is validated.
-  pub(crate) const fn address_validated(&self) -> bool {
-    self.address_validated
-  }
-
   /// Sends `frames`, raw, in the next 1-RTT packet.
   pub(crate) fn queue_test_frames(&mut self, frames: &[u8]) {
     self.test_client.get_or_insert_default().frames.extend_from_slice(frames);
@@ -2795,6 +2902,33 @@ where
   /// The streams, to change.
   pub(crate) const fn streams_mut(&mut self) -> &mut Streams {
     &mut self.streams
+  }
+}
+
+#[cfg(any(test, feature = "_fuzz-conn"))]
+#[allow(dead_code, reason = "what tests and the fuzz targets read")]
+impl<A, RNG, TCX, const IS_CLIENT: bool> QuicConn<A, RNG, TCX, IS_CLIENT>
+where
+  A: QuicApp,
+{
+  /// If the address of the peer is validated.
+  pub(crate) const fn address_validated(&self) -> bool {
+    self.address_validated
+  }
+
+  /// The address that the packets of the connection are sent to.
+  pub(crate) const fn peer_addr(&self) -> SocketAddr {
+    self.peer
+  }
+
+  /// The CID that the packets of the connection are sent to.
+  pub(crate) const fn peer_cid(&self) -> &Cid {
+    &self.peer_cid
+  }
+
+  /// The address of the last validated path, while the current one is not validated.
+  pub(crate) fn last_valid_peer(&self) -> Option<SocketAddr> {
+    self.cold.as_deref().and_then(|el| el.paths.last_valid_peer())
   }
 }
 
@@ -2909,6 +3043,8 @@ pub(crate) struct ConnCold {
   // Packets that failed to open, for the integrity limit
   open_failures: u64,
   path_challenges: RateBudget,
+  // The paths other than the current one, and the validation of the current one
+  paths: Paths,
   // The CIDs that the peer gave (RFC 9000 section 5.1.1), the one of its handshake, sequence 0,
   // included once a NEW_CONNECTION_ID arrived: at most the `active_connection_id_limit` that it
   // was given (ruling T10-d)
@@ -2939,6 +3075,7 @@ impl ConnCold {
       new_cids: RateBudget::default(),
       open_failures: 0,
       path_challenges: RateBudget::default(),
+      paths: Paths::new(),
       peer_cids: [None; ACTIVE_CID_LIMIT],
       peer_cid_seq: 0,
       pings: RateBudget::default(),
@@ -2990,6 +3127,12 @@ impl LostCtx<'_> {
         FrameRef::Crypto { .. } => pools.frame_refs.queue_push(self.crypto_lost, frame),
         FrameRef::HandshakeDone => {
           *self.handshake_done_owed = true;
+          Ok(())
+        }
+        FrameRef::PathChallenge => {
+          if let Some(elem) = self.cold.as_deref_mut() {
+            elem.paths.on_challenge_lost();
+          }
           Ok(())
         }
         // Owed again, with the ones after it (owed as a range)
@@ -3123,6 +3266,8 @@ impl CryptoRx {
 #[derive(Clone, Copy, Debug)]
 struct OpenPacket {
   ack_eliciting: bool,
+  // It has the PATH_CHALLENGE of the validation of the current path
+  challenge: bool,
   frames: FrameRefRange,
   // If the datagram must have at least 1200 bytes
   full_datagram: bool,
@@ -3132,6 +3277,8 @@ struct OpenPacket {
   length_at: Option<usize>,
   // A probe of path MTU discovery
   mtu_probe: bool,
+  // It goes to an address other than the one of the current path ([`path`])
+  off_path: bool,
   padded: bool,
   payload_len: usize,
   pn: u64,
@@ -3531,6 +3678,7 @@ fn write_header(
 #[cfg(any(test, feature = "_fuzz-conn"))]
 #[doc(hidden)]
 pub mod check;
+mod path;
 
 #[cfg(test)]
 mod tests {
