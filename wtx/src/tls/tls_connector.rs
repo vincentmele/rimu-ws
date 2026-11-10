@@ -821,3 +821,68 @@ fn alert<T>(
   let dw = &mut TlsDecodeWrapper::from_bytes(plaintext);
   Ok(ServerRecordsState::Alert(Alert::decode(dw)?))
 }
+
+#[cfg(test)]
+mod tests {
+  use super::check_alpn;
+  use alloc::vec::Vec;
+  use crate::{
+    codec::Decode,
+    collections::ArrayVectorCopy,
+    tls::{
+      Alpn, TlsConfig, TlsError,
+      protocol::encrypted_extensions::EncryptedExtensions,
+      tls_cc::TlsCc,
+      tls_cc_wrappers::TlsDecodeWrapper,
+    },
+  };
+
+  fn alpn(names: &[&[u8]]) -> Alpn {
+    let mut rslt = Alpn::default();
+    for name in names {
+      rslt.protocol_name_list.push(ArrayVectorCopy::try_from(*name).unwrap()).unwrap();
+    }
+    rslt
+  }
+
+  // The bytes of an EncryptedExtensions that selects `names`.
+  fn encrypted_extensions(names: &[&[u8]]) -> Vec<u8> {
+    let mut list = Vec::new();
+    for name in names {
+      list.push(u8::try_from(name.len()).unwrap());
+      list.extend_from_slice(name);
+    }
+    let mut ext = Vec::from(0x0010u16.to_be_bytes());
+    ext.extend_from_slice(&u16::try_from(list.len() + 2).unwrap().to_be_bytes());
+    ext.extend_from_slice(&u16::try_from(list.len()).unwrap().to_be_bytes());
+    ext.extend(list);
+    let mut rslt = u16::try_from(ext.len()).unwrap().to_be_bytes().to_vec();
+    rslt.extend(ext);
+    rslt
+  }
+
+  // Rule (RFC 7301 section 3.1, review I-1): the selection of the server must be one name that
+  // the client offered, whatever its length: the client reads it strictly.
+  #[test]
+  fn selection_that_was_not_offered_is_illegal_parameter() {
+    let mut config = TlsConfig::from_trust_anchors_pem([crate::tests::_ROOT_CA]).unwrap();
+    *config.alpn_mut() = Some(alpn(&[b"h2", b"http/1.1"]));
+    let selects = |names: &[&[u8]]| {
+      let bytes = encrypted_extensions(names);
+      let ee = EncryptedExtensions::decode(&mut TlsDecodeWrapper::from_bytes(&bytes)).unwrap();
+      check_alpn(&config, &ee)
+    };
+    assert!(selects(&[b"h2"]).is_none());
+    assert!(matches!(
+      selects(&[b"h3"]),
+      Some(crate::Error::TlsErrorReply(TlsError::MismatchedNegotiatedAlpnClient, _))
+    ));
+    assert!(matches!(
+      selects(&[b""]),
+      Some(crate::Error::TlsErrorReply(TlsError::EmptyNegotiatedAlpnClient, _))
+    ));
+    // A name longer than any that can be offered is not decoded as an empty list that passes
+    let bytes = encrypted_extensions(&[b"hq-interop"]);
+    assert!(EncryptedExtensions::decode(&mut TlsDecodeWrapper::from_bytes(&bytes)).is_err());
+  }
+}

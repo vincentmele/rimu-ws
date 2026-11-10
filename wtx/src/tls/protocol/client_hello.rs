@@ -272,7 +272,7 @@ fn manage_extension<'de>(
   match extension_ty {
     ExtensionTy::ApplicationLayerProtocolNegotiation => {
       duplicated_error(extensions.alpn.is_some())?;
-      extensions.alpn = Some(Alpn::decode(dw)?);
+      extensions.alpn = Some(Alpn::decode_offer(dw)?);
     }
     ExtensionTy::CertificateAuthorities => {
       duplicated_error(extensions.certificate_authorities)?;

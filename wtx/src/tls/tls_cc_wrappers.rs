@@ -1,7 +1,7 @@
 use crate::{
   collections::{TryExtend, VectorUsize},
   misc::{Lease, LeaseMut},
-  tls::CipherSuite,
+  tls::{Alpn, CipherSuite},
 };
 
 /// Struct used to represent decoded elements.
@@ -11,6 +11,8 @@ pub(crate) struct TlsDecodeWrapper<'de> {
   cipher_suite: CipherSuite,
   is_hello_retry_request: bool,
   is_x509: bool,
+  /// What a server serves, for the ALPN of a ClientHello (`Alpn::decode_offer`).
+  served_alpn: Alpn,
 }
 
 impl<'de> TlsDecodeWrapper<'de> {
@@ -20,7 +22,18 @@ impl<'de> TlsDecodeWrapper<'de> {
       cipher_suite: CipherSuite::default(),
       is_hello_retry_request: false,
       is_x509: false,
+      served_alpn: Alpn::default(),
     }
+  }
+
+  #[inline]
+  pub(crate) const fn served_alpn(&self) -> &Alpn {
+    &self.served_alpn
+  }
+
+  #[inline]
+  pub(crate) const fn served_alpn_mut(&mut self) -> &mut Alpn {
+    &mut self.served_alpn
   }
 
   #[inline]

@@ -1108,6 +1108,132 @@ mod tests {
     assert!(server.peer_transport_params().is_some());
   }
 
+  // The message `msg` (a ClientHello or an EncryptedExtensions) with the data of its extension
+  // `ty` replaced, and the lengths that hold it corrected.
+  fn with_extension_data(msg: &[u8], ty: u16, data: &[u8]) -> Vec<u8> {
+    let list_at = if msg[0] == 1 { extensions_len_at(msg) } else { 4 };
+    let u16_at = |idx: usize| usize::from(u16::from_be_bytes([msg[idx], msg[idx + 1]]));
+    let (mut idx, end) = (list_at + 2, list_at + 2 + u16_at(list_at));
+    let mut range = 0..0;
+    while idx < end {
+      let len = u16_at(idx + 2);
+      if u16_at(idx) == usize::from(ty) {
+        range = idx + 4..idx + 4 + len;
+      }
+      idx += 4 + len;
+    }
+    assert!(!range.is_empty());
+    let mut rslt = msg[..range.start].to_vec();
+    rslt.extend_from_slice(data);
+    rslt.extend_from_slice(&msg[range.end..]);
+    let delta = data.len() as isize - range.len() as isize;
+    let bump = |rslt: &mut Vec<u8>, at: usize, width: usize| {
+      let mut value = 0isize;
+      for byte in &rslt[at..at + width] {
+        value = value * 256 + isize::from(*byte);
+      }
+      value += delta;
+      for (idx, byte) in rslt[at..at + width].iter_mut().enumerate() {
+        *byte = ((value >> (8 * (width - 1 - idx))) & 0xff) as u8;
+      }
+    };
+    bump(&mut rslt, range.start - 2, 2);
+    bump(&mut rslt, list_at, 2);
+    bump(&mut rslt, 1, 3);
+    rslt
+  }
+
+  // Where the length of the extensions of the ClientHello `ch` is.
+  fn extensions_len_at(ch: &[u8]) -> usize {
+    let u16_at = |idx: usize| usize::from(u16::from_be_bytes([ch[idx], ch[idx + 1]]));
+    let mut idx = 4 + 2 + 32;
+    idx += 1 + usize::from(ch[idx]);
+    idx += 2 + u16_at(idx);
+    idx + 1 + usize::from(ch[idx])
+  }
+
+  // The data of an ALPN extension that lists `names`.
+  fn alpn_list(names: &[&[u8]]) -> Vec<u8> {
+    let mut list = Vec::new();
+    for name in names {
+      list.push(u8::try_from(name.len()).unwrap());
+      list.extend_from_slice(name);
+    }
+    let mut rslt = u16::try_from(list.len()).unwrap().to_be_bytes().to_vec();
+    rslt.extend(list);
+    rslt
+  }
+
+  // Rule (RFC 7301 section 3.2, review I-1): the server picks a protocol it serves from any
+  // position of the list of the client, however many names precede it and whatever their length.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn server_picks_h3_from_any_position_of_the_offer() {
+    let offers: [&[&[u8]]; 4] = [
+      &[b"a", b"b", b"c", b"d", b"h3"],
+      &[b"a", b"b", b"c", b"d", b"e", b"f", b"h3"],
+      &[b"unknown-protocol", b"h3"],
+      &[b"x", b"hq-interop", b"y", b"z", b"w", b"v", b"h3", b"h3"],
+    ];
+    for offer in offers {
+      let (mut client, mut server) = (client(b"h3"), server());
+      let ch = client_out(&mut client, Space::Initial);
+      let ch = with_extension_data(&ch, ALPN, &alpn_list(offer));
+      server.feed(Space::Initial, &ch).unwrap();
+      assert_eq!(server.alpn(), b"h3", "{offer:?}");
+    }
+  }
+
+  // Rule: an offer with nothing the server serves is no_application_protocol, a list of any
+  // length and names of any length alike.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn offer_of_unsupported_names_only_is_no_application_protocol() {
+    let offers: [&[&[u8]]; 3] = [
+      &[b"a", b"b", b"c", b"d", b"e", b"f", b"g"],
+      &[b"hq-interop", b"another-long-name"],
+      &[b"h2", b"http/1.1", b"h3-29"],
+    ];
+    for offer in offers {
+      let (mut client, mut server) = (client(b"h3"), server());
+      let ch = client_out(&mut client, Space::Initial);
+      let ch = with_extension_data(&ch, ALPN, &alpn_list(offer));
+      assert_eq!(crypto_alert(server.feed(Space::Initial, &ch)), 0x78, "{offer:?}");
+    }
+  }
+
+  // Rule (RFC 7301 section 3.1, review I-1): the client takes the selection of the server as it
+  // is, and fails if it is not exactly one name that it offered: the lenient reading is for the
+  // list of a client only.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn client_refuses_a_selection_that_is_not_one_offered_name() {
+    let selections: [&[&[u8]]; 4] =
+      [&[b"h4"], &[b"hq-interop"], &[b"h3", b"h3-29"], &[b"unknown-protocol"]];
+    for selection in selections {
+      let (mut client, mut server) = (client(b"h3"), server());
+      server.feed(Space::Initial, &client_out(&mut client, Space::Initial)).unwrap();
+      client.feed(Space::Initial, &server_out(&mut server, Space::Initial)).unwrap();
+      let handshake = messages(&server_out(&mut server, Space::Handshake));
+      let mut altered = Vec::new();
+      for (ty, msg) in handshake {
+        if ty == 8 {
+          altered.extend(with_extension_data(&msg, ALPN, &alpn_list(selection)));
+        } else {
+          altered.extend(msg);
+        }
+      }
+      // illegal_parameter for a name that was not offered (or two), handshake_failure for a name
+      // that the strict reading of the client cannot hold; never the decrypt_error of the
+      // Finished message, which the changed transcript would give if the selection went by
+      let code = match client.feed(Space::Handshake, &altered) {
+        Err(Error::QuicClose(TransportErrorCode::Crypto(alert), QuicError::TlsAlert)) => alert,
+        other => panic!("{selection:?} {other:?}"),
+      };
+      assert!(code == 47 || code == 40, "{selection:?} {code}");
+    }
+  }
+
   // QUIC carries bare handshake messages: no record header, no ChangeCipherSpec.
   #[cfg_attr(miri, ignore)]
   #[test]

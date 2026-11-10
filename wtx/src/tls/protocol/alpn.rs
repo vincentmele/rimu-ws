@@ -15,10 +15,40 @@ use crate::{
 /// Application-Layer Protocol Negotiation Extension
 ///
 /// <https://datatracker.ietf.org/doc/html/rfc7301>
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Alpn {
   /// List of names
   pub protocol_name_list: ArrayVectorCopy<ArrayVectorCopy<u8, 8>, MAX_ALPN_LEN>,
+}
+
+impl Alpn {
+  /// The ALPN of a ClientHello, for a server that serves the names in `dw.served_alpn()`
+  /// (RFC 7301 section 3.2: it picks one of the protocols it supports, from any position of the
+  /// list of the client). The list of the client has no limit and a name of the client can be of
+  /// any length, so only what can be picked is kept, in the order of the client: the names that
+  /// the server serves and the empty ones, which the server refuses. The other names are skipped
+  /// as they are read, which needs no memory and cannot lose a name that matches.
+  #[inline]
+  pub(crate) fn decode_offer(dw: &mut TlsDecodeWrapper<'_>) -> crate::Result<Self> {
+    let err = TlsError::InvalidOfferedPsks;
+    let served = dw.served_alpn().clone();
+    let mut protocol_name_list = ArrayVectorCopy::new();
+    u16_chunk(dw, err, |local_dw| {
+      while !local_dw.bytes().is_empty() {
+        u8_chunk(local_dw, err, |local_local_dw| {
+          let bytes = local_local_dw.bytes();
+          if let Ok(name) = ArrayVectorCopy::<u8, 8>::try_from(bytes)
+            && (name.is_empty() || served.protocol_name_list.contains(&name))
+          {
+            let _rslt = protocol_name_list.push(name);
+          }
+          Ok(())
+        })?;
+      }
+      Ok(())
+    })?;
+    Ok(Self { protocol_name_list })
+  }
 }
 
 impl<'de> Decode<'de, TlsCc> for Alpn {
@@ -29,12 +59,7 @@ impl<'de> Decode<'de, TlsCc> for Alpn {
     u16_chunk(dw, err, |local_dw| {
       while !local_dw.bytes().is_empty() {
         u8_chunk(local_dw, err, |local_local_dw| {
-          // RFC 7301 section 3.1: the server picks among the protocols it supports, so an offered
-          // name that does not fit (more than 8 bytes, as "hq-interop", or beyond the fourth)
-          // is not an error, it is a protocol that is not served
-          if let Ok(name) = local_local_dw.bytes().try_into() {
-            let _rslt = protocol_name_list.push(name);
-          }
+          protocol_name_list.push(local_local_dw.bytes().try_into()?)?;
           Ok(())
         })?;
       }

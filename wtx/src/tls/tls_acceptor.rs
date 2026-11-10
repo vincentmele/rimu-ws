@@ -361,6 +361,12 @@ where
   TCX: TlsCtx,
 {
   let mut dw = TlsDecodeWrapper::from_bytes(client_hello);
+  // What the ALPN of the ClientHello is read against
+  if IS_QUIC {
+    dw.served_alpn_mut().protocol_name_list.push(ArrayVectorCopy::from_array(*b"h3"))?;
+  } else if let Some(elem) = &config.inner.alpn {
+    *dw.served_alpn_mut() = elem.clone();
+  }
   let handshake = Handshake::<&[u8]>::decode(&mut dw)?;
   *dw.bytes_mut() = handshake.data;
   pre_handshake_dec_error(handshake.rec_len() != client_hello.len())?;
