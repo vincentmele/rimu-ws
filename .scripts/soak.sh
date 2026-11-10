@@ -79,16 +79,23 @@ if [[ $mode == h3 ]]; then
 	trap 'kill "$main_pid" "$idle_pid" 2>/dev/null; wait 2>/dev/null' EXIT
 	trap 'exit 130' INT
 	trap 'exit 143' TERM
-	for p in $main_port $idle_port; do
+	for p_pid in "$main_port:$main_pid" "$idle_port:$idle_pid"; do
+		p=${p_pid%%:*}
+		pid=${p_pid##*:}
 		for _ in $(seq 100); do
 			ss -lun "sport = :$p" | grep -q ":$p" && break
-			kill -0 "$main_pid" 2>/dev/null || { echo "a server exited early" >&2; exit 5; }
+			kill -0 "$pid" 2>/dev/null || { echo "a server exited early (port $p)" >&2; exit 5; }
 			sleep 0.1
 		done
 	done
 	sleep 0.5
 	set +e
-	"$rel/rimu-ws-soak" h3 \
+	# A whole-run wall-clock bound (ruling T23-k): the configured duration plus generous slack for
+	# warm-up, the idle_4096 phase and teardown, so a server bug that wedges the harness fails the
+	# run instead of hanging it. `timeout` unit suffixes match the DURATION style.
+	dur_s=${duration%s}
+	cap_s=$((dur_s + 300))
+	timeout "${cap_s}s" "$rel/rimu-ws-soak" h3 \
 		--url "https://127.0.0.1:$main_port" --pid "$main_pid" \
 		--idle-url "https://127.0.0.1:$idle_port" --idle-pid "$idle_pid" \
 		--duration "$duration" "$@"

@@ -1,13 +1,14 @@
-//! The QUIC/HTTP/3 soak: a well-behaved steady client (64 connections × 64 streams) that runs for
-//! the whole ~10-minute run beside abusive clients run in sequence, the server watched from
-//! outside once a second. Each abuser is bounded by one limit of [`rimu_ws::quic`] (spec section
-//! 5.12); its pass rule is the server's RSS staying within 10 % of the plateau the steady client
-//! settles at, the steady client never stalling, and the abuser being closed with the named error
-//! or rate-limited (rulings T23-a, T23-c).
+//! The QUIC/HTTP/3 soak: a well-behaved steady client (64 connections × 64 streams) on the
+//! four-worker server, a small steady client (4 × 4) on the one-worker server, both running for the
+//! whole ~10-minute run (rulings T23-a/T23-k), beside abusive clients run in sequence. Both servers
+//! are watched once a second. Each abuser is bounded by one limit of `rimu-ws` (spec section 5.12);
+//! its pass rule is that the server's RSS stays within 10 % of the plateau the steady client
+//! settles at (strict, ruling T23-i), the steady client never stalls, and the abuser is closed with
+//! the named error or rate-limited (ruling T23-c).
 
 use crate::{
   monitor::{Monitor, Sample},
-  quic::{client, raw, scenario},
+  quic::{client, scenario},
 };
 use std::{
   net::SocketAddr,
@@ -22,27 +23,20 @@ use tokio::time::Instant;
 /// What the soak runs against and for how long.
 #[derive(Clone, Debug)]
 pub struct H3Config {
-  /// The multi-worker server: the steady client and most abusers.
   pub main_addr: SocketAddr,
   pub main_pid: Option<u32>,
-  /// A one-worker server for the per-worker caps (idle × 4,096), or [`None`] to skip them.
   pub idle_addr: Option<SocketAddr>,
   pub idle_pid: Option<u32>,
-  /// The whole run (steady + abusers), about ten minutes.
   pub duration: Duration,
-  /// Probe-only time at the start that sets the RSS plateau.
   pub warmup: Duration,
-  /// Steady connections and streams each.
   pub conns: u32,
   pub streams: u32,
-  /// Where the JSONL goes.
   pub out: std::path::PathBuf,
-  /// The worker count and memlock, for the report.
   pub main_workers: u32,
   pub memlock_kib: Option<u64>,
 }
 
-/// What one scenario or the steady client reported.
+/// One JSONL line.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Line {
   pub kind: &'static str,
@@ -53,7 +47,7 @@ pub struct Line {
   pub rss_peak_kib: Option<u64>,
 }
 
-/// The counters the steady client keeps for the whole run.
+/// Counters a steady client keeps.
 #[derive(Debug, Default)]
 pub struct Steady {
   pub ok: AtomicU64,
@@ -62,12 +56,41 @@ pub struct Steady {
   pub max_rtt_us: AtomicU64,
 }
 
-/// A steady request slower than this, or one that failed while the run was live, is a stall of a
+/// A steady request slower than this (or one that fails while the run is live) is a stall of a
 /// well-behaved client.
 const STALL: Duration = Duration::from_secs(2);
 
-/// Runs the steady client's connections until `stop`. Each connection drives `streams` request
-/// loops at a modest rate, each `GET /baseline2` checked for `200` and the body `0`.
+/// One `GET /baseline2`, bounded by [`STALL`]: `Some(true)` = 200/`ok`, `Some(false)` = a bad
+/// answer, `None` = timed out (a stall).
+async fn one_request(
+  sr: &mut h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,
+) -> Option<bool> {
+  use bytes::Buf as _;
+  let fut = async {
+    let req =
+      http::Request::builder().method("GET").uri("https://localhost/baseline2").body(()).ok()?;
+    let mut stream = sr.send_request(req).await.ok()?;
+    stream.finish().await.ok()?;
+    let resp = stream.recv_response().await.ok()?;
+    let mut body = Vec::new();
+    while let Some(mut chunk) = stream.recv_data().await.ok()? {
+      while chunk.has_remaining() {
+        let n = chunk.chunk().len();
+        body.extend_from_slice(chunk.chunk());
+        chunk.advance(n);
+      }
+    }
+    Some(resp.status().as_u16() == 200 && body == b"ok")
+  };
+  match tokio::time::timeout(STALL, fut).await {
+    Ok(Some(ok)) => Some(ok),
+    Ok(None) => Some(false),
+    Err(_) => None,
+  }
+}
+
+/// Runs a steady client until `stop`: `conns` connections, each driving `streams` concurrent
+/// request loops over a shared (cloned) `SendRequest`, each request bounded by [`STALL`].
 async fn steady_client(
   addr: SocketAddr,
   conns: u32,
@@ -86,50 +109,55 @@ async fn steady_client(
         counters.bad.fetch_add(1, Ordering::Relaxed);
         return;
       };
-      // Reconnect if the connection drops, until the run ends.
       while !stop.load(Ordering::Relaxed) {
         let Ok(conn) = client::connect(&ep, addr, "localhost").await else {
           counters.bad.fetch_add(1, Ordering::Relaxed);
-          tokio::time::sleep(Duration::from_millis(100)).await;
+          if !stop.load(Ordering::Relaxed) {
+            counters.stalls.fetch_add(1, Ordering::Relaxed);
+          }
+          tokio::time::sleep(Duration::from_millis(200)).await;
           continue;
         };
-        let h3 = h3_quinn::Connection::new(conn.clone());
-        let Ok((mut driver, send_request)) = h3::client::new(h3).await else {
+        let h3c = h3_quinn::Connection::new(conn);
+        let Ok((mut driver, send_request)) = h3::client::new(h3c).await else {
           counters.bad.fetch_add(1, Ordering::Relaxed);
+          tokio::time::sleep(Duration::from_millis(200)).await; // no spin on failure
           continue;
         };
         let drive = tokio::spawn(async move {
           let _ = driver.wait_idle().await;
         });
-        let mut streams_tasks = Vec::new();
+        let mut stream_tasks = Vec::new();
         for _ in 0..streams {
           let (mut sr, stop, counters) = (send_request.clone(), stop.clone(), counters.clone());
-          streams_tasks.push(tokio::spawn(async move {
+          stream_tasks.push(tokio::spawn(async move {
             while !stop.load(Ordering::Relaxed) {
               let begin = Instant::now();
-              let ok = one_request(&mut sr).await;
-              let rtt = begin.elapsed();
-              let us = rtt.as_micros() as u64;
-              counters.max_rtt_us.fetch_max(us, Ordering::Relaxed);
-              if ok {
-                counters.ok.fetch_add(1, Ordering::Relaxed);
-                if rtt > STALL {
-                  counters.stalls.fetch_add(1, Ordering::Relaxed);
+              let got = one_request(&mut sr).await;
+              counters.max_rtt_us.fetch_max(begin.elapsed().as_micros() as u64, Ordering::Relaxed);
+              match got {
+                Some(true) => {
+                  counters.ok.fetch_add(1, Ordering::Relaxed);
                 }
-              } else {
-                // A failed request while the run is live is a stall (the connection may have
-                // dropped; the outer loop reconnects).
-                counters.bad.fetch_add(1, Ordering::Relaxed);
-                if !stop.load(Ordering::Relaxed) {
-                  counters.stalls.fetch_add(1, Ordering::Relaxed);
+                Some(false) => {
+                  counters.bad.fetch_add(1, Ordering::Relaxed);
+                  if !stop.load(Ordering::Relaxed) {
+                    counters.stalls.fetch_add(1, Ordering::Relaxed);
+                  }
+                  break;
                 }
-                break;
+                None => {
+                  if !stop.load(Ordering::Relaxed) {
+                    counters.stalls.fetch_add(1, Ordering::Relaxed);
+                  }
+                  break;
+                }
               }
               tokio::time::sleep(Duration::from_millis(25)).await;
             }
           }));
         }
-        for task in streams_tasks {
+        for task in stream_tasks {
           let _ = task.await;
         }
         drive.abort();
@@ -145,53 +173,36 @@ async fn steady_client(
   }
 }
 
-/// One `GET /baseline2`: `true` if it answered `200` with the body `0`.
-async fn one_request(
-  sr: &mut h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,
-) -> bool {
-  use bytes::Buf as _;
-  let Ok(req) = http::Request::builder().method("GET").uri("https://localhost/baseline2").body(())
-  else {
-    return false;
-  };
-  let Ok(mut stream) = sr.send_request(req).await else {
-    return false;
-  };
-  if stream.finish().await.is_err() {
-    return false;
-  }
-  let Ok(resp) = stream.recv_response().await else {
-    return false;
-  };
-  if resp.status().as_u16() != 200 {
-    return false;
-  }
-  let mut body = Vec::new();
-  loop {
-    match stream.recv_data().await {
-      Ok(Some(mut chunk)) => {
-        while chunk.has_remaining() {
-          let n = chunk.chunk().len();
-          body.extend_from_slice(chunk.chunk());
-          chunk.advance(n);
+/// Primes the per-thread static cache by fetching `/static/big.bin` (10 MiB) over `fetches`
+/// connections, so the warm-up plateau includes the cache the abuser routes touch (ruling T23-i).
+/// Enough connections that CID steering spreads them over all workers.
+async fn prime_cache(addr: SocketAddr, fetches: u32, idle: Duration) {
+  let cfg = client::client_config(None, idle);
+  let bind: SocketAddr = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" }.parse().unwrap();
+  let Ok(ep) = client::endpoint(bind, cfg) else { return };
+  let mut tasks = Vec::new();
+  for _ in 0..fetches {
+    let ep = ep.clone();
+    tasks.push(tokio::spawn(async move {
+      if let Ok(conn) = client::connect(&ep, addr, "localhost").await {
+        if let Ok(mut session) = client::H3Session::open(conn.clone()).await {
+          let _ = session.get("/static/big.bin").await;
         }
+        conn.close(client::H3_NO_ERROR, b"");
       }
-      Ok(None) => break,
-      Err(_) => return false,
-    }
+    }));
   }
-  body == b"ok"
+  for task in tasks {
+    let _ = task.await;
+  }
+  ep.wait_idle().await;
 }
 
-/// Samples the server once a second until `stop`; returns every sample.
+/// Samples the server once a second until `stop`.
 async fn sample_loop(pid: Option<u32>, port: u16, stop: Arc<AtomicBool>) -> Vec<Sample> {
   let mut out = Vec::new();
-  let Some(pid) = pid else {
-    return out;
-  };
-  let Ok(mut monitor) = Monitor::new(pid, port) else {
-    return out;
-  };
+  let Some(pid) = pid else { return out };
+  let Ok(mut monitor) = Monitor::new(pid, port) else { return out };
   while !stop.load(Ordering::Relaxed) {
     if let Ok(sample) = monitor.sample() {
       out.push(sample);
@@ -201,96 +212,135 @@ async fn sample_loop(pid: Option<u32>, port: u16, stop: Arc<AtomicBool>) -> Vec<
   out
 }
 
-/// The RSS plateau: the largest RSS seen in the warmup's samples (the steady client at rest).
-fn plateau_kib(warm: &[Sample]) -> u64 {
-  warm.iter().map(|el| el.rss_kib).max().unwrap_or(0)
+fn plateau_kib(samples: &[Sample]) -> u64 {
+  samples.iter().map(|el| el.rss_kib).max().unwrap_or(0)
 }
 
 /// Runs the whole soak and writes the JSONL, returning the number of failures.
 pub async fn run(cfg: H3Config, out: &mut dyn std::io::Write) -> u32 {
-  let idle = Duration::from_secs(30);
-  let stop = Arc::new(AtomicBool::new(false));
-  let counters = Arc::new(Steady::default());
+  let idle_to = Duration::from_secs(30);
+  let run_begin = Instant::now();
+  let deadline = run_begin + cfg.duration;
 
-  // Start the steady client and the sampler.
-  let steady = tokio::spawn(steady_client(
+  // Prime the static cache on both servers first, so the plateau already holds it.
+  prime_cache(cfg.main_addr, cfg.main_workers.saturating_mul(2).max(8), idle_to).await;
+  if let Some(idle_addr) = cfg.idle_addr {
+    prime_cache(idle_addr, 4, idle_to).await;
+  }
+
+  let main_stop = Arc::new(AtomicBool::new(false));
+  let main_counters = Arc::new(Steady::default());
+  let main_steady = tokio::spawn(steady_client(
     cfg.main_addr,
     cfg.conns,
     cfg.streams,
-    idle,
-    stop.clone(),
-    counters.clone(),
+    idle_to,
+    main_stop.clone(),
+    main_counters.clone(),
   ));
-  let sampler_stop = Arc::new(AtomicBool::new(false));
-  let sampler = tokio::spawn(sample_loop(cfg.main_pid, cfg.main_addr.port(), sampler_stop.clone()));
-
-  // Warm up: the steady client alone sets the plateau.
-  let warm_stop = Arc::new(AtomicBool::new(false));
-  let warm_sampler =
-    tokio::spawn(sample_loop(cfg.main_pid, cfg.main_addr.port(), warm_stop.clone()));
-  tokio::time::sleep(cfg.warmup).await;
-  warm_stop.store(true, Ordering::Relaxed);
-  let warm = warm_sampler.await.unwrap_or_default();
-  let plateau = plateau_kib(&warm);
-  let bound = plateau.saturating_mul(110) / 100 + 16 * 1024;
-  let mut lines = Vec::new();
-  lines.push(Line {
-    kind: "plateau",
-    name: "steady_warmup".into(),
-    pass: plateau > 0,
-    detail: format!(
-      "plateau {plateau} KiB over {} samples, bound {bound} KiB (+10% +16 MiB)",
-      warm.len()
-    ),
-    rss_peak_kib: Some(plateau),
+  let idle_stop = Arc::new(AtomicBool::new(false));
+  let idle_counters = Arc::new(Steady::default());
+  let idle_steady = cfg.idle_addr.map(|idle_addr| {
+    tokio::spawn(steady_client(idle_addr, 4, 4, idle_to, idle_stop.clone(), idle_counters.clone()))
   });
 
-  // The abusers, in sequence, while the steady client keeps running.
-  let deadline = Instant::now() + cfg.duration.saturating_sub(cfg.warmup);
+  // Plateau: warm-up window only.
+  let warm_stop = Arc::new(AtomicBool::new(false));
+  let warm_main = tokio::spawn(sample_loop(cfg.main_pid, cfg.main_addr.port(), warm_stop.clone()));
+  let warm_idle =
+    cfg.idle_addr.map(|a| tokio::spawn(sample_loop(cfg.idle_pid, a.port(), warm_stop.clone())));
+  tokio::time::sleep(cfg.warmup).await;
+  warm_stop.store(true, Ordering::Relaxed);
+  let plateau_main = plateau_kib(&warm_main.await.unwrap_or_default());
+  let plateau_idle = match warm_idle {
+    Some(h) => plateau_kib(&h.await.unwrap_or_default()),
+    None => 0,
+  };
+
+  // Whole-run sampling for the peak. The idle sampler is stopped before the idle_4096 phase, so the
+  // idle server's RSS gate reflects the steady client plus the raw floods, not the deliberate
+  // 4,096-connection spike (idle_4096 does its own per-connection RSS check, ruling T23-k).
+  let samp_main_stop = Arc::new(AtomicBool::new(false));
+  let samp_idle_stop = Arc::new(AtomicBool::new(false));
+  let samp_main =
+    tokio::spawn(sample_loop(cfg.main_pid, cfg.main_addr.port(), samp_main_stop.clone()));
+  let samp_idle = cfg
+    .idle_addr
+    .map(|a| tokio::spawn(sample_loop(cfg.idle_pid, a.port(), samp_idle_stop.clone())));
+
+  let mut lines = Vec::new();
+  lines.push(Line {
+    kind: "env",
+    name: "run".into(),
+    pass: true,
+    detail: format!(
+      "main_workers={}, memlock={}, plateau_main={plateau_main} KiB, plateau_idle={plateau_idle} KiB",
+      cfg.main_workers,
+      cfg.memlock_kib.map_or("unlimited".into(), |el| format!("{el} KiB"))
+    ),
+    rss_peak_kib: None,
+  });
+
+  // Abusers (each with its own deadline), while the steady clients run. idle_4096 is handled
+  // separately below, after the idle sampler is stopped.
   let results = scenario::run_all(&cfg, deadline).await;
-  for result in results {
+  for r in results {
     lines.push(Line {
       kind: "scenario",
-      name: result.name,
-      pass: result.pass,
-      detail: result.detail,
+      name: r.name,
+      pass: r.pass,
+      detail: r.detail,
       rss_peak_kib: None,
     });
   }
 
-  // Stop the steady client and the sampler.
-  stop.store(true, Ordering::Relaxed);
-  sampler_stop.store(true, Ordering::Relaxed);
-  let _ = tokio::time::timeout(Duration::from_secs(15), steady).await;
-  let samples = sampler.await.unwrap_or_default();
-  let peak = samples.iter().map(|el| el.rss_kib).max().unwrap_or(0).max(plateau);
-
-  let ok = counters.ok.load(Ordering::Relaxed);
-  let stalls = counters.stalls.load(Ordering::Relaxed);
-  let bad = counters.bad.load(Ordering::Relaxed);
-  let max_rtt = counters.max_rtt_us.load(Ordering::Relaxed);
-  lines.push(Line {
-    kind: "steady",
-    name: "steady_64x64".into(),
-    pass: stalls == 0,
-    detail: format!("{ok} ok, {bad} failed, {stalls} stalls, max rtt {max_rtt} us",),
-    rss_peak_kib: None,
-  });
-  lines.push(Line {
-    kind: "rss",
-    name: "rss_bound".into(),
-    pass: peak <= bound,
-    detail: format!("peak {peak} KiB, plateau {plateau} KiB, bound {bound} KiB"),
-    rss_peak_kib: Some(peak),
-  });
-
-  // Write every line and count failures.
-  let mut fails = 0;
-  for line in &lines {
-    if !line.pass {
-      fails += 1;
+  // idle_4096 phase: stop the idle steady client and its RSS sampler, then run the cap scenario,
+  // which does its own per-connection RSS check (ruling T23-k).
+  samp_idle_stop.store(true, Ordering::Relaxed);
+  let idle_samples = match samp_idle {
+    Some(h) => h.await.unwrap_or_default(),
+    None => Vec::new(),
+  };
+  if let (Some(idle_addr), Some(idle_pid)) = (cfg.idle_addr, cfg.idle_pid) {
+    idle_stop.store(true, Ordering::Relaxed);
+    if let Some(h) = idle_steady {
+      let _ = tokio::time::timeout(Duration::from_secs(10), h).await;
     }
-    if let Ok(text) = serde_json::to_string(line) {
+    // Let the idle steady client's connections drain from the one-worker server so the cap is free
+    // for the 4,096-connection fill.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let r = scenario::idle_connections(idle_addr, idle_pid).await;
+    lines.push(Line {
+      kind: "scenario",
+      name: r.name,
+      pass: r.pass,
+      detail: r.detail,
+      rss_peak_kib: None,
+    });
+  } else {
+    idle_stop.store(true, Ordering::Relaxed);
+    if let Some(h) = idle_steady {
+      let _ = tokio::time::timeout(Duration::from_secs(10), h).await;
+    }
+  }
+
+  // Keep the main steady client running until the full duration elapses (ruling T23-a).
+  let remaining = deadline.saturating_duration_since(Instant::now());
+  if remaining > Duration::ZERO {
+    tokio::time::sleep(remaining).await;
+  }
+
+  main_stop.store(true, Ordering::Relaxed);
+  samp_main_stop.store(true, Ordering::Relaxed);
+  let _ = tokio::time::timeout(Duration::from_secs(20), main_steady).await;
+  let main_samples = samp_main.await.unwrap_or_default();
+
+  let mut fails = 0u32;
+  let mut emit = |line: Line, fails: &mut u32| {
+    if !line.pass {
+      *fails = fails.wrapping_add(1);
+    }
+    if let Ok(text) = serde_json::to_string(&line) {
       let _ = writeln!(out, "{text}");
     }
     eprintln!(
@@ -300,12 +350,67 @@ pub async fn run(cfg: H3Config, out: &mut dyn std::io::Write) -> u32 {
       line.name,
       line.detail
     );
+  };
+
+  for (label, plateau, samples) in
+    [("rss_main", plateau_main, &main_samples), ("rss_idle", plateau_idle, &idle_samples)]
+  {
+    if plateau == 0 && samples.is_empty() {
+      continue;
+    }
+    let peak = samples.iter().map(|el| el.rss_kib).max().unwrap_or(0).max(plateau);
+    let bound = plateau.saturating_mul(110) / 100;
+    emit(
+      Line {
+        kind: "rss",
+        name: label.into(),
+        pass: peak <= bound,
+        detail: format!(
+          "peak {peak} KiB, plateau {plateau} KiB, bound {bound} KiB (×1.10, no slack)"
+        ),
+        rss_peak_kib: Some(peak),
+      },
+      &mut fails,
+    );
   }
+
+  for (label, c, present) in [
+    ("steady_main", &main_counters, true),
+    ("steady_idle", &idle_counters, cfg.idle_addr.is_some()),
+  ] {
+    if !present {
+      continue;
+    }
+    let (ok, bad, stalls) = (
+      c.ok.load(Ordering::Relaxed),
+      c.bad.load(Ordering::Relaxed),
+      c.stalls.load(Ordering::Relaxed),
+    );
+    emit(
+      Line {
+        kind: "steady",
+        name: label.into(),
+        pass: stalls == 0 && bad == 0,
+        detail: format!(
+          "{ok} ok, {bad} failed, {stalls} stalls, max rtt {} us",
+          c.max_rtt_us.load(Ordering::Relaxed)
+        ),
+        rss_peak_kib: None,
+      },
+      &mut fails,
+    );
+  }
+
+  for line in lines {
+    emit(line, &mut fails);
+  }
+
+  let wall = run_begin.elapsed();
   eprintln!(
-    "h3 soak: plateau {plateau} KiB, peak {peak} KiB, steady {ok} ok / {stalls} stalls, {} workers, memlock {}",
+    "h3 soak: wall {:.0}s, plateau main/idle {plateau_main}/{plateau_idle} KiB, {} workers, memlock {}",
+    wall.as_secs_f64(),
     cfg.main_workers,
     cfg.memlock_kib.map_or("unlimited".into(), |el| format!("{el} KiB"))
   );
-  let _ = raw::VERSION_1; // keep the raw module linked even if a scenario build drops it
   fails
 }

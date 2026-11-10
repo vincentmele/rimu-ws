@@ -68,6 +68,30 @@ pub fn client_config(keep_alive: Option<Duration>, idle: Duration) -> ClientConf
   cfg
 }
 
+/// Like [`client_config`] but with the connection and per-stream receive windows forced to
+/// `window` bytes (0 for the credit-starved `window_starved` scenario, so the server may send no
+/// STREAM data and must close on idle). `idle` is kept short so the idle close is quick.
+pub fn client_config_windows(idle: Duration, window: u64) -> ClientConfig {
+  let provider = Arc::new(rustls::crypto::ring::default_provider());
+  let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .expect("tls13")
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(TrustAny(provider)))
+    .with_no_client_auth();
+  tls.alpn_protocols = vec![b"h3".to_vec()];
+  let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic client config");
+  let mut cfg = ClientConfig::new(Arc::new(qcc));
+  let mut transport = TransportConfig::default();
+  transport.max_idle_timeout(Some(idle.try_into().expect("idle")));
+  // Only the per-stream window is starved; the connection window stays at its default so the
+  // server's own (mandatory) control and QPACK uni streams can still be sent, and the request
+  // stream alone is the one that gets no data — the server then closes on idle.
+  transport.stream_receive_window(VarInt::from_u64(window).unwrap_or(VarInt::from_u32(0)));
+  cfg.transport_config(Arc::new(transport));
+  cfg
+}
+
 /// A client endpoint bound to `bind`, already carrying `cfg` as its default.
 pub fn endpoint(bind: SocketAddr, cfg: ClientConfig) -> std::io::Result<Endpoint> {
   let mut ep = Endpoint::client(bind)?;

@@ -105,6 +105,116 @@ impl InitialKeys {
   }
 }
 
+/// Reads a QUIC varint at the start of `bytes`, returning (value, bytes consumed).
+fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
+  let first = *bytes.first()?;
+  let len = 1usize << (first >> 6);
+  let mut value = u64::from(first & 0x3f);
+  for i in 1..len {
+    value = (value << 8) | u64::from(*bytes.get(i)?);
+  }
+  Some((value, len))
+}
+
+/// Removes the protection of the first Initial packet of `datagram` (a server reply) with the
+/// server-side Initial keys for `dcid` (the client's original DCID), and returns its decrypted
+/// frame bytes. Used to read a handshake-level CONNECTION_CLOSE (ruling T23-j #2).
+pub fn open_server_initial(dcid: &[u8], datagram: &[u8]) -> Option<Vec<u8>> {
+  let keys = InitialKeys::server(dcid);
+  let first = *datagram.first()?;
+  if first & 0x80 == 0 || (first & 0x30) >> 4 != 0 {
+    return None; // not a long-header Initial
+  }
+  let mut at = 1 + 4; // first byte + version
+  let dcid_len = usize::from(*datagram.get(at)?);
+  at = at + 1 + dcid_len;
+  let scid_len = usize::from(*datagram.get(at)?);
+  at = at + 1 + scid_len;
+  let (token_len, token_vl) = read_varint(datagram.get(at..)?)?;
+  at = at.checked_add(token_vl)?.checked_add(usize::try_from(token_len).ok()?)?;
+  let (length, len_vl) = read_varint(datagram.get(at..)?)?;
+  let pn_offset = at.checked_add(len_vl)?;
+  let packet_end = pn_offset.checked_add(usize::try_from(length).ok()?)?;
+  if packet_end > datagram.len() {
+    return None;
+  }
+  let mut packet = datagram.get(..packet_end)?.to_vec();
+  let sample_at = pn_offset.checked_add(4)?;
+  let sample = packet.get(sample_at..sample_at.checked_add(16)?)?.to_vec();
+  let mask = keys.hp_mask(&sample);
+  let unprot_first = packet[0] ^ (mask[0] & 0x0f);
+  packet[0] = unprot_first;
+  let pn_len = usize::from(unprot_first & 0x03) + 1;
+  let mut pn: u64 = 0;
+  for i in 0..pn_len {
+    let b = packet.get_mut(pn_offset + i)?;
+    *b ^= mask[1 + i];
+    pn = (pn << 8) | u64::from(*b);
+  }
+  let header_end = pn_offset + pn_len;
+  let aad = packet.get(..header_end)?.to_vec();
+  let mut sealed = packet.get(header_end..)?.to_vec();
+  if sealed.len() < 16 {
+    return None;
+  }
+  let tag_at = sealed.len() - 16;
+  let tag = *GenericArray::from_slice(sealed.get(tag_at..)?);
+  sealed.truncate(tag_at);
+  let cipher = Aes128Gcm::new(GenericArray::from_slice(&keys.key));
+  let nonce = keys.nonce(pn);
+  cipher
+    .decrypt_in_place_detached(GenericArray::from_slice(&nonce), &aad, &mut sealed, &tag)
+    .ok()?;
+  Some(sealed)
+}
+
+/// Scans decrypted frame bytes for a CONNECTION_CLOSE (type 0x1c transport or 0x1d application) and
+/// returns its error code. Skips PADDING, PING, ACK and CRYPTO.
+pub fn connection_close_code(frames: &[u8]) -> Option<u64> {
+  let mut at = 0usize;
+  while at < frames.len() {
+    let (ty, vl) = read_varint(frames.get(at..)?)?;
+    at += vl;
+    match ty {
+      0x00 | 0x01 => {}
+      0x1c | 0x1d => {
+        let (code, _cvl) = read_varint(frames.get(at..)?)?;
+        return Some(code);
+      }
+      0x02 | 0x03 => {
+        let (_largest, a) = read_varint(frames.get(at..)?)?;
+        at += a;
+        let (_delay, b) = read_varint(frames.get(at..)?)?;
+        at += b;
+        let (count, c) = read_varint(frames.get(at..)?)?;
+        at += c;
+        let (_first, d) = read_varint(frames.get(at..)?)?;
+        at += d;
+        for _ in 0..count {
+          let (_gap, g) = read_varint(frames.get(at..)?)?;
+          at += g;
+          let (_len, l) = read_varint(frames.get(at..)?)?;
+          at += l;
+        }
+        if ty == 0x03 {
+          for _ in 0..3 {
+            let (_, e) = read_varint(frames.get(at..)?)?;
+            at += e;
+          }
+        }
+      }
+      0x06 => {
+        let (_off, a) = read_varint(frames.get(at..)?)?;
+        at += a;
+        let (dlen, b) = read_varint(frames.get(at..)?)?;
+        at += b + usize::try_from(dlen).ok()?;
+      }
+      _ => return None,
+    }
+  }
+  None
+}
+
 /// Builds a client Initial datagram: a single Initial packet carrying `crypto`, with a
 /// four-byte packet number `pn`, padded to at least `pad_to` bytes. `crypto` is placed in a CRYPTO
 /// frame at the offset given, so a fragmented ClientHello is built by two calls with a gap.
