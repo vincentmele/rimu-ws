@@ -122,8 +122,8 @@ fn request_fields(input: &mut Input<'_>, kind: u8) -> Vec<(Vec<u8>, Vec<u8>)> {
 /// What the client of a script has done that makes the answers of the server unpredictable.
 #[derive(Debug, Default)]
 struct Plan {
-  /// The requests that must be answered: stream, and whether their path is `/`.
-  good: Vec<StreamId>,
+  /// The requests that must be answered: stream, and whether their path is `/big`.
+  good: Vec<(StreamId, bool)>,
   /// Something other than valid requests, an acceptable control stream and time.
   noisy: bool,
   /// The control stream of the client, once opened.
@@ -164,7 +164,8 @@ fn action(duo: &mut Duo<Server>, input: &mut Input<'_>, plan: &mut Plan) {
         };
         let len = settings.encode(&mut payload).unwrap();
         payload.truncate(len);
-        let bytes = if valid { frame(4, &payload) } else { input.sized(64).to_vec() };
+        // `encode` writes the whole SETTINGS frame
+        let bytes = if valid { payload } else { input.sized(64).to_vec() };
         plan.noisy |= !valid;
         plan.control = open_uni(duo, 0, &bytes);
       } else {
@@ -227,7 +228,7 @@ fn action(duo: &mut Duo<Server>, input: &mut Input<'_>, plan: &mut Plan) {
       if let Some(id) = opened {
         plan.streams.push(id);
         if valid {
-          plan.good.push(id);
+          plan.good.push((id, fields[3].1 == b"/big"));
         }
       }
     }
@@ -372,11 +373,12 @@ fn drive(duo: &mut Duo<Server>, input: &mut Input<'_>) {
   check_codes(duo);
   if !plan.noisy && !duo.tainted {
     assert_ne!(duo.server.state(), ConnState::Closing, "the server closed on valid requests");
-    for id in &plan.good {
+    for (id, big) in &plan.good {
       let Some((frames, body, fin)) = response(duo, *id) else {
         panic!("no answer to the valid request of stream {}", id.0);
       };
-      assert!(fin && frames.first() == Some(&1) && body == BODY, "{frames:?} {fin} {}", body.len());
+      let want = if *big { BIG } else { BODY };
+      assert!(fin && frames.first() == Some(&1) && body == want, "{frames:?} {fin} {}", body.len());
     }
   }
 }
@@ -432,6 +434,25 @@ mod tests {
     let (frames, body, fin) = response(&duo, crate::quic::StreamId(0)).unwrap();
     assert_eq!((frames, body.as_slice(), fin), (alloc::vec![1, 0], BODY, true));
     duo.finish();
+  }
+
+  // The inputs that stopped the first version of the target `h3_conn`: a valid request after an
+  // acceptable control stream, which the script of the target had wrapped in a frame twice (the
+  // server rightly closed with H3_SETTINGS_ERROR). The target takes them now.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn valid_request_after_a_control_stream_is_answered() {
+    for hex in [
+      "0200000300000101010e070001000003010000000101010e07",
+      "1900170000000000000007032504050000000101010e07",
+      "0700000300000101010e0703010005000101010e070e07",
+      "0400000300000101010e0700010000030100000001010103010000000101010301000000010101030100000001010103010000000101010301000000010101030100000001010103010000000101010301000000010101030100000001010103010000000101010301000000010101030100000001010103010000000101010301000000010101030100000001010103010000000101010301000000010101030100000001010103010000000101010e07",
+    ] {
+      let data: Vec<u8> = (0..hex.len() / 2)
+        .map(|idx| u8::from_str_radix(&hex[idx * 2..idx * 2 + 2], 16).unwrap())
+        .collect();
+      run(&data);
+    }
   }
 
   // Rule: whatever the script is, the server holds the rules of the module.
