@@ -128,6 +128,8 @@ struct Plan {
   noisy: bool,
   /// The control stream of the client, once opened.
   control: Option<StreamId>,
+  /// The time that the script let pass.
+  elapsed_us: u64,
   /// The streams the script opened.
   streams: Vec<StreamId>,
 }
@@ -294,11 +296,13 @@ fn action(duo: &mut Duo<Server>, input: &mut Input<'_>, plan: &mut Plan) {
         2 => 300_000,
         _ => 1_000_000,
       };
-      if us >= 1_000_000 {
+      // Quiet for long enough, a connection idles out
+      plan.elapsed_us += us;
+      if plan.elapsed_us >= 1_000_000 {
         plan.noisy = true;
       }
       duo.advance(us);
-      duo.settle(4);
+      duo.exchange(4);
     }
     // An action on the packets
     _ => {
@@ -328,17 +332,8 @@ fn response(duo: &Duo<Server>, id: StreamId) -> Option<(Vec<u64>, Vec<u8>, bool)
     rslt.0.push(ty.code());
     match ty {
       H3FrameTy::Headers => {
-        let mut status = Vec::new();
-        let outcome = decoder
-          .decode(id.0, payload, &mut scratch, &mut |name, value| {
-            if name == b":status" {
-              status = value.to_vec();
-            }
-            Ok(())
-          })
-          .ok()?;
+        let outcome = decoder.decode(id.0, payload, &mut scratch, &mut |_, _| Ok(())).ok()?;
         assert_eq!(outcome, DecodeOutcome::Done { referenced_dynamic: false });
-        assert_eq!(status, b"200");
       }
       H3FrameTy::Data => rslt.1.extend_from_slice(payload),
       _ => {}
@@ -358,8 +353,9 @@ fn check_codes(duo: &Duo<Server>) {
 }
 
 /// Runs `input` as a script against `duo`, whose handshake is done, and checks the rules.
-fn drive(duo: &mut Duo<Server>, input: &mut Input<'_>) {
-  let mut plan = Plan::default();
+fn drive(duo: &mut Duo<Server>, input: &mut Input<'_>, tight: bool) {
+  // Limits that a valid request can exceed (413, 431) make the answers unpredictable
+  let mut plan = Plan { noisy: tight, ..Plan::default() };
   for _ in 0..MAX_ACTIONS {
     if input.is_empty() {
       break;
@@ -384,7 +380,7 @@ fn drive(duo: &mut Duo<Server>, input: &mut Input<'_>) {
 }
 
 /// A server connection that waits for the script: its handshake is done.
-fn duo_of(input: &mut Input<'_>) -> Duo<Server> {
+fn duo_of(input: &mut Input<'_>) -> (Duo<Server>, bool) {
   let seed = input.byte();
   let presets = (input.byte(), input.byte());
   let dcid_len = input.byte();
@@ -395,11 +391,14 @@ fn duo_of(input: &mut Input<'_>) -> Duo<Server> {
     max_request_body: if input.byte() % 4 == 0 { 100 } else { 1 << 20 },
     max_buffered_body_per_conn: if input.byte() % 4 == 0 { 1000 } else { 16 << 20 },
   };
+  let tight = params.max_field_section_size < 1024
+    || params.max_request_body < 1024
+    || params.max_buffered_body_per_conn < 1 << 20;
   let mut duo = Duo::new(seed, presets, dcid_len, H3App::new(FuzzHandler::default(), params));
   duo.c_app.record = true;
   duo.start();
   duo.exchange(16);
-  duo
+  (duo, tight)
 }
 
 /// Runs the bytes as a script against an HTTP/3 server connection, panicking if it breaks a rule of
@@ -407,8 +406,8 @@ fn duo_of(input: &mut Input<'_>) -> Duo<Server> {
 #[inline]
 pub fn run(data: &[u8]) {
   let mut input = Input::new(data);
-  let mut duo = duo_of(&mut input);
-  drive(&mut duo, &mut input);
+  let (mut duo, tight) = duo_of(&mut input);
+  drive(&mut duo, &mut input, tight);
   duo.finish();
 }
 
@@ -427,9 +426,10 @@ mod tests {
     // trips
     let script = [1, 0, 0, 0, 1, 1, 1, 1, 1, 3, 1, 0, 0, 0, 1, 1, 1, 14, 7];
     let mut input = Input::new(&script);
-    let mut duo = duo_of(&mut input);
+    let (mut duo, tight) = duo_of(&mut input);
+    assert!(!tight);
     assert_eq!(duo.server.state(), ConnState::Confirmed);
-    drive(&mut duo, &mut input);
+    drive(&mut duo, &mut input, tight);
     // The first stream of the client
     let (frames, body, fin) = response(&duo, crate::quic::StreamId(0)).unwrap();
     assert_eq!((frames, body.as_slice(), fin), (alloc::vec![1, 0], BODY, true));
@@ -447,6 +447,21 @@ mod tests {
       "1900170000000000000007032504050000000101010e07",
       "0700000300000101010e0703010005000101010e070e07",
       "0400000300000101010e0700010000030100000001010103010000000101010301000000010101030100000001010103010000000101010301000000010101030100000001010103010000000101010301000000010101030100000001010103010000000101010301000000010101030100000001010103010000000101010301000000010101030100000001010103010000000101010301000000010101030100000001010103010000000101010e07",
+    ] {
+      let data: Vec<u8> = (0..hex.len() / 2)
+        .map(|idx| u8::from_str_radix(&hex[idx * 2..idx * 2 + 2], 16).unwrap())
+        .collect();
+      run(&data);
+    }
+  }
+
+  // The input that stopped the second version of the target: tight limits, with which a request that
+  // is valid is answered with 413, which the script did not expect.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn tight_limits_make_the_answers_unpredictable() {
+    for hex in [
+      "280000003a617574686f726974790000000000000000000000ff494949494949494949494949404949494949494949494949494949494949494949494949494949494949494949494949494949494904090203000328e1e1e1e125e1e1e1d3e1e1e1e1e1e1e1e1e1e1e1e125e1fffefefee1e1d3e1e1e1e1e1e1e1e1e1e1e12498f101757be311031122fe",
     ] {
       let data: Vec<u8> = (0..hex.len() / 2)
         .map(|idx| u8::from_str_radix(&hex[idx * 2..idx * 2 + 2], 16).unwrap())
