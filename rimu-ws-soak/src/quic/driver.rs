@@ -223,7 +223,7 @@ pub async fn run(cfg: H3Config, out: &mut dyn std::io::Write) -> u32 {
   let deadline = run_begin + cfg.duration;
 
   // Prime the static cache on both servers first, so the plateau already holds it.
-  prime_cache(cfg.main_addr, cfg.main_workers.saturating_mul(2).max(8), idle_to).await;
+  prime_cache(cfg.main_addr, 32, idle_to).await; // 32 covers 4 workers with P(miss)≈0.4% (N12)
   if let Some(idle_addr) = cfg.idle_addr {
     prime_cache(idle_addr, 4, idle_to).await;
   }
@@ -309,7 +309,20 @@ pub async fn run(cfg: H3Config, out: &mut dyn std::io::Write) -> u32 {
     // Let the idle steady client's connections drain from the one-worker server so the cap is free
     // for the 4,096-connection fill.
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let r = scenario::idle_connections(idle_addr, idle_pid).await;
+    // Its own deadline (N10): a wedged fill fails the scenario instead of hanging the run.
+    let r = match tokio::time::timeout(
+      Duration::from_secs(300),
+      scenario::idle_connections(idle_addr, idle_pid),
+    )
+    .await
+    {
+      Ok(r) => r,
+      Err(_) => scenario::ScenarioResult {
+        name: "idle_4096".into(),
+        pass: false,
+        detail: "exceeded its 300 s deadline".into(),
+      },
+    };
     lines.push(Line {
       kind: "scenario",
       name: r.name,

@@ -72,8 +72,10 @@ if [[ $mode == h3 ]]; then
 	env "${malloc_env[@]}" SOAK_H3_ADDR="[::]:$main_port" SOAK_STATIC_DIR=/mnt/nvme1tb/claude-tmp/soak/h3-static \
 		CERT_DIR="$cert_dir" taskset -c "$cpus" "$srv" &
 	main_pid=$!
+	# The one-worker idle server counts net live heap bytes per worker thread (exposed on GET /mem)
+	# so idle_4096 can measure per-connection memory in the server (ruling N3).
 	env "${malloc_env[@]}" SOAK_H3_ADDR="[::]:$idle_port" SOAK_STATIC_DIR=/mnt/nvme1tb/claude-tmp/soak/h3-static-idle \
-		CERT_DIR="$cert_dir" taskset -c "$idle_cpu" "$srv" &
+		SOAK_H3_ALLOC_STATS=1 CERT_DIR="$cert_dir" taskset -c "$idle_cpu" "$srv" &
 	idle_pid=$!
 	# The servers must not outlive the script.
 	trap 'kill "$main_pid" "$idle_pid" 2>/dev/null; wait 2>/dev/null' EXIT
@@ -92,8 +94,13 @@ if [[ $mode == h3 ]]; then
 	set +e
 	# A whole-run wall-clock bound (ruling T23-k): the configured duration plus generous slack for
 	# warm-up, the idle_4096 phase and teardown, so a server bug that wedges the harness fails the
-	# run instead of hanging it. `timeout` unit suffixes match the DURATION style.
-	dur_s=${duration%s}
+	# run instead of hanging it. Parse the DURATION's unit (Ns, Nm, or a bare N seconds) so, e.g.,
+	# DURATION=10m works (N11).
+	case $duration in
+	*m) dur_s=$((${duration%m} * 60)) ;;
+	*s) dur_s=${duration%s} ;;
+	*) dur_s=$duration ;;
+	esac
 	cap_s=$((dur_s + 300))
 	timeout "${cap_s}s" "$rel/rimu-ws-soak" h3 \
 		--url "https://127.0.0.1:$main_port" --pid "$main_pid" \

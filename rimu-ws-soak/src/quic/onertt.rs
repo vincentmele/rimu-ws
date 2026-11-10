@@ -152,8 +152,40 @@ pub mod frames {
     out
   }
 
+  /// A MAX_DATA frame (type 0x10): an ack-eliciting frame with no budget, so a flood of it raises
+  /// the server's 1-RTT packet numbers (each draws an ACK) without tripping any limit.
+  pub fn max_data(max: u64) -> Vec<u8> {
+    let mut out = vec![0x10];
+    put_varint(&mut out, max);
+    out
+  }
+
+  /// An ACK frame of `ranges` extra ranges after the first, each gap 0 / length 0, walking down
+  /// from `largest` by two (RFC 9000 section 19.3): every acknowledged packet number is a real one
+  /// the server sent, provided `largest >= 2 * ranges`. For the valid 257+ range flood (N1).
+  pub fn ack_ranges(largest: u64, ranges: u64) -> Vec<u8> {
+    let mut out = vec![0x02];
+    put_varint(&mut out, largest);
+    put_varint(&mut out, 0); // ack delay
+    put_varint(&mut out, ranges);
+    put_varint(&mut out, 0); // first ack range: acks `largest` only
+    for _ in 0..ranges {
+      put_varint(&mut out, 0); // gap 0: skip one packet number
+      put_varint(&mut out, 0); // range length 0
+    }
+    out
+  }
+
+  /// A deliberately malformed ACK: a first range or extra ranges that reach below packet number 0
+  /// (RFC 9000 section 19.3.1 makes it a FRAME_ENCODING_ERROR). With `largest` 0 and one extra
+  /// range the second range implies packet number −2.
+  pub fn ack_below_zero() -> Vec<u8> {
+    ack_many(0, 1)
+  }
+
   /// An ACK frame with `range_count` extra ranges after the first, each a 1-gap, 0-length range
-  /// walking down from `largest` (RFC 9000 section 19.3). Used to flood the ACK-range parser.
+  /// walking down from `largest` (RFC 9000 section 19.3). Reaches below packet number 0 when
+  /// `largest` is small, so it is the malformed case; prefer [`ack_ranges`] for a valid flood.
   pub fn ack_many(largest: u64, range_count: u64) -> Vec<u8> {
     let mut out = vec![0x02];
     put_varint(&mut out, largest);
@@ -308,9 +340,22 @@ fn scan_crypto(frames: &[u8]) -> Vec<(u64, Vec<u8>)> {
 pub struct OneRttClient {
   sock: UdpSocket,
   dcid: Vec<u8>,
+  scid: Vec<u8>,
   pn_1rtt: u64,
   levels: [Option<Level>; 3],
   largest_recv: [Option<u64>; 3],
+}
+
+/// The outcome of a raw per-datagram flap (ruling T23-j #4 / N4).
+pub struct RawFlap {
+  /// Datagrams sent (one per flip).
+  pub flips: u64,
+  /// Bytes sent from \[validated socket 0, unvalidated socket 1].
+  pub bytes_out: [u64; 2],
+  /// Bytes received on \[socket 0, socket 1].
+  pub bytes_in: [u64; 2],
+  /// How the connection ended, if it did.
+  pub closed: Close,
 }
 
 impl OneRttClient {
@@ -336,6 +381,7 @@ impl OneRttClient {
     let mut client = OneRttClient {
       sock,
       dcid: dcid.clone(),
+      scid: scid.clone(),
       pn_1rtt: 0,
       levels: [Some(initial_level(&dcid)), None, None],
       largest_recv: [None; 3],
@@ -501,8 +547,9 @@ impl OneRttClient {
     while at < datagram.len() {
       let Some(&first) = datagram.get(at) else { break };
       if first & 0x80 == 0 {
-        // Short header (1-RTT): runs to the end of the datagram.
-        if let Some(res) = self.decode_one(ONE_RTT, &datagram[at..], 1 + self.dcid.len()) {
+        // Short header (1-RTT): its DCID is our own connection ID (the SCID we chose), so the
+        // packet-number offset skips that length (N7). Runs to the end of the datagram.
+        if let Some(res) = self.decode_one(ONE_RTT, &datagram[at..], 1 + self.scid.len()) {
           out.push(res);
         }
         break;
@@ -565,6 +612,78 @@ impl OneRttClient {
         Ok(Err(_)) | Err(_) => return Close::None,
       }
     }
+  }
+
+  /// Reads datagrams for `within`, updating the largest 1-RTT packet number seen, and returns it.
+  /// Used to learn the server's current packet numbers before an ACK flood.
+  pub async fn drain(&mut self, within: Duration) -> Option<u64> {
+    let deadline = Instant::now() + within;
+    let mut buf = [0u8; 2048];
+    loop {
+      let left = deadline.saturating_duration_since(Instant::now());
+      if left.is_zero() {
+        break;
+      }
+      match tokio::time::timeout(left.min(Duration::from_millis(50)), self.sock.recv(&mut buf))
+        .await
+      {
+        Ok(Ok(len)) => {
+          let datagram = buf[..len].to_vec();
+          for (space, _frames, pn) in self.decode_datagram(&datagram) {
+            self.largest_recv[space] =
+              Some(self.largest_recv[space].map_or(pn, |prev| prev.max(pn)));
+          }
+        }
+        Ok(Err(_)) => break,
+        Err(_) => {
+          if Instant::now() >= deadline {
+            break;
+          }
+        }
+      }
+    }
+    self.largest_recv[ONE_RTT]
+  }
+
+  /// A per-datagram migration flapper that sends no PING (ruling T23-j #4 / N4): one MAX_DATA
+  /// packet per datagram, alternating between the handshake socket (address 0, validated) and
+  /// `alt` (address 1, perpetually unvalidated). Both sockets must be connected to the server.
+  /// Counts bytes in and out per address and records the close, so a 3× amplification check can be
+  /// applied to the unvalidated address.
+  pub async fn raw_flap(&mut self, alt: &UdpSocket, dur: Duration) -> RawFlap {
+    let mut res = RawFlap { flips: 0, bytes_out: [0; 2], bytes_in: [0; 2], closed: Close::None };
+    let Some(local) = self.levels[ONE_RTT].as_ref().map(|lvl| &lvl.local) else {
+      return res;
+    };
+    let begin = Instant::now();
+    let mut buf = [0u8; 2048];
+    let mut fc = 1u64 << 20;
+    while begin.elapsed() < dur && matches!(res.closed, Close::None) {
+      let idx = (res.flips % 2) as usize;
+      let pn = self.pn_1rtt;
+      self.pn_1rtt = self.pn_1rtt.wrapping_add(1);
+      fc = fc.wrapping_add(1);
+      let packet = build_short(&self.dcid, pn, local, &frames::max_data(fc));
+      let sock = if idx == 0 { &self.sock } else { alt };
+      if sock.send(&packet).await.is_ok() {
+        res.bytes_out[idx] = res.bytes_out[idx].wrapping_add(packet.len() as u64);
+      }
+      res.flips = res.flips.wrapping_add(1);
+      // Drain both sockets without blocking the flap rate.
+      for (j, s) in [(0usize, &self.sock), (1usize, alt)] {
+        while let Ok(len) = s.try_recv(&mut buf) {
+          res.bytes_in[j] = res.bytes_in[j].wrapping_add(len as u64);
+          let datagram = buf[..len].to_vec();
+          for (_space, frames, _pn) in self.decode_datagram(&datagram) {
+            if let Some((app, code)) = scan_close(&frames) {
+              res.closed = if app { Close::App(code) } else { Close::Transport(code) };
+            }
+          }
+        }
+      }
+      tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    res
   }
 }
 
@@ -789,7 +908,7 @@ mod tests {
   #[ignore = "needs a running soak-server-h3 on 127.0.0.1:8443"]
   async fn smoke_all_floods() {
     let target = "127.0.0.1:8443".parse().unwrap();
-    let results = crate::quic::scenario::onertt_floods(target, None).await;
+    let results = crate::quic::scenario::onertt_floods(target).await;
     let mut failed = Vec::new();
     for r in &results {
       eprintln!("{} pass={} — {}", r.name, r.pass, r.detail);

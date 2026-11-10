@@ -75,9 +75,10 @@ pub fn client_config(keep_alive: Option<Duration>, idle: Duration) -> ClientConf
   cfg
 }
 
-/// Like [`client_config`] but with the connection and per-stream receive windows forced to
-/// `window` bytes (0 for the credit-starved `window_starved` scenario, so the server may send no
-/// STREAM data and must close on idle). `idle` is kept short so the idle close is quick.
+/// Like [`client_config`] but with every per-stream receive window (bidirectional and
+/// unidirectional alike — quinn's `stream_receive_window` sets both) forced to `window` bytes, 0 for
+/// the `window_starved` scenario; the connection window keeps its default. `idle` is quinn's own
+/// idle timeout (`window_starved` sets it far above the server's so the close is the server's).
 pub fn client_config_windows(idle: Duration, window: u64) -> ClientConfig {
   let provider = Arc::new(rustls::crypto::ring::default_provider());
   let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
@@ -91,9 +92,9 @@ pub fn client_config_windows(idle: Duration, window: u64) -> ClientConfig {
   let mut cfg = ClientConfig::new(Arc::new(qcc));
   let mut transport = TransportConfig::default();
   transport.max_idle_timeout(Some(idle.try_into().expect("idle")));
-  // Only the per-stream window is starved; the connection window stays at its default so the
-  // server's own (mandatory) control and QPACK uni streams can still be sent, and the request
-  // stream alone is the one that gets no data — the server then closes on idle.
+  // Every per-stream window, uni streams included, is starved: the server can open its control and
+  // QPACK uni streams but send them no data, and the request stream gets none either. The client's
+  // own control stream is unaffected (it is the server's receive window that governs it).
   transport.stream_receive_window(VarInt::from_u64(window).unwrap_or(VarInt::from_u32(0)));
   cfg.transport_config(Arc::new(transport));
   cfg
