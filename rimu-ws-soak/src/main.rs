@@ -29,6 +29,42 @@ enum Cmd {
   Run(RunArgs),
   /// Reruns one scenario run by its replay id and prints its record and transcript.
   Replay(ReplayArgs),
+  /// Soaks an HTTP/3 server: a steady client plus the abusive QUIC/HTTP/3 clients (task 23).
+  H3(H3Args),
+}
+
+#[derive(clap::Args)]
+struct H3Args {
+  /// The multi-worker h3 server, as `https://127.0.0.1:8443`.
+  #[arg(long, default_value = "https://127.0.0.1:8443")]
+  url: String,
+  /// The server's pid, for the monitor.
+  #[arg(long)]
+  pid: Option<u32>,
+  /// A one-worker h3 server for the per-worker caps (idle × 4,096), as `https://127.0.0.1:8444`.
+  #[arg(long)]
+  idle_url: Option<String>,
+  /// The one-worker server's pid.
+  #[arg(long)]
+  idle_pid: Option<u32>,
+  /// The whole run (steady plus abusers).
+  #[arg(long, default_value = "600s", value_parser = parse_duration)]
+  duration: Duration,
+  /// Probe-only time at the start that sets the RSS plateau.
+  #[arg(long, default_value = "30s", value_parser = parse_duration)]
+  warmup: Duration,
+  /// Steady connections.
+  #[arg(long, default_value_t = 64)]
+  conns: u32,
+  /// Streams per steady connection.
+  #[arg(long, default_value_t = 64)]
+  streams: u32,
+  /// The multi-worker server's worker count, for the report.
+  #[arg(long, default_value_t = 4)]
+  workers: u32,
+  /// JSONL output; defaults to /mnt/nvme1tb/claude-tmp/soak/h3-soak.jsonl.
+  #[arg(long)]
+  out: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -241,6 +277,7 @@ fn main() -> ExitCode {
   let rslt = match cli.cmd {
     Cmd::Run(args) => runtime.block_on(run(args)),
     Cmd::Replay(args) => runtime.block_on(replay_one(args)),
+    Cmd::H3(args) => runtime.block_on(run_h3(args)),
   };
   rslt.unwrap_or_else(|err| {
     eprintln!("error: {err}");
@@ -334,4 +371,55 @@ async fn replay_one(args: ReplayArgs) -> Result<ExitCode, String> {
     println!("{transcript}");
   }
   Ok(ExitCode::from(u8::from(record.outcome != "pass")))
+}
+
+/// Parses an `https://host:port` URL to a socket address (the h3 soak speaks HTTPS only).
+fn parse_h3_url(url: &str) -> Result<SocketAddr, String> {
+  let rest = url.strip_prefix("https://").ok_or("only https:// URLs are supported")?;
+  let authority = rest.split('/').next().unwrap_or(rest);
+  authority
+    .to_socket_addrs()
+    .map_err(|err| format!("{authority}: {err}"))?
+    .next()
+    .ok_or_else(|| format!("{authority} resolves to nothing"))
+}
+
+/// The soft `RLIMIT_MEMLOCK` in KiB, or `None` when it is unlimited (ruling T23-d).
+fn memlock_kib() -> Option<u64> {
+  let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+  // SAFETY: valid out pointer
+  if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut lim) } != 0 {
+    return None;
+  }
+  if lim.rlim_cur == libc::RLIM_INFINITY { None } else { Some(lim.rlim_cur / 1024) }
+}
+
+async fn run_h3(args: H3Args) -> Result<ExitCode, String> {
+  let main_addr = parse_h3_url(&args.url)?;
+  let idle_addr = args.idle_url.as_deref().map(parse_h3_url).transpose()?;
+  let out_path = args.out.unwrap_or_else(|| "/mnt/nvme1tb/claude-tmp/soak/h3-soak.jsonl".into());
+  if let Some(dir) = out_path.parent() {
+    std::fs::create_dir_all(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+  }
+  let mut out = std::io::BufWriter::new(
+    std::fs::File::create(&out_path).map_err(|err| format!("{}: {err}", out_path.display()))?,
+  );
+  let cfg = rimu_ws_soak::quic::driver::H3Config {
+    main_addr,
+    main_pid: args.pid,
+    idle_addr,
+    idle_pid: args.idle_pid,
+    duration: args.duration,
+    warmup: args.warmup,
+    conns: args.conns,
+    streams: args.streams,
+    out: out_path.clone(),
+    main_workers: args.workers,
+    memlock_kib: memlock_kib(),
+  };
+  let fails = rimu_ws_soak::quic::driver::run(cfg, &mut out).await;
+  use std::io::Write as _;
+  out.flush().map_err(|err| format!("{}: {err}", out_path.display()))?;
+  eprintln!("h3 soak: {fails} failures; {}", out_path.display());
+  Ok(ExitCode::from(if fails > 0 { 1 } else { 0 }))
 }

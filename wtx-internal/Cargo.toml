@@ -93,6 +93,11 @@ name = "soak-server-uring"
 path = "src/bin/soak-server-uring.rs"
 required-features = ["soak-server-uring"]
 
+[[bin]]
+name = "soak-server-h3"
+path = "src/bin/soak-server-h3.rs"
+required-features = ["soak-server-h3"]
+
 [dependencies]
 serde = { default-features = false, optional = true, version = "1.0" }
 serde_json = { default-features = false, features = ["alloc"], optional = true, version = "1.0" }
@@ -118,6 +123,7 @@ autobahn-server-uring = ["rimu-ws/crypto-ring", "rimu-ws/io-uring", "rimu-ws/web
 soak-server-tokio = ["tokio", "rimu-ws/crypto-ring", "rimu-ws/tokio", "rimu-ws/web-socket-server-framework", "rimu-ws/zlib-rs"]
 soak-server-h2 = ["rimu-ws/crypto-ring", "rimu-ws/http2-server-framework", "rimu-ws/io-uring", "rimu-ws/macros"]
 soak-server-uring = ["rimu-ws/crypto-ring", "rimu-ws/io-uring", "rimu-ws/web-socket-server-framework", "rimu-ws/zlib-rs"]
+soak-server-h3 = ["rimu-ws/crypto-ring", "rimu-ws/http3-server-framework", "rimu-ws/io-uring", "rimu-ws/macros"]
 boringssl = ["tokio", "rimu-ws/tls", "rimu-ws/tokio", "rimu-ws/_tracing-tree", "rimu-ws/x509"]
 boringssl-config = ["serde/derive", "serde_json/std", "rimu-ws/hashbrown", "rimu-ws/serde"]
 ccadb = ["tokio", "rimu-ws/ccadb", "rimu-ws/hashbrown", "rimu-ws/http2-client-pool", "rimu-ws/http2", "rimu-ws/tokio"]

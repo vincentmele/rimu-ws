@@ -12,6 +12,7 @@ pub mod fdflood;
 pub mod h2codec;
 pub mod monitor;
 pub mod probe;
+pub mod quic;
 pub mod rng;
 pub mod runner;
 pub mod scenario;

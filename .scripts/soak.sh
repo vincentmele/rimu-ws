@@ -29,11 +29,72 @@ cd "$(dirname "$0")/.."
 
 mode=soak
 case "${1:-}" in
-soak | long | fd-plain | fd-direct)
+soak | long | fd-plain | fd-direct | h3)
 	mode=$1
 	shift
 	;;
 esac
+
+# The HTTP/3 soak (task 23): a steady client plus the abusive QUIC/HTTP/3 clients, about ten
+# minutes total. Two servers of its own (not the ws/h2 soak-server): a four-worker one for the
+# steady client and most abusers, and a one-worker one for the per-worker caps (idle x 4,096,
+# ruling T23-f). Each is `soak-server-h3` on UDP, dual-stack, with the library's default QUIC/H3
+# limits. Environment: CERT_DIR (default arena-main's certs), DURATION (default 600s),
+# SOAK_H3_CPUS (default 0-3), SOAK_H3_IDLE_CPU (default 4).
+if [[ $mode == h3 ]]; then
+	cert_dir=${CERT_DIR:-/mnt/nvme1tb/claude-tmp/arena-main/certs}
+	duration=${DURATION:-600s}
+	cpus=${SOAK_H3_CPUS:-0-3}
+	idle_cpu=${SOAK_H3_IDLE_CPU:-4}
+	main_port=8443
+	idle_port=8444
+	if [[ ! -r $cert_dir/server.crt || ! -r $cert_dir/server.key ]]; then
+		echo "no server.crt/server.key in $cert_dir (set CERT_DIR)" >&2
+		exit 3
+	fi
+	for p in $main_port $idle_port; do
+		if ss -lun "sport = :$p" | grep -q ":$p"; then
+			echo "UDP port $p is busy" >&2
+			exit 1
+		fi
+	done
+	cargo build -q --release -p rimu-ws-internal --bin soak-server-h3 --features soak-server-h3
+	cargo build -q --release -p rimu-ws-soak
+	mkdir -p /mnt/nvme1tb/claude-tmp/soak
+	rel=${CARGO_TARGET_DIR:-./target}/release
+	srv=$rel/soak-server-h3
+	# MALLOC_MMAP_THRESHOLD_ stops glibc from keeping memory it freed (which would read as RSS
+	# growth), as the ws/h2 soak server runs; SOAK_MALLOC=0 leaves malloc alone.
+	malloc_env=()
+	if [[ ${SOAK_MALLOC:-1} != 0 ]]; then
+		malloc_env+=(MALLOC_MMAP_THRESHOLD_=262144)
+	fi
+	env "${malloc_env[@]}" SOAK_H3_ADDR="[::]:$main_port" SOAK_STATIC_DIR=/mnt/nvme1tb/claude-tmp/soak/h3-static \
+		CERT_DIR="$cert_dir" taskset -c "$cpus" "$srv" &
+	main_pid=$!
+	env "${malloc_env[@]}" SOAK_H3_ADDR="[::]:$idle_port" SOAK_STATIC_DIR=/mnt/nvme1tb/claude-tmp/soak/h3-static-idle \
+		CERT_DIR="$cert_dir" taskset -c "$idle_cpu" "$srv" &
+	idle_pid=$!
+	# The servers must not outlive the script.
+	trap 'kill "$main_pid" "$idle_pid" 2>/dev/null; wait 2>/dev/null' EXIT
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+	for p in $main_port $idle_port; do
+		for _ in $(seq 100); do
+			ss -lun "sport = :$p" | grep -q ":$p" && break
+			kill -0 "$main_pid" 2>/dev/null || { echo "a server exited early" >&2; exit 5; }
+			sleep 0.1
+		done
+	done
+	sleep 0.5
+	set +e
+	"$rel/rimu-ws-soak" h3 \
+		--url "https://127.0.0.1:$main_port" --pid "$main_pid" \
+		--idle-url "https://127.0.0.1:$idle_port" --idle-pid "$idle_pid" \
+		--duration "$duration" "$@"
+	rc=$?
+	exit $rc
+fi
 
 server_name=${SOAK_SERVER:-uring}
 case $server_name in
