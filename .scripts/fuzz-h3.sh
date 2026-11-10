@@ -6,7 +6,7 @@
 #
 #   fuzz-h3.sh [SECONDS [TARGET...]]
 #
-# Targets (default: all): quic_packet quic_frame quic_transport_params qpack_decoder quic_conn h3_conn.
+# Targets (default: all): quic_packet quic_frame quic_transport_params qpack_decoder quic_conn h3_conn quic_endpoint.
 # quic_conn and h3_conn also cap the heap of an input at 128 MiB (wtx-fuzz/lib/cap_alloc.rs).
 #
 # Only one cargo process may run at a time: this script runs the targets one after the other.
@@ -16,7 +16,7 @@ set -euo pipefail
 seconds=${1:-1800}
 shift || true
 targets=("$@")
-[ ${#targets[@]} -gt 0 ] || targets=(quic_packet quic_frame quic_transport_params qpack_decoder quic_conn h3_conn)
+[ ${#targets[@]} -gt 0 ] || targets=(quic_packet quic_frame quic_transport_params qpack_decoder quic_conn h3_conn quic_endpoint)
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/mnt/nvme1tb/claude-tmp/target-fuzz}
 
 for target in "${targets[@]}"; do

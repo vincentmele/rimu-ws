@@ -601,6 +601,27 @@ mod tests {
     );
   }
 
+  // The input that stopped the first run of the target: the datagrams of an Initial packet of one
+  // flow repeated from other addresses counted for the limit of the first address, which was sent
+  // 3,693 bytes for 1,200 (RFC 9000 section 8.1).
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn datagrams_repeated_from_other_addresses_do_not_raise_the_limit() {
+    let hex = concat!(
+      "0601bcc5cee99605000076000000020202020101ffffb66a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a696969696969",
+      "696969696969696969696969696969296969696969696969696969696969696969696969696969696969696969696969",
+      "6969696969696969696969696a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a",
+      "6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6969696a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6ab6b6b6b6",
+      "b6b6b6b6b6b6b6b6b6b6b6000c030003000000b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6",
+      "b6b6b6b6b6b6b6b6b6b6b72fb6b6b6b6b6b6bfb6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b637b6b6",
+      "b6b6b6b6b4b6b6ffff00000c000f0300000f0300000f0100000f0200007e",
+    );
+    let data: Vec<u8> = (0..hex.len() / 2)
+      .map(|idx| u8::from_str_radix(&hex[idx * 2..idx * 2 + 2], 16).unwrap())
+      .collect();
+    run(&data);
+  }
+
   // Rule: whatever the script is, the endpoints hold the rules of the module.
   #[cfg_attr(miri, ignore)]
   #[test]

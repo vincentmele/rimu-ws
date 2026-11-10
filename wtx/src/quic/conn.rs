@@ -829,10 +829,13 @@ where
     app: &mut A,
     pools: &mut QuicPools,
   ) -> crate::Result<()> {
-    // Connection migration and path validation are the endpoint's
-    let _meta = meta;
+    // Connection migration and path validation are the endpoint's. What the server may send to
+    // an address that is not validated is a multiple of what that address sent (RFC 9000
+    // section 8.1): the bytes that come from another address do not count
+    let from_peer = IS_CLIENT || (meta.peer.ip() == self.peer.ip() && meta.peer.port() == self.peer.port());
     let datagram_len = datagram.len();
     let len = u64::try_from(datagram_len).unwrap_or(u64::MAX);
+    let counted = if from_peer { len } else { 0 };
     self.count(|el| {
       el.datagrams_in = el.datagrams_in.wrapping_add(1);
       el.bytes_in = el.bytes_in.wrapping_add(len);
@@ -841,13 +844,13 @@ where
       ConnState::Handshake | ConnState::Confirmed => {}
       ConnState::Closing => {
         // What the amplification limit lets the CONNECTION_CLOSE in reply be
-        self.bytes_received = self.bytes_received.saturating_add(len);
+        self.bytes_received = self.bytes_received.saturating_add(counted);
         self.on_datagram_while_closing();
         return Ok(());
       }
       ConnState::Draining | ConnState::Closed => return Ok(()),
     }
-    self.bytes_received = self.bytes_received.saturating_add(len);
+    self.bytes_received = self.bytes_received.saturating_add(counted);
     if !IS_CLIENT && !self.address_validated {
       // More room under the amplification limit, which may let the timer be armed
       self.recovery.timer_stale = true;
@@ -4502,6 +4505,27 @@ mod tests {
     assert_eq!(ack.len(), 1);
     assert_eq!(packet_types(&ack[0]), [PacketTy::Initial]);
     assert!(ack[0].len() < 100, "{}", ack[0].len());
+  }
+
+  // Rule (RFC 9000 section 8.1; found by the fuzz target `quic_endpoint`): a server sends at most
+  // three times what it received from the address of the client, so the bytes of datagrams from
+  // another address (a packet of the same connection that an attacker sends from its own address)
+  // do not raise the limit on what goes to the first address.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn datagrams_from_another_address_do_not_raise_the_amplification_budget() {
+    let mut link = Link::new(&LinkOpts::new(None));
+    let _ = link.server.flush(link.now_us);
+    let _ = link.server.take_datagrams();
+    let other = core::net::SocketAddr::new(core::net::IpAddr::V4(core::net::Ipv4Addr::new(192, 0, 2, 9)), 40_000);
+    let before = link.server.conn.bytes_received;
+    let mut ping = client_packet(&mut link, Space::Initial, None, 0, &initial_ping(1200));
+    let len = ping.len() as u64;
+    let mut again = ping.clone();
+    link.server.recv(link.now_us, &mut ping, other);
+    assert_eq!(link.server.conn.bytes_received, before);
+    link.server.recv(link.now_us, &mut again, CLIENT_ADDR);
+    assert_eq!(link.server.conn.bytes_received, before + len);
   }
 
   // Rule: a server drops an Initial packet of a datagram below 1200 bytes (RFC 9000 section 14.1).
