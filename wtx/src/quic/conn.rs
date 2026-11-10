@@ -3511,6 +3511,10 @@ fn write_header(
   Some((w.pos(), pn_offset, length_at))
 }
 
+#[cfg(any(test, feature = "_fuzz-conn"))]
+#[doc(hidden)]
+pub mod check;
+
 #[cfg(test)]
 mod tests {
   use crate::{

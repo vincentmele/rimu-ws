@@ -31,12 +31,24 @@ name = "qpack_decoder"
 path = "qpack_decoder.rs"
 
 [[bin]]
+name = "h3_conn"
+path = "h3_conn.rs"
+
+[[bin]]
+name = "quic_conn"
+path = "quic_conn.rs"
+
+[[bin]]
 name = "quic_frame"
 path = "quic_frame.rs"
 
 [[bin]]
 name = "quic_packet"
 path = "quic_packet.rs"
+
+[[bin]]
+name = "quic_transport_params"
+path = "quic_transport_params.rs"
 
 [[bin]]
 name = "tls"
@@ -64,7 +76,7 @@ path = "x509.rs"
 
 [dependencies]
 libfuzzer-sys = { version = "0.4" }
-rimu-ws = { default-features = false, features = ["_fuzz", "arbitrary", "asn1", "crypto-ring", "http-cookie", "http2", "http3", "quic", "std", "web-socket", "x509"], path = "../wtx" }
+rimu-ws = { default-features = false, features = ["_fuzz-conn", "arbitrary", "asn1", "crypto-ring", "http-cookie", "http2", "http3", "quic", "std", "web-socket", "x509"], path = "../wtx" }
 
 [package]
 edition = "2024"

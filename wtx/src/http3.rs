@@ -29,6 +29,9 @@ pub mod loopback_client;
   allow(dead_code, reason = "only the HTTP/3 server framework runs the connection layer")
 )]
 mod qpack;
+#[cfg(any(test, feature = "_fuzz-conn"))]
+#[doc(hidden)]
+pub mod h3_check;
 #[cfg(any(test, feature = "_fuzz"))]
 #[doc(hidden)]
 pub mod qpack_check;

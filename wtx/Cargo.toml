@@ -186,6 +186,8 @@ zlib-rs = ["dep:zlib-rs", "zlib-rs?/rust-allocator"]
 
 _bench = []
 _fuzz = ["web-socket"]
+# Test-only, not a public API: the connection fuzz targets and their test client
+_fuzz-conn = ["_fuzz", "_h3-loopback-client", "quic"]
 # Test-only, not a public API: the HTTP/3 client of `http3::loopback_client`, for the in-process
 # tests of binaries (wtx-internal enables it through its dev-dependencies only)
 _h3-loopback-client = ["http3", "std"]

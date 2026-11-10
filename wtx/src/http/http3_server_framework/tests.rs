@@ -1227,6 +1227,23 @@ fn workers_are_pinned_physical_cores_first() {
   .unwrap();
 }
 
+// Rule (spec section 5.2, Miri): the unsafe calls of the CPU affinity module run in the
+// interpreter: the CPUs of the process come in increasing order, a thread pinned to one of them
+// sees that one only, and a CPU that the set cannot hold is refused.
+#[test]
+fn affinity_calls_are_sound() {
+  let allowed = affinity::allowed().unwrap();
+  assert!(!allowed.is_empty() && allowed.windows(2).all(|el| el[0] < el[1]));
+  let cpu = allowed[0];
+  std::thread::spawn(move || {
+    affinity::pin(cpu).unwrap();
+    assert_eq!(affinity::allowed().unwrap(), [cpu]);
+    assert!(affinity::pin(usize::MAX).is_err());
+  })
+  .join()
+  .unwrap();
+}
+
 // Fix X1: a worker that can not bind its socket ends the server with the error of the bind, never
 // with the error of a worker that stopped waiting for it.
 #[cfg_attr(miri, ignore)]
