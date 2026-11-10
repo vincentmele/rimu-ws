@@ -53,7 +53,9 @@ fi
 
 log=${TMPDIR:-/mnt/nvme1tb/claude-tmp}/h3spec-server.log
 server_pid=""
+container=h3spec-$$
 cleanup() {
+	docker rm -f "$container" >/dev/null 2>&1 || true
 	if [ -n "$server_pid" ]; then
 		kill "$server_pid" 2>/dev/null || true
 		for _ in $(seq 1 20); do
@@ -77,7 +79,9 @@ sleep 0.5
 
 # -n: the certificate of the arena is self-signed and h3spec has no option for a CA
 status=0
-out=$(docker run --rm --network host -v "$dir/h3spec:/h3spec:ro" "$image" \
+out=$(docker run --rm --name "$container" --network host --cap-drop ALL \
+	--security-opt no-new-privileges --pids-limit 256 --memory 1g --read-only \
+	-v "$dir/h3spec:/h3spec:ro" "$image" \
 	/h3spec -n -t "$timeout_ms" "$@" 127.0.0.1 "$port" 2>&1) || status=$?
 echo "$out"
 echo "h3spec: $(grep -E '^[0-9]+ examples?,' <<<"$out" || echo 'no summary')"
