@@ -52,20 +52,28 @@ use core::{
   net::{IpAddr, SocketAddr},
 };
 
+// The PATH_CHALLENGE frames of the validation of the current path whose answer is still taken:
+// the latest ones sent
+const CHALLENGES: usize = 4;
 // The shortest 1-RTT packet that carries a PATH_CHALLENGE or a PATH_RESPONSE: the first byte, a
 // CID of 20 bytes at most, a packet number of 4 bytes at most, the frame and the tag
-const OFF_PATH_MIN_LEN: usize = 1 + 20 + 4 + 9 + AEAD_TAG_LEN;
+const OFF_PATH_MIN_LEN: usize = 1 + 20 + 4 + PATH_FRAME_LEN + AEAD_TAG_LEN;
+/// A PATH_CHALLENGE or PATH_RESPONSE frame: its type and its data.
+pub(super) const PATH_FRAME_LEN: usize = 9;
 
 /// The paths of a connection of a server, in its seldom used state: the validation of the current
 /// path, the last validated one, the answer to a probe of another path. See the
 /// [module documentation](self).
 #[derive(Clone, Copy)]
 pub(crate) struct Paths {
-  // The data of the PATH_CHALLENGE that validates the current path, while that lasts
-  challenge: Option<[u8; 8]>,
-  // It went in a datagram of 1200 bytes at least (RFC 9000 section 8.2.1)
-  challenge_full: bool,
-  // It is to be sent, again if it was lost
+  // The PATH_CHALLENGE frames sent on the current path while its validation lasts, each with new
+  // data (RFC 9000 section 13.3), the answer to any of which validates the address: the latest
+  // `CHALLENGES` of them, in a ring
+  challenges: [Option<SentChallenge>; CHALLENGES],
+  // The slot of the latest one, and of the next one
+  challenge_last: usize,
+  challenge_next: usize,
+  // A PATH_CHALLENGE is to be sent on the current path, a new one if one was lost
   challenge_owed: bool,
   // When the validation is abandoned
   deadline_us: Option<u64>,
@@ -88,8 +96,9 @@ impl Paths {
   /// No path but the one of the handshake.
   pub(crate) const fn new() -> Self {
     Self {
-      challenge: None,
-      challenge_full: false,
+      challenges: [None; CHALLENGES],
+      challenge_last: 0,
+      challenge_next: 0,
       challenge_owed: false,
       deadline_us: None,
       last_valid: None,
@@ -101,24 +110,39 @@ impl Paths {
     }
   }
 
-  /// The PATH_CHALLENGE of the current path, if one is to be sent.
-  pub(super) const fn challenge_owed(&self) -> Option<[u8; 8]> {
-    if self.challenge_owed { self.challenge } else { None }
+  /// If a PATH_CHALLENGE is to be sent on the current path.
+  pub(super) const fn challenge_due(&self) -> bool {
+    self.challenge_owed
   }
 
-  /// The PATH_CHALLENGE was written into a packet.
-  pub(super) const fn on_challenge_written(&mut self) {
+  /// The data of the PATH_CHALLENGE that is written into a packet now: new, from the CSPRNG, and
+  /// outstanding from now on.
+  pub(super) fn take_challenge<RNG>(&mut self) -> crate::Result<[u8; 8]>
+  where
+    RNG: CryptoRng + CryptoSeedableRng,
+  {
+    let data = next_challenge::<RNG>(&mut self.seed)?;
+    let slot = self.challenge_next % CHALLENGES;
+    if let Some(elem) = self.challenges.get_mut(slot) {
+      *elem = Some(SentChallenge { data, full: false });
+    }
+    self.challenge_last = slot;
+    self.challenge_next = slot.wrapping_add(1) % CHALLENGES;
     self.challenge_owed = false;
+    Ok(data)
   }
 
-  /// The packet with the PATH_CHALLENGE went in a datagram of `len` bytes.
-  pub(super) const fn on_challenge_datagram(&mut self, len: usize) {
-    self.challenge_full |= len >= MIN_DATAGRAM_LEN;
+  /// The packet with the latest PATH_CHALLENGE went in a datagram of `len` bytes: its answer
+  /// validates the path MTU if that is 1200 bytes or more (RFC 9000 section 8.2.1).
+  pub(super) fn on_challenge_datagram(&mut self, len: usize) {
+    if let Some(Some(elem)) = self.challenges.get_mut(self.challenge_last) {
+      elem.full = len >= MIN_DATAGRAM_LEN;
+    }
   }
 
-  /// A packet with the PATH_CHALLENGE was lost: it is owed again while the validation lasts.
+  /// A packet with a PATH_CHALLENGE was lost: a new one is owed while the validation lasts.
   pub(super) const fn on_challenge_lost(&mut self) {
-    if self.challenge.is_some() {
+    if self.deadline_us.is_some() {
       self.challenge_owed = true;
     }
   }
@@ -141,10 +165,21 @@ impl Paths {
 
   // The validation of the current path is over, or abandoned.
   const fn end_validation(&mut self) {
-    self.challenge = None;
-    self.challenge_full = false;
+    self.challenges = [None; CHALLENGES];
     self.challenge_owed = false;
     self.deadline_us = None;
+  }
+
+  // The validation of the current path starts, or its second stage, until `deadline_us`.
+  const fn start_validation(&mut self, deadline_us: u64) {
+    self.challenge_owed = true;
+    self.deadline_us = Some(deadline_us);
+  }
+
+  // If `data` is that of an outstanding challenge of the current path: whether that one went in
+  // 1200 bytes.
+  fn answered(&self, data: [u8; 8]) -> Option<bool> {
+    self.challenges.iter().flatten().find(|el| el.data == data).map(|el| el.full)
   }
 }
 
@@ -159,6 +194,14 @@ impl Debug for Paths {
   }
 }
 
+// A PATH_CHALLENGE sent on the current path.
+#[derive(Clone, Copy, Debug)]
+struct SentChallenge {
+  data: [u8; 8],
+  // In a datagram of 1200 bytes or more
+  full: bool,
+}
+
 // A PATH_CHALLENGE for an address that is not the one of the current path.
 #[derive(Clone, Copy, Debug)]
 struct Challenge {
@@ -167,13 +210,15 @@ struct Challenge {
   peer: SocketAddr,
 }
 
-// Another address that sent a PATH_CHALLENGE: what came from it and what went to it.
+// Another address that sent a PATH_CHALLENGE, a probe or the path that the connection left: what
+// came from it and what went to it, unless it is validated.
 #[derive(Clone, Copy, Debug)]
 struct Probe {
   local: Option<IpAddr>,
   peer: SocketAddr,
   received: u64,
   sent: u64,
+  validated: bool,
 }
 
 // A validated path and the state that the connection had on it.
@@ -251,7 +296,8 @@ where
     if let Some(probe) = paths.probe.as_mut().filter(|el| same_addr(&el.peer, &meta.peer)) {
       probe.received = probe.received.saturating_add(len);
     } else if rx.challenged {
-      paths.probe = Some(Probe { local: meta.local, peer: meta.peer, received: len, sent: 0 });
+      let (local, peer) = (meta.local, meta.peer);
+      paths.probe = Some(Probe { local, peer, received: len, sent: 0, validated: false });
     }
     Ok(())
   }
@@ -295,25 +341,27 @@ where
       return Ok(());
     };
     let paths = &mut cold.paths;
-    if paths.challenge != Some(data) {
+    let Some(full) = paths.answered(data) else {
       return Ok(());
-    }
-    if !self.address_validated {
+    };
+    let first = !self.address_validated;
+    if first {
       self.address_validated = true;
       // The amplification limit may have held the timer
       self.recovery.timer_stale = true;
     }
-    if paths.challenge_full {
+    if full {
       paths.end_validation();
       paths.last_valid = None;
       paths.reset = false;
       cold.stats.paths_validated = cold.stats.paths_validated.wrapping_add(1);
-    } else {
+    } else if first {
       // The address is validated but not the path MTU: a second validation, in 1200 bytes now
       // that no limit holds it (RFC 9000 section 8.2.1)
-      paths.challenge = Some(next_challenge::<RNG>(&mut paths.seed)?);
+      paths.start_validation(now_us.saturating_add(timeout));
+    } else if !paths.challenges.iter().flatten().any(|el| el.full) {
+      // Another small one answered, and none of 1200 bytes is outstanding
       paths.challenge_owed = true;
-      paths.deadline_us = Some(now_us.saturating_add(timeout));
     }
     Ok(())
   }
@@ -379,7 +427,11 @@ where
     }
     if self.path_response.is_some() && self.path_response_off {
       let probe = paths.probe.as_ref()?;
-      let allowed = probe.received.saturating_mul(3).saturating_sub(probe.sent);
+      let allowed = if probe.validated {
+        u64::MAX
+      } else {
+        probe.received.saturating_mul(3).saturating_sub(probe.sent)
+      };
       let size = usize::try_from(allowed).unwrap_or(usize::MAX).min(MIN_DATAGRAM_LEN);
       return Some((probe.peer, probe.local, size));
     }
@@ -428,8 +480,11 @@ where
     }
     if self.path_response.is_some() {
       if !self.path_response_off {
-        // It answers a challenge of the path that was left, where it would have to go
-        self.path_response = None;
+        // It answers a challenge of the path that is left, where it goes, as to a probe, within
+        // what the amplification limit of that path leaves (RFC 9000 section 8.2.2)
+        let (received, sent) = (self.bytes_received, self.bytes_sent);
+        paths.probe = Some(Probe { local, peer, received, sent, validated });
+        self.path_response_off = true;
       } else if rx.challenged || probe.is_some() {
         self.path_response_off = false;
       }
@@ -448,10 +503,8 @@ where
       }
       return Ok(());
     }
-    paths.challenge = Some(next_challenge::<RNG>(&mut paths.seed)?);
-    paths.challenge_full = false;
-    paths.challenge_owed = true;
-    paths.deadline_us = Some(now_us.saturating_add(timeout));
+    paths.end_validation();
+    paths.start_validation(now_us.saturating_add(timeout));
     if validated {
       // The path that is left is the last validated one, and it is challenged (RFC 9000 section
       // 9.3.3). A path that was not validated yet is abandoned, without a challenge: what it may
@@ -1044,5 +1097,171 @@ mod tests {
     let allocations = SERVER.load(Ordering::Relaxed) - before;
     assert_eq!(allocations, 0, "{allocations} allocations in three rebindings");
     assert_eq!(link.server.conn.stats().migrations, 9);
+  }
+
+  // The PATH_CHALLENGE and PATH_RESPONSE data of the datagrams of the server to `to`, which the
+  // client opens with its keys without taking them: (challenges, responses).
+  fn path_frames(
+    link: &Link,
+    out: &[(SocketAddr, Vec<u8>)],
+    to: SocketAddr,
+  ) -> (Vec<[u8; 8]>, Vec<[u8; 8]>) {
+    let (mut challenges, mut responses) = (Vec::new(), Vec::new());
+    let keys = link.client.conn.data.keys.as_ref().unwrap();
+    for (_, datagram) in out.iter().filter(|el| el.0 == to) {
+      let mut packet = datagram.clone();
+      let header = crate::quic::parse_header(&packet, 8).unwrap();
+      let pn_offset = header.pn_offset;
+      let largest = link.client.conn.data.recv.largest();
+      let (pn, pn_len, _) =
+        crate::quic::remove_header_protection(keys.remote.hp(), &mut packet, pn_offset, largest)
+          .unwrap();
+      let header_len = pn_offset + pn_len;
+      let payload = crate::quic::open_payload(
+        keys.remote.aead(),
+        keys.remote.iv(),
+        &mut packet,
+        header_len,
+        pn,
+      )
+      .unwrap();
+      for frame in crate::quic::FrameReader::new(payload, Space::Data) {
+        match frame.unwrap() {
+          crate::quic::Frame::PathChallenge(data) => challenges.push(data),
+          crate::quic::Frame::PathResponse(data) => responses.push(data),
+          _ => {}
+        }
+      }
+    }
+    (challenges, responses)
+  }
+
+  // A packet of the client of a PING padded to about 1200 bytes, from `from`: room for a challenge
+  // of 1200 bytes under the amplification limit.
+  fn padded_ping_from(link: &mut Link, from: SocketAddr) -> u64 {
+    let mut payload = vec![0; 1150];
+    payload[0] = 0x01;
+    let packet = client_packet(link, &payload);
+    to_server(link, packet, from)
+  }
+
+  // The client moved to MOVED, from which its first datagram is a small PING: the first challenge
+  // goes in a datagram that the amplification limit keeps below 1200 bytes. Returns its data.
+  fn rebound_with_a_small_challenge(link: &mut Link) -> [u8; 8] {
+    let _ = ping_from(link, MOVED);
+    assert_eq!(link.server.conn.peer, MOVED);
+    let _ = link.server.flush(link.now_us);
+    let out = link.server.take_datagrams_to();
+    assert!(out.iter().filter(|el| el.0 == MOVED).all(|el| el.1.len() < 1200));
+    let (challenges, _) = path_frames(link, &out, MOVED);
+    assert_eq!(challenges.len(), 1);
+    challenges[0]
+  }
+
+  // The challenge of the current path is declared lost and sent again, now in 1200 bytes, which a
+  // padded PING from the new address leaves room for. Returns its data.
+  fn challenge_sent_again(link: &mut Link) -> [u8; 8] {
+    let _ = padded_ping_from(link, MOVED);
+    link.server.conn.declare_in_flight_lost(&mut link.server.parts.pools);
+    let _ = link.server.flush(link.now_us);
+    let out = link.server.take_datagrams_to();
+    let (challenges, _) = path_frames(link, &out, MOVED);
+    assert_eq!(
+      challenges.len(),
+      1,
+      "{:?}",
+      out.iter().map(|el| (el.0, el.1.len())).collect::<Vec<_>>()
+    );
+    assert!(out.iter().any(|el| el.0 == MOVED && el.1.len() >= 1200));
+    challenges[0]
+  }
+
+  // The client answers `data` from MOVED.
+  fn respond(link: &mut Link, data: [u8; 8]) {
+    let mut payload = vec![0x1b];
+    payload.extend_from_slice(&data);
+    let packet = client_packet(link, &payload);
+    let _ = to_server(link, packet, MOVED);
+  }
+
+  // Rule (RFC 9000 section 13.3): a PATH_CHALLENGE that is sent again has a new payload.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn retransmitted_challenge_carries_new_data() {
+    let mut link = settled(&LinkOpts::new(None));
+    let first = rebound_with_a_small_challenge(&mut link);
+    let again = challenge_sent_again(&mut link);
+    assert_ne!(first, again);
+  }
+
+  // Rule (RFC 9000 sections 8.2.1 and 8.2.3): the answer to the challenge that went in a datagram
+  // below 1200 bytes validates the address, not the path MTU, even when a copy of that challenge
+  // went in 1200 bytes later: the validation goes on, with a challenge of 1200 bytes owed.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn response_to_the_small_challenge_does_not_validate_the_path_mtu() {
+    let mut link = settled(&LinkOpts::new(None));
+    let small = rebound_with_a_small_challenge(&mut link);
+    let _full = challenge_sent_again(&mut link);
+    respond(&mut link, small);
+    let conn = &link.server.conn;
+    assert!(conn.address_validated);
+    assert_eq!(conn.stats().paths_validated, 0);
+    assert!(conn.path_deadline().is_some());
+    assert!(conn.cold.as_deref().unwrap().paths.challenge_owed);
+  }
+
+  // Rule (RFC 9000 sections 8.2.3 and 13.3): the answer to any challenge that is still outstanding
+  // validates the address; the answer to the one of 1200 bytes validates the path MTU too.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn response_to_any_outstanding_challenge_validates_the_address() {
+    for answer_small in [true, false] {
+      let mut link = settled(&LinkOpts::new(None));
+      let small = rebound_with_a_small_challenge(&mut link);
+      let full = challenge_sent_again(&mut link);
+      respond(&mut link, if answer_small { small } else { full });
+      let conn = &link.server.conn;
+      assert!(conn.address_validated, "{answer_small}");
+      assert_eq!(conn.stats().paths_validated, u64::from(!answer_small));
+      assert_eq!(conn.path_deadline().is_none(), !answer_small);
+    }
+  }
+
+  // Rule (RFC 9000 section 8.2.2): a PATH_CHALLENGE that came on the path that the connection then
+  // leaves is still answered, on that path.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn pending_path_response_survives_a_migration() {
+    let mut link = settled(&LinkOpts::new(None));
+    let mut payload = vec![0x1a, 9, 8, 7, 6, 5, 4, 3, 2];
+    payload.resize(1100, 0);
+    let packet = client_packet(&mut link, &payload);
+    let _ = to_server(&mut link, packet, CLIENT_ADDR);
+    assert_eq!(link.server.conn.path_response, Some([9, 8, 7, 6, 5, 4, 3, 2]));
+    // The NAT rebinds before the server sends anything
+    let _ = ping_from(&mut link, MOVED);
+    assert_eq!(link.server.conn.peer, MOVED);
+    let _ = link.server.flush(link.now_us);
+    let out = link.server.take_datagrams_to();
+    let (_, to_old) = path_frames(&link, &out, CLIENT_ADDR);
+    let (_, to_new) = path_frames(&link, &out, MOVED);
+    assert_eq!(to_old, [[9, 8, 7, 6, 5, 4, 3, 2]]);
+    assert!(to_new.is_empty());
+    assert_eq!(link.server.conn.path_response, None);
+  }
+
+  // Spec section 5.4 (review finding 11): the size of a connection and of its seldom used state,
+  // which holds the paths, as this build lays them out (a test build: the production connection
+  // is smaller, see the const assert next to `SizeProbeApp`).
+  #[test]
+  fn connection_and_cold_state_sizes() {
+    use crate::quic::conn::{ConnCold, Paths, SizeProbeApp};
+    let conn =
+      size_of::<crate::quic::QuicConn<SizeProbeApp, crate::rng::ChaCha20, crate::tls::SkCtx>>();
+    let (cold, paths) = (size_of::<ConnCold>(), size_of::<Paths>());
+    std::eprintln!("sizes: QuicConn {conn} B, ConnCold {cold} B, of which Paths {paths} B");
+    assert!(conn <= 4096, "{conn}");
+    assert!(cold <= 1024, "{cold}");
   }
 }

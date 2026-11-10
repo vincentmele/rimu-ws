@@ -80,7 +80,7 @@ use core::{
   hint::cold_path,
   net::{IpAddr, Ipv4Addr, SocketAddr},
 };
-use path::{Paths, RxPath};
+use path::{PATH_FRAME_LEN, Paths, RxPath};
 
 /// The connection IDs of the peer that a connection stores, the `active_connection_id_limit`
 /// that it sends.
@@ -1661,7 +1661,7 @@ where
     let initial =
       self.space_wants_send(Space::Initial) && (IS_CLIENT || self.initial_elicits(true));
     let path = (self.path_response.is_some() && !self.path_response_off)
-      || self.cold.as_deref().is_some_and(|el| el.paths.challenge_owed().is_some());
+      || self.cold.as_deref().is_some_and(|el| el.paths.challenge_due());
     initial || (path && has_keys(Space::Data))
   }
 
@@ -2287,9 +2287,10 @@ where
       wants |= self.handshake_done_owed
         || (self.path_response.is_some() && !self.path_response_off)
         || self.streams.wants_send()
-        || self.cold.as_deref().is_some_and(|el| {
-          el.retire_next < el.retire_prior_to || el.paths.challenge_owed().is_some()
-        });
+        || self
+          .cold
+          .as_deref()
+          .is_some_and(|el| el.retire_next < el.retire_prior_to || el.paths.challenge_due());
       #[cfg(test)]
       {
         wants |= self.test_client.as_ref().is_some_and(|el| !el.frames.is_empty());
@@ -2602,13 +2603,14 @@ where
           full_datagram = true;
         }
         // The validation of a new path (RFC 9000 sections 8.2.1 and 9.3), in a datagram of 1200
-        // bytes if the amplification limit lets it be that large
+        // bytes if the amplification limit lets it be that large, with new data each time (RFC
+        // 9000 section 13.3)
         if let Some(cold) = self.cold.as_deref_mut()
-          && let Some(data) = cold.paths.challenge_owed()
-          && fw.write_frame(&Frame::PathChallenge(data))
+          && cold.paths.challenge_due()
+          && fw.remaining() >= PATH_FRAME_LEN
+          && fw.write_frame(&Frame::PathChallenge(cold.paths.take_challenge::<RNG>()?))
         {
           pools.frame_refs.push(&mut frames, FrameRef::PathChallenge)?;
-          cold.paths.on_challenge_written();
           cold.stats.path_challenges_out = cold.stats.path_challenges_out.wrapping_add(1);
           ack_eliciting = true;
           challenge = true;
@@ -2929,6 +2931,11 @@ where
   /// The address of the last validated path, while the current one is not validated.
   pub(crate) fn last_valid_peer(&self) -> Option<SocketAddr> {
     self.cold.as_deref().and_then(|el| el.paths.last_valid_peer())
+  }
+
+  /// The data of the latest PATH_CHALLENGE received, while its PATH_RESPONSE is owed.
+  pub(crate) const fn path_response_data(&self) -> Option<[u8; 8]> {
+    self.path_response
   }
 }
 

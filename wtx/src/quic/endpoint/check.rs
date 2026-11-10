@@ -13,10 +13,12 @@
 //! Whatever the script is, the endpoints must hold these:
 //!
 //! - they never panic;
-//! - before an address is validated (a Retry token of it came back, its handshake completed, or the
-//!   server validated the new address of a real client) the server sends it at most three times
-//!   the bytes it received from it (RFC 9000 sections 8.1 and 9.3.1), counted on the datagrams that
-//!   leave;
+//! - before an address is validated (a Retry token of it came back, its handshake completed, or a
+//!   real client got a PATH_CHALLENGE there) the server sends it at most three times the bytes it
+//!   received from it (RFC 9000 sections 8.1 and 9.3.1), counted on the datagrams that leave;
+//! - an address of a real client that the server holds as validated (the one of the path of its
+//!   connection, or the last validated one) is the first one of the client or one where the client
+//!   received a datagram of the handshake or a PATH_CHALLENGE, which the harness tracks on its own;
 //! - the handshakes under way and the connections stay within the limits, and the first never
 //!   exceed the second;
 //! - a CONNECTION_CLOSE that a connection owes has an error code of RFC 9000 section 20.1 or one
@@ -34,7 +36,11 @@ use crate::{
   sync::Arc,
   tls::{QuicTls, SkCtx, UnverifiedCtx},
 };
-use alloc::{collections::BTreeMap, vec, vec::Vec};
+use alloc::{
+  collections::{BTreeMap, BTreeSet},
+  vec,
+  vec::Vec,
+};
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const SERVER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8443);
@@ -89,6 +95,8 @@ struct RetryOf {
 struct Harness {
   // The addresses of the two real clients now
   client_addrs: [SocketAddr; 2],
+  // The addresses where a real client received a datagram of the handshake or a PATH_CHALLENGE
+  reachable: BTreeSet<SocketAddr>,
   clients: Vec<(u8, Client, FuzzApp)>,
   client_pools: crate::quic::pools::QuicPools,
   client_tx: TxArena,
@@ -198,6 +206,7 @@ impl Harness {
     }
     Self {
       client_addrs: [peer(0), peer(1)],
+      reachable: BTreeSet::new(),
       clients: Vec::new(),
       client_pools: crate::quic::pools::QuicPools::new(),
       client_tx: TxArena::new(64 * 1500).unwrap(),
@@ -300,9 +309,17 @@ impl Harness {
     let addrs = self.client_addrs;
     for (idx, client, app) in &mut self.clients {
       if addrs.get(usize::from(*idx)) == Some(&to) {
+        let handshake = client.state() == crate::quic::ConnState::Handshake;
+        let challenge = client.path_response_data();
         let meta = DatagramMeta { peer: SERVER_ADDR, local: None, segment_size: None };
         let _rslt =
           client.recv_datagram(now_us, datagram, meta, app, &mut self.client_pools);
+        // A datagram of the handshake, or a PATH_CHALLENGE, reached the client at `to`
+        let now = client.path_response_data();
+        // (a Retry included, which no packet counts)
+        if handshake || (now.is_some() && now != challenge) {
+          let _new = self.reachable.insert(to);
+        }
       }
     }
   }
@@ -333,6 +350,7 @@ impl Harness {
     }
     let now_us = self.now_us;
     let mut out = Vec::new();
+    let mut rebinding = None;
     for (idx, client, app) in &mut self.clients {
       if *idx != which {
         continue;
@@ -344,11 +362,9 @@ impl Harness {
           }
         });
       }
-      // A NAT rebinding now and then
-      if input.byte().is_multiple_of(8)
-        && let Some(addr) = self.client_addrs.get_mut(usize::from(which))
-      {
-        *addr = rebound(which, input.byte());
+      // A NAT rebinding now and then, when the client sends
+      if input.byte().is_multiple_of(8) {
+        rebinding = Some(rebound(which, input.byte()));
       }
       let _rslt = client.flush(now_us, &mut self.client_tx, app, &mut self.client_pools);
       loop {
@@ -365,26 +381,35 @@ impl Harness {
         self.client_tx.release(id);
       }
     }
+    if let Some(addr) = rebinding.filter(|_| !out.is_empty())
+      && let Some(elem) = self.client_addrs.get_mut(usize::from(which))
+    {
+      *elem = addr;
+    }
     let from = self.client_addrs.get(usize::from(which)).copied().unwrap_or_else(|| peer(which));
     for mut datagram in out {
-      // A real client completes its handshake: the address of it is validated, another one once
-      // the server validated it
+      // A real client completes its handshake: its first address is validated, another one is
+      // reachable once the client got a PATH_CHALLENGE there
       self.deliver(&mut datagram, from, from == peer(which));
-      self.note_validated();
+      self.check_validated();
     }
   }
 
-  // The addresses of the real clients that the server validated: that of the path of a connection
-  // if it is, and the last validated one while it is not.
-  fn note_validated(&mut self) {
-    for (_, client, _) in &self.clients {
+  // The addresses of a real client that the server holds as validated, that of the path of its
+  // connection and the last validated one, are its first one or ones where it was reached (RFC
+  // 9000 sections 8.1 and 8.2).
+  fn check_validated(&self) {
+    for (idx, client, _) in &self.clients {
       for (server, _, _) in &self.servers {
         let Some(conn) = server.conn(client.peer_cid().as_slice()) else {
           continue;
         };
         let current = conn.address_validated().then(|| conn.peer_addr());
         for addr in current.into_iter().chain(conn.last_valid_peer()) {
-          self.flows.entry(addr).or_default().validated = true;
+          assert!(
+            addr == peer(*idx) || self.reachable.contains(&addr),
+            "the server holds {addr} of client {idx} as validated"
+          );
         }
       }
     }
@@ -517,7 +542,7 @@ impl Harness {
   }
 
   fn check(&mut self) {
-    self.note_validated();
+    self.check_validated();
     for (server, _, _) in &self.servers {
       let stats = server.stats();
       assert!(stats.half_open <= stats.conns, "{stats:?}");
@@ -542,7 +567,9 @@ impl Harness {
     }
     for (addr, flow) in &self.flows {
       assert!(
-        flow.validated || flow.sent <= flow.received.saturating_mul(3),
+        flow.validated
+          || self.reachable.contains(addr)
+          || flow.sent <= flow.received.saturating_mul(3),
         "{} bytes sent to {addr} for {} received",
         flow.sent,
         flow.received
@@ -567,6 +594,16 @@ impl Harness {
       .filter(|el| el.1.state() == crate::quic::ConnState::Confirmed)
       .count();
     reach.confirmed = reach.confirmed.max(u32::try_from(confirmed).unwrap_or(0));
+    for (_, client, _) in &self.clients {
+      for (server, _, _) in &self.servers {
+        if let Some(conn) = server.conn(client.peer_cid().as_slice()) {
+          let stats = conn.stats();
+          reach.migrated |= stats.migrations > 0;
+          reach.path_validated |= stats.paths_validated > 0;
+          reach.path_reverted |= stats.path_validation_failures > 0;
+        }
+      }
+    }
   }
 
   fn finish(&mut self) {
@@ -593,6 +630,12 @@ pub fn run(data: &[u8]) {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Reach {
   pub(crate) confirmed: u32,
+  /// A server connection of a real client moved to another address of it.
+  pub(crate) migrated: bool,
+  /// It validated a new path, its MTU included.
+  pub(crate) path_validated: bool,
+  /// It abandoned the validation of a path and went back to the last validated one.
+  pub(crate) path_reverted: bool,
   pub(crate) peak_conns: u32,
   pub(crate) peak_half_open: u32,
   pub(crate) resets: u64,
@@ -620,8 +663,38 @@ pub(crate) fn run_reach(data: &[u8]) -> Reach {
 
 #[cfg(test)]
 mod tests {
-  use super::run;
+  use super::{Harness, Reach, peer, rebound, run};
+  use crate::quic::conn::check::Input;
   use alloc::vec::Vec;
+
+  // Review finding 6: a real client that a NAT moves to another IP address, with CID steering on,
+  // gets its connection to migrate and validate the new path, which the reach records.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn rebinding_real_client_reaches_migration_and_validation() {
+    // Seed, the three limits (Retry off), connections, steering on, balance on, the long timeout
+    let mut harness = Harness::new(&mut Input::new(&[1, 2, 2, 2, 2, 1, 0, 1]));
+    // Client 0, a request, no rebinding
+    for _ in 0..8 {
+      harness.client_step(&mut Input::new(&[0, 0, 1]));
+      harness.flush();
+    }
+    assert!(harness.clients.iter().any(|el| el.1.state() == crate::quic::ConnState::Confirmed));
+    // A request and a rebinding to another IP address
+    harness.client_step(&mut Input::new(&[0, 0, 0, 2]));
+    harness.flush();
+    for _ in 0..8 {
+      harness.client_step(&mut Input::new(&[0, 0, 1]));
+      harness.flush();
+    }
+    harness.check();
+    let mut reach = Reach::default();
+    harness.tally(&mut reach);
+    assert_eq!(harness.client_addrs[0], rebound(0, 2));
+    assert_ne!(rebound(0, 2), peer(0));
+    assert!(reach.migrated && reach.path_validated && !reach.path_reverted, "{reach:?}");
+    harness.finish();
+  }
 
   // What the scripts of the directory in `FUZZ_CORPUS` reach, by hand:
   // `FUZZ_CORPUS=wtx-fuzz/corpus/quic_endpoint cargo test ... -- --ignored corpus_reach`.
@@ -630,7 +703,7 @@ mod tests {
   fn corpus_reach() {
     let dir = std::env::var("FUZZ_CORPUS").unwrap();
     let (mut files, mut confirmed, mut retried, mut reset, mut refused_peak) = (0, 0, 0, 0, 0);
-    let mut peak = 0;
+    let (mut peak, mut migrated, mut validated, mut reverted) = (0, 0, 0, 0);
     for entry in std::fs::read_dir(dir).unwrap() {
       let reach = super::run_reach(&std::fs::read(entry.unwrap().path()).unwrap());
       files += 1;
@@ -639,9 +712,12 @@ mod tests {
       reset += u32::from(reach.resets > 0);
       refused_peak += u32::from(reach.peak_half_open > 2);
       peak = peak.max(reach.peak_conns);
+      migrated += u32::from(reach.migrated);
+      validated += u32::from(reach.path_validated);
+      reverted += u32::from(reach.path_reverted);
     }
     std::println!(
-      "{files} scripts: {confirmed} with a confirmed client, {retried} with a Retry, {reset} with a stateless reset, {refused_peak} with more than 2 half-open at once, {peak} connections at most"
+      "{files} scripts: {confirmed} with a confirmed client, {retried} with a Retry, {reset} with a stateless reset, {refused_peak} with more than 2 half-open at once, {peak} connections at most, {migrated} with a migration, {validated} with a new path validated, {reverted} with a path abandoned"
     );
   }
 

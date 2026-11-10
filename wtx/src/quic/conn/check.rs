@@ -14,8 +14,14 @@
 //! - it never panics;
 //! - it never sends more than three times the bytes it received before the address of the client
 //!   is validated (RFC 9000 section 8.1), on its current path, and to every address, counted on the
-//!   datagrams that leave until the server validated that address (sections 8.2.2, 9.3.1 and
-//!   21.1.1.2);
+//!   datagrams that leave until the address is validated (sections 8.2.2, 9.3.1 and 21.1.1.2);
+//! - an address that the server holds as validated (the one of its path, or the last validated
+//!   one) is one where the client received a datagram of the handshake or a PATH_CHALLENGE, which
+//!   the harness tracks on its own (sections 8.1 and 8.2);
+//! - if the script only did what a correct client does, a last non-probing packet of the client
+//!   from its address leaves the server on that address, validated, once both sides settled: a
+//!   client that answers the challenges is not left behind on a path it no longer has (section
+//!   9.3);
 //! - a CONNECTION_CLOSE of the transport that it owes has an error code of RFC 9000 section 20.1,
 //!   which includes the TLS alerts of RFC 9001 section 4.8;
 //! - the application is told once that the connection is established and once that it is closed;
@@ -259,6 +265,12 @@ pub(crate) struct Reach {
   pub(crate) answered: bool,
   /// The server received 1-RTT packets that carried a key update.
   pub(crate) key_update: bool,
+  /// The server moved to another address of the client (RFC 9000 section 9.3).
+  pub(crate) migrated: bool,
+  /// The server validated a new path, its MTU included.
+  pub(crate) path_validated: bool,
+  /// The server abandoned the validation of a path and went back to the last validated one.
+  pub(crate) path_reverted: bool,
 }
 
 /// A client and a server that exchange datagrams through their arenas, on a clock of their own.
@@ -271,8 +283,11 @@ where
   // The address of the client now
   client_addr: SocketAddr,
   c_pools: QuicPools,
-  // What the server and each address exchanged: (received, sent, validated)
-  flows: BTreeMap<SocketAddr, (u64, u64, bool)>,
+  // What the server and each address exchanged: (received, sent)
+  flows: BTreeMap<SocketAddr, (u64, u64)>,
+  // The addresses where the client received a datagram of the handshake or a PATH_CHALLENGE: those
+  // that the server can hold as validated
+  reachable: BTreeSet<SocketAddr>,
   c_tx: TxArena,
   hello: Vec<u8>,
   pub(crate) now_us: u64,
@@ -378,6 +393,7 @@ where
       client_addr: CLIENT_ADDR,
       c_pools,
       flows: BTreeMap::new(),
+      reachable: BTreeSet::new(),
       c_tx: TxArena::new(ARENA_BYTES).unwrap(),
       hello,
       now_us,
@@ -476,17 +492,19 @@ where
     let meta = DatagramMeta { peer: from, local: None, segment_size: None };
     let _rslt =
       self.server.recv_datagram(self.now_us, datagram, meta, &mut self.s_app, &mut self.s_pools);
-    self.note_validated();
+    self.check_validated();
   }
 
-  // The addresses that the server validated so far: that of its path if it is, and the last
-  // validated one while it is not.
-  fn note_validated(&mut self) {
+  // The addresses that the server holds as validated, that of its path and the last validated
+  // one, are ones where the client got what proves the address (RFC 9000 sections 8.1 and 8.2).
+  fn check_validated(&self) {
     let server = &self.server;
+    if !matches!(server.state(), ConnState::Handshake | ConnState::Confirmed | ConnState::Closing) {
+      return;
+    }
     let current = server.address_validated.then_some(server.peer);
-    let last = server.last_valid_peer();
-    for addr in current.into_iter().chain(last) {
-      self.flows.entry(addr).or_default().2 = true;
+    for addr in current.into_iter().chain(server.last_valid_peer()) {
+      assert!(self.reachable.contains(&addr), "the server holds {addr} as validated");
     }
   }
 
@@ -495,9 +513,16 @@ where
     if to != self.client_addr {
       return;
     }
+    let (handshake, challenge) =
+      (self.client.state() == ConnState::Handshake, self.client.path_response);
     let meta = DatagramMeta { peer: SERVER_ADDR, local: None, segment_size: None };
     let _rslt =
       self.client.recv_datagram(self.now_us, datagram, meta, &mut self.c_app, &mut self.c_pools);
+    // A datagram of the handshake, or a PATH_CHALLENGE, reached the client at `to`
+    let challenged = self.client.path_response.is_some() && self.client.path_response != challenge;
+    if handshake || challenged {
+      let _new = self.reachable.insert(to);
+    }
   }
 
   /// Moves the clock forward by `us` and runs what is due on both sides.
@@ -786,12 +811,15 @@ where
           self.to_server(&mut datagram);
         }
       }
-      // The same after a NAT rebinding of the client, which a correct client goes through
+      // The same after a NAT rebinding of the client, which a correct client goes through: a NAT
+      // makes a new mapping when the client sends
       1 => {
-        if let Some(addr) = CLIENT_ADDRS.get(usize::from(input.byte() % 4)) {
-          self.client_addr = *addr;
+        let addr = CLIENT_ADDRS.get(usize::from(input.byte() % 4)).copied();
+        let datagrams = self.flush_client();
+        if let Some(elem) = addr.filter(|_| !datagrams.is_empty()) {
+          self.client_addr = elem;
         }
-        for mut datagram in self.flush_client() {
+        for mut datagram in datagrams {
           self.to_server(&mut datagram);
         }
       }
@@ -935,6 +963,9 @@ where
     self.reach.confirmed |= server.state() == ConnState::Confirmed;
     self.reach.answered |= server.stats().datagrams_out > 0;
     self.reach.key_update |= server.key.remote_phase;
+    self.reach.migrated |= server.stats().migrations > 0;
+    self.reach.path_validated |= server.stats().paths_validated > 0;
+    self.reach.path_reverted |= server.stats().path_validation_failures > 0;
     if let Some(close) = self.server_close() {
       self.reach.close.get_or_insert(close);
     }
@@ -957,11 +988,12 @@ where
         server.bytes_received
       );
     }
-    // An address that the server validated takes anything from then on
-    self.note_validated();
-    for (addr, (received, sent, validated)) in &self.flows {
+    // An address that the client was reached at takes anything from then on: whether the server
+    // was allowed to take it as validated is the check above
+    self.check_validated();
+    for (addr, (received, sent)) in &self.flows {
       assert!(
-        *validated || *sent <= received.saturating_mul(3),
+        self.reachable.contains(addr) || *sent <= received.saturating_mul(3),
         "{sent} bytes sent to {addr} for {received} received"
       );
     }
@@ -984,6 +1016,46 @@ where
       self.check();
     }
     self.settle(MAX_ROUNDS);
+    self.check();
+    if !self.tainted {
+      self.check_liveness();
+    }
+  }
+
+  // Exchanges what both sides send, letting a millisecond pass between rounds for what the pacer
+  // holds, until the validation of the path of the server is over; at most `rounds` times. The
+  // clock stays far from the idle timeouts.
+  fn quiet(&mut self, rounds: usize) {
+    for _ in 0..rounds {
+      self.exchange(8);
+      self.check();
+      if self.server.path_deadline().is_none() && self.server.peer == self.client_addr {
+        return;
+      }
+      self.advance(1_000);
+    }
+  }
+
+  // A correct client that sends a non-probing packet from its address, the highest-numbered so
+  // far, and answers what comes, has the server on that address, validated, once both sides are
+  // quiet (RFC 9000 section 9.3), if both are still confirmed.
+  fn check_liveness(&mut self) {
+    if (self.client.state(), self.server.state()) != (ConnState::Confirmed, ConnState::Confirmed) {
+      return;
+    }
+    let dcid = self.client.peer_cid;
+    let scid = self.client.local_cid;
+    let Some(mut ping) = self.packet(Space::Data, (&dcid, &scid), &[], (0, 4), 0, (&[0x01], false))
+    else {
+      return;
+    };
+    self.to_server(&mut ping);
+    self.quiet(16);
+    if (self.client.state(), self.server.state()) == (ConnState::Confirmed, ConnState::Confirmed) {
+      let server = &self.server;
+      assert_eq!(server.peer, self.client_addr, "the server is left on another address");
+      assert!(server.address_validated, "the address of the client is not validated");
+    }
     self.check();
   }
 }
@@ -1021,8 +1093,63 @@ pub(crate) fn run_reach(data: &[u8]) -> (Reach, u64) {
 #[cfg(test)]
 mod tests {
   use super::{Duo, FuzzApp, Space, put_varint, run};
-  use crate::quic::ConnState;
+  use crate::quic::{ConnState, DatagramMeta};
   use alloc::vec::Vec;
+
+  // Review finding 6: a correct client that a NAT moves to another IP address gets the server to
+  // migrate and validate the new path, which the reach of the harness records, and the liveness
+  // check holds.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn rebinding_client_reaches_migration_and_validation() {
+    let mut duo = Duo::new(3, (0, 0), 0, FuzzApp::default());
+    duo.start();
+    duo.exchange(16);
+    assert_eq!(duo.server.state(), ConnState::Confirmed);
+    duo.client_addr = super::CLIENT_ADDRS[2];
+    let now_us = duo.now_us;
+    duo.with_client_ctx(now_us, |cx| {
+      let id = cx.open_bidi().unwrap();
+      cx.write(id, b"GET /", true).unwrap();
+    });
+    for mut datagram in duo.flush_client() {
+      duo.to_server(&mut datagram);
+    }
+    duo.quiet(16);
+    duo.check();
+    assert!(duo.reach.migrated && duo.reach.path_validated && !duo.reach.path_reverted);
+    assert_eq!(duo.server.peer, super::CLIENT_ADDRS[2]);
+    assert!(duo.reachable.contains(&super::CLIENT_ADDRS[2]));
+    duo.check_liveness();
+    duo.finish();
+  }
+
+  // Review finding 6: the oracle of the harness is its own: a server that held a new address as
+  // validated before the client was reached there breaks it.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  #[should_panic(expected = "as validated")]
+  fn address_held_validated_without_reaching_the_client_breaks_the_oracle() {
+    let mut duo = Duo::new(3, (0, 0), 0, FuzzApp::default());
+    duo.start();
+    duo.exchange(16);
+    duo.client_addr = super::CLIENT_ADDRS[2];
+    let now_us = duo.now_us;
+    duo.with_client_ctx(now_us, |cx| {
+      let id = cx.open_bidi().unwrap();
+      cx.write(id, b"GET /", true).unwrap();
+    });
+    let datagrams = duo.flush_client();
+    let meta = DatagramMeta { peer: super::CLIENT_ADDRS[2], local: None, segment_size: None };
+    for mut datagram in datagrams {
+      let _rslt =
+        duo.server.recv_datagram(duo.now_us, &mut datagram, meta, &mut duo.s_app, &mut duo.s_pools);
+    }
+    assert_eq!(duo.server.peer, super::CLIENT_ADDRS[2]);
+    // The bug: the new address taken as validated at once
+    duo.server.address_validated = true;
+    duo.check();
+  }
 
   // Rule: a client that is not tainted completes the handshake with the server.
   #[cfg_attr(miri, ignore)]
@@ -1092,6 +1219,15 @@ mod tests {
       }
       if reach.key_update {
         hit("peer key phase flipped".into());
+      }
+      if reach.migrated {
+        hit("server moved to another address".into());
+      }
+      if reach.path_validated {
+        hit("server validated a new path".into());
+      }
+      if reach.path_reverted {
+        hit("server went back to the last validated path".into());
       }
       if calls > 0 {
         hit("stream data reached the application".into());
