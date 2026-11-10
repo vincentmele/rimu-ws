@@ -320,9 +320,9 @@ fn pick(streams: &[StreamId], input: &mut Input<'_>) -> Option<StreamId> {
 
 /// What the client got on stream `id`: the types of the frames and the DATA, and whether the FIN
 /// came.
-fn response(duo: &Duo<Server>, id: StreamId) -> Option<(Vec<u64>, Vec<u8>, bool)> {
+fn response(duo: &Duo<Server>, id: StreamId) -> Option<(Vec<u64>, Vec<u8>, bool, Vec<u8>)> {
   let data = duo.c_app.streams.get(&id.0)?;
-  let mut rslt = (Vec::new(), Vec::new(), duo.c_app.fins.contains(&id.0));
+  let mut rslt = (Vec::new(), Vec::new(), duo.c_app.fins.contains(&id.0), Vec::new());
   let mut decoder = QpackDecoder::new(0, 0).unwrap();
   let mut scratch = VectorUsize::new();
   let mut rest = data.as_slice();
@@ -332,7 +332,16 @@ fn response(duo: &Duo<Server>, id: StreamId) -> Option<(Vec<u64>, Vec<u8>, bool)
     rslt.0.push(ty.code());
     match ty {
       H3FrameTy::Headers => {
-        let outcome = decoder.decode(id.0, payload, &mut scratch, &mut |_, _| Ok(())).ok()?;
+        let mut status = Vec::new();
+        let outcome = decoder
+          .decode(id.0, payload, &mut scratch, &mut |name, value| {
+            if name == b":status" {
+              status = value.to_vec();
+            }
+            Ok(())
+          })
+          .ok()?;
+        rslt.3 = status;
         assert_eq!(outcome, DecodeOutcome::Done { referenced_dynamic: false });
       }
       H3FrameTy::Data => rslt.1.extend_from_slice(payload),
@@ -370,10 +379,11 @@ fn drive(duo: &mut Duo<Server>, input: &mut Input<'_>, tight: bool) {
   if !plan.noisy && !duo.tainted {
     assert_ne!(duo.server.state(), ConnState::Closing, "the server closed on valid requests");
     for (id, big) in &plan.good {
-      let Some((frames, body, fin)) = response(duo, *id) else {
+      let Some((frames, body, fin, status)) = response(duo, *id) else {
         panic!("no answer to the valid request of stream {}", id.0);
       };
       let want = if *big { BIG } else { BODY };
+      assert_eq!(status, b"200", "stream {}", id.0);
       assert!(fin && frames.first() == Some(&1) && body == want, "{frames:?} {fin} {}", body.len());
     }
   }
@@ -431,8 +441,9 @@ mod tests {
     assert_eq!(duo.server.state(), ConnState::Confirmed);
     drive(&mut duo, &mut input, tight);
     // The first stream of the client
-    let (frames, body, fin) = response(&duo, crate::quic::StreamId(0)).unwrap();
+    let (frames, body, fin, status) = response(&duo, crate::quic::StreamId(0)).unwrap();
     assert_eq!((frames, body.as_slice(), fin), (alloc::vec![1, 0], BODY, true));
+    assert_eq!(status, b"200");
     duo.finish();
   }
 

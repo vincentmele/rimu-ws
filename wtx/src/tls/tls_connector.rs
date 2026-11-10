@@ -832,7 +832,6 @@ mod tests {
     tls::{
       Alpn, TlsConfig, TlsError,
       protocol::encrypted_extensions::EncryptedExtensions,
-      tls_cc::TlsCc,
       tls_cc_wrappers::TlsDecodeWrapper,
     },
   };
