@@ -430,6 +430,10 @@ where
   // Key updates of the 1-RTT keys
   key: KeyPhase,
   last_activity_us: u64,
+  // Ruling T23-m: the PING allowance the last validated path had, kept until the path after an IP
+  // change has its own RTT sample, so a legitimate client that rebinds is not closed for the PINGs
+  // it already sent this second. Zero before the first validated path.
+  ping_allowance_floor: u32,
   local: Option<IpAddr>,
   local_cid: Cid,
   max_datagram: usize,
@@ -1629,7 +1633,17 @@ where
     let per_rtt = 1_000_000u64 / self.recovery.rtt.smoothed_us.max(1);
     let scaled = u64::from(base).saturating_add(per_rtt.saturating_mul(2));
     let cap = u64::from(base.max(PING_ALLOWANCE_CAP));
-    u32::try_from(scaled.min(cap)).unwrap_or(u32::MAX)
+    let computed = u32::try_from(scaled.min(cap)).unwrap_or(u32::MAX);
+    // Ruling T23-m: an IP change resets the RTT estimate (RFC 9000 section 9.4), which would drop
+    // the allowance to the pre-sample base mid-window and close a legitimate client that already
+    // pinged within the old allowance. Until the new path has its own RTT sample, keep the floor
+    // set at the IP change (the last validated path's allowance). A same-path flooder never sets
+    // the floor, so it is still closed; a flooder that rebinds is still bounded by the floor.
+    if self.recovery.rtt.first_sample_us.is_none() {
+      computed.max(self.ping_allowance_floor)
+    } else {
+      computed
+    }
   }
 
   // A budget is spent: the application closes the connection with its excessive load code. The
@@ -2345,6 +2359,7 @@ where
       idle_restart_on_send: true,
       key: KeyPhase::new(),
       last_activity_us: now_us,
+      ping_allowance_floor: 0,
       local: meta.local,
       local_cid,
       max_datagram: INITIAL_MAX_DATAGRAM,
@@ -4492,6 +4507,52 @@ mod tests {
   #[test]
   fn ping_flood_with_a_tiny_rtt_is_capped() {
     assert_eq!(pings_until_closed(1, 64), (16_384, ConnState::Closing));
+  }
+
+  // Ruling T23-m: a legitimate client that has sent many PINGs this second at a short RTT and then
+  // changes its IP must not be closed. An IP change resets the RTT estimate (RFC 9000 section 9.4),
+  // which would otherwise drop the PING allowance to the pre-sample 70/s mid-window and close a
+  // client already past it. The allowance of the last validated path is kept until the new path has
+  // an RTT sample.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn a_legitimate_rebind_keeps_the_ping_allowance() {
+    let mut opts = LinkOpts::new(None);
+    // No path MTU probe from the client, whose PING the budget would count
+    opts.server.max_udp_payload_size = 1200;
+    let mut link = settled(&opts);
+    // A 1 ms smoothed RTT: the allowance is 64 + 2 * 1000 = 2,064 a second
+    link.server.conn.recovery.rtt.smoothed_us = 1_000;
+    assert_eq!(link.server.conn.ping_allowance(), 2_064);
+    // 200 PINGs this second, all within the allowance
+    for _ in 0..200 {
+      link.client.conn.queue_test_frames(&PING);
+      let _ = link.client.flush(link.now_us);
+      assert_eq!(link.deliver_to_server(), 1);
+      assert_eq!(link.server.conn.state(), ConnState::Confirmed);
+      let _ = link.server.flush(link.now_us);
+      let _ = link.server.take_datagrams();
+    }
+    // The client rebinds to a new IP (the IP change resets the RTT estimate) and keeps pinging in
+    // the same second, as quinn does in answer to the server's path challenge. Each PING after the
+    // rebind is checked against the allowance of the new, sample-less path.
+    let moved = core::net::SocketAddr::new(
+      core::net::IpAddr::V4(core::net::Ipv4Addr::new(127, 0, 0, 2)),
+      50_000,
+    );
+    for _ in 0..3 {
+      link.client.conn.queue_test_frames(&PING);
+      let _ = link.client.flush(link.now_us);
+      let mut datagram = link.client.take_datagrams().pop().unwrap();
+      link.server.recv(link.now_us, &mut datagram, moved);
+      let _ = link.server.flush(link.now_us);
+      let _ = link.server.take_datagrams();
+    }
+    assert_eq!(
+      link.server.conn.state(),
+      ConnState::Confirmed,
+      "a legitimate rebind within the allowance must not be closed"
+    );
   }
 
   // Ruling T21-g: the allowance follows the RTT between the two ends, and a base above the cap

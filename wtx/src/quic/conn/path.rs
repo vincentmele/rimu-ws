@@ -519,6 +519,9 @@ where
     let (received, sent) = probe.map_or((0, 0), |el| (el.received, el.sent));
     self.set_path(meta.peer, meta.local, false, (received.saturating_add(len), sent));
     if ip_changed {
+      // Ruling T23-m: keep the PING allowance the (now previous) validated path had until the new
+      // path has an RTT sample, computed before the RTT estimate is reset below.
+      self.ping_allowance_floor = self.ping_allowance();
       // RFC 9000 section 9.4
       self.retag_in_flight();
       self.recovery.cc = NewReno::new(INITIAL_MAX_DATAGRAM);
