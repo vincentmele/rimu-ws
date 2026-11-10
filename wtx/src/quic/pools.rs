@@ -10,7 +10,7 @@ use crate::quic::{
   conn::{ConnCold, HandshakeSpaces},
   key_phase::KeySlot,
   recv_tracker::RecvSpill,
-  sent::{FrameRef, FrameRefRange, SENT_RING_LEN, SentPacket},
+  sent::{FrameRef, FrameRefRange, SentPacket},
   stream::{OooBlock, RangeBlock, Seg, StreamSlots, StreamsCold},
   wipe,
 };
@@ -32,8 +32,12 @@ pub(crate) type TxBlock = [u8; TX_BLOCK_LEN];
 
 // References per chunk of the frame reference pool
 const CHUNK_REFS: usize = 8;
-// Chunks of the frame reference pool on top of those of its idle connections, for the packets in
-// flight: 2^15 of about 200 bytes
+// Chunks of the frame reference pool for each connection of a worker: an idle connection holds
+// none (its ACK-only packets keep no frame reference, task 23c), this is headroom for the records
+// that one keeps after it went idle
+const CONN_CHUNKS: usize = 2;
+// Chunks of the frame reference pool on top of those of its connections, for the packets in
+// flight: 2^15 of 200 bytes
 const FLIGHT_CHUNKS: usize = 1 << 15;
 /// The chunks that the frame reference pool makes room for at a time (about 100 KB), so that one
 /// chunk past those in use grows the pool by this much and not by as much again (`Vec` doubles).
@@ -104,7 +108,8 @@ impl QuicPools {
   }
 
   /// Empty pools of a worker of at most `max_conns` connections, which allocate nothing until
-  /// used: the cap of the stream slots follows the connections (spec section 5.4).
+  /// used: the caps of the stream slots and of the frame-reference chunks follow the connections
+  /// (spec section 5.4).
   pub(crate) const fn for_conns(max_conns: usize) -> Self {
     Self {
       conn_cold: FreeList::new(),
@@ -548,13 +553,12 @@ impl Chunk {
 }
 
 /// The chunks of the frame reference pool of a worker of at most `max_conns` connections (spec
-/// section 5.4): [`SENT_RING_LEN`] for each, because an idle connection keeps a chunk for each of
-/// its ACK-only packets until its sent ring wraps (a client that pings to keep the connection open
-/// acknowledges none of them while the server sends nothing else), and [`FLIGHT_CHUNKS`] for the
-/// packets in flight. They are made on demand, [`GROW_CHUNKS`] at a time, so a higher cap costs
-/// nothing until used.
+/// section 5.4): [`CONN_CHUNKS`] for each, and [`FLIGHT_CHUNKS`] for the packets in flight. An
+/// idle connection holds none, even one whose client pings to keep it open and never acknowledges
+/// the ACK-only packets that answer: those keep no frame reference (task 23c). They are made on
+/// demand, [`GROW_CHUNKS`] at a time, so a higher cap costs nothing until used.
 const fn max_chunks(max_conns: usize) -> usize {
-  max_conns.saturating_mul(SENT_RING_LEN).saturating_add(FLIGHT_CHUNKS)
+  max_conns.saturating_mul(CONN_CHUNKS).saturating_add(FLIGHT_CHUNKS)
 }
 
 #[inline(always)]

@@ -630,6 +630,7 @@ where
     }
     let packet = OpenPacket {
       ack_eliciting: true,
+      ack_only_largest: None,
       challenge: false,
       frames: FrameRefRange::EMPTY,
       full_datagram: false,

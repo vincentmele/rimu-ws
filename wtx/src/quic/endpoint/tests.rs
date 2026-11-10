@@ -4,7 +4,6 @@ use crate::{
     RecvOutcome, TxArena,
     cid_table::FORWARDED_TTL_US,
     parse_header,
-    sent::SENT_RING_LEN,
     testing::{Behavior, Net, NetRoute, TestApp, TestEndpoint, encode_frames, server_tls_config},
     token::RETRY_TOKEN_LIFETIME_US,
   },
@@ -703,21 +702,24 @@ fn initials_dropped_at_the_connection_cap() {
   assert!(confirmed(&net, late));
 }
 
-// Task 23b (spec section 5.4): an idle connection whose client pings to keep it open keeps a chunk
-// of frame references for each ACK-only packet that answers a PING, up to a sent ring's worth,
-// since the client acknowledges none of them while the server sends nothing else. More such
-// connections than the 2^15 chunks of a worker of before had room for (128 of 256 chunks) all
-// stay open, and a request on each of them is served.
+// Task 23c (spec section 5.4): an idle connection whose client pings to keep it open holds no
+// frame-reference chunk for the ACK-only packets that answer the PINGs, which the client never
+// acknowledges (Task 23b had a chunk for each, up to a sent ring's worth, 51 KB a connection).
+// After 1,000 PINGs the 129 connections hold at most 2 chunks each (measured: none), and a
+// request on each of them is served.
 #[cfg_attr(miri, ignore)]
 #[test]
-fn idle_connections_that_ping_keep_their_frame_references() {
+fn idle_connections_that_ping_hold_no_frame_references_for_their_acks() {
   const CLIENTS: usize = 129;
+  const PINGS: usize = 1_000;
   let mut net = net(1, QuicParams::default());
   for _ in 0..CLIENTS {
     let _ = net.add_client();
   }
   net.run();
-  for _ in 0..SENT_RING_LEN + 8 {
+  let before = net.servers[0].endpoint.pools().frame_refs.live_chunks();
+  let ack_only = net.servers[0].endpoint.stats().ack_only_out;
+  for _ in 0..PINGS {
     for client in &mut net.clients {
       client.conn.queue_test_frames(&[0x01]);
     }
@@ -725,11 +727,14 @@ fn idle_connections_that_ping_keep_their_frame_references() {
     net.advance(1_000_000);
     net.run();
   }
-  let chunks = net.servers[0].endpoint.pools_mut().frame_refs.live_chunks();
+  let chunks = net.servers[0].endpoint.pools().frame_refs.live_chunks();
   let closed: Vec<usize> = (0..CLIENTS).filter(|el| !confirmed(&net, *el)).collect();
   assert!(closed.is_empty(), "closed {closed:?}, {chunks} chunks");
   assert_eq!(net.servers[0].endpoint.stats().conns, u32::try_from(CLIENTS).unwrap());
-  assert!(chunks > 1 << 15, "{chunks} chunks");
+  // Every PING was answered with an ACK-only packet
+  let answers = net.servers[0].endpoint.stats().ack_only_out - ack_only;
+  assert!(answers >= u64::try_from(CLIENTS * PINGS).unwrap(), "{answers} ACK-only packets");
+  assert!(chunks <= 2 * CLIENTS, "{chunks} chunks, {before} before the PINGs");
   assert_eq!(net.run_requests(1, 1, b"GET /"), u64::try_from(CLIENTS).unwrap());
 }
 

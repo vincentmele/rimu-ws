@@ -26,9 +26,9 @@ pub(crate) const REQUEST_SLOTS: usize = 1 << 14;
 
 pub(super) const NO_SLOT: u32 = u32::MAX;
 
-/// The slots that the table makes room for at a time (about 0.8 MB), so that one stream past the
+/// The slots that the table makes room for at a time (about 0.4 MB), so that one stream past the
 /// slots in use grows the table by this much and not by as much again (`Vec` doubles), which at
-/// 4,096 slots of 3.2 KB would be 13 MB.
+/// 4,096 slots of 1,632 B would be 6.7 MB.
 pub(crate) const GROW_SLOTS: usize = 256;
 
 /// The slots of a worker of at most `max_conns` connections (spec section 5.4): [`SLOTS_PER_CONN`]

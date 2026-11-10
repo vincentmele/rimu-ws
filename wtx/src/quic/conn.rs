@@ -1453,6 +1453,7 @@ where
     }
     let packet = OpenPacket {
       ack_eliciting: true,
+      ack_only_largest: None,
       challenge: false,
       frames: FrameRefRange::EMPTY,
       full_datagram: false,
@@ -1723,7 +1724,15 @@ where
     if sp.largest_acked.is_none_or(|elem| ack.largest > elem) {
       sp.largest_acked = Some(ack.largest);
     }
-    let PacketSpace { ack_eliciting_in_flight, crypto_lost, recv, sent, .. } = sp;
+    let PacketSpace {
+      ack_eliciting_in_flight,
+      ack_only_largest,
+      ack_only_pn,
+      crypto_lost,
+      recv,
+      sent,
+      ..
+    } = sp;
     // The window grows after loss detection: what the packets acknowledged here would give, sent
     // after the recovery period that is current now (RFC 9002 appendix A.7, review J1)
     let recovery_start = recovery.cc.recovery_start_us();
@@ -1740,6 +1749,10 @@ where
         };
         newly = true;
         ack_eliciting |= packet.ack_eliciting;
+        // The ACK frame of the newest ACK-only packet, which its record does not keep (task 23c)
+        if pn == *ack_only_pn {
+          our_ack = our_ack.max(Some(*ack_only_largest));
+        }
         // A packet of another path gives no sample of this one (RFC 9000 section 9.4)
         if pn == ack.largest && packet.kind != SentKind::OffPath {
           largest_sent_us = Some(packet.time_us);
@@ -2271,6 +2284,9 @@ where
         frames: packet.frames,
       };
       sp.sent.on_sent(record);
+      if let Some(largest) = packet.ack_only_largest {
+        (sp.ack_only_pn, sp.ack_only_largest) = (packet.pn, largest);
+      }
       if packet.ack_eliciting {
         sp.ack_eliciting_in_flight = sp.ack_eliciting_in_flight.saturating_add(1);
         sp.last_ack_eliciting_us = now_us;
@@ -2562,6 +2578,9 @@ where
     let mut fw = FrameWriter::new(payload);
     let mut frames = FrameRefRange::EMPTY;
     let mut ack_eliciting = false;
+    // The Largest Acknowledged of the ACK frame of the packet, if it has one, until it is a frame
+    // reference: left for an ACK-only packet
+    let mut ack_largest = None;
     let mut challenge = false;
     let mut full_datagram = false;
     if closing {
@@ -2595,7 +2614,7 @@ where
         if repeat {
           repeated = Some((largest, written));
         } else {
-          pools.frame_refs.push(&mut frames, FrameRef::Ack { largest })?;
+          ack_largest = Some(largest);
           self.flush_acked |= space == Space::Data;
           // A frame with its first range only leaves the others owed (carried rule 4)
           if written == AckWritten::All {
@@ -2663,6 +2682,13 @@ where
       if probe && !ack_eliciting && fw.write_bytes(&PING_FRAME) {
         ack_eliciting = true;
       }
+      // The ACK frame of an ack-eliciting packet is a frame reference, as its other frames are.
+      // That of an ACK-only packet, of which nothing is sent again if it is lost and whose ACK
+      // frame only serves ACK-of-ACK, goes with the packet space instead (task 23c): a peer that
+      // never acknowledges ACK-only packets would otherwise keep a chunk for each in the sent ring
+      if ack_eliciting && let Some(largest) = ack_largest.take() {
+        pools.frame_refs.push(&mut frames, FrameRef::Ack { largest })?;
+      }
       if let Some((largest, written)) = repeated {
         if !ack_eliciting {
           // Nothing but the repeated ACK, the first frame: the packet does not go
@@ -2692,6 +2718,7 @@ where
     full_datagram |= space == Space::Initial && (IS_CLIENT || ack_eliciting);
     Ok(Some(OpenPacket {
       ack_eliciting,
+      ack_only_largest: ack_largest,
       challenge,
       frames,
       full_datagram,
@@ -3288,6 +3315,9 @@ impl CryptoRx {
 #[derive(Clone, Copy, Debug)]
 struct OpenPacket {
   ack_eliciting: bool,
+  // The Largest Acknowledged of its ACK frame if it is an ACK-only packet, whose record keeps no
+  // frame reference (task 23c)
+  ack_only_largest: Option<u64>,
   // It has the PATH_CHALLENGE of the validation of the current path
   challenge: bool,
   frames: FrameRefRange,
@@ -3323,6 +3353,12 @@ impl OpenPacket {
 struct PacketSpace {
   // The ack-eliciting packets in flight
   ack_eliciting_in_flight: u32,
+  // The Largest Acknowledged of the ACK frame of the newest ACK-only packet, whose record keeps no
+  // frame reference (task 23c): if the peer acknowledges that packet, the ranges up to it can go
+  // (RFC 9000 section 13.2.4)
+  ack_only_largest: u64,
+  // The packet number of the newest ACK-only packet, `u64::MAX` before the first
+  ack_only_pn: u64,
   // The CRYPTO data of lost packets, sent again before new data
   crypto_lost: FrameRefQueue,
   // The bytes of the TLS output of the level that were sent
@@ -3342,6 +3378,8 @@ impl PacketSpace {
   const fn new() -> Self {
     Self {
       ack_eliciting_in_flight: 0,
+      ack_only_largest: 0,
+      ack_only_pn: u64::MAX,
       crypto_lost: FrameRefQueue::EMPTY,
       crypto_tx: 0,
       keys: None,
@@ -3711,7 +3749,7 @@ mod tests {
       parse_header,
       pools::{CRYPTO_BUFFER_LEN, QuicPools, RX_BLOCK_LEN, TX_BLOCK_LEN},
       protect,
-      sent::FrameRef,
+      sent::{FrameRef, FrameRefRange, SentKind},
       testing::{
         Behavior, CLIENT_ADDR, Impairment, Link, LinkOpts, Parts, SERVER_ADDR, TestApp,
         encode_frames, run_lossy_requests,
@@ -3914,6 +3952,83 @@ mod tests {
     assert_eq!(server_data_ranges(&link), [(largest + 2, largest + 2)]);
     let recv = &link.server.conn.data.recv;
     assert!(recv.is_duplicate(ranges[0].0) && recv.is_duplicate(largest + 1));
+  }
+
+  // Task 23c: an ACK-only packet of the server is recorded without a frame-reference chunk: it is
+  // neither ack-eliciting nor in flight, and its ACK frame is only of use for ACK-of-ACK.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn ack_only_packet_holds_no_frame_reference() {
+    let mut link = settled(&LinkOpts::new(None));
+    link.client.conn.queue_test_frames(&PING);
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
+    let largest = link.server.conn.data.recv.largest().unwrap();
+    let pn = link.server.conn.data.sent.next_pn();
+    let (chunks, ack_only) =
+      (link.server.parts.pools.frame_refs.live_chunks(), link.server.conn.stats().ack_only_out);
+    let _ = link.server.flush(link.now_us);
+    assert_eq!(link.server.conn.stats().ack_only_out, ack_only + 1);
+    let record = *link.server.conn.data.sent.get_mut(pn).unwrap();
+    assert_eq!((record.kind, record.frames), (SentKind::NotInFlight, FrameRefRange::EMPTY));
+    assert_eq!(link.server.parts.pools.frame_refs.live_chunks(), chunks);
+    // Its ACK frame is kept by the space
+    let data = &link.server.conn.data;
+    assert_eq!((data.ack_only_pn, data.ack_only_largest), (pn, largest));
+  }
+
+  // Task 23c: ACK-of-ACK still works for an ACK-only packet. The server's ACK-only packet, and
+  // then a PING of its own that carries no ACK frame, are acknowledged by the client: everything
+  // up to the Largest Acknowledged of the ACK-only packet is forgotten.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn acked_ack_only_packet_raises_the_receive_floor() {
+    let mut link = settled(&LinkOpts::new(None));
+    link.client.conn.queue_test_frames(&PING);
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
+    let ranges = server_data_ranges(&link);
+    let largest = ranges[0].1;
+    let ack_only = link.server.conn.data.sent.next_pn();
+    let _ = link.server.flush(link.now_us);
+    let ping = link.server.conn.data.sent.next_pn();
+    link.server.conn.queue_test_frames(&PING);
+    let _ = link.server.flush(link.now_us);
+    assert_eq!(ping, ack_only + 1);
+    // The PING carries no ACK frame: only the ACK-only packet can raise the floor
+    let pools = &link.server.parts.pools;
+    let ping_frames = link.server.conn.data.sent.get_mut(ping).unwrap().frames;
+    assert_eq!(pools.frame_refs.iter(ping_frames).count(), 0);
+    assert_eq!(server_data_ranges(&link), ranges);
+    assert_eq!(link.deliver_to_client(), 2);
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
+    // Only the ACK-only packet of the client, which came after, is left
+    assert_eq!(server_data_ranges(&link), [(largest + 1, largest + 1)]);
+    let recv = &link.server.conn.data.recv;
+    assert!(recv.is_duplicate(ranges[0].0) && recv.is_duplicate(largest));
+  }
+
+  // Task 23c: a packet with an ACK frame and ack-eliciting frames keeps its ACK frame in a
+  // frame-reference chunk, as before.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn ack_with_ack_eliciting_frames_keeps_its_frame_reference() {
+    let mut link = settled(&LinkOpts::new(None));
+    link.client.conn.queue_test_frames(&PING);
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
+    let largest = link.server.conn.data.recv.largest().unwrap();
+    let pn = link.server.conn.data.sent.next_pn();
+    let chunks = link.server.parts.pools.frame_refs.live_chunks();
+    link.server.conn.queue_test_frames(&PING);
+    let _ = link.server.flush(link.now_us);
+    let record = *link.server.conn.data.sent.get_mut(pn).unwrap();
+    assert!(record.ack_eliciting && record.kind == SentKind::InFlight);
+    let pools = &link.server.parts.pools;
+    let frames: Vec<_> = pools.frame_refs.iter(record.frames).collect();
+    assert_eq!(frames, [FrameRef::Ack { largest }]);
+    assert_eq!(pools.frame_refs.live_chunks(), chunks + 1);
   }
 
   // An ACK-only packet makes no packet in return, in either direction.
@@ -4181,12 +4296,14 @@ mod tests {
     assert_eq!(link.server.app.closed, 1);
     assert_eq!(counts(&link.server.parts), warm);
     let (client_parts, server_parts) = link.into_parts();
-    // In the middle of a transfer: an ACK of the server is not acknowledged
+    // In the middle of a transfer: an ACK of the server, in an ack-eliciting packet (an ACK-only
+    // one holds no frame reference, task 23c), is not acknowledged
     let mut link = Link::with_parts(&opts, client_parts, server_parts);
     link.run();
     link.client.conn.queue_test_frames(&PING);
     let _ = link.client.flush(link.now_us);
     assert_eq!(link.deliver_to_server(), 1);
+    link.server.conn.queue_test_frames(&PING);
     let _ = link.server.flush(link.now_us);
     assert!(link.server.parts.pools.frame_refs.live_chunks() > 0);
     link.server.conn.abort(&mut link.server.app, &mut link.server.parts.pools);

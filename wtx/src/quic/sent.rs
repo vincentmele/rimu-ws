@@ -4,7 +4,10 @@
 //! A ring indexed by packet number holds one record per packet, ACK-only packets included: an
 //! acknowledged ACK frame of ours lets the receiver forget ranges (RFC 9000 section 13.2.4). The
 //! frames of a packet are references into the worker-wide pool of frame references
-//! ([`QuicPools::frame_refs`]), so that a record stays small whatever the packet carried.
+//! ([`QuicPools::frame_refs`]), so that a record stays small whatever the packet carried. The
+//! record of an ACK-only packet has none: nothing of such a packet is sent again if it is lost,
+//! and the Largest Acknowledged of the newest one is kept by its packet number space instead (task
+//! 23c), so that a peer that never acknowledges ACK-only packets does not hold a chunk for each.
 //!
 //! A packet that is declared lost keeps its record, out of flight, until the ring needs its slot:
 //! an acknowledgment that comes late still tells which of its frames arrived, so that they are
@@ -19,7 +22,7 @@ pub(crate) const SENT_RING_LEN: usize = 256;
 /// A frame of a sent packet: what is needed of it once the packet is acknowledged or lost.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FrameRef {
-  /// An ACK frame, by its Largest Acknowledged.
+  /// An ACK frame of an ack-eliciting packet, by its Largest Acknowledged.
   Ack {
     /// The Largest Acknowledged field of the frame.
     largest: u64,

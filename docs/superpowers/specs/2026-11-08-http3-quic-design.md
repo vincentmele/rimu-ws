@@ -255,31 +255,37 @@ deployment allocate the pools at start.
   - stream slots: 6 per connection (`SLOTS_PER_CONN`: our control, QPACK encoder and decoder streams
     and the client's three) plus 16,384 for requests (`REQUEST_SLOTS`, 64 connections × a window of
     256), 40,960 at the default cap;
-  - frame-reference chunks: 256 per connection (`SENT_RING_LEN`: an idle connection keeps a chunk for
-    each ACK-only packet until its sent ring wraps, and a client that only pings to keep the
-    connection open acknowledges none of them) plus 32,768 for packets in flight (`FLIGHT_CHUNKS`),
-    1,081,344 at the default cap;
+  - frame-reference chunks: 2 per connection (`CONN_CHUNKS`) plus 32,768 for packets in flight
+    (`FLIGHT_CHUNKS`), 40,960 at the default cap. An idle connection holds none (measured: 0 after
+    the 4,096-connection fill, and 0 for 129 connections after 1,000 client PINGs each): the
+    record of an ACK-only packet keeps no frame reference (task 23c, below), so a client that pings
+    to keep a connection open and never acknowledges the ACK-only answers pins nothing. The 2 a
+    connection are headroom for records that a connection keeps once it went idle (a lost packet's
+    record stays until its sent ring wraps). Task 23b had 256 a connection (`SENT_RING_LEN`, one
+    chunk for each ACK-only record until the ring wraps), 1,081,344 at the default cap;
   - the CID table (one server CID per connection), the timer wheel and the dirty/fired lists were
     already sized by the connection cap; the free lists (≤ 1,024 entries each) and the H3 box pool
     (≤ 256 boxes, 4 MiB) bound what is kept for reuse, not what is live, so a connection past them
     allocates and is never refused.
 
   Measured idle connection (task 23, net live heap of a one-worker server): ≈ 21.6 KB QUIC-only
-  (21,613 B), ≈ 27 KB with the client's three HTTP/3 unidirectional streams (+3 × 1,824 B). Worst
-  case per worker at the default cap of 4,096: idle connections 4,096 × 27 KB ≈ 111 MB; a client
-  that keeps each one open with PINGs adds up to 256 chunks × 200 B = 51 KB per connection, ≈ 210 MB
-  more (≈ 78 KB per connection, ≈ 321 MB); with the request budgets full on top (16,384 slots ×
-  1,632 B ≈ 27 MB, 32,768 chunks ≈ 7 MB), ≈ 354 MB (≈ 338 MiB), before the data blocks of requests
-  in flight, which flow control bounds. Slot exhaustion can still happen when clients hold whole
-  windows of requests on more than 64 connections; it fails per stream and per connection, never
-  stalling the worker: a request stream that finds no slot is refused with H3_REQUEST_REJECTED
-  (ruling T10-c; past eight refused at once the connection closes with INTERNAL_ERROR), and a new
+  (21,613 B), ≈ 27 KB with the client's three HTTP/3 unidirectional streams (+3 × 1,824 B, 27,085
+  B). Task 23c adds 16 B to the connection core (4,032 → 4,048 B in the production build) and
+  removes the two ACK-only chunks (2 × 200 B) that an idle connection held when that was
+  measured; the figures here keep the measured ones plus 16 B, an upper bound (27,101 B). Worst
+  case per worker at the default cap of 4,096: idle connections 4,096 × 27,101 B = 111,005,696 B
+  ≈ 111 MB, pinged or not; with the request budgets full on top (16,384 slots × 1,632 B =
+  26,738,688 B ≈ 27 MB) and every frame-reference chunk in use (40,960 × 200 B = 8,192,000 B ≈ 8
+  MB), 145,936,384 B ≈ 146 MB (≈ 139.2 MiB), before the data blocks of requests in flight, which
+  flow control bounds (task 23b, before task 23c: ≈ 354 MB, of which ≈ 210 MB were chunks pinned
+  by pinging clients). Slot exhaustion can still happen when clients hold whole windows of
+  requests on more than 64 connections; it fails per stream and per connection, never stalling
+  the worker: a request stream that finds no slot is refused with H3_REQUEST_REJECTED (ruling
+  T10-c; past eight refused at once the connection closes with INTERNAL_ERROR), and a new
   connection whose own control or QPACK streams find no slot is closed with INTERNAL_ERROR.
   Deferred reductions (future work, not done): the 1-RTT sent ring taken on demand (≈ −6 KB per
   idle connection); no QPACK encoder/decoder streams when both dynamic-table capacities are 0
-  (RFC 9204 §4.2, ≈ −3.6 KB and −2 slots); the QPACK decode memo allocated lazily (≈ −1.7 KB); an
-  ACK-only packet's record kept without a frame-reference chunk (≈ −51 KB per pinged idle
-  connection, and −256 chunks per connection from the rule).
+  (RFC 9204 §4.2, ≈ −3.6 KB and −2 slots); the QPACK decode memo allocated lazily (≈ −1.7 KB).
 - **CID table**: our CIDs are 8 bytes: byte 0 = worker index, bytes 1–7 random (CSPRNG), with a
   stateless-reset token derived from a per-process key (HMAC). While CID steering is on, each connection has
   **exactly one** server CID and we send no NEW_CONNECTION_ID: RFC 9000 §5.1 forbids CIDs of one connection
@@ -297,7 +303,15 @@ deployment allocate the pools at start.
 - **Sent-packet ring** per packet-number space, indexed by PN; each record holds time, size, flags and a
   range of entries in a worker-wide pool of frame references (stream slot + generation, offset, length, FIN;
   control frames as "owed" bits re-raised on loss), since a baseline packet carries ~64 STREAM frames.
-  Every frame is recorded, small responses included.
+  Every frame is recorded, small responses included, but for the ACK frame of an ACK-only packet
+  (task 23c): such a packet is not ack-eliciting, nothing of it is sent again if it is lost, and
+  its ACK frame only serves ACK-of-ACK (RFC 9000 §13.2.4), so its record holds no frame reference
+  and the packet number space keeps the packet number and Largest Acknowledged of the newest
+  ACK-only packet (two u64s). When the peer acknowledges that packet the receive floor rises as
+  before; an older ACK-only packet acknowledged alone no longer raises it, which only keeps ACK
+  frames a little larger for a little longer. A packet with an ACK frame and ack-eliciting frames
+  keeps the ACK frame as a frame reference. This holds in all three spaces (Initial and Handshake
+  are discarded at confirmation, so it matters there only for fewer chunk pushes).
 - **Received PNs**: per space, a sliding window of u64 bitmaps; ACK frames are encoded from it with
   trailing/leading-zero scans; ranges are kept until an ACK of ours that carried them is acknowledged.
 - All caps are bounded in count and bytes; idle trims keep a few entries per pool, like the D2/D3 pools.
