@@ -1388,7 +1388,8 @@ impl StatelessQueue {
   }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "_fuzz-conn"))]
+#[allow(dead_code, reason = "what tests and the fuzz targets read")]
 impl<A, RNG, TCX> Endpoint<A, RNG, TCX>
 where
   A: QuicApp,
@@ -1452,5 +1453,8 @@ where
   }
 }
 
+#[cfg(any(test, feature = "_fuzz-conn"))]
+#[doc(hidden)]
+pub mod check;
 #[cfg(test)]
 mod tests;

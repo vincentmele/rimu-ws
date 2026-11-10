@@ -27,7 +27,11 @@ use crate::{
   sync::Arc,
   tls::{QuicTls, SkCtx, TlsConfig, UnverifiedCtx},
 };
-use alloc::{collections::{BTreeMap, BTreeSet}, vec, vec::Vec};
+use alloc::{
+  collections::{BTreeMap, BTreeSet},
+  vec,
+  vec::Vec,
+};
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 const CERT: &[u8] = include_bytes!("../../../../.certs/cert.pem");
@@ -42,6 +46,11 @@ const MAX_ROUNDS: usize = 64;
 
 std::thread_local! {
   static CONFIG: Arc<TlsConfig<SkCtx>> = Arc::new(TlsConfig::from_keys_pem(CERT, KEY).unwrap());
+}
+
+/// The TLS configuration of the test certificate, made once for each thread.
+pub(crate) fn server_config() -> Arc<TlsConfig<SkCtx>> {
+  CONFIG.with(Arc::clone)
 }
 
 /// The bytes of a script.
@@ -426,7 +435,8 @@ where
 
   /// The CONNECTION_CLOSE that the server owes, while it is closing: (application, code).
   pub(crate) fn server_close(&self) -> Option<(bool, u64)> {
-    (self.server.state() == ConnState::Closing).then_some((self.server.close.app, self.server.close.code))
+    (self.server.state() == ConnState::Closing)
+      .then_some((self.server.close.app, self.server.close.code))
   }
 
   /// Gives `datagram` to the server.
@@ -892,7 +902,6 @@ where
     assert!(self.c_app.closed <= 1 && self.c_app.established <= 1);
   }
 
-
   /// Gives everything back to the pools.
   pub(crate) fn finish(&mut self) {
     self.client.abort(&mut self.c_app, &mut self.c_pools);
@@ -917,7 +926,7 @@ where
 /// breaks a rule of the module.
 #[inline]
 pub fn run(data: &[u8]) {
-    let _reach = run_reach(data);
+  let _reach = run_reach(data);
 }
 
 /// [`run`], with what the script got the server to do and the calls of its application for stream
@@ -956,7 +965,10 @@ mod tests {
     let mut duo = Duo::new(1, (0, 0), 0, FuzzApp::default());
     duo.start();
     duo.exchange(16);
-    assert_eq!((duo.client.state(), duo.server.state()), (ConnState::Confirmed, ConnState::Confirmed));
+    assert_eq!(
+      (duo.client.state(), duo.server.state()),
+      (ConnState::Confirmed, ConnState::Confirmed)
+    );
     assert_eq!((duo.c_app.established, duo.s_app.established), (1, 1));
     duo.check();
     duo.finish();

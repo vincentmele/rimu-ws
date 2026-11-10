@@ -52,6 +52,9 @@ pub use cid::{Cid, MAX_CID_LEN};
 pub use conn::check as conn_check;
 #[cfg(any(test, feature = "_fuzz-conn"))]
 pub(crate) use conn::check::{Duo, Input};
+#[cfg(any(test, feature = "_fuzz-conn"))]
+#[doc(hidden)]
+pub use endpoint::check as endpoint_check;
 pub(crate) use conn::{ConnParams, ConnState, FlushOutcome, QuicConn};
 use core::net::{IpAddr, SocketAddr};
 #[cfg(test)]

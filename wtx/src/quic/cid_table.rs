@@ -81,7 +81,7 @@ impl CidTable {
   }
 
   /// Our connection IDs in the table.
-  #[cfg(test)]
+  #[cfg(any(test, feature = "_fuzz-conn"))]
   pub(crate) const fn len(&self) -> usize {
     self.len
   }

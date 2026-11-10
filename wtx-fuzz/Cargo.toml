@@ -39,6 +39,10 @@ name = "quic_conn"
 path = "quic_conn.rs"
 
 [[bin]]
+name = "quic_endpoint"
+path = "quic_endpoint.rs"
+
+[[bin]]
 name = "quic_frame"
 path = "quic_frame.rs"
 

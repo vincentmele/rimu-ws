@@ -2795,6 +2795,20 @@ where
   }
 }
 
+#[cfg(all(feature = "_fuzz-conn", not(test)))]
+impl<A, RNG, TCX, const IS_CLIENT: bool> QuicConn<A, RNG, TCX, IS_CLIENT>
+where
+  A: QuicApp,
+{
+  /// The CONNECTION_CLOSE that the connection owes, if it is closing: (application, code).
+  pub(crate) const fn close_code(&self) -> Option<(bool, u64)> {
+    match self.state {
+      ConnState::Closing => Some((self.close.app, self.close.code)),
+      _ => None,
+    }
+  }
+}
+
 impl<A, RNG, TCX, const IS_CLIENT: bool> Drop for QuicConn<A, RNG, TCX, IS_CLIENT>
 where
   A: QuicApp,
