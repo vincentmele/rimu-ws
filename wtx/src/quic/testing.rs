@@ -1071,7 +1071,13 @@ impl<SA: QuicApp> Net<SA> {
     Self {
       clients: Vec::new(),
       client_params: ConnParams::default(),
-      client_parts: Parts::new(),
+      client_parts: {
+        // The clients of a net share one pool, whose cap is not what a test of the server is
+        // about: thousands of clients take more slots than any worker
+        let mut parts = Parts::new();
+        parts.pools.stream_slots.set_cap(usize::MAX);
+        parts
+      },
       client_tp: |_| {},
       client_alpn: b"h3",
       counters: None,

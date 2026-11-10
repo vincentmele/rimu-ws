@@ -10,7 +10,7 @@ use crate::quic::{
   conn::{ConnCold, HandshakeSpaces},
   key_phase::KeySlot,
   recv_tracker::RecvSpill,
-  sent::{FrameRef, FrameRefRange, SentPacket},
+  sent::{FrameRef, FrameRefRange, SENT_RING_LEN, SentPacket},
   stream::{OooBlock, RangeBlock, Seg, StreamSlots, StreamsCold},
   wipe,
 };
@@ -32,8 +32,9 @@ pub(crate) type TxBlock = [u8; TX_BLOCK_LEN];
 
 // References per chunk of the frame reference pool
 const CHUNK_REFS: usize = 8;
-// Chunks of the frame reference pool at most: 2^15 of about 200 bytes
-const MAX_CHUNKS: usize = 1 << 15;
+// Chunks of the frame reference pool on top of those of its idle connections, for the packets in
+// flight: 2^15 of about 200 bytes
+const FLIGHT_CHUNKS: usize = 1 << 15;
 /// The chunks that the frame reference pool makes room for at a time (about 100 KB), so that one
 /// chunk past those in use grows the pool by this much and not by as much again (`Vec` doubles).
 pub(crate) const GROW_CHUNKS: usize = 512;
@@ -97,12 +98,18 @@ pub(crate) struct QuicPools {
 }
 
 impl QuicPools {
-  /// Empty pools, which allocate nothing until used.
+  /// Empty pools of a side of one connection, a client, which allocate nothing until used.
   pub(crate) const fn new() -> Self {
+    Self::for_conns(1)
+  }
+
+  /// Empty pools of a worker of at most `max_conns` connections, which allocate nothing until
+  /// used: the cap of the stream slots follows the connections (spec section 5.4).
+  pub(crate) const fn for_conns(max_conns: usize) -> Self {
     Self {
       conn_cold: FreeList::new(),
       crypto_buffers: FreeList::new(),
-      frame_refs: FrameRefPool::new(MAX_CHUNKS),
+      frame_refs: FrameRefPool::new(max_chunks(max_conns)),
       handshake_spaces: FreeList::new(),
       key_slots: FreeList::new(),
       ooo_indexes: FreeList::new(),
@@ -111,7 +118,7 @@ impl QuicPools {
       rx_blocks: FreeList::new(),
       seg_queues: FreeList::new(),
       sent_rings: FreeList::new(),
-      stream_slots: StreamSlots::new(),
+      stream_slots: StreamSlots::new(max_conns),
       streams_cold: FreeList::new(),
       tx_blocks: FreeList::new(),
       hp_batch: HpBatch::new(),
@@ -540,6 +547,16 @@ impl Chunk {
   const EMPTY: Self = Self { next: NO_CHUNK, refs: [FrameRef::HandshakeDone; CHUNK_REFS] };
 }
 
+/// The chunks of the frame reference pool of a worker of at most `max_conns` connections (spec
+/// section 5.4): [`SENT_RING_LEN`] for each, because an idle connection keeps a chunk for each of
+/// its ACK-only packets until its sent ring wraps (a client that pings to keep the connection open
+/// acknowledges none of them while the server sends nothing else), and [`FLIGHT_CHUNKS`] for the
+/// packets in flight. They are made on demand, [`GROW_CHUNKS`] at a time, so a higher cap costs
+/// nothing until used.
+const fn max_chunks(max_conns: usize) -> usize {
+  max_conns.saturating_mul(SENT_RING_LEN).saturating_add(FLIGHT_CHUNKS)
+}
+
 #[inline(always)]
 fn exhausted() -> crate::Error {
   cold_path();
@@ -623,7 +640,7 @@ mod tests {
   // again, at the size of the benchmark's load (64 connections with 64 streams: 4,096 chunks).
   #[test]
   fn frame_ref_pool_growth_is_bounded_past_the_steady_state() {
-    let mut pool = FrameRefPool::new(super::MAX_CHUNKS);
+    let mut pool = FrameRefPool::new(super::max_chunks(4096));
     let mut range = FrameRefRange::EMPTY;
     for _ in 0..4096 * super::CHUNK_REFS {
       pool.push(&mut range, FrameRef::HandshakeDone).unwrap();

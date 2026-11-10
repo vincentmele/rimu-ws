@@ -315,7 +315,7 @@ where
       loads,
       params,
       placement: false,
-      pools: QuicPools::new(),
+      pools: QuicPools::for_conns(conns),
       reset_budget: RateBudget::default(),
       rng,
       shutdown: false,

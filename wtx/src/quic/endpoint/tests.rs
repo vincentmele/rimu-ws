@@ -4,6 +4,7 @@ use crate::{
     RecvOutcome, TxArena,
     cid_table::FORWARDED_TTL_US,
     parse_header,
+    sent::SENT_RING_LEN,
     testing::{Behavior, Net, NetRoute, TestApp, TestEndpoint, encode_frames, server_tls_config},
     token::RETRY_TOKEN_LIFETIME_US,
   },
@@ -700,6 +701,36 @@ fn initials_dropped_at_the_connection_cap() {
   let _ = net.deliver_to_server(late, &mut first[0].clone());
   net.run();
   assert!(confirmed(&net, late));
+}
+
+// Task 23b (spec section 5.4): an idle connection whose client pings to keep it open keeps a chunk
+// of frame references for each ACK-only packet that answers a PING, up to a sent ring's worth,
+// since the client acknowledges none of them while the server sends nothing else. More such
+// connections than the 2^15 chunks of a worker of before had room for (128 of 256 chunks) all
+// stay open, and a request on each of them is served.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn idle_connections_that_ping_keep_their_frame_references() {
+  const CLIENTS: usize = 129;
+  let mut net = net(1, QuicParams::default());
+  for _ in 0..CLIENTS {
+    let _ = net.add_client();
+  }
+  net.run();
+  for _ in 0..SENT_RING_LEN + 8 {
+    for client in &mut net.clients {
+      client.conn.queue_test_frames(&[0x01]);
+    }
+    net.run();
+    net.advance(1_000_000);
+    net.run();
+  }
+  let chunks = net.servers[0].endpoint.pools_mut().frame_refs.live_chunks();
+  let closed: Vec<usize> = (0..CLIENTS).filter(|el| !confirmed(&net, *el)).collect();
+  assert!(closed.is_empty(), "closed {closed:?}, {chunks} chunks");
+  assert_eq!(net.servers[0].endpoint.stats().conns, u32::try_from(CLIENTS).unwrap());
+  assert!(chunks > 1 << 15, "{chunks} chunks");
+  assert_eq!(net.run_requests(1, 1, b"GET /"), u64::try_from(CLIENTS).unwrap());
 }
 
 // An Initial packet of version 1 to `dcid`, of `len` bytes, that nothing opens.

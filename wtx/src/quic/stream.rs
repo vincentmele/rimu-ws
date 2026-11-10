@@ -1080,7 +1080,7 @@ mod tests {
   // much again, at the size of the benchmark's load (64 connections with 64 streams: 4,096 slots).
   #[test]
   fn stream_slot_growth_is_bounded_past_the_steady_state() {
-    let mut slots = StreamSlots::new();
+    let mut slots = StreamSlots::new(1);
     for _ in 0..4096 {
       let _ = slots.alloc().unwrap();
     }
@@ -1094,7 +1094,7 @@ mod tests {
   // left it do not match, and an idle trim keeps a few slots once none is in use.
   #[test]
   fn stream_slots_reuse_with_generations_and_trim_at_idle() {
-    let mut slots = StreamSlots::new();
+    let mut slots = StreamSlots::new(1);
     let taken: Vec<u32> = (0..100).map(|_| slots.alloc().unwrap()).collect();
     assert_eq!(slots.live(), 100);
     let generation = slots.generation(taken[7]);

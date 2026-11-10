@@ -17,8 +17,12 @@ pub(super) const IMPLICIT: u32 = u32::MAX - 1;
 // A stream of the peer that was refused for want of a slot (ruling T10-c)
 pub(super) const REJECTED: u32 = u32::MAX - 2;
 
-// Slots of a worker at most
-pub(super) const MAX_SLOTS: usize = 1 << 14;
+/// The stream slots that an idle HTTP/3 connection holds: our control, QPACK encoder and QPACK
+/// decoder streams, and the same three of the client (RFC 9114 section 6.2, RFC 9204 section 4.2).
+pub(crate) const SLOTS_PER_CONN: usize = 6;
+/// The slots of a worker on top of [`SLOTS_PER_CONN`] for each of its connections, for requests:
+/// 64 connections with their whole window of 256 bidirectional streams.
+pub(crate) const REQUEST_SLOTS: usize = 1 << 14;
 
 pub(super) const NO_SLOT: u32 = u32::MAX;
 
@@ -27,10 +31,19 @@ pub(super) const NO_SLOT: u32 = u32::MAX;
 /// 4,096 slots of 3.2 KB would be 13 MB.
 pub(crate) const GROW_SLOTS: usize = 256;
 
+/// The slots of a worker of at most `max_conns` connections (spec section 5.4): [`SLOTS_PER_CONN`]
+/// for each, so that idle HTTP/3 connections reach the connection cap before the slots run out,
+/// and [`REQUEST_SLOTS`] for requests. They are made on demand, [`GROW_SLOTS`] at a time, so a
+/// higher cap costs nothing until used.
+#[inline]
+pub(crate) const fn max_slots(max_conns: usize) -> usize {
+  max_conns.saturating_mul(SLOTS_PER_CONN).saturating_add(REQUEST_SLOTS)
+}
+
 /// The streams of the connections of a worker: a slab of slots with generations, grown on demand
-/// up to 16,384 slots, whose slots are used again without allocating. A frame reference names a
-/// stream by slot and generation, so that a stream that is gone is not mistaken for the next one
-/// in its slot.
+/// up to [`max_slots`] of the connection cap, whose slots are used again without allocating. A
+/// frame reference names a stream by slot and generation, so that a stream that is gone is not
+/// mistaken for the next one in its slot.
 #[derive(Debug)]
 pub(crate) struct StreamSlots {
   // Slots at most
@@ -45,10 +58,11 @@ pub(crate) struct StreamSlots {
 }
 
 impl StreamSlots {
-  /// No slots.
+  /// No slots, and room for [`max_slots`] of `max_conns` connections.
   #[inline]
-  pub(crate) const fn new() -> Self {
-    Self { cap: MAX_SLOTS, entries: Vec::new(), free: NO_SLOT, generation_floor: 0, live: 0 }
+  pub(crate) const fn new(max_conns: usize) -> Self {
+    let cap = max_slots(max_conns);
+    Self { cap, entries: Vec::new(), free: NO_SLOT, generation_floor: 0, live: 0 }
   }
 
   /// Lowers the slots of the worker to at most `cap`, for tests that run out of them.

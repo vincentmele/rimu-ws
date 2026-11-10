@@ -482,6 +482,117 @@ fn h3_steady_state_allocates_nothing_after_warmup() {
   assert_eq!(net.servers[0].app.handler.count, (2 * CLIENTS * REQUESTS) as u64);
 }
 
+// Task 23b (spec section 5.4): a worker reaches its connection cap, 4,096 by default, with idle
+// HTTP/3 connections that hold the unidirectional streams of a real client (control, QPACK encoder
+// and decoder) besides the server's three. Every one of them is established and usable, and the
+// next client is refused by the connection cap, its first Initial dropped without a reply, not
+// for want of a stream slot.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn idle_h3_connections_reach_the_connection_cap() {
+  // Below the handshakes from which a client gets a Retry
+  const BATCH: usize = 32;
+  let cap = usize::try_from(QuicParams::default().max_conns_per_worker()).unwrap();
+  let handler = TestHandler { record: false, ..TestHandler::new(OK) };
+  let mut net = h3_net(QuicParams::default(), H3Params::default(), &handler);
+  let control = control_stream(client_settings());
+  while net.clients.len() < cap {
+    let first = net.clients.len();
+    for _ in 0..BATCH {
+      let _ = net.add_client();
+    }
+    net.run();
+    for idx in first..first + BATCH {
+      let slots = net.servers[0].endpoint.pools_mut().stream_slots.live();
+      let state = net.clients[idx].conn.state();
+      assert_eq!(state, ConnState::Confirmed, "client {idx}, {slots} stream slots live");
+      let _ = open_uni(&mut net, idx, &control);
+      let _ = open_uni(&mut net, idx, &[0x02]);
+      let _ = open_uni(&mut net, idx, &[0x03]);
+    }
+    net.run();
+  }
+  assert_eq!(net.servers[0].endpoint.stats().conns, u32::try_from(cap).unwrap());
+  for idx in 0..cap {
+    let client = &net.clients[idx];
+    assert_eq!(client.conn.state(), ConnState::Confirmed, "client {idx}");
+    assert_eq!((client.app.resets.len(), client.app.stops.len()), (0, 0), "client {idx}");
+    assert_eq!(server_streams(&net, idx).len(), 3, "client {idx}");
+    assert_eq!(server_close(&net, idx), None, "client {idx}");
+  }
+  assert_eq!(net.servers[0].endpoint.pools_mut().stream_slots.live(), 6 * cap);
+  // A request on the first and on the last is served
+  let request = headers_frame(&GET);
+  for idx in [0, cap - 1] {
+    let id = send(&mut net, idx, &request, true);
+    net.run();
+    assert_eq!(status(&net, idx, id).as_deref(), Some(&b"200"[..]), "client {idx}");
+  }
+  // One more: the connection cap drops its first Initial, without a reply
+  let late = net.add_client();
+  let mut initial = net.client_datagrams(late);
+  let _ = net.deliver_to_server(late, &mut initial[0]);
+  assert!(net.server_datagrams(0).is_empty());
+  assert_eq!(net.servers[0].endpoint.stats().conns, u32::try_from(cap).unwrap());
+}
+
+// Task 23b: the stream slots of a worker can still run out when clients hold whole windows of
+// requests on many connections, since the slots for requests are shared. It fails per stream and
+// per connection, with documented codes, and the worker goes on: a request that finds no slot is
+// refused with H3_REQUEST_REJECTED (ruling T10-c) while its connection stays open, a new
+// connection whose own streams find none is closed with INTERNAL_ERROR, and once slots are free
+// again every connection is served.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn exhausted_stream_slots_fail_per_stream_and_connection() {
+  let rejected = QuicLimits::default().stream_rejected_app_code;
+  let mut net = h3_net(QuicParams::default(), H3Params::default(), &TestHandler::new(OK));
+  let control = control_stream(client_settings());
+  let clients = [net.add_client(), net.add_client()];
+  net.run();
+  for idx in clients {
+    let _ = open_uni(&mut net, idx, &control);
+    let _ = open_uni(&mut net, idx, &[0x02]);
+    let _ = open_uni(&mut net, idx, &[0x03]);
+  }
+  net.run();
+  // Room for a whole window of requests and four more
+  let slots = &mut net.servers[0].endpoint.pools_mut().stream_slots;
+  assert_eq!(slots.live(), 12);
+  slots.set_cap(12 + 256 + 4);
+  let park = headers_frame(&request_fields(b"GET", b"/park", &[]));
+  let parked: Vec<StreamId> = (0..256).map(|_| send(&mut net, clients[0], &park, true)).collect();
+  net.run();
+  let more: Vec<StreamId> = (0..8).map(|_| send(&mut net, clients[1], &park, true)).collect();
+  net.run();
+  assert_eq!(handler(&net).parked.len(), 256 + 4);
+  // The requests came whole, with their FIN: a RESET_STREAM, and no STOP_SENDING, refuses them
+  let refused: Vec<(u64, u64)> = more[4..].iter().map(|el| (el.0, rejected)).collect();
+  assert_eq!(resets(&net, clients[1]), refused);
+  for idx in clients {
+    assert_eq!(net.clients[idx].conn.state(), ConnState::Confirmed);
+    assert_eq!(server_close(&net, idx), None);
+  }
+  // A new connection finds no slot for its own streams
+  let late = net.add_client();
+  net.run();
+  assert_eq!(server_close(&net, late), Some((false, 0x01)));
+  // Slots free again: the parked requests are answered, then the others are served
+  for id in &parked {
+    resume(&mut net, clients[0], *id);
+  }
+  net.run();
+  net.advance(100_000);
+  net.run();
+  assert!(parked.iter().all(|el| status(&net, clients[0], *el).as_deref() == Some(&b"200"[..])));
+  let request = headers_frame(&GET);
+  for idx in clients {
+    let id = send(&mut net, idx, &request, true);
+    net.run();
+    assert_eq!(status(&net, idx, id).as_deref(), Some(&b"200"[..]), "client {idx}");
+  }
+}
+
 // Carried from task 13 (ruling T16-a): a response copied whole that is larger than the response
 // buffer keeps (16 KiB) leaves its body with a write of its own instead of through that buffer,
 // which would be made and freed again for each response; the client gets the same bytes.

@@ -247,6 +247,39 @@ deployment allocate the pools at start.
   sized by configuration (transmit arena, receive ring, inbox, send slots, CID table, timer wheel). Measured
   floors: 1.86 MiB with GRO on (ring apart) and 2.41 MiB with the library's I/O defaults, pinned by test
   bounds of 2.0 and 2.5 MiB; measured on-demand state after the idle trim: 0.51 MiB (ruling T20-f).
+- **Caps follow the connection cap** (task 23b): every per-worker pool that an idle connection holds a
+  share of is capped at that share times `max_conns_per_worker` plus a budget for work in flight, so
+  that idle HTTP/3 connections reach the connection cap (the next client's first Initial is dropped)
+  before any pool runs out. The pools still grow on demand in bounded chunks and are never
+  preallocated, so the benchmark and idle budgets above are unchanged. Sizing rule:
+  - stream slots: 6 per connection (`SLOTS_PER_CONN`: our control, QPACK encoder and decoder streams
+    and the client's three) plus 16,384 for requests (`REQUEST_SLOTS`, 64 connections × a window of
+    256), 40,960 at the default cap;
+  - frame-reference chunks: 256 per connection (`SENT_RING_LEN`: an idle connection keeps a chunk for
+    each ACK-only packet until its sent ring wraps, and a client that only pings to keep the
+    connection open acknowledges none of them) plus 32,768 for packets in flight (`FLIGHT_CHUNKS`),
+    1,081,344 at the default cap;
+  - the CID table (one server CID per connection), the timer wheel and the dirty/fired lists were
+    already sized by the connection cap; the free lists (≤ 1,024 entries each) and the H3 box pool
+    (≤ 256 boxes, 4 MiB) bound what is kept for reuse, not what is live, so a connection past them
+    allocates and is never refused.
+
+  Measured idle connection (task 23, net live heap of a one-worker server): ≈ 21.6 KB QUIC-only
+  (21,613 B), ≈ 27 KB with the client's three HTTP/3 unidirectional streams (+3 × 1,824 B). Worst
+  case per worker at the default cap of 4,096: idle connections 4,096 × 27 KB ≈ 111 MB; a client
+  that keeps each one open with PINGs adds up to 256 chunks × 200 B = 51 KB per connection, ≈ 210 MB
+  more (≈ 78 KB per connection, ≈ 321 MB); with the request budgets full on top (16,384 slots ×
+  1,632 B ≈ 27 MB, 32,768 chunks ≈ 7 MB), ≈ 354 MB (≈ 338 MiB), before the data blocks of requests
+  in flight, which flow control bounds. Slot exhaustion can still happen when clients hold whole
+  windows of requests on more than 64 connections; it fails per stream and per connection, never
+  stalling the worker: a request stream that finds no slot is refused with H3_REQUEST_REJECTED
+  (ruling T10-c; past eight refused at once the connection closes with INTERNAL_ERROR), and a new
+  connection whose own control or QPACK streams find no slot is closed with INTERNAL_ERROR.
+  Deferred reductions (future work, not done): the 1-RTT sent ring taken on demand (≈ −6 KB per
+  idle connection); no QPACK encoder/decoder streams when both dynamic-table capacities are 0
+  (RFC 9204 §4.2, ≈ −3.6 KB and −2 slots); the QPACK decode memo allocated lazily (≈ −1.7 KB); an
+  ACK-only packet's record kept without a frame-reference chunk (≈ −51 KB per pinged idle
+  connection, and −256 chunks per connection from the rule).
 - **CID table**: our CIDs are 8 bytes: byte 0 = worker index, bytes 1–7 random (CSPRNG), with a
   stateless-reset token derived from a per-process key (HMAC). While CID steering is on, each connection has
   **exactly one** server CID and we send no NEW_CONNECTION_ID: RFC 9000 §5.1 forbids CIDs of one connection
