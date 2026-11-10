@@ -730,7 +730,7 @@ pub(crate) fn client_conn(
   pools: &mut QuicPools,
   change_tp: fn(&mut TransportParams),
 ) -> ClientConn {
-  client_conn_padded(params, (local_cid, original_dcid), rng, now_us, pools, change_tp, 0)
+  client_conn_padded(params, (local_cid, original_dcid), rng, now_us, pools, change_tp, (0, b"h3"))
 }
 
 /// [`client_conn`] whose transport parameters end with an unknown one of `padding` bytes, which
@@ -742,7 +742,7 @@ pub(crate) fn client_conn_padded(
   now_us: u64,
   pools: &mut QuicPools,
   change_tp: fn(&mut TransportParams),
-  padding: usize,
+  (padding, alpn): (usize, &[u8]),
 ) -> ClientConn {
   let mut tp = [0; 256];
   let mut params_tp = params.transport_params(local_cid, None);
@@ -754,7 +754,7 @@ pub(crate) fn client_conn_padded(
     bytes.extend_from_slice(&(0x4000 | u16::try_from(padding).unwrap()).to_be_bytes());
     bytes.resize(bytes.len() + padding, 0x5a);
   }
-  let tls = QuicTls::new_client("localhost", b"h3", &bytes, rng).unwrap();
+  let tls = QuicTls::new_client("localhost", alpn, &bytes, rng).unwrap();
   QuicConn::new_client(params, local_cid, original_dcid, SERVER_ADDR, tls, now_us, pools).unwrap()
 }
 
@@ -995,6 +995,8 @@ pub(crate) struct Net<SA: QuicApp = TestApp> {
   client_parts: Parts,
   /// Changes the transport parameters that the clients send.
   pub(crate) client_tp: fn(&mut TransportParams),
+  /// The ALPN that the clients offer.
+  pub(crate) client_alpn: &'static [u8],
   counters: Option<(&'static AtomicU64, &'static AtomicU64)>,
   /// The keys of the stateless packets of the server.
   pub(crate) keys: Arc<EndpointKeys>,
@@ -1048,6 +1050,7 @@ impl<SA: QuicApp> Net<SA> {
       client_params: ConnParams::default(),
       client_parts: Parts::new(),
       client_tp: |_| {},
+      client_alpn: b"h3",
       counters: None,
       keys,
       loads,
@@ -1087,7 +1090,7 @@ impl<SA: QuicApp> Net<SA> {
       self.now_us,
       &mut self.client_parts.pools,
       self.client_tp,
-      padding,
+      (padding, self.client_alpn),
     );
     let port = 50_000u16.wrapping_add(u16::try_from(idx).unwrap());
     self.clients.push(NetClient {

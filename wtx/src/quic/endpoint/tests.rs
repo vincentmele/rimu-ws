@@ -1144,24 +1144,68 @@ fn slot_table_grows_a_chunk_at_a_time_and_clear_keeps_handles_stale() {
 }
 
 // Rule (RFC 9000 section 10.2.3, RFC 9001 section 4.8; h3spec): the first Initial packet of a client
-// whose transport parameters are rejected (a failure of the handshake while the connection has no
-// processed packet yet) is answered with a CONNECTION_CLOSE, in an Initial packet, and not dropped
-// without a word. The connection then drains like any other that closed.
+// whose handshake data is refused, for its transport parameters (TRANSPORT_PARAMETER_ERROR) or
+// its TLS (no_application_protocol, an alert of RFC 9001 section 4.8), is answered with a
+// CONNECTION_CLOSE with that code, in an Initial packet, and not dropped without a word. The
+// connection then drains like any other that closed.
 #[cfg_attr(miri, ignore)]
 #[test]
 fn rejected_first_initial_is_answered_with_connection_close() {
-  let mut net = net(1, QuicParams::default());
-  // The server requires the CID of the Initial packets in the parameters (RFC 9000 section 7.3)
+  // (the ALPN of the client, its transport parameters, the code that is expected)
+  let cases: [(&'static [u8], fn(&mut crate::quic::TransportParams), u64); 2] = [
+    // The server requires the CID of the Initial packets in the parameters (RFC 9000 section 7.3)
+    (b"h3", |el| el.initial_source_connection_id = None, 0x08),
+    // 0x100 + no_application_protocol (120)
+    (b"h2", |_| {}, 0x178),
+  ];
+  for (alpn, tp, code) in cases {
+    let mut net = net(1, QuicParams::default());
+    net.client_alpn = alpn;
+    net.client_tp = tp;
+    let client = net.add_client();
+    let mut first = net.client_datagrams(client);
+    let _ = net.deliver_to_server(client, &mut first[0]);
+    let out = net.server_datagrams(0);
+    assert_eq!(out.len(), 1, "{code:#x}");
+    assert_eq!(parse_header(&out[0].1, 8).unwrap().ty, PacketTy::Initial);
+    assert_eq!(net.servers[0].endpoint.stats().conns, 1);
+    net.deliver_to_client(client, &mut out[0].1.clone());
+    assert_eq!(net.clients[client].conn.state(), ConnState::Draining);
+    assert_eq!(net.clients[client].conn.test_client().unwrap().peer_close, Some((false, code)));
+    net.advance(CLOSING_US);
+    assert_eq!(net.servers[0].endpoint.stats().conns, 0);
+  }
+}
+
+// Rule (review I-2): a connection kept to say that a first Initial was refused is a half-open one
+// until it has drained, as a handshake that has not finished: a flood of such Initials from many
+// addresses fills `half_open`, gets the Retry above `retry_above_half_open` and is refused at
+// `max_half_open_per_worker`, as a flood of ordinary half-open handshakes is; and the slots are
+// released once they drained.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn refused_initials_count_as_half_open_until_they_drain() {
+  let mut net =
+    net(1, limits(|el| {
+      el.retry_above_half_open = 4;
+      el.max_half_open_per_worker = 6;
+    }));
   net.client_tp = |el| el.initial_source_connection_id = None;
-  let client = net.add_client();
-  let mut first = net.client_datagrams(client);
-  let _ = net.deliver_to_server(client, &mut first[0]);
-  let out = net.server_datagrams(0);
-  assert_eq!(out.len(), 1);
-  assert_eq!(parse_header(&out[0].1, 8).unwrap().ty, PacketTy::Initial);
-  assert_eq!(net.servers[0].endpoint.stats().conns, 1);
-  net.deliver_to_client(client, &mut out[0].1.clone());
-  assert_eq!(net.clients[client].conn.state(), ConnState::Draining);
+  let mut retries = 0;
+  for _ in 0..12 {
+    let client = net.add_client();
+    let mut first = net.client_datagrams(client);
+    let _ = net.deliver_to_server(client, &mut first[0]);
+    for (_, datagram) in net.server_datagrams(0) {
+      if parse_header(&datagram, 8).unwrap().ty == PacketTy::Retry {
+        retries += 1;
+      }
+    }
+  }
+  let stats = net.servers[0].endpoint.stats();
+  // Four refused Initials held a slot each, the other eight got a Retry
+  assert_eq!((stats.half_open, stats.conns, retries), (4, 4, 8));
   net.advance(CLOSING_US);
-  assert_eq!(net.servers[0].endpoint.stats().conns, 0);
+  let stats = net.servers[0].endpoint.stats();
+  assert_eq!((stats.half_open, stats.conns), (0, 0));
 }

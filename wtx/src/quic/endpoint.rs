@@ -577,7 +577,10 @@ where
     let Some(state) = slot.conn.as_ref().map(QuicConn::state) else {
       return;
     };
-    if state != ConnState::Handshake && slot.handshake_deadline_us.take().is_some() {
+    // The handshake is over once it is confirmed; a connection that closes before is half-open
+    // until it drains, which is how a flood of Initial packets that are refused (review I-2) is
+    // counted for Retry and for the cap, with the slots that it holds
+    if state == ConnState::Confirmed && slot.handshake_deadline_us.take().is_some() {
       self.half_open = self.half_open.saturating_sub(1);
       // The client sends to our CID from now on
       if let Some(elem) = slot.original_dcid.take() {
