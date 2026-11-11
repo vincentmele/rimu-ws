@@ -79,6 +79,7 @@ fn empty_and_one_byte_inputs_round_trip() {
   let _ = round_trip(&mut encoder, b"x");
 }
 
+#[cfg_attr(miri, ignore = "slow under Miri; covered natively")]
 #[test]
 fn literals_round_trip() {
   let mut rng = Rng::new(1);
@@ -98,6 +99,7 @@ fn encode_appends() {
   assert_eq!(inflate(&out[3..]), b"hello hello hello");
 }
 
+#[cfg_attr(miri, ignore = "slow under Miri; covered natively")]
 #[test]
 fn bound_holds() {
   let mut rng = Rng::new(2);
@@ -249,6 +251,7 @@ fn zlib_l6(input: &[u8]) -> usize {
   out.len()
 }
 
+#[cfg_attr(miri, ignore = "slow under Miri; covered natively")]
 #[test]
 fn json_is_within_five_percent_of_zlib_l6() {
   let mut rng = Rng::new(7);
@@ -285,4 +288,22 @@ fn block_type_is_the_cheapest() {
   assert_eq!(encoder.last_block_types(), [BlockType::Fixed]);
   let _ = round_trip(&mut encoder, &rng.bytes(4_000));
   assert_eq!(encoder.last_block_types(), [BlockType::Stored]);
+}
+
+#[cfg_attr(miri, ignore = "slow under Miri; covered natively")]
+#[test]
+fn check_bytes_accepts_a_seed_corpus() {
+  use crate::codec::gzip_encoder::check::check_bytes;
+  let mut rng = Rng::new(10);
+  for _ in 0..200 {
+    let len = rng.below(4_000);
+    check_bytes(&rng.bytes(len));
+  }
+  for items in [1, 25, 50] {
+    let mut data = alloc::vec![4, 0, 32, 0, 8, 0, 4, 1];
+    data.extend_from_slice(&dataset_json(&mut rng, items));
+    check_bytes(&data);
+  }
+  check_bytes(&[]);
+  check_bytes(&[0xff; 9]);
 }

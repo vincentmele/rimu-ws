@@ -37,7 +37,7 @@ pub(crate) fn code_lengths(freq: &[u32], max_bits: u8, out: &mut [u8]) {
     weight[i] = leaf >> 16;
   }
   let (mut next_leaf, mut next_node, mut nodes) = (0, n, n);
-  let mut pick = |next_leaf: &mut usize, next_node: &mut usize, nodes: usize, weight: &[u64]| -> usize {
+  let pick = |next_leaf: &mut usize, next_node: &mut usize, nodes: usize, weight: &[u64]| -> usize {
     if *next_leaf < n && (*next_node >= nodes || weight[*next_leaf] <= weight[*next_node]) {
       *next_leaf += 1;
       *next_leaf - 1

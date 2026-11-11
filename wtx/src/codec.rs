@@ -44,6 +44,9 @@ pub use encode::Encode;
 pub use from_radix_10::{FromRadix10, FromRadix10Error};
 #[cfg(feature = "gzip-encoder")]
 pub use gzip_encoder::{GzipEncoder, GzipParams};
+#[cfg(feature = "_fuzz-gzip")]
+#[doc(hidden)]
+pub use gzip_encoder::check as gzip_check;
 pub use generic_codec::{DecodeWrapper, EncodeWrapper, GenericCodec};
 pub use hex::*;
 pub use misc::{
