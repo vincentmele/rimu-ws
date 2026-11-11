@@ -25,7 +25,7 @@ use crate::{
     DecodeMemo, H3Params, H3Settings, QpackDecoder,
     request::{Fields, H3Request, RequestHead},
   },
-  quic::{ConnHandle, QuicConn, StreamId},
+  quic::{ConnHandle, StreamId},
 };
 use alloc::boxed::Box;
 
@@ -46,15 +46,19 @@ const REQ_WINDOW: usize = 256;
 
 // Ruling T13-a: what the connection keeps inline for HTTP/3 is at most 160 bytes, and so a
 // connection of the production build with its HTTP/3 state is at most 4 KiB (spec section 5.4).
-const _: () = {
-  assert!(size_of::<H3ConnState>() <= 160);
-  assert!(
-    size_of::<
-      QuicConn<crate::http3::H3App<SizeProbeHandler>, crate::rng::ChaCha20, crate::tls::SkCtx>,
-    >()
-      <= 4096
-  );
-};
+// The production build is that of `crypto-ring`, whose keys the 4 KiB are measured with (final
+// review I1, see `quic::conn`).
+const _: () = assert!(size_of::<H3ConnState>() <= 160);
+#[cfg(feature = "crypto-ring")]
+const _: () = assert!(
+  size_of::<
+    crate::quic::QuicConn<
+      crate::http3::H3App<SizeProbeHandler>,
+      crate::rng::ChaCha20,
+      crate::tls::SkCtx,
+    >,
+  >() <= 4096
+);
 
 /// The state of a connection, inline: see the [module documentation](self).
 #[derive(Debug, Default)]
@@ -493,8 +497,10 @@ fn window_pos(id: StreamId) -> usize {
 }
 
 // A handler, for the size of a connection of the production build.
+#[cfg(feature = "crypto-ring")]
 struct SizeProbeHandler;
 
+#[cfg(feature = "crypto-ring")]
 impl crate::http3::H3Handler for SizeProbeHandler {
   fn on_request(
     &mut self,

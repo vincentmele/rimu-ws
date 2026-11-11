@@ -209,6 +209,10 @@ impl TxArena {
 
   /// The most trains that the arena holds at once, pending, submitted or not yet released: a
   /// driver that keeps the kernel's view of each submitted train needs that many.
+  #[cfg_attr(
+    not(feature = "io-uring"),
+    allow(dead_code, reason = "only the io_uring UDP socket keeps a view of each train")
+  )]
   #[inline]
   pub(crate) fn max_trains(&self) -> usize {
     self.trains.len()

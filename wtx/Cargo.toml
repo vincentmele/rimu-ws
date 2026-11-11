@@ -157,7 +157,9 @@ portable-atomic-util = ["portable-atomic", "dep:portable-atomic-util", "portable
 postgres = ["crypto", "database", "foldhash", "hashbrown", "tls"]
 postgres-pool = ["postgres", "secret"]
 # QUIC seals and opens every packet and protects its headers (RFC 9001 section 5.4), which only
-# `crypto-ring`, `crypto-alr` and `crypto-ruco` provide: `crypto-graviola` has no header protection.
+# `crypto-ring`, `crypto-alr` and `crypto-ruco` provide: `crypto-graviola` has no header protection,
+# and with one of the others that one protects the headers. A connection is at most 4 KiB with
+# `crypto-ring`; the expanded keys of `crypto-ruco` make it about 6.4 KiB.
 quic = ["tls", "foldhash", "hashbrown"]
 quick-protobuf = ["dep:quick-protobuf", "quick-protobuf?/std", "std"]
 rand_core = ["dep:rand_core"]

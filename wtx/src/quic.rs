@@ -4,6 +4,14 @@
 //! Everything here is sans-I/O: decoders return slices of their input, encoders write into
 //! buffers of the caller and connections are fed datagrams and drained into a [`TxArena`].
 
+// Every packet is sealed and its header protected (RFC 9001 section 5.4): Graviola alone, or no
+// backend, would fail every handshake (final review M2)
+#[cfg(not(any(feature = "crypto-alr", feature = "crypto-ring", feature = "crypto-ruco")))]
+compile_error!(
+  "the `quic` feature needs a crypto backend with header protection: `crypto-ring`, `crypto-alr` \
+   or `crypto-ruco`"
+);
+
 #[allow(dead_code, reason = "the application interface, which the HTTP/3 layer of task 13 uses")]
 mod app;
 mod cc;

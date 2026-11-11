@@ -48,7 +48,7 @@ pub use hmac::{
   Hmac, HmacDummy,
   global::{HmacSha256Global, HmacSha384Global},
 };
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[cfg(all(target_arch = "x86_64", feature = "quic", feature = "std"))]
 pub(crate) use hp_key::x86_aesni::{Aes128HpAesNi, Aes256HpAesNi, has_aes_ni};
 pub use hp_key::{
   HpKey, HpKeyDummy,

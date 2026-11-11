@@ -13,6 +13,8 @@ $rt test-with-features rimu-ws http-cookie-secure
 $rt test-with-features rimu-ws http-session,crypto-ring
 $rt test-with-features rimu-ws http2,crypto-ring
 $rt test-with-features rimu-ws http2-server-framework,crypto-ring
+$rt test-with-features rimu-ws http3,web-socket,crypto-ring
+$rt test-with-features rimu-ws http3-server-framework,web-socket,crypto-ring
 $rt test-with-features rimu-ws httparse
 $rt test-with-features rimu-ws libc
 $rt test-with-features rimu-ws macros

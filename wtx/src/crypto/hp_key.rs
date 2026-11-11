@@ -5,7 +5,7 @@ pub(crate) mod global;
 mod ring;
 #[cfg(feature = "crypto-ruco")]
 mod ruco;
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[cfg(all(target_arch = "x86_64", feature = "quic", feature = "std"))]
 pub(crate) mod x86_aesni;
 
 use crate::crypto::CryptoError;
@@ -231,13 +231,11 @@ mod tests {
     };
   }
 
-  // Under Miri only the Rust Crypto backend runs, the others call C or assembly
+  // Under Miri only the Rust Crypto backend runs, the others call C or assembly. Graviola has no
+  // header protection: with another backend that has it the globals use that one (final review I1)
   #[cfg(all(
     not(miri),
-    any(
-      feature = "crypto-ring",
-      all(not(feature = "crypto-graviola"), any(feature = "crypto-alr", feature = "crypto-ruco"))
-    )
+    any(feature = "crypto-ring", feature = "crypto-alr", feature = "crypto-ruco")
   ))]
   suite!(
     global,

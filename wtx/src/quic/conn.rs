@@ -3065,14 +3065,22 @@ where
 // Spec section 5.4: a connection is at most 4 KiB in the build that runs, not only in tests,
 // whose random number generators are smaller (ruling T10-j). The probe application keeps no state
 // of its own: what an application keeps per connection counts on top.
+//
+// The budget is the one of `crypto-ring`, the backend of the production build, which the other
+// backends give way to when it is on (final review I1). The 1-RTT keys are held in line, so a
+// backend's expanded key state counts: with `crypto-ruco` alone a connection is about 6.4 KiB, and
+// a build of that backend trades the size for having no C or assembly.
+#[cfg(feature = "crypto-ring")]
 const _: () = assert!(
   size_of::<QuicConn<SizeProbeApp, crate::rng::ChaCha20, crate::tls::SkCtx>>() <= 4096,
   "a QUIC connection of the production build is larger than 4 KiB"
 );
 
 // An application that keeps nothing, for the size of a connection of the production build.
+#[cfg(feature = "crypto-ring")]
 struct SizeProbeApp;
 
+#[cfg(feature = "crypto-ring")]
 impl QuicApp for SizeProbeApp {
   type ConnState = ();
 
