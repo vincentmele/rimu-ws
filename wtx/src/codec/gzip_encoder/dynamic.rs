@@ -3,7 +3,7 @@
 
 use crate::codec::gzip_encoder::{
   END_OF_BLOCK,
-  huffman::{canonical_codes, code_lengths},
+  huffman::{Scratch, canonical_codes, code_lengths},
   tokens::{DIST_SYMBOLS, LIT_SYMBOLS, Tokens},
 };
 
@@ -27,6 +27,7 @@ pub(crate) struct Dynamic {
   hlit: usize,
   hdist: usize,
   hclen: usize,
+  scratch: Scratch,
 }
 
 impl Dynamic {
@@ -43,6 +44,7 @@ impl Dynamic {
       hlit: 257,
       hdist: 1,
       hclen: 4,
+      scratch: Scratch::new(),
     }
   }
 
@@ -51,8 +53,8 @@ impl Dynamic {
   pub(crate) fn plan(&mut self, tokens: &Tokens) -> u64 {
     let mut lit_freq = tokens.lit_freq;
     lit_freq[END_OF_BLOCK] = 1;
-    code_lengths(&lit_freq, 15, &mut self.lit_len);
-    code_lengths(&tokens.dist_freq, 15, &mut self.dist_len);
+    code_lengths(&lit_freq, 15, &mut self.lit_len, &mut self.scratch);
+    code_lengths(&tokens.dist_freq, 15, &mut self.dist_len, &mut self.scratch);
     if self.dist_len.iter().all(|&len| len == 0) {
       // No match: one distance code, never used, keeps every decoder content
       self.dist_len[0] = 1;
@@ -66,7 +68,7 @@ impl Dynamic {
     for &(sym, _) in &self.rle[..self.rle_len] {
       cl_freq[usize::from(sym)] += 1;
     }
-    code_lengths(&cl_freq, 7, &mut self.cl_len);
+    code_lengths(&cl_freq, 7, &mut self.cl_len, &mut self.scratch);
     canonical_codes(&self.cl_len, &mut self.cl_code);
     self.hclen = 4.max(19 - CL_ORDER.iter().rev().take_while(|&&sym| self.cl_len[sym] == 0).count());
     let mut bits = 3 + 5 + 5 + 4 + 3 * self.hclen as u64;

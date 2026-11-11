@@ -8,6 +8,8 @@
 //! DEFLATE block (RFC 1951) written in whichever of the block types costs the fewest bits.
 
 mod bits;
+#[cfg(any(test, feature = "_fuzz-gzip"))]
+pub mod check;
 mod dynamic;
 mod huffman;
 mod matcher;
@@ -39,12 +41,14 @@ pub struct GzipParams {
   pub good_match: u16,
   /// Longer matches enter only their first positions into the hash chains.
   pub max_insert: u16,
+  /// One step of lazy evaluation: a match is deferred when the next position starts a longer one.
+  pub lazy: bool,
 }
 
 impl Default for GzipParams {
   #[inline]
   fn default() -> Self {
-    Self { search_depth: 4, nice_match: 32, good_match: 8, max_insert: 4 }
+    Self { search_depth: 4, nice_match: 32, good_match: 8, max_insert: 4, lazy: true }
   }
 }
 
@@ -237,6 +241,7 @@ fn write_fixed(writer: &mut BitWriter<'_>, tokens: &Tokens, last: bool) {
 }
 
 /// The tokens of a block in its codes, then its end of block.
+#[inline(always)]
 fn write_tokens(
   writer: &mut BitWriter<'_>,
   tokens: &Tokens,
@@ -253,12 +258,15 @@ fn write_tokens(
     }
     let len = ((token >> 16) & 0xff) as usize + 3;
     let distance = (token & 0xffff) as usize + 1;
+    // Each code goes out with its extra bits in one write: at most 15 + 5 and 15 + 13 bits
     let ls = usize::from(LEN_SYM[len]);
-    writer.put(lit_code[257 + ls].into(), lit_len[257 + ls].into());
-    writer.put(u32::from(len as u16 - LEN_BASE[ls]), LEN_XBITS[ls].into());
+    let code_len = u32::from(lit_len[257 + ls]);
+    let extra = u32::from(len as u16 - LEN_BASE[ls]);
+    writer.put(u32::from(lit_code[257 + ls]) | extra << code_len, code_len + u32::from(LEN_XBITS[ls]));
     let ds = dist_sym(distance);
-    writer.put(dist_code[ds].into(), dist_len[ds].into());
-    writer.put(u32::from(distance as u16 - DIST_BASE[ds]), DIST_XBITS[ds].into());
+    let code_len = u32::from(dist_len[ds]);
+    let extra = u32::from(distance as u16 - DIST_BASE[ds]);
+    writer.put(u32::from(dist_code[ds]) | extra << code_len, code_len + u32::from(DIST_XBITS[ds]));
   }
   writer.put(lit_code[END_OF_BLOCK].into(), lit_len[END_OF_BLOCK].into());
 }

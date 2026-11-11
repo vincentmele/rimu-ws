@@ -17,8 +17,9 @@ pub fn check_bytes(data: &[u8]) {
     nice_match: field(2) % 258 + 1,
     good_match: field(4) % 258 + 1,
     max_insert: u16::from(seed[6]) % 258 + 1,
+    lazy: seed[7] & 0x80 == 0,
   };
-  let parts = usize::from(seed[7] % 3) + 1;
+  let parts = usize::from((seed[7] & 0x7f) % 3) + 1;
   let mut encoder = GzipEncoder::with_params(params);
   let mut out = Vec::new();
   let mut start = 0;

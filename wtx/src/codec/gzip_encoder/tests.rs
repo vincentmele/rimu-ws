@@ -212,7 +212,8 @@ fn zero_allocations_after_warm_up() {
 
 #[test]
 fn lengths_are_limited_and_complete() {
-  use crate::codec::gzip_encoder::huffman::code_lengths;
+  use crate::codec::gzip_encoder::huffman::{Scratch, code_lengths};
+  let mut scratch = Scratch::new();
   let mut fib = [0u32; 40];
   fib[0] = 1;
   fib[1] = 1;
@@ -229,7 +230,7 @@ fn lengths_are_limited_and_complete() {
   ];
   for (freq, max) in cases {
     let mut lengths = [0u8; 40];
-    code_lengths(freq, max, &mut lengths[..freq.len()]);
+    code_lengths(freq, max, &mut lengths[..freq.len()], &mut scratch);
     let used: alloc::vec::Vec<u8> =
       freq.iter().zip(&lengths).filter(|(f, _)| **f > 0).map(|(_, l)| *l).collect();
     assert!(used.iter().all(|&l| l >= 1 && l <= max), "{freq:?}: {lengths:?}");

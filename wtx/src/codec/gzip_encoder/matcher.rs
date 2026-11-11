@@ -19,46 +19,49 @@ impl Matcher {
     Self { head: Vec::new(), prev: Vec::new(), bits: 8 }
   }
 
-  /// Tokens for `chunk` (at most 65,534 bytes), greedy with one step of lazy evaluation.
+  /// Tokens for `chunk` (at most 65,534 bytes), greedy, with one step of lazy evaluation when
+  /// `params.lazy`.
   pub(crate) fn find(&mut self, chunk: &[u8], params: &GzipParams, tokens: &mut Tokens) {
     let n = chunk.len();
     tokens.clear(n);
     self.reset(n);
+    let mut t = Tables { head: &mut self.head[..1 << self.bits], prev: &mut self.prev[..n], shift: 32 - self.bits };
     let depth = u32::from(params.search_depth.max(1));
     let lazy_depth = (depth / 4).max(1);
     let nice = usize::from(params.nice_match).clamp(MIN_MATCH, MAX_MATCH);
     let good = usize::from(params.good_match);
     let max_insert = usize::from(params.max_insert.max(1));
+    let last_hashed = (n + 1).saturating_sub(MIN_MATCH);
     let mut i = 0;
     while i < n {
-      if i + MIN_MATCH > n {
+      if i >= last_hashed {
         tokens.literal(chunk[i]);
         i += 1;
         continue;
       }
-      let (len, dist) = self.search_and_insert(chunk, i, depth, nice);
+      let (len, dist) = t.search_and_insert(chunk, i, depth, nice);
       if len < MIN_MATCH {
         tokens.literal(chunk[i]);
         i += 1;
         continue;
       }
-      if len < nice && i + 1 + MIN_MATCH <= n {
+      if params.lazy && len < nice && i + 1 < last_hashed {
         let next_depth = if len >= good { lazy_depth } else { depth };
-        let (len2, dist2) = self.search_and_insert(chunk, i + 1, next_depth, nice);
+        let (len2, dist2) = t.search_and_insert(chunk, i + 1, next_depth, nice);
         if len2 > len {
           tokens.literal(chunk[i]);
           tokens.matched(len2, dist2);
-          self.insert_match(chunk, i + 2, i + 1 + len2, len2, max_insert);
+          t.insert_match(chunk, i + 2, i + 1 + len2, len2, max_insert, last_hashed);
           i += 1 + len2;
           continue;
         }
         tokens.matched(len, dist);
-        self.insert_match(chunk, i + 2, i + len, len, max_insert);
+        t.insert_match(chunk, i + 2, i + len, len, max_insert, last_hashed);
         i += len;
         continue;
       }
       tokens.matched(len, dist);
-      self.insert_match(chunk, i + 1, i + len, len, max_insert);
+      t.insert_match(chunk, i + 1, i + len, len, max_insert, last_hashed);
       i += len;
     }
   }
@@ -75,36 +78,48 @@ impl Matcher {
     }
     self.bits = bits;
   }
+}
 
-  #[inline]
-  fn hash(&self, chunk: &[u8], pos: usize) -> usize {
-    let word = u32::from_le_bytes([chunk[pos], chunk[pos + 1], chunk[pos + 2], chunk[pos + 3]]);
-    (word.wrapping_mul(0x9e37_79b1) >> (32 - self.bits)) as usize
-  }
+/// The chunk's views of the hash tables, for the hot loop.
+struct Tables<'tables> {
+  head: &'tables mut [u16],
+  prev: &'tables mut [u16],
+  shift: u32,
+}
 
-  #[inline]
+impl Tables<'_> {
+  #[inline(always)]
   fn insert(&mut self, chunk: &[u8], pos: usize) -> u16 {
-    let h = self.hash(chunk, pos);
-    let first = self.head[h];
+    let word = u32::from_le_bytes(chunk[pos..pos + 4].try_into().unwrap_or_default());
+    let h = (word.wrapping_mul(0x9e37_79b1) >> self.shift) as usize;
+    let slot = &mut self.head[h];
+    let first = *slot;
+    *slot = (pos + 1) as u16;
     self.prev[pos] = first;
-    self.head[h] = (pos + 1) as u16;
     first
   }
 
-  /// Inserts the positions `from..to` a match covered (those that can still be hashed), only the
-  /// first `max_insert` of them when the match is longer than that.
-  #[inline]
-  fn insert_match(&mut self, chunk: &[u8], from: usize, to: usize, len: usize, max_insert: usize) {
+  /// Inserts the positions `from..to` a match covered (those below `last_hashed`), only the first
+  /// `max_insert` of them when the match is longer than that.
+  #[inline(always)]
+  fn insert_match(
+    &mut self,
+    chunk: &[u8],
+    from: usize,
+    to: usize,
+    len: usize,
+    max_insert: usize,
+    last_hashed: usize,
+  ) {
     let end = if len > max_insert { to.min(from + max_insert) } else { to };
-    let end = end.min((chunk.len() + 1).saturating_sub(MIN_MATCH));
-    for pos in from..end {
+    for pos in from..end.min(last_hashed) {
       let _ = self.insert(chunk, pos);
     }
   }
 
   /// Inserts `pos` and returns the longest match for it among at most `depth` earlier positions
   /// of its chain within the window: (length, distance), length 0 when none.
-  #[inline]
+  #[inline(always)]
   fn search_and_insert(&mut self, chunk: &[u8], pos: usize, depth: u32, nice: usize) -> (usize, usize) {
     let mut cand = self.insert(chunk, pos);
     let max = (chunk.len() - pos).min(MAX_MATCH);
@@ -134,20 +149,19 @@ impl Matcher {
 }
 
 /// How many bytes at `a` and `b` (`a < b`) agree, up to `max`, eight at a time.
-#[inline]
+#[inline(always)]
 pub(crate) fn match_len(chunk: &[u8], a: usize, b: usize, max: usize) -> usize {
+  let (Some(x), Some(y)) = (chunk.get(a..a + max), chunk.get(b..b + max)) else {
+    return 0;
+  };
   let mut len = 0;
-  while len + 8 <= max {
-    let x = u64::from_le_bytes(chunk[a + len..a + len + 8].try_into().unwrap_or_default());
-    let y = u64::from_le_bytes(chunk[b + len..b + len + 8].try_into().unwrap_or_default());
-    let diff = x ^ y;
+  for (xs, ys) in x.chunks_exact(8).zip(y.chunks_exact(8)) {
+    let diff = u64::from_le_bytes(xs.try_into().unwrap_or_default())
+      ^ u64::from_le_bytes(ys.try_into().unwrap_or_default());
     if diff != 0 {
       return len + (diff.trailing_zeros() / 8) as usize;
     }
     len += 8;
   }
-  while len < max && chunk[a + len] == chunk[b + len] {
-    len += 1;
-  }
-  len
+  len + x[len..].iter().zip(&y[len..]).take_while(|(l, r)| l == r).count()
 }

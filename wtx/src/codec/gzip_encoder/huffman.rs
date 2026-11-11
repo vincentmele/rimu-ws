@@ -6,13 +6,29 @@ use crate::codec::gzip_encoder::reverse;
 /// The most symbols any DEFLATE alphabet has (literal/length, with the two unused ones).
 const MAX_SYMBOLS: usize = 288;
 
+/// The working arrays of [`code_lengths`], kept between calls so they are not cleared each time:
+/// every entry is written before it is read.
+#[derive(Debug)]
+pub(crate) struct Scratch {
+  leaves: [u64; MAX_SYMBOLS],
+  weight: [u64; 2 * MAX_SYMBOLS],
+  parent: [u16; 2 * MAX_SYMBOLS],
+  depth: [u8; 2 * MAX_SYMBOLS],
+}
+
+impl Scratch {
+  pub(crate) const fn new() -> Self {
+    Self { leaves: [0; MAX_SYMBOLS], weight: [0; 2 * MAX_SYMBOLS], parent: [0; 2 * MAX_SYMBOLS], depth: [0; 2 * MAX_SYMBOLS] }
+  }
+}
+
 /// Writes into `out` (as long as `freq`) a code length for every symbol: 0 for unused symbols,
 /// 1..=`max_bits` for used ones, forming a complete prefix code; a lone used symbol gets length 1.
-pub(crate) fn code_lengths(freq: &[u32], max_bits: u8, out: &mut [u8]) {
+pub(crate) fn code_lengths(freq: &[u32], max_bits: u8, out: &mut [u8], scratch: &mut Scratch) {
+  let Scratch { leaves, weight, parent, depth } = scratch;
   debug_assert!(freq.len() <= MAX_SYMBOLS && out.len() == freq.len() && (1..=15).contains(&max_bits));
   out.fill(0);
   // The used symbols sorted by frequency (then symbol), packed for one sort
-  let mut leaves = [0u64; MAX_SYMBOLS];
   let mut n = 0;
   for (sym, &f) in freq.iter().enumerate() {
     if f > 0 {
@@ -31,8 +47,6 @@ pub(crate) fn code_lengths(freq: &[u32], max_bits: u8, out: &mut [u8]) {
   leaves[..n].sort_unstable();
   // Two queues: the sorted leaves and the internal nodes, made in non-decreasing weight order.
   // Nodes 0..n are leaves, n.. internal; `parent` links every node to the internal node above it.
-  let mut weight = [0u64; 2 * MAX_SYMBOLS];
-  let mut parent = [0u16; 2 * MAX_SYMBOLS];
   for (i, leaf) in leaves[..n].iter().enumerate() {
     weight[i] = leaf >> 16;
   }
@@ -47,8 +61,8 @@ pub(crate) fn code_lengths(freq: &[u32], max_bits: u8, out: &mut [u8]) {
     }
   };
   while nodes < 2 * n - 1 {
-    let a = pick(&mut next_leaf, &mut next_node, nodes, &weight);
-    let b = pick(&mut next_leaf, &mut next_node, nodes, &weight);
+    let a = pick(&mut next_leaf, &mut next_node, nodes, weight);
+    let b = pick(&mut next_leaf, &mut next_node, nodes, weight);
     weight[nodes] = weight[a] + weight[b];
     parent[a] = nodes as u16;
     parent[b] = nodes as u16;
@@ -58,7 +72,7 @@ pub(crate) fn code_lengths(freq: &[u32], max_bits: u8, out: &mut [u8]) {
   // `max_bits`. As in zlib (gen_bitlen), every clamped node, internal or leaf, counts as
   // overflow, and the counts are then rebalanced into a complete code.
   let root = nodes - 1;
-  let mut depth = [0u8; 2 * MAX_SYMBOLS];
+  depth[root] = 0;
   let mut bl_count = [0u16; 16];
   let mut overflow = 0u32;
   for node in (0..root).rev() {
