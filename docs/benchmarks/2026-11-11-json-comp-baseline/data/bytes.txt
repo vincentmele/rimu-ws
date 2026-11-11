@@ -1,0 +1,13 @@
+rimu 25?m=4 header 119 body 947 enc gzip
+rimu 40?m=8 header 120 body 1301 enc gzip
+rimu 50?m=6 header 120 body 1519 enc gzip
+port 8080 busy
+viltrum 25?m=4 header 156 body 967 enc gzip
+viltrum 40?m=8 header 157 body 1322 enc gzip
+viltrum 50?m=6 header 157 body 1563 enc gzip
+plod 25?m=4 header 172 body 1008 enc gzip
+plod 40?m=8 header 172 body 1420 enc gzip
+plod 50?m=6 header 172 body 1703 enc gzip
+aegon 25?m=4 header 157 body 1023 enc gzip
+aegon 40?m=8 header 157 body 1412 enc gzip
+aegon 50?m=6 header 157 body 1704 enc gzip
