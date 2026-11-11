@@ -1199,7 +1199,7 @@ where
     if self.len >= self.cap {
       return Err(());
     }
-    if self.len % SLOT_CHUNK == 0 {
+    if self.len.is_multiple_of(SLOT_CHUNK) {
       let mut chunk = Vec::new();
       chunk.try_reserve_exact(SLOT_CHUNK).map_err(|_err| ())?;
       self.chunks.try_reserve(1).map_err(|_err| ())?;
