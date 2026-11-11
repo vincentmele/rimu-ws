@@ -15,5 +15,8 @@ cargo check -p rimu-ws --lib --no-default-features --features quic,std,crypto-gr
 cargo check -p rimu-ws --lib --no-default-features --features http3,std,crypto-ruco
 cargo check -p rimu-ws --lib --no-default-features --features http3-server-framework,crypto-ring
 cargo check -p rimu-ws --lib --no-default-features --features http3-server-framework,crypto-ruco
+# The one-shot gzip encoder, with and without std
+cargo check -p rimu-ws --lib --no-default-features --features gzip-encoder
+cargo check -p rimu-ws --lib --no-default-features --features std,gzip-encoder
 
 RUSTDOCFLAGS="-Dwarnings" cargo doc --all-features

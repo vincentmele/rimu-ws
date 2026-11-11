@@ -19,6 +19,8 @@ mod encode;
 pub mod format;
 mod from_radix_10;
 mod generic_codec;
+#[cfg(feature = "gzip-encoder")]
+mod gzip_encoder;
 mod hex;
 mod misc;
 pub mod num_str;
@@ -40,6 +42,8 @@ pub use decode::{Decode, DecodeSeq};
 pub use decompression::{Decompression, DecompressionFlush};
 pub use encode::Encode;
 pub use from_radix_10::{FromRadix10, FromRadix10Error};
+#[cfg(feature = "gzip-encoder")]
+pub use gzip_encoder::{GzipEncoder, GzipParams};
 pub use generic_codec::{DecodeWrapper, EncodeWrapper, GenericCodec};
 pub use hex::*;
 pub use misc::{

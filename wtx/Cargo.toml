@@ -61,6 +61,7 @@ spki = { default-features = false, optional = true, version = "0.8" }
 x25519-dalek = { default-features = false, optional = true, version = "3.0" }
 
 [dev-dependencies]
+miniz_oxide = { default-features = false, features = ["with-alloc"], version = "0.8" }
 rimu-ws = { default-features = false, features = ["crypto-ring", "macros", "std"], path = "." }
 
 [features]
@@ -144,6 +145,8 @@ http-session = ["http-cookie-secure", "secret", "serde_json"]
 httparse = ["dep:httparse"]
 io-uring = ["dep:io-uring", "libc", "socket2", "std"]
 json-writer = ["dep:zmij"]
+# A one-shot gzip encoder for small bodies (CRC32 from zlib-rs).
+gzip-encoder = ["zlib-rs"]
 libc = ["dep:libc"]
 macros = ["dep:rimu-ws-macros"]
 memchr = ["dep:memchr"]
