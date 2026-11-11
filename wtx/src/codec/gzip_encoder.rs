@@ -8,6 +8,8 @@
 //! DEFLATE block (RFC 1951) written in whichever of the block types costs the fewest bits.
 
 mod bits;
+mod dynamic;
+mod huffman;
 mod matcher;
 #[cfg(test)]
 mod tests;
@@ -15,6 +17,7 @@ mod tokens;
 
 use alloc::vec::Vec;
 use bits::BitWriter;
+use dynamic::Dynamic;
 use matcher::Matcher;
 use tokens::{DIST_XBITS, LEN_BASE, LEN_SYM, LEN_XBITS, DIST_BASE, MATCH, Tokens, dist_sym};
 
@@ -45,9 +48,21 @@ impl Default for GzipParams {
   }
 }
 
+/// How a block was coded.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BlockType {
+  Stored,
+  Fixed,
+  Dynamic,
+}
+
 /// A reusable one-shot gzip encoder. See the module documentation.
 #[derive(Debug)]
 pub struct GzipEncoder {
+  #[cfg(test)]
+  block_types: Vec<BlockType>,
+  dynamic: Dynamic,
   matcher: Matcher,
   params: GzipParams,
   tokens: Tokens,
@@ -63,7 +78,20 @@ impl GzipEncoder {
   /// An encoder with `params`. Allocates nothing.
   #[inline]
   pub fn with_params(params: GzipParams) -> Self {
-    Self { matcher: Matcher::new(), params, tokens: Tokens::new() }
+    Self {
+      #[cfg(test)]
+      block_types: Vec::new(),
+      dynamic: Dynamic::new(),
+      matcher: Matcher::new(),
+      params,
+      tokens: Tokens::new(),
+    }
+  }
+
+  /// The block types of the last [`Self::encode`].
+  #[cfg(test)]
+  pub(crate) fn last_block_types(&self) -> &[BlockType] {
+    &self.block_types
   }
 
   /// The parameters of this encoder.
@@ -83,12 +111,16 @@ impl GzipEncoder {
   /// to [`Self::bound`]) or this encoder's state beyond their high-water marks.
   #[inline]
   pub fn encode(&mut self, input: &[u8], out: &mut Vec<u8>) -> crate::Result<()> {
+    #[cfg(test)]
+    self.block_types.clear();
     out.reserve(Self::bound(input.len()));
     out.extend_from_slice(&HEADER);
     let mut writer = BitWriter::new(out);
     let mut chunks = input.chunks(MAX_CHUNK).peekable();
     if chunks.peek().is_none() {
       self.tokens.clear(0);
+      #[cfg(test)]
+      self.block_types.push(BlockType::Fixed);
       write_fixed(&mut writer, &self.tokens, true);
     }
     while let Some(chunk) = chunks.next() {
@@ -96,9 +128,20 @@ impl GzipEncoder {
       self.matcher.find(chunk, &self.params, &mut self.tokens);
       let stored = stored_bits(writer.position(), chunk.len());
       let fixed = fixed_bits(&self.tokens);
-      if fixed < stored {
+      let dynamic = self.dynamic.plan(&self.tokens);
+      if dynamic < fixed && dynamic < stored {
+        #[cfg(test)]
+        self.block_types.push(BlockType::Dynamic);
+        self.dynamic.write_header(&mut writer, last);
+        let d = &self.dynamic;
+        write_tokens(&mut writer, &self.tokens, &d.lit_code, &d.lit_len, &d.dist_code, &d.dist_len);
+      } else if fixed < stored {
+        #[cfg(test)]
+        self.block_types.push(BlockType::Fixed);
         write_fixed(&mut writer, &self.tokens, last);
       } else {
+        #[cfg(test)]
+        self.block_types.push(BlockType::Stored);
         write_stored(&mut writer, chunk, last);
       }
     }
@@ -150,26 +193,26 @@ pub(crate) const fn reverse(code: u16, len: u8) -> u16 {
   code.reverse_bits() >> (16 - len as u32)
 }
 
-const FIXED_LIT: [(u16, u8); 288] = {
-  let mut table = [(0, 0); 288];
+const FIXED_LIT_CODE: [u16; 288] = {
+  let mut table = [0; 288];
   let mut symbol = 0;
   while symbol < 288 {
-    table[symbol] = fixed_lit_code(symbol);
+    table[symbol] = fixed_lit_code(symbol).0;
     symbol += 1;
   }
   table
 };
-
-/// Bits of `tokens` as one fixed-code block: header, symbols, extra bits, end of block.
-fn fixed_bits(tokens: &Tokens) -> u64 {
-  let symbols: u64 =
-    tokens.lit_freq.iter().enumerate().map(|(sym, &freq)| u64::from(freq) * u64::from(FIXED_LIT[sym].1)).sum();
-  let distances: u64 = tokens.dist_freq.iter().map(|&freq| u64::from(freq) * 5).sum();
-  3 + symbols + distances + tokens.extra_bits + u64::from(FIXED_LIT[END_OF_BLOCK].1)
-}
-
-/// The fixed distance code of `symbol`, bit-reversed (all 5 bits long).
-const FIXED_DIST: [u16; 30] = {
+const FIXED_LIT_LEN: [u8; 288] = {
+  let mut table = [0; 288];
+  let mut symbol = 0;
+  while symbol < 288 {
+    table[symbol] = fixed_lit_code(symbol).1;
+    symbol += 1;
+  }
+  table
+};
+/// The fixed distance codes, bit-reversed (all 5 bits long).
+const FIXED_DIST_CODE: [u16; 30] = {
   let mut table = [0; 30];
   let mut sym = 0;
   while sym < 30 {
@@ -178,25 +221,44 @@ const FIXED_DIST: [u16; 30] = {
   }
   table
 };
+const FIXED_DIST_LEN: [u8; 30] = [5; 30];
+
+/// Bits of `tokens` as one fixed-code block: header, symbols, extra bits, end of block.
+fn fixed_bits(tokens: &Tokens) -> u64 {
+  let symbols: u64 =
+    tokens.lit_freq.iter().enumerate().map(|(sym, &freq)| u64::from(freq) * u64::from(FIXED_LIT_LEN[sym])).sum();
+  let distances: u64 = tokens.dist_freq.iter().map(|&freq| u64::from(freq) * 5).sum();
+  3 + symbols + distances + tokens.extra_bits + u64::from(FIXED_LIT_LEN[END_OF_BLOCK])
+}
 
 fn write_fixed(writer: &mut BitWriter<'_>, tokens: &Tokens, last: bool) {
   writer.put(u32::from(last) | (1 << 1), 3);
+  write_tokens(writer, tokens, &FIXED_LIT_CODE, &FIXED_LIT_LEN, &FIXED_DIST_CODE, &FIXED_DIST_LEN);
+}
+
+/// The tokens of a block in its codes, then its end of block.
+fn write_tokens(
+  writer: &mut BitWriter<'_>,
+  tokens: &Tokens,
+  lit_code: &[u16],
+  lit_len: &[u8],
+  dist_code: &[u16],
+  dist_len: &[u8],
+) {
   for &token in &tokens.items {
     if token & MATCH == 0 {
-      let (code, len) = FIXED_LIT[token as usize];
-      writer.put(code.into(), len.into());
+      let sym = token as usize;
+      writer.put(lit_code[sym].into(), lit_len[sym].into());
       continue;
     }
     let len = ((token >> 16) & 0xff) as usize + 3;
     let distance = (token & 0xffff) as usize + 1;
     let ls = usize::from(LEN_SYM[len]);
-    let (code, bits) = FIXED_LIT[257 + ls];
-    writer.put(code.into(), bits.into());
+    writer.put(lit_code[257 + ls].into(), lit_len[257 + ls].into());
     writer.put(u32::from(len as u16 - LEN_BASE[ls]), LEN_XBITS[ls].into());
     let ds = dist_sym(distance);
-    writer.put(FIXED_DIST[ds].into(), 5);
+    writer.put(dist_code[ds].into(), dist_len[ds].into());
     writer.put(u32::from(distance as u16 - DIST_BASE[ds]), DIST_XBITS[ds].into());
   }
-  let (code, len) = FIXED_LIT[END_OF_BLOCK];
-  writer.put(code.into(), len.into());
+  writer.put(lit_code[END_OF_BLOCK].into(), lit_len[END_OF_BLOCK].into());
 }

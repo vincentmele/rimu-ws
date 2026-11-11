@@ -207,3 +207,82 @@ fn zero_allocations_after_warm_up() {
   assert_eq!(ALLOCS.load(core::sync::atomic::Ordering::Relaxed), 0);
   assert_eq!(inflate(&out), input);
 }
+
+#[test]
+fn lengths_are_limited_and_complete() {
+  use crate::codec::gzip_encoder::huffman::code_lengths;
+  let mut fib = [0u32; 40];
+  fib[0] = 1;
+  fib[1] = 1;
+  for i in 2..fib.len() {
+    fib[i] = fib[i - 1].saturating_add(fib[i - 2]);
+  }
+  let cases: [(&[u32], u8); 6] = [
+    (&[5; 30], 15),
+    (&fib[..30], 15),
+    (&fib[..19], 7),
+    (&[0, 0, 9, 0], 15),
+    (&[3, 0, 7, 0, 0], 15),
+    (&[0, 1, 0, 1000, 1, 0, 0, 2, 1, 1], 7),
+  ];
+  for (freq, max) in cases {
+    let mut lengths = [0u8; 40];
+    code_lengths(freq, max, &mut lengths[..freq.len()]);
+    let used: alloc::vec::Vec<u8> =
+      freq.iter().zip(&lengths).filter(|(f, _)| **f > 0).map(|(_, l)| *l).collect();
+    assert!(used.iter().all(|&l| l >= 1 && l <= max), "{freq:?}: {lengths:?}");
+    assert!(freq.iter().zip(&lengths).all(|(f, l)| (*f == 0) == (*l == 0)), "{freq:?}: {lengths:?}");
+    if used.len() == 1 {
+      assert_eq!(used[0], 1);
+    } else {
+      let kraft: u64 = used.iter().map(|&l| 1u64 << (15 - u32::from(l))).sum();
+      assert_eq!(kraft, 1 << 15, "{freq:?}: {lengths:?}");
+    }
+  }
+}
+
+fn zlib_l6(input: &[u8]) -> usize {
+  let mut buf = alloc::vec![0u8; zlib_rs::compress_bound(input.len()) + 64];
+  let config = zlib_rs::DeflateConfig { window_bits: 31, ..zlib_rs::DeflateConfig::new(6) };
+  let (out, rc) = zlib_rs::compress_slice(&mut buf, input, config);
+  assert_eq!(rc, zlib_rs::ReturnCode::Ok);
+  out.len()
+}
+
+#[test]
+fn json_is_within_five_percent_of_zlib_l6() {
+  let mut rng = Rng::new(7);
+  let mut encoder = GzipEncoder::new();
+  for items in [25, 40, 50] {
+    let input = dataset_json(&mut rng, items);
+    let ours = round_trip(&mut encoder, &input).len();
+    let zlib = zlib_l6(&input);
+    assert!(ours * 100 <= zlib * 105, "{items} items: {ours} vs zlib {zlib}");
+  }
+}
+
+#[cfg_attr(miri, ignore = "large inputs")]
+#[test]
+fn random_input_stays_within_bound() {
+  let mut rng = Rng::new(8);
+  let mut encoder = GzipEncoder::new();
+  for _ in 0..50 {
+    let len = rng.below(100_000) + 1;
+    let input = rng.bytes(len);
+    let out = round_trip(&mut encoder, &input);
+    assert!(out.len() <= GzipEncoder::bound(len) && out.len() >= len, "{len}: {}", out.len());
+  }
+}
+
+#[test]
+fn block_type_is_the_cheapest() {
+  use crate::codec::gzip_encoder::BlockType;
+  let mut rng = Rng::new(9);
+  let mut encoder = GzipEncoder::new();
+  let _ = round_trip(&mut encoder, &dataset_json(&mut rng, 25));
+  assert_eq!(encoder.last_block_types(), [BlockType::Dynamic]);
+  let _ = round_trip(&mut encoder, b"a short text, twenty");
+  assert_eq!(encoder.last_block_types(), [BlockType::Fixed]);
+  let _ = round_trip(&mut encoder, &rng.bytes(4_000));
+  assert_eq!(encoder.last_block_types(), [BlockType::Stored]);
+}
