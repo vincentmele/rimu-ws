@@ -43,10 +43,10 @@ which ran first, held 195 K; the others fell ~25 %); the medians rest on passes 
 |---|---|---|---|---|---|
 | h1-baseline (quiet rerun) | 798,464 req/s, 14.46 µs | 798,576 req/s, 14.58 µs | +0.01 % rps, +0.8 % cpu | 0.8 / 0.5 % rps, 0.9 / 1.4 % cpu | ok |
 | h1-json-tls | 294,588 req/s | 295,254 req/s | +0.23 % | 17.8 / 14.2 % | ok |
-| h1-8gbit (quiet rerun; rate-capped, judged by cpu) | 34.22 µs/req | 34.57 µs/req | +1.03 % cpu | 1.6 / 8.6 % cpu | within spread |
+| h1-8gbit (quiet rerun; rate-capped, judged by cpu) | 34.22 µs/req | 34.57 µs/req | **+1.03 % cpu** | 1.6 / 8.6 % cpu | over the 1 % rule by 0.03 %; accepted by ruling (below) |
 | h1-jsoncomp-4096 | 134,043 req/s, 89.4 µs | 246,131 req/s, 48.7 µs | **+83.6 % rps, −45.6 % cpu** | 3.1 / 5.9 % | the change |
 | async (`/delay/10`, 3 rounds) | 414 K (414 / 411 / 429) | 419 K (412 / 419 / 425) | +1.2 % | | ok |
-| latency-10k (3 rounds, medians) | mean 106 µs, p99 123 µs, 287 K cyc/req | mean 104 µs, p99 128 µs, 288 K cyc/req | equal | ±5 µs between rounds | ok |
+| latency-10k (3 rounds, medians) | mean 106 µs, p99 123 µs, 287 K cyc/req | mean 104 µs, p99 128 µs, 288 K cyc/req | mean −2 %, **p99 +4 %** (higher in all three rounds: 124/128/128 vs 123/123/127 µs), cycles equal | ±5 µs between rounds | not a measured regression of this branch's code (below) |
 
 The first regression run (`data/regress-run1-results.tsv`) started at load 18–26 and gave noise for baseline (−3.5 %
 with 26 % / 59 % pass spreads) and 8gbit (+5.8 % cpu from one 61 µs pass); both were rerun quiet
@@ -54,6 +54,19 @@ with 26 % / 59 % pass spreads) and 8gbit (+5.8 % cpu from one 61 µs pass); both
 new feature-gated module. latency-10k's cycles count everything on the server CPUs (`perf stat -C`), so other jobs
 inflate both builds alike.
 
+**gcannon read errors.** json-comp's load reconnects every 25 requests, so read errors scale with throughput: per
+reconnect at 16,384 connections rimu (new) 0.24 %, plod 0.26 %, aegon 0.23 %, viltrum 0.17 %, rimu (`main`) 0.16 %
+(runs of passes 1–2). Every response was 2xx; the errors are connection teardown races of the reconnecting client, at
+rates comparable to the rivals'.
+
+**Ruling (8gbit).** The plan's rule is "none worse than 1 %"; 8gbit's cpu per request came out +1.03 % on the quiet
+rerun, with this branch's own passes spread 8.6 % (paired per pass +2.1 / +8.5 / −0.05 / −1.8 %) and +5.8 % on the
+noisy first run driven by one 61 µs pass. The branch changes no TLS, h1 or executor code (8gbit is `POST /echo` over
+TLS; only arena-h1's gzip call and a feature-gated module changed), so the difference is taken as measurement noise and
+accepted; cost if wrong: about 1 % of 8gbit's server cpu. Likewise latency-10k's p99 is 4 % higher on the medians with
+the mean 2 % lower and cycles equal, on a path (`/baseline11`) the branch does not touch.
+
 ## Verdict
-Goal 6 of the spec is met on colossus: rimu leads json-comp in the experimental league with eff 1.27 × viltrum's, and no
-measured h1 profile regresses beyond its own spread.
+Goal 6 of the spec is met on colossus: rimu leads json-comp in the experimental league with eff 1.27 × viltrum's. Of the
+other h1 profiles measured, baseline, json-tls and async are within 1 %; 8gbit's cpu is +1.03 % and latency-10k's p99
++4 %, both on code the branch does not change and accepted as noise by the ruling above. latency-1m was not measured.
