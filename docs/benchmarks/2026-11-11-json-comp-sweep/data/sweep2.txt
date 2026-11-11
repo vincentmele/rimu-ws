@@ -1,0 +1,28 @@
+test gzip_sweep::sweep ... calibration: zlib-rs level 6 27.17 us here = 62 us loaded (factor 2.28)
+zlib-rs level 6                            bodies   947  1301  1519 bpr  1375.3 encode  27.17 us (loaded  62.00) score 1.000
+zlib-rs level 1                            bodies  1266  1828  2212 bpr  1888.3 encode   8.94 us (loaded  20.40) score 0.974
+lazy   depth  6 nice  16 good  8 insert   1 bodies   969  1330  1564 bpr  1407.3 encode  11.33 us (loaded  25.85) score 1.581
+lazy   depth  8 nice  16 good  8 insert   1 bodies   967  1324  1560 bpr  1403.3 encode  11.48 us (loaded  26.19) score 1.580
+lazy   depth  6 nice  24 good  8 insert   1 bodies   964  1326  1559 bpr  1402.7 encode  11.52 us (loaded  26.29) score 1.579
+lazy   depth  8 nice  16 good  4 insert   1 bodies   967  1324  1563 bpr  1404.3 encode  11.46 us (loaded  26.16) score 1.579
+lazy   depth  6 nice  48 good  8 insert   1 bodies   962  1320  1553 bpr  1398.0 encode  11.71 us (loaded  26.72) score 1.577
+lazy   depth  6 nice  32 good  8 insert   1 bodies   963  1320  1553 bpr  1398.3 encode  11.70 us (loaded  26.69) score 1.577
+lazy   depth  6 nice  64 good  8 insert   1 bodies   962  1319  1548 bpr  1396.0 encode  11.78 us (loaded  26.88) score 1.577
+lazy   depth  6 nice 128 good  8 insert   1 bodies   962  1319  1548 bpr  1396.0 encode  11.80 us (loaded  26.93) score 1.576
+lazy   depth  8 nice  24 good  8 insert   1 bodies   964  1320  1556 bpr  1399.7 encode  11.69 us (loaded  26.68) score 1.575
+lazy   depth  8 nice  24 good  4 insert   1 bodies   964  1320  1558 bpr  1400.3 encode  11.67 us (loaded  26.63) score 1.575
+lazy   depth  6 nice  16 good  4 insert   1 bodies   970  1335  1573 bpr  1412.3 encode  11.28 us (loaded  25.74) score 1.573
+lazy   depth  6 nice  24 good  4 insert   1 bodies   967  1331  1569 bpr  1408.7 encode  11.41 us (loaded  26.03) score 1.573
+lazy   depth  6 nice  16 good  8 insert   2 bodies   964  1324  1561 bpr  1402.7 encode  11.65 us (loaded  26.59) score 1.571
+lazy   depth  4 nice  24 good  8 insert   1 bodies   970  1332  1568 bpr  1409.7 encode  11.42 us (loaded  26.05) score 1.570
+lazy   depth  4 nice  48 good  8 insert   1 bodies   965  1327  1562 bpr  1404.3 encode  11.62 us (loaded  26.52) score 1.569
+lazy   depth  6 nice  64 good  8 insert   2 bodies   958  1313  1544 bpr  1391.3 encode  12.08 us (loaded  27.58) score 1.569
+lazy   depth  4 nice  16 good  8 insert   1 bodies   972  1335  1572 bpr  1412.7 encode  11.34 us (loaded  25.87) score 1.569
+lazy   depth  4 nice  32 good  8 insert   1 bodies   967  1327  1563 bpr  1405.3 encode  11.60 us (loaded  26.47) score 1.568
+lazy   depth  6 nice  32 good  8 insert   2 bodies   958  1314  1549 bpr  1393.3 encode  12.02 us (loaded  27.44) score 1.568
+lazy   depth  4 nice  16 good  8 insert   2 bodies   967  1326  1564 bpr  1405.3 encode  11.60 us (loaded  26.48) score 1.568
+lazy   depth  6 nice  16 good  4 insert   2 bodies   964  1328  1568 bpr  1406.3 encode  11.57 us (loaded  26.40) score 1.568
+lazy   depth  3 nice  16 good  8 insert   1 bodies   974  1337  1579 bpr  1416.3 encode  11.23 us (loaded  25.62) score 1.568
+lazy   depth  6 nice  24 good  4 insert   2 bodies   960  1324  1564 bpr  1402.3 encode  11.71 us (loaded  26.73) score 1.567
+lazy   depth  4 nice 128 good  8 insert   1 bodies   966  1326  1558 bpr  1403.0 encode  11.70 us (loaded  26.70) score 1.567
+lazy   depth  4 nice  24 good  8 insert   2 bodies   965  1323  1562 bpr  1403.0 encode  11.70 us (loaded  26.71) score 1.566

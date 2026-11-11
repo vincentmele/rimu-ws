@@ -1,0 +1,28 @@
+test gzip_sweep::sweep ... calibration: zlib-rs level 6 26.94 us here = 62 us loaded (factor 2.30)
+zlib-rs level 6                            bodies   947  1301  1519 bpr  1375.3 encode  26.94 us (loaded  62.00) score 1.000
+zlib-rs level 1                            bodies  1266  1828  2212 bpr  1888.3 encode  10.01 us (loaded  23.03) score 0.925
+depth  8 nice  16 good  4 insert   2       bodies   964  1322  1563 bpr  1402.7 encode  16.51 us (loaded  38.00) score 1.304
+depth  6 nice  24 good  8 insert   2       bodies   960  1320  1557 bpr  1398.7 encode  16.74 us (loaded  38.52) score 1.302
+depth  3 nice  16 good  8 insert   2       bodies   970  1332  1576 bpr  1412.3 encode  16.18 us (loaded  37.25) score 1.301
+depth  8 nice  16 good  8 insert   2       bodies   963  1321  1558 bpr  1400.3 encode  16.69 us (loaded  38.42) score 1.301
+depth  6 nice  16 good  8 insert   2       bodies   964  1324  1561 bpr  1402.7 encode  16.63 us (loaded  38.28) score 1.299
+depth  6 nice  24 good  4 insert   2       bodies   960  1324  1564 bpr  1402.3 encode  16.72 us (loaded  38.48) score 1.296
+depth  6 nice  64 good  8 insert   2       bodies   958  1313  1544 bpr  1391.3 encode  17.23 us (loaded  39.67) score 1.294
+depth  6 nice  32 good  8 insert   2       bodies   958  1314  1549 bpr  1393.3 encode  17.15 us (loaded  39.47) score 1.293
+depth 12 nice  16 good  4 insert   2       bodies   961  1319  1555 bpr  1398.0 encode  16.95 us (loaded  39.02) score 1.293
+depth  6 nice  16 good  4 insert   2       bodies   964  1328  1568 bpr  1406.3 encode  16.61 us (loaded  38.22) score 1.293
+depth  8 nice  24 good  8 insert   2       bodies   959  1317  1553 bpr  1396.0 encode  17.05 us (loaded  39.24) score 1.293
+depth  6 nice  48 good  8 insert   2       bodies   958  1314  1549 bpr  1393.3 encode  17.17 us (loaded  39.51) score 1.293
+depth 12 nice  16 good  8 insert   2       bodies   961  1319  1553 bpr  1397.3 encode  17.01 us (loaded  39.16) score 1.292
+depth  4 nice  16 good  8 insert   2       bodies   967  1326  1564 bpr  1405.3 encode  16.72 us (loaded  38.48) score 1.290
+depth  3 nice  16 good  4 insert   2       bodies   970  1340  1585 bpr  1418.0 encode  16.23 us (loaded  37.35) score 1.289
+depth  6 nice  48 good  4 insert   2       bodies   959  1320  1559 bpr  1399.0 encode  17.02 us (loaded  39.17) score 1.289
+depth  8 nice  24 good  4 insert   2       bodies   960  1318  1558 bpr  1398.3 encode  17.08 us (loaded  39.32) score 1.287
+depth  6 nice 128 good  8 insert   2       bodies   958  1313  1544 bpr  1391.3 encode  17.42 us (loaded  40.09) score 1.286
+depth  3 nice  16 good 32 insert   2       bodies   969  1329  1573 bpr  1410.0 encode  16.64 us (loaded  38.30) score 1.285
+depth  8 nice  32 good  8 insert   2       bodies   957  1310  1545 bpr  1390.3 encode  17.49 us (loaded  40.27) score 1.284
+depth  3 nice  32 good  8 insert   2       bodies   966  1327  1564 bpr  1405.3 encode  16.86 us (loaded  38.81) score 1.284
+depth  4 nice  24 good  8 insert   2       bodies   965  1323  1562 bpr  1403.0 encode  16.97 us (loaded  39.05) score 1.284
+depth  3 nice  16 good 16 insert   2       bodies   969  1329  1573 bpr  1410.0 encode  16.69 us (loaded  38.42) score 1.283
+depth  8 nice  48 good  8 insert   2       bodies   957  1310  1545 bpr  1390.3 encode  17.56 us (loaded  40.42) score 1.281
+depth  3 nice  24 good 16 insert   2       bodies   967  1326  1571 bpr  1407.7 encode  16.82 us (loaded  38.71) score 1.281

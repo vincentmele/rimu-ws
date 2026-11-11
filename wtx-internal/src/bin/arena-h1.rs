@@ -702,6 +702,9 @@ fn push_i64(out: &mut Vec<u8>, n: i64) {
 #[cfg(test)]
 #[path = "arena_h1/alloc_tests.rs"]
 mod alloc_tests;
+#[cfg(test)]
+#[path = "arena_h1/gzip_sweep.rs"]
+mod gzip_sweep;
 
 #[cfg(test)]
 mod tests {

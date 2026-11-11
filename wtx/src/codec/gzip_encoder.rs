@@ -46,9 +46,14 @@ pub struct GzipParams {
 }
 
 impl Default for GzipParams {
+  /// The winner of the json-comp sweep of 11 Nov 2026
+  /// (`docs/benchmarks/2026-11-11-json-comp-sweep/README.md`): on the profile's three bodies,
+  /// 958 / 1,313 / 1,544 bytes against zlib level 6's 947 / 1,301 / 1,519, in 12.1 µs per body on
+  /// one core against zlib's 27.2 µs; json-comp's `rps / bpr²` 1.57 times zlib level 6's. Of the
+  /// settings within 1 % of the best score, it is the one with the fewest bytes.
   #[inline]
   fn default() -> Self {
-    Self { search_depth: 4, nice_match: 32, good_match: 8, max_insert: 4, lazy: true }
+    Self { search_depth: 6, nice_match: 64, good_match: 8, max_insert: 2, lazy: true }
   }
 }
 
