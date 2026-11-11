@@ -12,7 +12,7 @@
 //! (`docs/benchmarks/2026-11-11-json-comp-baseline/README.md`). The score is json-comp's:
 //! `1 / ((T_OTHER + t) × bpr²)`, `bpr` the mean of rimu's header bytes plus the body.
 
-use crate::{DatasetItem, gzip, gzip_stream, write_json};
+use crate::{DatasetItem, GZIP_WINDOW_BITS, write_json};
 use rimu_ws::{
   codec::{GzipEncoder, GzipParams},
   collections::VectorUsize,
@@ -20,6 +20,17 @@ use rimu_ws::{
 use std::time::Instant;
 
 const ENCODES: usize = 2_000;
+
+/// One gzip member of `input` from the reused zlib-rs stream `deflate` (what arena-h1 sent before
+/// the rimu-ws encoder), into the empty `out`.
+fn zlib_gzip(deflate: &mut zlib_rs::Deflate, input: &[u8], out: &mut Vec<u8>) {
+  deflate.reset();
+  out.clear();
+  out.resize(zlib_rs::compress_bound(input.len()) + 64, 0);
+  let status = deflate.compress(input, out, zlib_rs::DeflateFlush::Finish).unwrap();
+  assert_eq!(status, zlib_rs::Status::StreamEnd);
+  out.truncate(usize::try_from(deflate.total_out()).unwrap());
+}
 const BODIES: [(usize, i64); 3] = [(25, 4), (40, 8), (50, 6)];
 /// rimu's header bytes on the three bodies (status line through the blank line)
 const HEADERS: [usize; 3] = [119, 120, 120];
@@ -78,14 +89,13 @@ fn sweep() {
       buf.as_slice().to_vec()
     })
     .collect();
-  let mut zlib = |level: i32| {
+  let zlib = |level: i32| {
     let mut stream = zlib_rs::Deflate::new_with_config(zlib_rs::DeflateConfig {
-      window_bits: 31,
+      window_bits: GZIP_WINDOW_BITS,
       ..zlib_rs::DeflateConfig::new(level)
     });
-    measure(format!("zlib-rs level {level}"), &bodies, |body, out| gzip(&mut stream, body, out).unwrap())
+    measure(format!("zlib-rs level {level}"), &bodies, |body, out| zlib_gzip(&mut stream, body, out))
   };
-  let _ = gzip_stream();
   let zlib6 = zlib(6);
   let zlib1 = zlib(1);
   let factor = ZLIB6_LOADED_US / zlib6.us;

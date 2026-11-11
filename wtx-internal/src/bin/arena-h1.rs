@@ -8,7 +8,7 @@
 //! `POST /echo` (8gbit), which answers with the request body verbatim.
 //!
 //! `/json` serializes the dataset on every request and compresses those bytes on every request by
-//! the request's `Accept-Encoding` lines: gzip (level 6) if offered, else brotli (quality 2), else
+//! the request's `Accept-Encoding` lines: gzip (rimu-ws's one-shot `GzipEncoder`) if offered, else brotli (quality 2), else
 //! none; with `Vary: Accept-Encoding`, and 406 if identity is refused and nothing else is
 //! acceptable. Nothing is cached.
 //!
@@ -17,6 +17,7 @@
 
 use core::{cell::RefCell, num::NonZeroUsize, time::Duration};
 use rimu_ws::{
+  codec::GzipEncoder,
   collections::{ArrayVectorU8, VectorUsize},
   executor::{UringExecutor, UringParams, UringRuntime},
   http::{Http1Req, Http1Res, Http1Router, Http1ServerFramework, Method, StatusCode},
@@ -34,9 +35,9 @@ const BROTLI_QUALITY: i32 = 2;
 /// Brotli window bits. The default 22 makes the encoder allocate and clear multi-megabyte tables on
 /// every call (about 100 us for a 4 KiB body); 16 covers the largest body (8.4 KB) with identical output.
 const BROTLI_LGWIN: i32 = 16;
-/// zlib level of gzip, the preferred coding.
-const GZIP_LEVEL: i32 = 6;
-/// gzip framing for zlib: a window of 15 bits plus 16.
+/// gzip framing for zlib (the tests' decoder and the sweep's reference): a window of 15 bits plus
+/// 16.
+#[cfg(test)]
 const GZIP_WINDOW_BITS: i32 = 31;
 
 static DATASET: OnceLock<VectorUsize<DatasetItem>> = OnceLock::new();
@@ -444,12 +445,11 @@ fn encode(encoding: Encoding, input: &[u8], out: &mut Vec<u8>) -> std::io::Resul
       )?;
     }
     Encoding::Gzip => {
-      let thread =
-        GZIP.try_with(|cell| gzip(cell.borrow_mut().get_or_insert_with(gzip_stream), input, out));
+      let thread = GZIP.try_with(|cell| cell.borrow_mut().get_or_insert_with(GzipEncoder::new).encode(input, out));
       match thread {
-        Ok(rslt) => rslt?,
-        // The thread is being torn down: a stream of this response's own
-        Err(_) => gzip(&mut gzip_stream(), input, out)?,
+        Ok(rslt) => rslt.map_err(|_| std::io::Error::other("gzip failed"))?,
+        // The thread is being torn down: an encoder of this response's own
+        Err(_) => GzipEncoder::new().encode(input, out).map_err(|_| std::io::Error::other("gzip failed"))?,
       }
     }
     Encoding::Identity => out.extend_from_slice(input),
@@ -457,41 +457,9 @@ fn encode(encoding: Encoding, input: &[u8], out: &mut Vec<u8>) -> std::io::Resul
   Ok(())
 }
 
-/// A gzip stream at the arena's level.
-fn gzip_stream() -> zlib_rs::Deflate {
-  zlib_rs::Deflate::new_with_config(zlib_rs::DeflateConfig {
-    window_bits: GZIP_WINDOW_BITS,
-    ..zlib_rs::DeflateConfig::new(GZIP_LEVEL)
-  })
-}
-
-/// Compresses `input` into the empty `out` with `deflate`, which is reset first.
-fn gzip(deflate: &mut zlib_rs::Deflate, input: &[u8], out: &mut Vec<u8>) -> std::io::Result<()> {
-  // Also after a failed response, whose stream may have stopped in the middle
-  deflate.reset();
-  out.clear();
-  out.reserve(zlib_rs::compress_bound(input.len()).saturating_add(64));
-  let status = deflate
-    .compress_uninit(input, out.spare_capacity_mut(), zlib_rs::DeflateFlush::Finish)
-    .map_err(|_| std::io::Error::other("gzip failed"))?;
-  if status != zlib_rs::Status::StreamEnd {
-    return Err(std::io::Error::other("gzip failed"));
-  }
-  let len = usize::try_from(deflate.total_out()).unwrap_or(usize::MAX);
-  if len > out.capacity() {
-    return Err(std::io::Error::other("gzip failed"));
-  }
-  // SAFETY: the stream wrote `len` bytes into the spare capacity, which starts at 0 (`out` is
-  // empty)
-  unsafe {
-    out.set_len(len);
-  }
-  Ok(())
-}
-
 thread_local! {
-  /// The thread's gzip stream, built by the first gzip response.
-  static GZIP: RefCell<Option<zlib_rs::Deflate>> = const { RefCell::new(None) };
+  /// The thread's gzip encoder, built by the first gzip response.
+  static GZIP: RefCell<Option<GzipEncoder>> = const { RefCell::new(None) };
   /// The blocks brotli encoders freed on this thread, for [`BrotliPool`].
   static BROTLI_FREE: RefCell<BrotliFree> = const { RefCell::new(BrotliFree { blocks: Vec::new(), bytes: 0 }) };
 }
@@ -858,6 +826,21 @@ mod tests {
     }
   }
 
+  /// The json-comp body is gzip from the rimu-ws encoder: `/json/50?m=6`'s bytes inflate to the
+  /// serialized dataset and have exactly the length a new `GzipEncoder` writes for them.
+  #[test]
+  fn json_gzip_uses_the_new_encoder() {
+    let dataset = test_dataset();
+    let mut json = VectorUsize::new();
+    write_json(&mut json, &dataset, 50, 6).unwrap();
+    let mut out = Vec::new();
+    encode(Encoding::Gzip, json.as_slice(), &mut out).unwrap();
+    assert_eq!(ungzip(&out), json.as_slice());
+    let mut fresh = Vec::new();
+    rimu_ws::codec::GzipEncoder::new().encode(json.as_slice(), &mut fresh).unwrap();
+    assert_eq!(out.len(), fresh.len());
+  }
+
   /// Inputs of several sizes, the larger ones less compressible, for the reuse tests.
   fn reuse_inputs() -> Vec<Vec<u8>> {
     let mut seed: u32 = 7;
@@ -875,22 +858,17 @@ mod tests {
     out
   }
 
-  // The thread's gzip stream, reset for every response, writes what a new one would, input after
+  // The thread's gzip encoder, reused for every response, writes what a new one would, input after
   // input.
   #[test]
-  fn reused_gzip_stream_matches_a_new_one() {
+  fn reused_gzip_encoder_matches_a_new_one() {
     let mut out = Vec::new();
     for _ in 0..2 {
       for input in reuse_inputs() {
         encode(Encoding::Gzip, &input, &mut out).unwrap();
-        let mut fresh = vec![0u8; zlib_rs::compress_bound(input.len()) + 64];
-        let config = zlib_rs::DeflateConfig {
-          window_bits: GZIP_WINDOW_BITS,
-          ..zlib_rs::DeflateConfig::new(GZIP_LEVEL)
-        };
-        let (done, code) = zlib_rs::compress_slice(&mut fresh, &input, config);
-        assert_eq!(code, zlib_rs::ReturnCode::Ok);
-        assert_eq!(out, done, "{} bytes", input.len());
+        let mut fresh = Vec::new();
+        GzipEncoder::new().encode(&input, &mut fresh).unwrap();
+        assert_eq!(out, fresh, "{} bytes", input.len());
         assert_eq!(ungzip(&out), input);
       }
     }
