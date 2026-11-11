@@ -326,6 +326,16 @@ impl H3LoopbackClient {
     Ok(())
   }
 
+  /// Sends what the connection has to send and reads nothing: the datagrams that arrive stay in
+  /// the socket and are not acknowledged (task 23d: a peer that withholds its ACKs).
+  ///
+  /// # Errors
+  ///
+  /// If the socket fails.
+  pub fn send_pending_only(&mut self) -> crate::Result<()> {
+    self.flush()
+  }
+
   fn flush(&mut self) -> crate::Result<()> {
     let now_us = self.now_us();
     let _outcome = self.conn.flush(now_us, &mut self.tx, &mut self.app, &mut self.pools);

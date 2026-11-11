@@ -2283,6 +2283,11 @@ where
         frames: packet.frames,
       };
       sp.sent.on_sent(record);
+      #[cfg(feature = "_h3-loopback-client")]
+      if !IS_CLIENT && packet.ack_eliciting {
+        let in_flight = sp.sent.records().filter(|el| el.in_flight()).count();
+        crate::quic::diag::on_record(packet.frames.len().div_ceil(8), in_flight);
+      }
       if let Some(largest) = packet.ack_only_largest {
         (sp.ack_only_pn, sp.ack_only_largest) = (packet.pn, largest);
       }

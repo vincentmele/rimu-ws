@@ -902,3 +902,83 @@ fn memory_report() {
     eprintln!("{}", pool_memory(gro).report(if gro { "GRO on" } else { "GRO off" }));
   }
 }
+
+// ---- the frame-reference pool under load (task 23d)
+
+/// Prints what the frame-reference chunks and the sent rings hold under `profile`'s load: 64
+/// connections with 64 streams each, once honest and once with the clients withholding their ACKs
+/// for `HOLD_MS` (the connections reach their congestion window and PTO probes pile on).
+fn chunk_pool_profile(profile: &str, request: &mut dyn FnMut(usize) -> H3Get) {
+  use rimu_ws::quic::diag;
+  let counts = Counts::leak();
+  let served = Served::new(counts);
+  let mut clients: Vec<_> = (0..CONNS).map(|_| served.client()).collect();
+  diag::reset();
+  let mut seq = 0usize;
+  drive(
+    &mut clients,
+    DEPTH,
+    8_000,
+    |_| {
+      seq += 1;
+      request(seq)
+    },
+    |_, reply| assert_eq!(reply.status, 200),
+  );
+  let normal = diag::snapshot();
+  eprintln!("{profile} honest: {normal:?} chunks/record {:?}", normal.chunks_per_record());
+  // The congestion windows are grown now: send a full depth on each connection and read nothing
+  diag::reset();
+  let withheld_depth: usize = env_or("WITHHOLD_DEPTH", "256").parse().unwrap();
+  let mut flights: Vec<Vec<u64>> = vec![Vec::new(); clients.len()];
+  for (client, flight) in clients.iter_mut().zip(flights.iter_mut()) {
+    while flight.len() < withheld_depth {
+      seq += 1;
+      match client.send(&request(seq)) {
+        Ok(id) => flight.push(id),
+        Err(_) => break,
+      }
+    }
+  }
+  let hold = Duration::from_millis(env_or("HOLD_MS", "3000").parse().unwrap());
+  let begin = Instant::now();
+  while begin.elapsed() < hold {
+    for client in &mut clients {
+      client.send_pending_only().unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(5));
+  }
+  let withheld = diag::snapshot();
+  eprintln!("{profile} ACKs withheld {hold:?} depth {withheld_depth}: {withheld:?} chunks/record {:?}", withheld.chunks_per_record());
+  // Resume: every reply must still arrive, or the connection was closed
+  let begin = Instant::now();
+  let mut open = 0usize;
+  for (client, flight) in clients.iter_mut().zip(flights.iter()) {
+    let mut left: Vec<u64> = flight.clone();
+    while !left.is_empty() {
+      if begin.elapsed() > Duration::from_secs(60) {
+        break;
+      }
+      client.poll(Duration::from_millis(1)).unwrap();
+      left.retain(|id| !matches!(client.take(*id), Ok(Some(_))));
+    }
+    open += usize::from(left.is_empty());
+  }
+  let after = diag::snapshot();
+  eprintln!("{profile}: {open} of {CONNS} connections completed all replies after resume; exhausted {}", after.exhausted);
+  for client in &mut clients {
+    let _ = client.close();
+  }
+}
+
+/// Prints the peak live frame-reference chunks and in-flight records (see
+/// [`chunk_pool_profile`]).
+#[test]
+#[ignore = "prints numbers"]
+fn chunk_pool_report() {
+  chunk_pool_profile("baseline-h3", &mut |n| baseline(n).0);
+  let files = static_files(&env_or("STATIC_DIR", STATIC_ROOT));
+  chunk_pool_profile("static-h3", &mut |n| {
+    get(format!("/static/{}", files[n % files.len()].0), &[("accept-encoding", "br")])
+  });
+}

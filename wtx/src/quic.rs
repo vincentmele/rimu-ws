@@ -11,6 +11,9 @@ mod cid;
 mod cid_table;
 mod conn;
 mod crypto;
+#[cfg(feature = "_h3-loopback-client")]
+#[doc(hidden)]
+pub mod diag;
 #[cfg_attr(
   not(feature = "http3-server-framework"),
   allow(dead_code, reason = "only the HTTP/3 server framework creates and drives endpoints")

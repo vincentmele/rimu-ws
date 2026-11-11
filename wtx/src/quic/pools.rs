@@ -464,6 +464,10 @@ impl FrameRefPool {
       idx
     };
     self.live = self.live.wrapping_add(1);
+    #[cfg(feature = "_h3-loopback-client")]
+    if self.max_chunks != max_chunks(1) {
+      crate::quic::diag::on_live(self.live);
+    }
     Ok(idx)
   }
 
@@ -564,6 +568,8 @@ const fn max_chunks(max_conns: usize) -> usize {
 #[inline(always)]
 fn exhausted() -> crate::Error {
   cold_path();
+  #[cfg(feature = "_h3-loopback-client")]
+  crate::quic::diag::on_exhausted();
   crate::Error::QuicClose(TransportErrorCode::InternalError, QuicError::PoolExhausted)
 }
 
