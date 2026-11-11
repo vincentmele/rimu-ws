@@ -176,20 +176,34 @@ fn chunk_boundaries_round_trip() {
 fn long_runs_encode_in_linear_time() {
   let mut encoder = GzipEncoder::new();
   let _ = round_trip(&mut encoder, &alloc::vec![b'a'; 200_000]);
+  // A run is coded with maximum-length matches: 258 bytes (length symbol 285) at distance 1
+  let longest = encoder
+    .tokens
+    .items
+    .iter()
+    .filter(|&&token| token & crate::codec::gzip_encoder::tokens::MATCH != 0)
+    .map(|&token| ((token >> 16) & 0xff) + 3)
+    .max();
+  assert_eq!(longest, Some(258));
   let _ = round_trip(&mut encoder, &b"ab".repeat(100_000));
-  let time = |len: usize, encoder: &mut GzipEncoder| {
+  // The fastest of several encodes, so that a test running beside this one does not decide it
+  let fastest = |len: usize, encoder: &mut GzipEncoder| {
     let input = b"ab".repeat(len / 2);
     let mut out = Vec::new();
-    let begin = std::time::Instant::now();
-    for _ in 0..5 {
-      out.clear();
-      encoder.encode(&input, &mut out).unwrap();
-    }
-    begin.elapsed()
+    (0..7)
+      .map(|_| {
+        out.clear();
+        let begin = std::time::Instant::now();
+        encoder.encode(&input, &mut out).unwrap();
+        begin.elapsed()
+      })
+      .min()
+      .unwrap_or_default()
   };
-  let small = time(100_000, &mut encoder);
-  let large = time(2_000_000, &mut encoder);
-  assert!(large <= small * 20 + core::time::Duration::from_millis(50), "{small:?} vs {large:?}");
+  let small = fastest(100_000, &mut encoder);
+  let large = fastest(2_000_000, &mut encoder);
+  // 20 times the input: linear work takes about 20 times as long, quadratic about 400 times
+  assert!(large <= small * 60, "{small:?} vs {large:?}");
 }
 
 #[test]
