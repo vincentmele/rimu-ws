@@ -346,6 +346,35 @@ impl FrameRefPool {
     self.live
   }
 
+  /// The number of chunks that the pool has, in use or free.
+  #[cfg(test)]
+  pub(crate) const fn chunk_count(&self) -> usize {
+    self.chunks.len()
+  }
+
+  /// Exhausts the pool but for `more` chunks: every free chunk goes into the first range returned,
+  /// to free afterwards, and the cap becomes the chunks that the pool has and `more`. The second
+  /// is the cap before, for [`Self::set_max_chunks`].
+  #[cfg(test)]
+  pub(crate) fn starve(&mut self, more: usize) -> (FrameRefRange, usize) {
+    let previous = self.max_chunks;
+    let mut held = FrameRefRange::EMPTY;
+    let free = self.chunks.len().wrapping_sub(self.live);
+    self.max_chunks = self.chunks.len();
+    for _ in 0..free.wrapping_mul(CHUNK_REFS) {
+      self.push(&mut held, FrameRef::HandshakeDone).unwrap();
+    }
+    assert_eq!(self.live, self.chunks.len());
+    self.max_chunks = self.chunks.len().wrapping_add(more);
+    (held, previous)
+  }
+
+  /// Sets the cap of the pool.
+  #[cfg(test)]
+  pub(crate) const fn set_max_chunks(&mut self, max_chunks: usize) {
+    self.max_chunks = max_chunks;
+  }
+
   /// Gives back the chunks of `queue`, which is empty afterwards.
   #[inline]
   pub(crate) fn queue_clear(&mut self, queue: &mut FrameRefQueue) {

@@ -2423,9 +2423,9 @@ where
     // Probes, CONNECTION_CLOSE and ACK-only packets are not held back by the window or the pacer
     let probing = !closing && self.recovery.probes > 0;
     let allow_ae = closing || probing || self.window_allows(now_us, buffer.len());
-    let mut packets = [None, None, None];
+    let mut packets: [Option<OpenPacket>; 3] = [None, None, None];
     let mut pos = 0usize;
-    for (space, slot) in SPACES.into_iter().zip(&mut packets) {
+    for (nth, space) in SPACES.into_iter().enumerate() {
       let wanted = if closing {
         space_ref(&self.data, &self.handshake, space).is_some_and(|el| el.keys.is_some())
       } else {
@@ -2445,11 +2445,28 @@ where
         break;
       };
       let probe = probing && self.recovery.probe_space == space;
-      let written = self.write_packet(now_us, space, out, closing, allow_ae, probe, pools)?;
-      if let Some(mut packet) = written {
-        packet.start = pos;
-        pos = pos.wrapping_add(packet.len());
-        *slot = Some(packet);
+      let mut frames = FrameRefRange::EMPTY;
+      let written =
+        match self.write_packet(now_us, space, out, closing, allow_ae, probe, &mut frames, pools) {
+          Ok(elem) => elem,
+          Err(err) => {
+            cold_path();
+            // Nothing of the datagram goes: the packets before this one give theirs back too
+            pools.frame_refs.free(frames);
+            for packet in packets.iter().flatten() {
+              pools.frame_refs.free(packet.frames);
+            }
+            return Err(err);
+          }
+        };
+      match (written, packets.get_mut(nth)) {
+        (Some(mut packet), Some(slot)) => {
+          packet.start = pos;
+          pos = pos.wrapping_add(packet.len());
+          *slot = Some(packet);
+        }
+        // A packet that does not go holds no reference, or gives them back
+        _ => pools.frame_refs.free(frames),
       }
     }
     if packets.iter().all(Option::is_none) {
@@ -2477,8 +2494,16 @@ where
     let mut sent_handshake = false;
     let mut ack_eliciting = false;
     let mut in_flight = false;
-    for packet in packets.iter().flatten() {
-      let _len = self.seal(now_us, buffer, packet, hp_at.map(|el| (el, &mut pools.hp_batch)))?;
+    for (nth, packet) in packets.iter().flatten().enumerate() {
+      let hp = hp_at.map(|el| (el, &mut pools.hp_batch));
+      if let Err(err) = self.seal(now_us, buffer, packet, hp) {
+        cold_path();
+        // The packets that are not sealed are not recorded: they give their frame references back
+        for elem in packets.iter().flatten().skip(nth) {
+          pools.frame_refs.free(elem.frames);
+        }
+        return Err(err);
+      }
       sent_handshake |= packet.space == Space::Handshake;
       ack_eliciting |= packet.ack_eliciting;
       in_flight |= packet.ack_eliciting || packet.padded;
@@ -2508,6 +2533,9 @@ where
 
   // A packet of `space` at the start of `out`, not sealed yet, or `None` if nothing fit. Only an
   // ACK goes unless `allow_ae`; a `probe` is ack-eliciting, a PING if nothing else is.
+  //
+  // The frame references of the packet go into `frames`, empty at first, which the caller frees if
+  // this fails: a frame-reference pool at its cap fails after some went in (final review I2).
   fn write_packet(
     &mut self,
     now_us: u64,
@@ -2516,6 +2544,7 @@ where
     closing: bool,
     allow_ae: bool,
     probe: bool,
+    frames: &mut FrameRefRange,
     pools: &mut QuicPools,
   ) -> crate::Result<Option<OpenPacket>> {
     let (dcid, scid) = (self.peer_cid, self.local_cid);
@@ -2580,7 +2609,6 @@ where
       return Ok(None);
     };
     let mut fw = FrameWriter::new(payload);
-    let mut frames = FrameRefRange::EMPTY;
     let mut ack_eliciting = false;
     // The Largest Acknowledged of the ACK frame of the packet, if it has one, until it is a frame
     // reference: left for an ACK-only packet
@@ -2628,7 +2656,7 @@ where
       }
       if space == Space::Data && allow_ae {
         if self.handshake_done_owed && fw.write_handshake_done() {
-          pools.frame_refs.push(&mut frames, FrameRef::HandshakeDone)?;
+          pools.frame_refs.push(frames, FrameRef::HandshakeDone)?;
           self.handshake_done_owed = false;
           ack_eliciting = true;
         }
@@ -2648,7 +2676,7 @@ where
           && fw.remaining() >= PATH_FRAME_LEN
           && fw.write_frame(&Frame::PathChallenge(cold.paths.take_challenge::<RNG>()?))
         {
-          pools.frame_refs.push(&mut frames, FrameRef::PathChallenge)?;
+          pools.frame_refs.push(frames, FrameRef::PathChallenge)?;
           cold.stats.path_challenges_out = cold.stats.path_challenges_out.wrapping_add(1);
           ack_eliciting = true;
           challenge = true;
@@ -2660,7 +2688,7 @@ where
           {
             pools
               .frame_refs
-              .push(&mut frames, FrameRef::RetireConnectionId { seq: cold.retire_next })?;
+              .push(frames, FrameRef::RetireConnectionId { seq: cold.retire_next })?;
             cold.retire_next = cold.retire_next.wrapping_add(1);
             ack_eliciting = true;
           }
@@ -2678,9 +2706,9 @@ where
       }
       if allow_ae {
         let output = self.tls.as_ref().map_or(&[][..], |el| el.output(space));
-        ack_eliciting |= write_crypto(output, sp, &mut fw, &mut frames, pools)?;
+        ack_eliciting |= write_crypto(output, sp, &mut fw, frames, pools)?;
         if space == Space::Data {
-          ack_eliciting |= self.streams.write_frames(&mut fw, &mut frames, pools, &self.params)?;
+          ack_eliciting |= self.streams.write_frames(&mut fw, frames, pools, &self.params)?;
         }
       }
       if probe && !ack_eliciting && fw.write_bytes(&PING_FRAME) {
@@ -2690,20 +2718,15 @@ where
       // That of an ACK-only packet, of which nothing is sent again if it is lost and whose ACK
       // frame only serves ACK-of-ACK, goes with the packet space instead (task 23c): a peer that
       // never acknowledges ACK-only packets would otherwise keep a chunk for each in the sent ring
-      if ack_eliciting
-        && let Some(largest) = ack_largest.take()
-        && let Err(err) = pools.frame_refs.push(&mut frames, FrameRef::Ack { largest })
-      {
-        // The packet does not go: the references of its other frames go back (review 23c M-1)
-        pools.frame_refs.free(frames);
-        return Err(err);
+      if ack_eliciting && let Some(largest) = ack_largest.take() {
+        pools.frame_refs.push(frames, FrameRef::Ack { largest })?;
       }
       if let Some((largest, written)) = repeated {
         if !ack_eliciting {
           // Nothing but the repeated ACK, the first frame: the packet does not go
           return Ok(None);
         }
-        pools.frame_refs.push(&mut frames, FrameRef::Ack { largest })?;
+        pools.frame_refs.push(frames, FrameRef::Ack { largest })?;
         self.flush_acked = true;
         if written == AckWritten::All {
           sp.recv.on_ack_sent(pools);
@@ -2729,7 +2752,7 @@ where
       ack_eliciting,
       ack_only_largest: ack_largest,
       challenge,
-      frames,
+      frames: *frames,
       full_datagram,
       header_len,
       length_at,
@@ -4420,6 +4443,63 @@ mod tests {
       warm = Some((after, old));
       (client_parts, server_parts) = link.into_parts();
     }
+  }
+
+  // Final review I2: a packet that fails for want of a frame-reference chunk gives back the chunks
+  // it took, and so do the packets of the same datagram before it. Once the connection is gone no
+  // chunk is in use and the idle pool trims again.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn exhausted_frame_refs_come_back_once_the_connection_is_gone() {
+    fn closes_with_internal_error(link: &mut Link) {
+      let code = TransportErrorCode::InternalError.code();
+      assert_eq!(link.server.conn.close_code(), Some((false, code)));
+      for _ in 0..16 {
+        let Some(deadline) = link.server.conn.next_deadline() else {
+          break;
+        };
+        link.advance(deadline.saturating_sub(link.now_us).max(1));
+      }
+      assert_eq!(link.server.conn.state(), ConnState::Closed);
+    }
+    fn trims(pools: &mut QuicPools, held: FrameRefRange, cap: usize) {
+      pools.frame_refs.free(held);
+      pools.frame_refs.set_max_chunks(cap);
+      assert_eq!(pools.frame_refs.live_chunks(), 0);
+      let mut range = FrameRefRange::EMPTY;
+      for _ in 0..1000 {
+        pools.frame_refs.push(&mut range, FrameRef::HandshakeDone).unwrap();
+      }
+      pools.frame_refs.free(range);
+      pools.trim_idle();
+      assert_eq!(pools.frame_refs.chunk_count(), 64);
+    }
+    // A packet of many frames: the responses of 20 requests, after its first chunk
+    let mut opts = LinkOpts::new(None);
+    opts.server_app = TestApp::new(Behavior::Respond(b"ok"));
+    let mut link = settled(&opts);
+    let _ = link.client.with_ctx(link.now_us, |cx| {
+      for _ in 0..20 {
+        let id = cx.open_bidi()?;
+        cx.write(id, b"GET /", true)?;
+      }
+      Ok::<_, crate::Error>(())
+    });
+    let _ = link.client.flush(link.now_us);
+    assert!(link.deliver_to_server() > 0);
+    assert_eq!(link.server.app.fins, 20);
+    let (held, cap) = link.server.parts.pools.frame_refs.starve(1);
+    let _ = link.server.flush(link.now_us);
+    closes_with_internal_error(&mut link);
+    trims(&mut link.server.parts.pools, held, cap);
+    // The first flight of the server: its Initial packet took the chunk, its Handshake packet, in
+    // the same datagram, finds none
+    let (client_parts, mut server_parts) = link.into_parts();
+    let (held, cap) = server_parts.pools.frame_refs.starve(1);
+    let mut link = Link::with_parts(&LinkOpts::new(None), client_parts, server_parts);
+    let _ = link.server.flush(link.now_us);
+    closes_with_internal_error(&mut link);
+    trims(&mut link.server.parts.pools, held, cap);
   }
 
   // What a connection holds of the pools goes back only if it is closed or aborted, so dropping it
