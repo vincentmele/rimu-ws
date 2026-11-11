@@ -1,0 +1,6 @@
+r1 A Throughput: 414.13K req/s
+r1 B Throughput: 412.11K req/s
+r2 A Throughput: 411.06K req/s
+r2 B Throughput: 419.40K req/s
+r3 A Throughput: 428.60K req/s
+r3 B Throughput: 425.46K req/s

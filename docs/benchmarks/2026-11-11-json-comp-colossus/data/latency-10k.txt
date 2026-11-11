@@ -1,0 +1,6 @@
+l1-A         R=10000    ratio=0.955  mean=     98us p50=   94us p99=   123us  cyc/req u=100977 k=186312 tot=287289  conn_err=118634 2xx=133755
+l1-B         R=10000    ratio=0.955  mean=    104us p50=   94us p99=   124us  cyc/req u=98553 k=181382 tot=279935  conn_err=118637 2xx=133777
+l2-A         R=10000    ratio=0.954  mean=    108us p50=   94us p99=   123us  cyc/req u=93145 k=180672 tot=273817  conn_err=118422 2xx=133528
+l2-B         R=10000    ratio=0.955  mean=    106us p50=   95us p99=   128us  cyc/req u=105196 k=182416 tot=287612  conn_err=118551 2xx=133698
+l3-A         R=10000    ratio=0.954  mean=    106us p50=   95us p99=   127us  cyc/req u=220800 k=196312 tot=417112  conn_err=118414 2xx=133529
+l3-B         R=10000    ratio=0.954  mean=    104us p50=   95us p99=   128us  cyc/req u=214179 k=179444 tot=393623  conn_err=118478 2xx=133627

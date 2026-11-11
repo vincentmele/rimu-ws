@@ -1,0 +1,22 @@
+runs with non-2xx responses: 0
+
+## League with the new encoder (rimu-new, viltrum, plod, aegon)
+| server | avgRps (median of passes) | per pass | bpr | eff | column |
+|---|---|---|---|---|---|
+| rimu-new | 233.7 K | 237K, 234K, 174K | 1391.5 | 233.7 K | 1000 |
+| viltrum | 198.0 K | 200K, 198K, 195K | 1440.6 | 184.7 K | 790 |
+| aegon | 200.7 K | 210K, 201K, 140K | 1536.4 | 164.6 K | 704 |
+| plod | 200.8 K | 201K, 202K, 158K | 1549.2 | 162.0 K | 693 |
+league minBpr 1391.5
+
+## League with main's zlib (rimu-main, viltrum, plod, aegon)
+| server | avgRps (median of passes) | per pass | bpr | eff | column |
+|---|---|---|---|---|---|
+| viltrum | 198.0 K | 200K, 198K, 195K | 1440.6 | 180.5 K | 1000 |
+| aegon | 200.7 K | 210K, 201K, 140K | 1536.4 | 160.9 K | 891 |
+| plod | 200.8 K | 201K, 202K, 158K | 1549.2 | 158.4 K | 877 |
+| rimu-main | 134.7 K | 137K, 135K, 91K | 1375.5 | 134.7 K | 746 |
+league minBpr 1375.5
+
+rimu-new eff / viltrum eff = 1.265 (goal >= 1.05)
+rimu-main eff / viltrum eff = 0.746

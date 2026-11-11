@@ -1,0 +1,17 @@
+pass	family	profile	variant	rps	cpu_us	user_us	sys_us	core_us	steal_pct	ok	note
+1	h1	h1-baseline	A	796419	14.523	1.912	12.612	14.782	0.00	6371350	
+1	h1	h1-baseline	B	801548	14.471	1.867	12.604	14.825	0.00	6412385	
+1	h1	h1-8gbit	A	47154	34.076	13.783	20.293	40.080	0.00	471733	p50=78us p99=186us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+1	h1	h1-8gbit	B	47191	34.796	13.978	20.818	39.694	0.00	472092	p50=78us p99=181us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+2	h1	h1-baseline	B	797245	14.670	1.984	12.686	14.907	0.00	6377959	
+2	h1	h1-baseline	A	802721	14.481	1.924	12.557	14.775	0.00	6421771	
+2	h1	h1-8gbit	B	47076	36.885	14.991	21.894	40.908	0.00	470985	p50=79us p99=259us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+2	h1	h1-8gbit	A	47136	34.002	13.448	20.553	38.104	0.00	471587	p50=77us p99=144us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+3	h1	h1-baseline	A	797529	14.438	1.886	12.552	14.709	0.00	6380235	
+3	h1	h1-baseline	B	799856	14.609	1.933	12.676	14.870	0.00	6398849	
+3	h1	h1-8gbit	A	47112	34.360	13.583	20.777	38.423	0.00	471345	p50=78us p99=153us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+3	h1	h1-8gbit	B	47138	34.344	13.788	20.556	39.377	0.00	471559	p50=77us p99=151us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+4	h1	h1-baseline	B	797296	14.546	1.920	12.626	14.839	0.00	6378369	
+4	h1	h1-baseline	A	799398	14.387	1.835	12.552	14.797	0.00	6395188	
+4	h1	h1-8gbit	B	47121	33.923	13.282	20.642	38.534	0.00	471394	p50=77us p99=151us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+4	h1	h1-8gbit	A	47088	34.545	13.632	20.913	38.228	0.00	471087	p50=79us p99=173us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
