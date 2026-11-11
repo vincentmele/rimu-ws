@@ -8,11 +8,15 @@
 //! DEFLATE block (RFC 1951) written in whichever of the block types costs the fewest bits.
 
 mod bits;
+mod matcher;
 #[cfg(test)]
 mod tests;
+mod tokens;
 
 use alloc::vec::Vec;
 use bits::BitWriter;
+use matcher::Matcher;
+use tokens::{DIST_XBITS, LEN_BASE, LEN_SYM, LEN_XBITS, DIST_BASE, MATCH, Tokens, dist_sym};
 
 /// The longest chunk one block covers: positions are stored plus one in 16 bits.
 pub(crate) const MAX_CHUNK: usize = 65_534;
@@ -44,7 +48,9 @@ impl Default for GzipParams {
 /// A reusable one-shot gzip encoder. See the module documentation.
 #[derive(Debug)]
 pub struct GzipEncoder {
+  matcher: Matcher,
   params: GzipParams,
+  tokens: Tokens,
 }
 
 impl GzipEncoder {
@@ -57,7 +63,7 @@ impl GzipEncoder {
   /// An encoder with `params`. Allocates nothing.
   #[inline]
   pub fn with_params(params: GzipParams) -> Self {
-    Self { params }
+    Self { matcher: Matcher::new(), params, tokens: Tokens::new() }
   }
 
   /// The parameters of this encoder.
@@ -82,14 +88,16 @@ impl GzipEncoder {
     let mut writer = BitWriter::new(out);
     let mut chunks = input.chunks(MAX_CHUNK).peekable();
     if chunks.peek().is_none() {
-      write_fixed_literals(&mut writer, &[], true);
+      self.tokens.clear(0);
+      write_fixed(&mut writer, &self.tokens, true);
     }
     while let Some(chunk) = chunks.next() {
       let last = chunks.peek().is_none();
+      self.matcher.find(chunk, &self.params, &mut self.tokens);
       let stored = stored_bits(writer.position(), chunk.len());
-      let fixed = fixed_literals_bits(chunk);
+      let fixed = fixed_bits(&self.tokens);
       if fixed < stored {
-        write_fixed_literals(&mut writer, chunk, last);
+        write_fixed(&mut writer, &self.tokens, last);
       } else {
         write_stored(&mut writer, chunk, last);
       }
@@ -152,16 +160,42 @@ const FIXED_LIT: [(u16, u8); 288] = {
   table
 };
 
-fn fixed_literals_bits(chunk: &[u8]) -> u64 {
-  let body: u64 = chunk.iter().map(|&byte| u64::from(FIXED_LIT[usize::from(byte)].1)).sum();
-  3 + body + u64::from(FIXED_LIT[END_OF_BLOCK].1)
+/// Bits of `tokens` as one fixed-code block: header, symbols, extra bits, end of block.
+fn fixed_bits(tokens: &Tokens) -> u64 {
+  let symbols: u64 =
+    tokens.lit_freq.iter().enumerate().map(|(sym, &freq)| u64::from(freq) * u64::from(FIXED_LIT[sym].1)).sum();
+  let distances: u64 = tokens.dist_freq.iter().map(|&freq| u64::from(freq) * 5).sum();
+  3 + symbols + distances + tokens.extra_bits + u64::from(FIXED_LIT[END_OF_BLOCK].1)
 }
 
-fn write_fixed_literals(writer: &mut BitWriter<'_>, chunk: &[u8], last: bool) {
+/// The fixed distance code of `symbol`, bit-reversed (all 5 bits long).
+const FIXED_DIST: [u16; 30] = {
+  let mut table = [0; 30];
+  let mut sym = 0;
+  while sym < 30 {
+    table[sym] = reverse(sym as u16, 5);
+    sym += 1;
+  }
+  table
+};
+
+fn write_fixed(writer: &mut BitWriter<'_>, tokens: &Tokens, last: bool) {
   writer.put(u32::from(last) | (1 << 1), 3);
-  for &byte in chunk {
-    let (code, len) = FIXED_LIT[usize::from(byte)];
-    writer.put(code.into(), len.into());
+  for &token in &tokens.items {
+    if token & MATCH == 0 {
+      let (code, len) = FIXED_LIT[token as usize];
+      writer.put(code.into(), len.into());
+      continue;
+    }
+    let len = ((token >> 16) & 0xff) as usize + 3;
+    let distance = (token & 0xffff) as usize + 1;
+    let ls = usize::from(LEN_SYM[len]);
+    let (code, bits) = FIXED_LIT[257 + ls];
+    writer.put(code.into(), bits.into());
+    writer.put(u32::from(len as u16 - LEN_BASE[ls]), LEN_XBITS[ls].into());
+    let ds = dist_sym(distance);
+    writer.put(FIXED_DIST[ds].into(), 5);
+    writer.put(u32::from(distance as u16 - DIST_BASE[ds]), DIST_XBITS[ds].into());
   }
   let (code, len) = FIXED_LIT[END_OF_BLOCK];
   writer.put(code.into(), len.into());

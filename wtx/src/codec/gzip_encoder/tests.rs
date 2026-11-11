@@ -108,3 +108,102 @@ fn bound_holds() {
     assert!(out.len() <= GzipEncoder::bound(len), "len {len}: {} > {}", out.len(), GzipEncoder::bound(len));
   }
 }
+
+/// A JSON array of `items` objects shaped like the HttpArena dataset items.
+pub(crate) fn dataset_json(rng: &mut Rng, items: usize) -> Vec<u8> {
+  const CATEGORIES: [&str; 6] = ["electronics", "books", "garden", "toys", "sports", "food"];
+  const TAGS: [&str; 8] = ["new", "sale", "popular", "eco", "premium", "limited", "gift", "classic"];
+  let mut out = Vec::from(&b"{\"items\":["[..]);
+  for id in 0..items {
+    let price = rng.below(10_000);
+    let quantity = rng.below(50) + 1;
+    let item = alloc::format!(
+      "{{\"id\":{id},\"name\":\"Item {id}\",\"category\":\"{}\",\"price\":{price},\"quantity\":{quantity},\
+       \"active\":{},\"tags\":[\"{}\",\"{}\"],\"rating\":{{\"score\":{},\"count\":{}}},\"total\":{}}}",
+      CATEGORIES[rng.below(CATEGORIES.len())],
+      rng.below(2) == 0,
+      TAGS[rng.below(TAGS.len())],
+      TAGS[rng.below(TAGS.len())],
+      rng.below(5) + 1,
+      rng.below(1_000),
+      price * quantity * 4,
+    );
+    out.extend_from_slice(item.as_bytes());
+    out.push(if id + 1 == items { b']' } else { b',' });
+  }
+  out.extend_from_slice(alloc::format!(",\"count\":{items}}}").as_bytes());
+  out
+}
+
+#[test]
+fn matches_shrink_json() {
+  let mut rng = Rng::new(3);
+  let input = dataset_json(&mut rng, 50);
+  let out = round_trip(&mut GzipEncoder::new(), &input);
+  assert!(out.len() * 4 <= input.len(), "{} of {} bytes", out.len(), input.len());
+}
+
+#[cfg_attr(miri, ignore = "large inputs")]
+#[test]
+fn chunk_boundaries_round_trip() {
+  let mut rng = Rng::new(4);
+  let json = dataset_json(&mut rng, 1_500);
+  let mut encoder = GzipEncoder::new();
+  for len in [65_533, 65_534, 65_535, 131_068, 200_000] {
+    let input: Vec<u8> = json.iter().copied().cycle().take(len).collect();
+    let _ = round_trip(&mut encoder, &input);
+  }
+}
+
+#[cfg_attr(miri, ignore = "large inputs")]
+#[test]
+fn long_runs_encode_in_linear_time() {
+  let mut encoder = GzipEncoder::new();
+  let _ = round_trip(&mut encoder, &alloc::vec![b'a'; 200_000]);
+  let _ = round_trip(&mut encoder, &b"ab".repeat(100_000));
+  let time = |len: usize, encoder: &mut GzipEncoder| {
+    let input = b"ab".repeat(len / 2);
+    let mut out = Vec::new();
+    let begin = std::time::Instant::now();
+    for _ in 0..5 {
+      out.clear();
+      encoder.encode(&input, &mut out).unwrap();
+    }
+    begin.elapsed()
+  };
+  let small = time(100_000, &mut encoder);
+  let large = time(2_000_000, &mut encoder);
+  assert!(large <= small * 20 + core::time::Duration::from_millis(50), "{small:?} vs {large:?}");
+}
+
+#[test]
+fn reuse_across_sizes_has_no_stale_matches() {
+  let mut rng = Rng::new(5);
+  let big = dataset_json(&mut rng, 250);
+  let mid = dataset_json(&mut rng, 25);
+  let mut encoder = GzipEncoder::new();
+  let _ = round_trip(&mut encoder, &big);
+  let _ = round_trip(&mut encoder, b"tiny input");
+  let _ = round_trip(&mut encoder, &mid);
+  let mut out = Vec::new();
+  encoder.encode(&big, &mut out).unwrap();
+  out.truncate(0);
+  encoder.encode(&big, &mut out).unwrap();
+  assert_eq!(inflate(&out), big);
+}
+
+#[test]
+fn zero_allocations_after_warm_up() {
+  static ALLOCS: crate::sync::AtomicU64 = crate::sync::AtomicU64::new(0);
+  let mut rng = Rng::new(6);
+  let input = dataset_json(&mut rng, 25);
+  let mut encoder = GzipEncoder::new();
+  let mut out = Vec::new();
+  encoder.encode(&input, &mut out).unwrap();
+  out.clear();
+  crate::tests::_count_allocations_in(&ALLOCS);
+  encoder.encode(&input, &mut out).unwrap();
+  crate::tests::_count_allocations_in(&crate::tests::_ALLOCATIONS);
+  assert_eq!(ALLOCS.load(core::sync::atomic::Ordering::Relaxed), 0);
+  assert_eq!(inflate(&out), input);
+}
