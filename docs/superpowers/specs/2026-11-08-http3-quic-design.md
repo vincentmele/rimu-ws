@@ -462,6 +462,17 @@ Configurable limits, each with a production default, each with a unit test:
   answers that stream with 500 / H3_INTERNAL_ERROR and the endpoint and its other connections keep going.
 - **Graceful shutdown:** GOAWAY, drain in-flight requests within a deadline, CONNECTION_CLOSE.
 - Connection cap per worker and per process; idle timeout; stateless reset rate limit.
+- **Known limit (user's decision, 11 Nov): a non-acknowledging peer can pin the shared frame-reference pool.**
+  A peer that acknowledges honestly, then stops acknowledging while keeping the connection alive with PINGs,
+  pins its in-flight records (≤ 256 a connection, about 218 at the 256 KiB in-flight cap) and their
+  frame-reference chunks; PTO backoff and persistent congestion give no relief, and the idle timer keeps
+  restarting. If it also grants tiny stream windows, so that each packet carries many small STREAM frames
+  (up to ≈ 37 chunks a record), about 4 such connections exhaust a worker's `FLIGHT_CHUNKS` (32,768). Other
+  connections that then need a chunk are closed with INTERNAL_ERROR. Measured headroom on the benchmark path
+  (Task 23d, 64 × 64 in-process, ACKs withheld included): peak 7,315 chunks a worker (22 %); theoretical
+  ≤ 13,952 on static-h3 (43 %) and ≈ 4–5 k on baseline-h3, so the benchmark is unaffected. Not fixed; the
+  candidate fixes are (d) closing a peer that acknowledges no newer packet for N PTOs, keyed on the newest
+  ack-eliciting packet, and (b) making a connection wait instead of closing it when the pool is exhausted.
 
 ## 6. HttpArena entry (local only, never pushed)
 
