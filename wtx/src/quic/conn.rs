@@ -1329,8 +1329,7 @@ where
     let Some(record) = sp.sent.get_mut(base) else {
       return Ok(());
     };
-    let packet = *record;
-    record.kind = SentKind::Lost;
+    let packet = record.declare_lost();
     let PacketSpace { ack_eliciting_in_flight, crypto_lost, .. } = sp;
     let mut lost = LostCtx {
       ack_eliciting_in_flight,
@@ -2686,8 +2685,13 @@ where
       // That of an ACK-only packet, of which nothing is sent again if it is lost and whose ACK
       // frame only serves ACK-of-ACK, goes with the packet space instead (task 23c): a peer that
       // never acknowledges ACK-only packets would otherwise keep a chunk for each in the sent ring
-      if ack_eliciting && let Some(largest) = ack_largest.take() {
-        pools.frame_refs.push(&mut frames, FrameRef::Ack { largest })?;
+      if ack_eliciting
+        && let Some(largest) = ack_largest.take()
+        && let Err(err) = pools.frame_refs.push(&mut frames, FrameRef::Ack { largest })
+      {
+        // The packet does not go: the references of its other frames go back (review 23c M-1)
+        pools.frame_refs.free(frames);
+        return Err(err);
       }
       if let Some((largest, written)) = repeated {
         if !ack_eliciting {
@@ -2830,8 +2834,7 @@ where
     let (base, next) = (sent.base(), sent.next_pn());
     for pn in base..next {
       if let Some(record) = sent.get_mut(pn).filter(|el| el.in_flight()) {
-        let packet = *record;
-        record.kind = SentKind::Lost;
+        let packet = record.declare_lost();
         lost.on_lost(pn, &packet, pools).unwrap();
       }
     }
@@ -3157,7 +3160,8 @@ struct LostCtx<'any> {
 
 impl LostCtx<'_> {
   // `packet`, `pn`, was declared lost: its frames are owed again, CRYPTO and STREAM data by
-  // range, control frames with their current values (carried rule 5).
+  // range, control frames with their current values (carried rule 5), and go back to the pool,
+  // its record keeping none ([`SentPacket::declare_lost`]), even after an error.
   fn on_lost(&mut self, pn: u64, packet: &SentPacket, pools: &mut QuicPools) -> crate::Result<()> {
     self.recovery.on_gone(packet);
     if packet.ack_eliciting && packet.in_flight() {
@@ -3197,6 +3201,7 @@ impl LostCtx<'_> {
         rslt = requeued;
       }
     }
+    pools.frame_refs.free(packet.frames);
     rslt
   }
 }
@@ -5121,11 +5126,23 @@ mod tests {
     }
   }
 
-  // Review J8: a lost control frame whose packet is acknowledged late, before it went again, is
-  // owed no more: HANDSHAKE_DONE, MAX_DATA and MAX_STREAM_DATA with the current limits.
+  // Review J8, changed by task 23c fix round 1 (ruling T23c-a): the record of a lost packet keeps
+  // no frames, so an ACK of it that comes late, before its control frames went again, does not
+  // cancel the copies owed: HANDSHAKE_DONE, MAX_DATA and MAX_STREAM_DATA with the current limits go
+  // once more, and the ACK of that copy ends them.
   #[cfg_attr(miri, ignore)]
   #[test]
-  fn late_ack_of_a_lost_control_frame_owes_nothing() {
+  fn late_ack_of_a_lost_control_frame_leaves_one_copy_owed() {
+    // The copies owed go, the client acknowledges them, and nothing is owed afterwards
+    fn copies_go_once(link: &mut Link) {
+      let _ = link.server.flush(link.now_us);
+      assert!(link.deliver_to_client() > 0);
+      let _ = link.client.flush(link.now_us);
+      assert!(link.deliver_to_server() > 0);
+      let _ = link.server.flush(link.now_us);
+      assert!(link.server.take_datagrams().is_empty());
+      assert_eq!(link.server.conn.state(), ConnState::Confirmed);
+    }
     // No path MTU probes, whose PINGs would be acknowledged
     let mut opts = LinkOpts::new(None);
     opts.client.max_udp_payload_size = 1200;
@@ -5144,12 +5161,14 @@ mod tests {
     let mut acks = link.client.take_datagrams();
     link.server.conn.declare_in_flight_lost(&mut link.server.parts.pools);
     assert!(link.server.conn.handshake_done_owed);
+    let late = link.server.conn.stats().late_acks;
     for datagram in &mut acks {
       link.server.recv(link.now_us, datagram, CLIENT_ADDR);
     }
+    assert!(link.server.conn.stats().late_acks > late);
+    assert!(link.server.conn.handshake_done_owed);
+    copies_go_once(&mut link);
     assert!(!link.server.conn.handshake_done_owed);
-    let _ = link.server.flush(link.now_us);
-    assert!(link.server.take_datagrams().is_empty());
     // MAX_DATA and MAX_STREAM_DATA
     let mut opts = LinkOpts::new(None);
     opts.server.stream_window = 4096;
@@ -5172,8 +5191,57 @@ mod tests {
     for datagram in &mut acks {
       link.server.recv(link.now_us, datagram, CLIENT_ADDR);
     }
+    assert!(link.server.conn.streams().wants_send());
+    copies_go_once(&mut link);
+  }
+
+  // Task 23c fix round 1 (ruling T23c-a): a packet declared lost gives its frame references back
+  // to the pool at once, its frames being owed again, so that the record that it keeps until its
+  // sent ring wraps holds no chunk. An ACK of the packet that comes late finds no frames: it counts
+  // as late, what was owed again goes again (a copy too many at worst), and the response arrives
+  // whole.
+  #[cfg_attr(miri, ignore)]
+  #[test]
+  fn lost_records_hold_no_frames_and_a_late_ack_is_harmless() {
+    const LEN: u32 = 60_000;
+    let bytes: Vec<u8> = (0..LEN).map(|el| el as u8).collect();
+    let body = BodyRef::new(crate::misc::SharedBytes::from_slice(&bytes), 0..LEN).unwrap();
+    let mut opts = LinkOpts::new(None);
+    opts.server_app = TestApp::new(Behavior::RespondBody(b"", body));
+    let mut link = settled(&opts);
+    let id = link
+      .client
+      .with_ctx(link.now_us, |cx| {
+        let id = cx.open_bidi()?;
+        cx.write(id, b"GET /", true)?;
+        Ok::<_, crate::Error>(id)
+      })
+      .unwrap();
+    let _ = link.client.flush(link.now_us);
+    assert_eq!(link.deliver_to_server(), 1);
     let _ = link.server.flush(link.now_us);
-    assert!(link.server.take_datagrams().is_empty());
+    assert!(link.deliver_to_client() > 1);
+    let _ = link.client.flush(link.now_us);
+    let mut acks = link.client.take_datagrams();
+    assert!(!acks.is_empty());
+    link.server.conn.declare_in_flight_lost(&mut link.server.parts.pools);
+    let sent = &link.server.conn.data.sent;
+    let lost: Vec<_> = sent.records().filter(|el| el.kind == SentKind::Lost).collect();
+    assert!(lost.len() > 1, "{} lost", lost.len());
+    assert!(lost.iter().all(|el| el.frames == FrameRefRange::EMPTY), "{lost:?}");
+    let late = link.server.conn.stats().late_acks;
+    for datagram in &mut acks {
+      link.server.recv(link.now_us, datagram, CLIENT_ADDR);
+    }
+    assert!(link.server.conn.stats().late_acks > late);
+    link.run();
+    assert_eq!(
+      (link.server.conn.state(), link.client.conn.state()),
+      (ConnState::Confirmed, ConnState::Confirmed)
+    );
+    let stream = &link.client.app.streams[&id.0];
+    assert!(stream.fin);
+    assert!(stream.data == bytes, "{} B", stream.data.len());
   }
 
   // Review J9: CRYPTO data that a probe sent again is not queued once more when the packets that

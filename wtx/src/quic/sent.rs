@@ -9,9 +9,12 @@
 //! and the Largest Acknowledged of the newest one is kept by its packet number space instead (task
 //! 23c), so that a peer that never acknowledges ACK-only packets does not hold a chunk for each.
 //!
-//! A packet that is declared lost keeps its record, out of flight, until the ring needs its slot:
-//! an acknowledgment that comes late still tells which of its frames arrived, so that they are
-//! not sent again ([`crate::quic::recovery`]).
+//! A packet that is declared lost keeps its record, out of flight, until the ring needs its slot,
+//! so that an acknowledgment that comes late is known as such ([`crate::quic::recovery`]). The
+//! record gives its frames back to the pool when the packet is declared lost, its frames being
+//! owed again (task 23c fix round 1): an idle connection would otherwise hold a chunk for each of
+//! its last lost packets. A late acknowledgment then cancels nothing that was owed again, so the
+//! frames that it covers can go once more (RFC 9000 section 13.3 allows it).
 
 use crate::quic::pools::QuicPools;
 use alloc::vec::Vec;
@@ -188,6 +191,16 @@ impl SentPacket {
       self.kind,
       SentKind::InFlight | SentKind::MtuProbe | SentKind::OffPath | SentKind::Probed
     )
+  }
+
+  /// Declares it lost: the record keeps no frames (task 23c fix round 1). Returns it as it was,
+  /// with its frames, which the caller owes again and then gives back to the pool.
+  #[inline]
+  pub(crate) const fn declare_lost(&mut self) -> Self {
+    let packet = *self;
+    self.kind = SentKind::Lost;
+    self.frames = FrameRefRange::EMPTY;
+    packet
   }
 }
 

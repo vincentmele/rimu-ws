@@ -301,8 +301,7 @@ pub(crate) fn detect_lost(
       rslt.loss_time_us = Some(packet.time_us.saturating_add(loss_delay_us));
       break;
     }
-    let lost = *packet;
-    packet.kind = SentKind::Lost;
+    let lost = packet.declare_lost();
     if lost.counts_for_congestion() {
       rslt.newest_lost_us = rslt.newest_lost_us.max(Some(lost.time_us));
       if let Some((first_sample, duration)) = persistent
@@ -408,7 +407,9 @@ mod tests {
 
   // Lost stream data goes again, and only the parts that were not acknowledged: across the lossy
   // run, which declares packets lost that arrive later (reordering) and acknowledges them late,
-  // no range that was acknowledged is sent again.
+  // no range that the sender knew acknowledged is sent again. A late acknowledgment of a lost
+  // packet tells nothing of its frames since task 23c fix round 1, whose records keep none: their
+  // ranges can go again.
   #[cfg_attr(miri, ignore)]
   #[test]
   fn no_spurious_retransmit_of_acknowledged_ranges() {

@@ -738,6 +738,65 @@ fn idle_connections_that_ping_hold_no_frame_references_for_their_acks() {
   assert_eq!(net.run_requests(1, 1, b"GET /"), u64::try_from(CLIENTS).unwrap());
 }
 
+// Task 23c fix round 1 (ruling T23c-a): a client that receives one datagram in four of a download
+// makes the server declare most of its packets lost by packet threshold, and its connection, idle
+// afterwards, keeps the records of the lost packets among its last 256 until its sent ring wraps.
+// Those records hold no frame-reference chunk (before the fix: ≈ 170 each, and the 40,960 chunks
+// of a worker at the default cap ran out at the 243rd connection), so 250 such connections leave
+// the flight budget to the others: no connection of the server is closed, every download is whole,
+// and a fresh connection is served.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn lost_records_of_idle_connections_leave_the_flight_budget_free() {
+  const CLIENTS: usize = 250;
+  const BODY_LEN: u32 = 100_000;
+  let bytes: Vec<u8> = (0..BODY_LEN).map(|el| el as u8).collect();
+  let body = crate::quic::BodyRef::new(crate::misc::SharedBytes::from_slice(&bytes), 0..BODY_LEN);
+  let app = TestApp::new(Behavior::RespondBody(b"", body.unwrap()));
+  // The downloads take minutes of the fake clock: the idle connections must not time out
+  let params = QuicParams::default().set_max_idle_timeout_ms(86_400_000);
+  let mut net = Net::new(1, params, &app);
+  net.client_params.max_idle_timeout_ms = 86_400_000;
+  // The response of the server to client `client`, `None` once the server closed a connection
+  let download = |net: &mut Net, client: usize| {
+    let id = net.open_request(client, b"GET /");
+    loop {
+      if net.servers[0].app.closed > 0 {
+        return None;
+      }
+      if net.clients[client].app.streams.get(&id.0).is_some_and(|el| el.fin) {
+        return net.clients[client].app.streams.remove(&id.0).map(|el| el.data);
+      }
+      if !net.step() {
+        assert!(net.advance_to_next_event(), "client {client}: nothing left to happen");
+      }
+    }
+  };
+  for _ in 0..CLIENTS {
+    let client = net.add_client();
+    net.run();
+    assert!(confirmed(&net, client));
+    net.clients[client].keep_one_in = 4;
+    let data = download(&mut net, client);
+    net.clients[client].keep_one_in = 0;
+    let chunks = net.servers[0].endpoint.pools().frame_refs.live_chunks();
+    let closed = net.servers[0].app.closed;
+    assert_eq!(closed, 0, "{closed} closed by the server at client {client}, {chunks} chunks");
+    assert!(data.is_some_and(|el| el == bytes), "client {client}");
+  }
+  // The idle connections keep their lost records, but no chunk for them
+  let lost = net.servers[0].endpoint.stats().packets_lost;
+  assert!(lost > u64::try_from(CLIENTS * 150).unwrap(), "{lost} packets lost");
+  let chunks = net.servers[0].endpoint.pools().frame_refs.live_chunks();
+  assert!(chunks <= 2 * CLIENTS, "{chunks} chunks");
+  assert_eq!(net.servers[0].endpoint.stats().conns, u32::try_from(CLIENTS).unwrap());
+  let fresh = net.add_client();
+  net.run();
+  assert!(confirmed(&net, fresh));
+  assert!(download(&mut net, fresh).is_some_and(|el| el == bytes));
+  assert_eq!(net.servers[0].app.closed, 0);
+}
+
 // An Initial packet of version 1 to `dcid`, of `len` bytes, that nothing opens.
 fn garbage_initial(dcid: &[u8; 8], len: usize) -> Vec<u8> {
   let mut datagram = vec![0x5au8; len];

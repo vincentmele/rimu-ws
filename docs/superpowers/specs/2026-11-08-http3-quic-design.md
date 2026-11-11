@@ -259,10 +259,16 @@ deployment allocate the pools at start.
     (`FLIGHT_CHUNKS`), 40,960 at the default cap. An idle connection holds none (measured: 0 after
     the 4,096-connection fill, and 0 for 129 connections after 1,000 client PINGs each): the
     record of an ACK-only packet keeps no frame reference (task 23c, below), so a client that pings
-    to keep a connection open and never acknowledges the ACK-only answers pins nothing. The 2 a
-    connection are headroom for records that a connection keeps once it went idle (a lost packet's
-    record stays until its sent ring wraps). Task 23b had 256 a connection (`SENT_RING_LEN`, one
-    chunk for each ACK-only record until the ring wraps), 1,081,344 at the default cap;
+    to keep a connection open and never acknowledges the ACK-only answers pins nothing. Nor does an
+    idle connection that had losses: the record of a lost packet stays until its sent ring wraps,
+    but gives its frame references back when the packet is declared lost (task 23c fix round 1),
+    so after a download that a client acknowledged one datagram in four of (≈ 170 lost records
+    kept per connection) it holds none (measured: 250 such connections, 1 chunk in the worker;
+    before the fix the worker ran out at the 243rd). The 2 a connection are headroom, not a quota:
+    what a connection holds beyond them, its packets in flight (at most a sent ring, 256 records)
+    and the lost frames queued to go again, comes from the shared `FLIGHT_CHUNKS`. Task 23b had 256
+    a connection (`SENT_RING_LEN`, one chunk for each ACK-only record until the ring wraps),
+    1,081,344 at the default cap;
   - the CID table (one server CID per connection), the timer wheel and the dirty/fired lists were
     already sized by the connection cap; the free lists (≤ 1,024 entries each) and the H3 box pool
     (≤ 256 boxes, 4 MiB) bound what is kept for reuse, not what is live, so a connection past them
@@ -311,7 +317,12 @@ deployment allocate the pools at start.
   before; an older ACK-only packet acknowledged alone no longer raises it, which only keeps ACK
   frames a little larger for a little longer. A packet with an ACK frame and ack-eliciting frames
   keeps the ACK frame as a frame reference. This holds in all three spaces (Initial and Handshake
-  are discarded at confirmation, so it matters there only for fewer chunk pushes).
+  are discarded at confirmation, so it matters there only for fewer chunk pushes). A packet
+  declared lost keeps its record, so that a late acknowledgment is known as one, but not its frame
+  references: they are owed again (data by range, control frames with their current values) and go
+  back to the pool at once (task 23c fix round 1). A late acknowledgment of a lost packet then
+  cancels nothing: what was owed again goes once more, a copy too many at worst (RFC 9000 §13.3),
+  never data lost or a stream stuck.
 - **Received PNs**: per space, a sliding window of u64 bitmaps; ACK frames are encoded from it with
   trailing/leading-zero scans; ranges are kept until an ACK of ours that carried them is acknowledged.
 - All caps are bounded in count and bytes; idle trims keep a few entries per pool, like the D2/D3 pools.

@@ -1003,8 +1003,13 @@ pub(crate) struct NetClient {
   pub(crate) conn: ClientConn,
   /// The datagrams of the server to it are lost.
   pub(crate) deaf: bool,
+  /// A datagram of the server to it arrives with a chance of one in this many, by a generator of
+  /// its own (0: all arrive).
+  pub(crate) keep_one_in: u32,
   /// What it sends is lost.
   pub(crate) mute: bool,
+  // The state of the generator of `keep_one_in`
+  seen: u32,
 }
 
 /// Clients and the workers of a server, whose application is a `SA`, a fake network between them
@@ -1127,7 +1132,9 @@ impl<SA: QuicApp> Net<SA> {
       app: TestApp::default(),
       conn,
       deaf: false,
+      keep_one_in: 0,
       mute: false,
+      seen: 0x9e37_79b9 ^ u32::from(port),
     });
     idx
   }
@@ -1269,6 +1276,18 @@ impl<SA: QuicApp> Net<SA> {
     self.run_for(256);
   }
 
+  /// Opens a bidirectional stream of client `client` and writes `request` on it, with the FIN.
+  pub(crate) fn open_request(&mut self, client: usize, request: &[u8]) -> StreamId {
+    let NetClient { conn, .. } = &mut self.clients[client];
+    conn
+      .with_ctx(self.now_us, &mut self.client_parts.pools, |cx| {
+        let id = cx.open_bidi()?;
+        cx.write(id, request, true)?;
+        Ok::<_, crate::Error>(id)
+      })
+      .unwrap()
+  }
+
   /// Sends `per_client` requests from every client, at most `concurrent` at once on each, each
   /// with its FIN, until every response has its FIN. Returns the responses, which are dropped.
   pub(crate) fn run_requests(
@@ -1390,6 +1409,17 @@ impl<SA: QuicApp> Net<SA> {
         };
         let meta = DatagramMeta { peer: SERVER_ADDR, local: None, segment_size: None };
         for datagram in self.scratch.chunks_mut(segment) {
+          if client.keep_one_in > 0 {
+            // xorshift32
+            let mut state = client.seen;
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            client.seen = state;
+            if state % client.keep_one_in != 0 {
+              continue;
+            }
+          }
           let _ = client.conn.recv_datagram(
             now_us,
             datagram,
