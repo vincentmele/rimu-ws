@@ -77,6 +77,8 @@ or stored, whichever is fewest bits; CLMUL CRC32; everything allocated once per 
 - **Measurement:** local head-to-head on colossus against the rivals' Docker images, benchmark pinned to CPUs 0-10 and
   12-22 (core 11/23 left free for colossus's live services), no sysctl or service changes, started only when the
   machine is quiet (no foreign load such as `xauhft`). No EC2.
+- **Headers:** keep `Vary: Accept-Encoding` (strictly HTTP-correct); the compressor must win on its own speed and size.
+  No response header is removed or shortened for score.
 
 ## 7. Design
 
@@ -161,11 +163,36 @@ Exact type and module names; whether block splitting earns its cost; the sweep's
 extension pays over u64; the CRC source (reuse vs own); test helper choices; the microbenchmark harness location
 (`wtx-internal` or a bench target).
 
+## 8a. Settled after the builder check (controller's calls unless marked)
+
+- **unsafe and SIMD:** allowed, as elsewhere in the crate: every `unsafe` has a `// SAFETY:` comment and a Miri test of
+  its portable twin. The module is `no_std + alloc`; the CLMUL CRC and any AVX2 path are compiled for x86_64 and
+  selected by runtime detection when `std` is on (as `quic` header protection does), or by `target_feature` when the
+  build enables it. A portable path is always present and correct on every target; Miri runs it.
+- **A ceiling gate first:** before the full encoder, measure the share of json-comp request time spent compressing
+  (perf on arena-h1 under the json-comp load on colossus) and a quick prototype (matcher plus fixed Huffman) in the
+  microbenchmark. If even a zero-cost compressor at today's size could not lift rimu's eff above viltrum's, stop and
+  report before building the rest.
+- **Acceptance:** the plan measures each entry's bytes per response (headers + body) on the three bodies, computes
+  the league minimum from those, and the sweep maximises eff against it. Ship only if the end-to-end local eff beats
+  viltrum's by ≥ 5 % (Goal 6); otherwise report the best result.
+- **Output buffer:** `&mut Vec<u8>` (what arena-h1's gzip path fills today).
+- **Inputs over 64 KiB:** chunks are independent (no window carried across chunks); acceptable, since json-comp and
+  validator bodies are a few KB; correctness is tested past the boundary.
+- **Inputs for the sweep:** dataset `/mnt/nvme1tb/claude-tmp/arena-main/data/dataset.json`; the profile's
+  `(count, m)` pairs (25, 4), (40, 8), (50, 6) (rules: `/mnt/nvme1tb/claude-tmp/httpwin/rules.md` §4); request files
+  `arena-main/requests/json-gzip-{25,40,50}.raw`; harness `/mnt/nvme1tb/claude-tmp/h1bench/bench-jsoncomp.sh`; rival
+  images `httparena-viltrum`, `httparena-plod`, `httparena-aegon` (local). "Quiet" = load average < 2 and no
+  process outside the run above 50 % of a CPU, checked before each run.
+- **Dependencies:** `miniz_oxide` as a dev-dependency only (the independent inflater for tests); the fuzz target uses
+  the new feature from `wtx-fuzz`.
+
 ## 9. Risks
 
 - **Speed target not reached:** the score needs ≈ 1.5× today's json-comp throughput at about the same size. If the
   sweep cannot get there at ≤ 967 bpr, the fallback is to report the best eff found and stop (no rule-bending).
-- **Header bytes:** rimu sends `Vary: Accept-Encoding` (~23 B) that viltrum may not; bpr includes headers. Removing a
-  header is out of scope unless the validator and HTTP semantics allow it (decide with the user, separately).
+- **Header bytes:** bpr counts headers (~96 B for rimu plus ~23 B of `Vary`); the user chose to keep `Vary`. The
+  earlier 947 B / 967 B figures are body bytes of one sample, so the plan first measures every entry's header and
+  body bytes on all three bodies.
 - **Measurement noise on a shared machine:** runs start only when colossus is quiet; interleaved passes; spreads
   reported.
