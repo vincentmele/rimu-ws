@@ -284,20 +284,30 @@ deployment allocate the pools at start.
   26,738,688 B ≈ 27 MB) and every frame-reference chunk in use (40,960 × 200 B = 8,192,000 B ≈ 8
   MB), 145,936,384 B ≈ 146 MB (≈ 139.2 MiB), before the data blocks of requests in flight, which
   flow control bounds (task 23b, before task 23c: ≈ 354 MB, of which ≈ 210 MB were chunks pinned
-  by pinging clients). Slot exhaustion can still happen when clients hold whole windows of
-  requests on more than 64 connections; it fails per stream and per connection, never stalling
-  the worker: a request stream that finds no slot is refused with H3_REQUEST_REJECTED (ruling
-  T10-c; past eight refused at once the connection closes with INTERNAL_ERROR), and a new
-  connection whose own control or QPACK streams find no slot is closed with INTERNAL_ERROR.
+  by pinging clients). Flow control bounds them per connection only: received stream data has no
+  worker-wide cap, and a peer can pin up to `max_out_of_order_bytes_per_conn` (16 MiB) a
+  connection of data that waits for earlier data (16 streams × `max_out_of_order_bytes_per_stream`,
+  1 MiB, sent out of order with byte 0 withheld), up to 16 MiB × 4,096 = 64 GiB a worker at the
+  default cap, on top of the 146 MB. The attacker uploads every byte it pins (1:1), so this is
+  not cheap, but nothing below the connection limits bounds it (final review M7). Slot exhaustion
+  can still happen when clients hold whole windows of requests on more than 64 connections. It
+  does not stall the worker's loop, but it fails for every client of the worker, not only for
+  the one that holds the slots: a request stream that finds no slot is refused with
+  H3_REQUEST_REJECTED (ruling T10-c; past eight refused at once the connection closes with
+  INTERNAL_ERROR), and a new connection whose own control or QPACK streams find no slot is
+  closed with INTERNAL_ERROR. One client can cause this on purpose: see the second known limit
+  of §5.12.
   Deferred reductions (future work, not done): the 1-RTT sent ring taken on demand (≈ −6 KB per
   idle connection); no QPACK encoder/decoder streams when both dynamic-table capacities are 0
   (RFC 9204 §4.2, ≈ −3.6 KB and −2 slots); the QPACK decode memo allocated lazily (≈ −1.7 KB).
 - **CID table**: our CIDs are 8 bytes: byte 0 = worker index, bytes 1–7 random (CSPRNG), with a
   stateless-reset token derived from a per-process key (HMAC). While CID steering is on, each connection has
   **exactly one** server CID and we send no NEW_CONNECTION_ID: RFC 9000 §5.1 forbids CIDs of one connection
-  carrying information that correlates them, and a shared worker byte would. With steering off, spare CIDs
-  are issued up to `active_connection_id_limit`. NAT rebinding works either way (same CID, path
-  validation). The client's original DCID maps to the connection during the handshake only.
+  carrying information that correlates them, and a shared worker byte would. With steering off it is the
+  same: no NEW_CONNECTION_ID is ever sent (the frame is encoded only by the codec and its tests), so a
+  client has no spare server CID to move to, which RFC 9000 §5.1.1 recommends (SHOULD) and does not
+  require (final review M8). NAT rebinding works either way (same CID, path validation). The client's
+  original DCID maps to the connection during the handshake only.
 - **Streams**: a pooled stream slot per open stream; the connection maps client stream `id >> 2` modulo the
   window (default 256) to a slot index through its u32 index array, with generations; no maps. A slot holds
   a small inline receive buffer (default 256 B, enough for a QPACK-encoded request head); larger heads or
@@ -473,6 +483,20 @@ Configurable limits, each with a production default, each with a unit test:
   ≤ 13,952 on static-h3 (43 %) and ≈ 4–5 k on baseline-h3, so the benchmark is unaffected. Not fixed; the
   candidate fixes are (d) closing a peer that acknowledges no newer packet for N PTOs, keyed on the newest
   ack-eliciting packet, and (b) making a connection wait instead of closing it when the pool is exhausted.
+- **Known limit (user's decision, 11 Nov): one client can take a worker's request slots.** The 16,384
+  request slots of a worker (`REQUEST_SLOTS`, §5.4) are one budget for all of its connections: a connection
+  has no share of its own, and nothing bounds how long a request may take to send its head (the connection
+  idle timeout is the only deadline, and PINGs keep restarting it). A client that opens 256 bidirectional
+  streams (`max_streams_bidi`) on each of about 65 connections, sends one byte of a HEADERS frame on each and
+  keeps the connections alive with PINGs holds them all, for a few hundred KB of traffic. Every other
+  client's new requests on that worker are then refused with H3_REQUEST_REJECTED; at about 160 connections
+  the stream-slot pool as a whole is gone and new connections are closed with INTERNAL_ERROR after a full
+  handshake (task 23b M-2). With least-loaded placement the attack spreads over the workers: about 65
+  connections a worker take the process. h2 in this fork has no request pool shared between connections, so
+  this exposure is new with h3. Not fixed; the candidate fixes are a request-head deadline (as h1 and h2
+  bound the first head), which frees the slot of a head that does not complete, and a fair share of
+  `REQUEST_SLOTS` for each connection before it may borrow more (for example a lower MAX_STREAMS granted
+  when the pool runs low) (final review I3).
 
 ## 6. HttpArena entry (local only, never pushed)
 
@@ -517,6 +541,19 @@ Production gate (all green):
   baseline-h3 and static-h3 paths, with ring's 9 per handshake as the only budget.
 - h1, h2 and WebSocket suites green; their A/B within 1%.
 Plus the score goal in §3.
+
+**Not measured (the user's decision, 11 Nov).** Task 24's EC2 batch was not run: neither the h1/h2/WebSocket
+regression A/B against main `85c9fe8d` nor the final h3 composite of §3. So the "A/B within 1%" item above and
+the score goal are unconfirmed after the last changes that affect speed (tasks 23b–23d). These shared-code
+changes ship to every h1, h2 and WebSocket user without an A/B:
+- the TLS record AEAD keyed once per traffic secret (`9c5732df`, `a23a2176`);
+- `BUF_POOL_MAX` of the TLS buffer pool raised from 64 to 256 (ruling T10-q);
+- StaticFiles reusing its path buffer on the once-a-second disk check (task 20).
+
+The kit is ready at `/mnt/nvme1tb/claude-tmp/aws-final` (outside the repository; reviewed and fixed, never run).
+If the A/B finds a regression above 1 % later, Ruling T18-f's revert plan applies: revert `a23a2176`'s AEAD
+wrapping together with `9c5732df` by hand, keeping the `Drop` wipe of the raw fields. The per-task correctness
+gates (suites, h2spec, h3spec, interop, validators) did run and passed (final review I4).
 
 ## 9. Calls made without the user (check these)
 

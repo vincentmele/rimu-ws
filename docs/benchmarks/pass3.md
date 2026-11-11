@@ -11,7 +11,7 @@ passes over their median), CPU spreads included.
 ## 1. What was built
 | step | change | switch | measured where |
 |---|---|---|---|
-| 1 | TLS records sealed and opened with the AEAD of their traffic key, expanded once per traffic secret (not once per record); the state wipes its secrets on drop | none (always on) | h1/h2 only: its A/B (h1 json-tls and 8gbit, h2 baseline-h2 and static-h2; revert if any regresses > 1 %) runs in Task 24's regression batch (Rulings T18-a, T18-f) |
+| 1 | TLS records sealed and opened with the AEAD of their traffic key, expanded once per traffic secret (not once per record); the state wipes its secrets on drop | none (always on) | h1/h2 only: its A/B (h1 json-tls and 8gbit, h2 baseline-h2 and static-h2; revert if any regresses > 1 %) was planned for Task 24's regression batch (Rulings T18-a, T18-f), which was **not run** (§5) |
 | 2 | header-protection masks of the 1-RTT packets of a flush computed eight at a time with AES-NI, applied in the TX arena before the flush returns | `QuicParams::set_batched_header_protection`, arena-h2 `ARENA_H3_HP=ring\|batched` | `hp-batched`, both profiles |
 | 3 | QPACK dynamic table offered to clients; decode memo hit rate counted (`Http3WorkerStats::qpack_sections`, `qpack_memo_hits`) | `H3Params::qpack_max_table_capacity` / `qpack_blocked_streams`, arena-h2 `ARENA_H3_QPACK=0\|4096` (4096 bytes, 100 blocked streams) | `qpack4096`, both profiles |
 
@@ -61,4 +61,13 @@ baseline-h3 base: 5,937k req/s, 2.04 µs/req (rps spread 0.3 %, CPU spread 0.9 %
 | arena-h2 `ARENA_H3_HP` | `ring` | follows the library default |
 | arena-h2 `ARENA_H3_QPACK` | `0` | follows the library default |
 
-The keyed TLS record AEAD (Step 1) stays in; its h1/h2 A/B belongs to Task 24.
+The keyed TLS record AEAD (Step 1) stays in, unmeasured on h1/h2 (§5).
+
+## 5. Not measured
+Task 24's EC2 batch was not run (the user's decision, 11 Nov): neither the h1/h2/WebSocket regression A/B against
+main `85c9fe8d` nor the final h3 composite. These shared-code changes ship to h1, h2 and WebSocket users without an
+A/B: Step 1's keyed TLS record AEAD (`9c5732df`, `a23a2176`), the TLS buffer pool's `BUF_POOL_MAX` raised from 64 to
+256, and StaticFiles reusing its path buffer. The kit is ready at `/mnt/nvme1tb/claude-tmp/aws-final` (outside the
+repository, never run). If a later A/B finds a regression above 1 %, Ruling T18-f's revert plan applies: revert
+`a23a2176`'s AEAD wrapping together with `9c5732df` by hand, keeping the `Drop` wipe of the raw fields. See the
+spec's §8.
