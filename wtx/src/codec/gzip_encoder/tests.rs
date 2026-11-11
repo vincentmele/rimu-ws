@@ -28,8 +28,18 @@ impl Rng {
 /// JSON-like text: words from a small vocabulary with punctuation, of `len` bytes.
 pub(crate) fn jsonish(rng: &mut Rng, len: usize) -> Vec<u8> {
   const WORDS: [&[u8]; 12] = [
-    b"{\"id\":", b"\"name\":\"", b"Item ", b"\",\"category\":\"", b"electronics", b"\"price\":",
-    b"\"quantity\":", b"\"active\":true,", b"\"tags\":[\"", b"\"rating\":{", b"}],", b"\"total\":",
+    b"{\"id\":",
+    b"\"name\":\"",
+    b"Item ",
+    b"\",\"category\":\"",
+    b"electronics",
+    b"\"price\":",
+    b"\"quantity\":",
+    b"\"active\":true,",
+    b"\"tags\":[\"",
+    b"\"rating\":{",
+    b"}],",
+    b"\"total\":",
   ];
   let mut out = Vec::with_capacity(len + 32);
   while out.len() < len {
@@ -47,13 +57,11 @@ pub(crate) fn inflate(member: &[u8]) -> Vec<u8> {
   assert!(member.len() >= 18, "a member has a 10-byte header and an 8-byte trailer");
   assert_eq!(&member[..10], &[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3]);
   let raw = &member[10..member.len() - 8];
-  let miniz = miniz_oxide::inflate::decompress_to_vec(raw).expect("miniz_oxide inflates the deflate stream");
+  let miniz =
+    miniz_oxide::inflate::decompress_to_vec(raw).expect("miniz_oxide inflates the deflate stream");
   let mut buf = alloc::vec![0u8; miniz.len() + 64];
-  let (out, rc) = zlib_rs::decompress_slice(
-    &mut buf,
-    member,
-    zlib_rs::InflateConfig { window_bits: 31 },
-  );
+  let (out, rc) =
+    zlib_rs::decompress_slice(&mut buf, member, zlib_rs::InflateConfig { window_bits: 31 });
   assert_eq!(rc, zlib_rs::ReturnCode::Ok, "zlib-rs inflates the gzip member");
   assert_eq!(out, &miniz[..], "both decoders agree");
   let trailer = &member[member.len() - 8..];
@@ -107,14 +115,20 @@ fn bound_holds() {
   for len in [0, 1, 100, 65_534, 65_535, 200_000] {
     let input = rng.bytes(len);
     let out = round_trip(&mut encoder, &input);
-    assert!(out.len() <= GzipEncoder::bound(len), "len {len}: {} > {}", out.len(), GzipEncoder::bound(len));
+    assert!(
+      out.len() <= GzipEncoder::bound(len),
+      "len {len}: {} > {}",
+      out.len(),
+      GzipEncoder::bound(len)
+    );
   }
 }
 
 /// A JSON array of `items` objects shaped like the HttpArena dataset items.
 pub(crate) fn dataset_json(rng: &mut Rng, items: usize) -> Vec<u8> {
   const CATEGORIES: [&str; 6] = ["electronics", "books", "garden", "toys", "sports", "food"];
-  const TAGS: [&str; 8] = ["new", "sale", "popular", "eco", "premium", "limited", "gift", "classic"];
+  const TAGS: [&str; 8] =
+    ["new", "sale", "popular", "eco", "premium", "limited", "gift", "classic"];
   let mut out = Vec::from(&b"{\"items\":["[..]);
   for id in 0..items {
     let price = rng.below(10_000);
@@ -234,7 +248,10 @@ fn lengths_are_limited_and_complete() {
     let used: alloc::vec::Vec<u8> =
       freq.iter().zip(&lengths).filter(|(f, _)| **f > 0).map(|(_, l)| *l).collect();
     assert!(used.iter().all(|&l| l >= 1 && l <= max), "{freq:?}: {lengths:?}");
-    assert!(freq.iter().zip(&lengths).all(|(f, l)| (*f == 0) == (*l == 0)), "{freq:?}: {lengths:?}");
+    assert!(
+      freq.iter().zip(&lengths).all(|(f, l)| (*f == 0) == (*l == 0)),
+      "{freq:?}: {lengths:?}"
+    );
     if used.len() == 1 {
       assert_eq!(used[0], 1);
     } else {

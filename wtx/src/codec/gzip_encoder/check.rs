@@ -36,7 +36,10 @@ pub fn check_bytes(data: &[u8]) {
     assert_eq!(rc, zlib_rs::ReturnCode::Ok, "zlib-rs refused the member");
     assert_eq!(inflated, input, "the member inflates to something else");
     let trailer = &out[out.len() - 8..];
-    assert_eq!(u32::from_le_bytes(trailer[..4].try_into().unwrap()), zlib_rs::crc32::crc32(0, input));
+    assert_eq!(
+      u32::from_le_bytes(trailer[..4].try_into().unwrap()),
+      zlib_rs::crc32::crc32(0, input)
+    );
     assert_eq!(u32::from_le_bytes(trailer[4..].try_into().unwrap()), input.len() as u32);
   }
 }

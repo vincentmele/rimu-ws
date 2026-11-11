@@ -42,12 +42,12 @@ pub use decode::{Decode, DecodeSeq};
 pub use decompression::{Decompression, DecompressionFlush};
 pub use encode::Encode;
 pub use from_radix_10::{FromRadix10, FromRadix10Error};
-#[cfg(feature = "gzip-encoder")]
-pub use gzip_encoder::{GzipEncoder, GzipParams};
+pub use generic_codec::{DecodeWrapper, EncodeWrapper, GenericCodec};
 #[cfg(feature = "_fuzz-gzip")]
 #[doc(hidden)]
 pub use gzip_encoder::check as gzip_check;
-pub use generic_codec::{DecodeWrapper, EncodeWrapper, GenericCodec};
+#[cfg(feature = "gzip-encoder")]
+pub use gzip_encoder::{GzipEncoder, GzipParams};
 pub use hex::*;
 pub use misc::{
   decode_base64_into_buffer, decode_hex_into_buffer, encode_base64_into_buffer,

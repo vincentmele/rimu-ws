@@ -25,7 +25,11 @@ impl Matcher {
     let n = chunk.len();
     tokens.clear(n);
     self.reset(n);
-    let mut t = Tables { head: &mut self.head[..1 << self.bits], prev: &mut self.prev[..n], shift: 32 - self.bits };
+    let mut t = Tables {
+      head: &mut self.head[..1 << self.bits],
+      prev: &mut self.prev[..n],
+      shift: 32 - self.bits,
+    };
     let depth = u32::from(params.search_depth.max(1));
     let lazy_depth = (depth / 4).max(1);
     let nice = usize::from(params.nice_match).clamp(MIN_MATCH, MAX_MATCH);
@@ -120,7 +124,13 @@ impl Tables<'_> {
   /// Inserts `pos` and returns the longest match for it among at most `depth` earlier positions
   /// of its chain within the window: (length, distance), length 0 when none.
   #[inline(always)]
-  fn search_and_insert(&mut self, chunk: &[u8], pos: usize, depth: u32, nice: usize) -> (usize, usize) {
+  fn search_and_insert(
+    &mut self,
+    chunk: &[u8],
+    pos: usize,
+    depth: u32,
+    nice: usize,
+  ) -> (usize, usize) {
     let mut cand = self.insert(chunk, pos);
     let max = (chunk.len() - pos).min(MAX_MATCH);
     let (mut best, mut best_dist) = (0, 0);

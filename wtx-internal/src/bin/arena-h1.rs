@@ -445,11 +445,14 @@ fn encode(encoding: Encoding, input: &[u8], out: &mut Vec<u8>) -> std::io::Resul
       )?;
     }
     Encoding::Gzip => {
-      let thread = GZIP.try_with(|cell| cell.borrow_mut().get_or_insert_with(GzipEncoder::new).encode(input, out));
+      let thread = GZIP
+        .try_with(|cell| cell.borrow_mut().get_or_insert_with(GzipEncoder::new).encode(input, out));
       match thread {
         Ok(rslt) => rslt.map_err(|_| std::io::Error::other("gzip failed"))?,
         // The thread is being torn down: an encoder of this response's own
-        Err(_) => GzipEncoder::new().encode(input, out).map_err(|_| std::io::Error::other("gzip failed"))?,
+        Err(_) => {
+          GzipEncoder::new().encode(input, out).map_err(|_| std::io::Error::other("gzip failed"))?
+        }
       }
     }
     Encoding::Identity => out.extend_from_slice(input),

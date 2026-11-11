@@ -94,7 +94,9 @@ fn sweep() {
       window_bits: GZIP_WINDOW_BITS,
       ..zlib_rs::DeflateConfig::new(level)
     });
-    measure(format!("zlib-rs level {level}"), &bodies, |body, out| zlib_gzip(&mut stream, body, out))
+    measure(format!("zlib-rs level {level}"), &bodies, |body, out| {
+      zlib_gzip(&mut stream, body, out)
+    })
   };
   let zlib6 = zlib(6);
   let zlib1 = zlib(1);
@@ -141,7 +143,10 @@ fn sweep() {
       score(row) / base
     );
   };
-  println!("calibration: zlib-rs level 6 {:.2} us here = {ZLIB6_LOADED_US} us loaded (factor {factor:.2})", zlib6.us);
+  println!(
+    "calibration: zlib-rs level 6 {:.2} us here = {ZLIB6_LOADED_US} us loaded (factor {factor:.2})",
+    zlib6.us
+  );
   print(&zlib6);
   print(&zlib1);
   rows.sort_by(|a, b| score(b).total_cmp(&score(a)));

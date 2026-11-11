@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 use bits::BitWriter;
 use dynamic::Dynamic;
 use matcher::Matcher;
-use tokens::{DIST_XBITS, LEN_BASE, LEN_SYM, LEN_XBITS, DIST_BASE, MATCH, Tokens, dist_sym};
+use tokens::{DIST_BASE, DIST_XBITS, LEN_BASE, LEN_SYM, LEN_XBITS, MATCH, Tokens, dist_sym};
 
 /// The longest chunk one block covers: positions are stored plus one in 16 bits.
 pub(crate) const MAX_CHUNK: usize = 65_534;
@@ -234,8 +234,12 @@ const FIXED_DIST_LEN: [u8; 30] = [5; 30];
 
 /// Bits of `tokens` as one fixed-code block: header, symbols, extra bits, end of block.
 fn fixed_bits(tokens: &Tokens) -> u64 {
-  let symbols: u64 =
-    tokens.lit_freq.iter().enumerate().map(|(sym, &freq)| u64::from(freq) * u64::from(FIXED_LIT_LEN[sym])).sum();
+  let symbols: u64 = tokens
+    .lit_freq
+    .iter()
+    .enumerate()
+    .map(|(sym, &freq)| u64::from(freq) * u64::from(FIXED_LIT_LEN[sym]))
+    .sum();
   let distances: u64 = tokens.dist_freq.iter().map(|&freq| u64::from(freq) * 5).sum();
   3 + symbols + distances + tokens.extra_bits + u64::from(FIXED_LIT_LEN[END_OF_BLOCK])
 }
@@ -267,7 +271,8 @@ fn write_tokens(
     let ls = usize::from(LEN_SYM[len]);
     let code_len = u32::from(lit_len[257 + ls]);
     let extra = u32::from(len as u16 - LEN_BASE[ls]);
-    writer.put(u32::from(lit_code[257 + ls]) | extra << code_len, code_len + u32::from(LEN_XBITS[ls]));
+    writer
+      .put(u32::from(lit_code[257 + ls]) | extra << code_len, code_len + u32::from(LEN_XBITS[ls]));
     let ds = dist_sym(distance);
     let code_len = u32::from(dist_len[ds]);
     let extra = u32::from(distance as u16 - DIST_BASE[ds]);

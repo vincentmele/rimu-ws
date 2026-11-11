@@ -61,8 +61,10 @@ impl Dynamic {
     }
     canonical_codes(&self.lit_len, &mut self.lit_code);
     canonical_codes(&self.dist_len, &mut self.dist_code);
-    self.hlit = 257.max(LIT_SYMBOLS - self.lit_len.iter().rev().take_while(|&&len| len == 0).count());
-    self.hdist = 1.max(DIST_SYMBOLS - self.dist_len.iter().rev().take_while(|&&len| len == 0).count());
+    self.hlit =
+      257.max(LIT_SYMBOLS - self.lit_len.iter().rev().take_while(|&&len| len == 0).count());
+    self.hdist =
+      1.max(DIST_SYMBOLS - self.dist_len.iter().rev().take_while(|&&len| len == 0).count());
     self.run_lengths();
     let mut cl_freq = [0u32; 19];
     for &(sym, _) in &self.rle[..self.rle_len] {
@@ -70,7 +72,8 @@ impl Dynamic {
     }
     code_lengths(&cl_freq, 7, &mut self.cl_len, &mut self.scratch);
     canonical_codes(&self.cl_len, &mut self.cl_code);
-    self.hclen = 4.max(19 - CL_ORDER.iter().rev().take_while(|&&sym| self.cl_len[sym] == 0).count());
+    self.hclen =
+      4.max(19 - CL_ORDER.iter().rev().take_while(|&&sym| self.cl_len[sym] == 0).count());
     let mut bits = 3 + 5 + 5 + 4 + 3 * self.hclen as u64;
     for &(sym, _) in &self.rle[..self.rle_len] {
       bits += u64::from(self.cl_len[usize::from(sym)]);
@@ -132,7 +135,11 @@ impl Dynamic {
   }
 
   /// Writes the block header that [`Self::plan`] prepared.
-  pub(crate) fn write_header(&self, writer: &mut crate::codec::gzip_encoder::bits::BitWriter<'_>, last: bool) {
+  pub(crate) fn write_header(
+    &self,
+    writer: &mut crate::codec::gzip_encoder::bits::BitWriter<'_>,
+    last: bool,
+  ) {
     writer.put(u32::from(last) | (2 << 1), 3);
     writer.put((self.hlit - 257) as u32, 5);
     writer.put((self.hdist - 1) as u32, 5);

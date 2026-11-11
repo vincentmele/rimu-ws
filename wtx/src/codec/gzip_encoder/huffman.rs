@@ -18,7 +18,12 @@ pub(crate) struct Scratch {
 
 impl Scratch {
   pub(crate) const fn new() -> Self {
-    Self { leaves: [0; MAX_SYMBOLS], weight: [0; 2 * MAX_SYMBOLS], parent: [0; 2 * MAX_SYMBOLS], depth: [0; 2 * MAX_SYMBOLS] }
+    Self {
+      leaves: [0; MAX_SYMBOLS],
+      weight: [0; 2 * MAX_SYMBOLS],
+      parent: [0; 2 * MAX_SYMBOLS],
+      depth: [0; 2 * MAX_SYMBOLS],
+    }
   }
 }
 
@@ -26,7 +31,9 @@ impl Scratch {
 /// 1..=`max_bits` for used ones, forming a complete prefix code; a lone used symbol gets length 1.
 pub(crate) fn code_lengths(freq: &[u32], max_bits: u8, out: &mut [u8], scratch: &mut Scratch) {
   let Scratch { leaves, weight, parent, depth } = scratch;
-  debug_assert!(freq.len() <= MAX_SYMBOLS && out.len() == freq.len() && (1..=15).contains(&max_bits));
+  debug_assert!(
+    freq.len() <= MAX_SYMBOLS && out.len() == freq.len() && (1..=15).contains(&max_bits)
+  );
   out.fill(0);
   // The used symbols sorted by frequency (then symbol), packed for one sort
   let mut n = 0;
@@ -51,15 +58,16 @@ pub(crate) fn code_lengths(freq: &[u32], max_bits: u8, out: &mut [u8], scratch: 
     weight[i] = leaf >> 16;
   }
   let (mut next_leaf, mut next_node, mut nodes) = (0, n, n);
-  let pick = |next_leaf: &mut usize, next_node: &mut usize, nodes: usize, weight: &[u64]| -> usize {
-    if *next_leaf < n && (*next_node >= nodes || weight[*next_leaf] <= weight[*next_node]) {
-      *next_leaf += 1;
-      *next_leaf - 1
-    } else {
-      *next_node += 1;
-      *next_node - 1
-    }
-  };
+  let pick =
+    |next_leaf: &mut usize, next_node: &mut usize, nodes: usize, weight: &[u64]| -> usize {
+      if *next_leaf < n && (*next_node >= nodes || weight[*next_leaf] <= weight[*next_node]) {
+        *next_leaf += 1;
+        *next_leaf - 1
+      } else {
+        *next_node += 1;
+        *next_node - 1
+      }
+    };
   while nodes < 2 * n - 1 {
     let a = pick(&mut next_leaf, &mut next_node, nodes, weight);
     let b = pick(&mut next_leaf, &mut next_node, nodes, weight);

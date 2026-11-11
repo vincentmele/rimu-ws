@@ -11,16 +11,19 @@ pub(crate) const LIT_SYMBOLS: usize = 286;
 /// Distance symbols in use (0..=29).
 pub(crate) const DIST_SYMBOLS: usize = 30;
 
-pub(crate) const LEN_BASE: [u16; 29] =
-  [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+pub(crate) const LEN_BASE: [u16; 29] = [
+  3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+  163, 195, 227, 258,
+];
 pub(crate) const LEN_XBITS: [u8; 29] =
   [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
 pub(crate) const DIST_BASE: [u16; 30] = [
-  1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097,
-  6145, 8193, 12289, 16385, 24577,
+  1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049,
+  3073, 4097, 6145, 8193, 12289, 16385, 24577,
 ];
-pub(crate) const DIST_XBITS: [u8; 30] =
-  [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+pub(crate) const DIST_XBITS: [u8; 30] = [
+  0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
+];
 
 /// The length symbol (minus 257) of every match length 0..=258 (0..=2 unused).
 pub(crate) const LEN_SYM: [u8; MAX_MATCH + 1] = {
@@ -84,7 +87,12 @@ pub(crate) const MATCH: u32 = 1 << 31;
 
 impl Tokens {
   pub(crate) const fn new() -> Self {
-    Self { items: Vec::new(), lit_freq: [0; LIT_SYMBOLS], dist_freq: [0; DIST_SYMBOLS], extra_bits: 0 }
+    Self {
+      items: Vec::new(),
+      lit_freq: [0; LIT_SYMBOLS],
+      dist_freq: [0; DIST_SYMBOLS],
+      extra_bits: 0,
+    }
   }
 
   /// Empties the tokens for a chunk of `len` bytes, keeping the buffer.
