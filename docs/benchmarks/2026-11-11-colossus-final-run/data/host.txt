@@ -1,0 +1,142 @@
+== 2026-11-11T05:08:10Z colossus phase=h3final smoke=0
+imds instance-type: 
+imds placement/availability-zone: 
+imds instance-id: 
+imds ami-id: 
+imds instance-life-cycle: 
+uptime:  06:08:22 up 26 days,  9:54,  7 users,  load average: 11.12, 12.42, 8.52
+uname -r: 7.0.0-38-generic
+cmdline: BOOT_IMAGE=/@/boot/vmlinuz-7.0.0-38-generic root=UUID=ff464666-a029-4ef9-901c-5a718b7980f4 ro rootflags=subvol=@ quiet splash
+server cpus 0-5,12-17 | generator cpus 6-10,18-22 | h2load -t 10
+cpu model: AMD Ryzen 9 5900X 12-Core Processor
+cpu flags of note: aes avx2 sha_ni vaes vpclmulqdq 
+vaes=yes
+== PMU probe: perf stat -e cycles,instructions -- true
+
+ Performance counter stats for 'true':
+
+         1,700,964      cycles                                                                
+           838,563      instructions                                                          
+
+       0.001418534 seconds time elapsed
+
+       0.001351000 seconds user
+       0.000000000 seconds sys
+
+
+pmu=yes
+== perf: /usr/bin/perf perf version 7.0.14
+== sysctl
+net.core.rmem_max = 4194304
+net.core.wmem_max = 4194304
+net.core.rmem_default = 212992
+net.core.wmem_default = 212992
+net.core.netdev_max_backlog = 1000
+net.ipv4.udp_mem = 1534386	2045850	3068772
+kernel.perf_event_paranoid = -1
+kernel.kptr_restrict = 0
+kernel.io_uring_disabled = 0
+kernel.nmi_watchdog = 1
+ulimit -n 524288 -l unlimited
+== docker: 29.9.3
+httparena-plod:latest 0863be51c171 104MB
+httparena-plod:znver2 0863be51c171 104MB
+httparena-rimu-ws:latest 55bde2584b8d 77.6MB
+httparena-aegon:latest f95366082829 495MB
+httparena-cnetmod:latest 1f9a16177b27 150MB
+httparena-zix:latest 438b7e3dfde6 8.44MB
+httparena-h2load-h3:latest 367de4ea8ff6 167MB
+httparena-fib:latest 15e0add4cd53 17.7MB
+httparena-viltrum:latest 7787cf346797 76.1MB
+httparena-h2load:latest 85d358e1ea4c 122MB
+httparena-wtx-ws:latest b3ff1b0dd487 76.3MB
+httparena-ringzero-ws:latest d3f7a3176d5d 78.3MB
+httparena-tokio-ws:latest e1e91777f043 75.4MB
+httparena-vanilla-epoll:latest 50fd19f767c9 88.5MB
+httparena-uwebzockets:latest cdeb2bae3c3c 15.2MB
+httparena-tokio-websockets:latest 8d095194ed17 75.7MB
+httparena-zix-ws:latest 4b7371ce7cdd 8.55MB
+/mnt/nvme1tb/claude-tmp/aws-final/remote/bin/prev-znver2-prof/REVISION: 44752fa868c6888da6188ea18c54e64b61f14a59 quic: static transfer tuning (measured) RUSTFLAGS=-C target-cpu=znver2 -C force-frame-pointers=yes profile=profiling toolchain=nightly-2026-10-12 
+/mnt/nvme1tb/claude-tmp/aws-final/remote/bin/prev-znver2/REVISION: 44752fa868c6888da6188ea18c54e64b61f14a59 quic: static transfer tuning (measured) RUSTFLAGS=-C target-cpu=znver2 profile=release toolchain=nightly-2026-10-12 
+/mnt/nvme1tb/claude-tmp/aws-final/remote/bin/znver2-prof/REVISION: 1a3c3b0802086d900765196cc9286e8b34b5a3e8 http3: the framework docs say that workers are pinned by default (final review M11) RUSTFLAGS=-C target-cpu=znver2 -C force-frame-pointers=yes profile=profiling toolchain=nightly-2026-10-12 
+/mnt/nvme1tb/claude-tmp/aws-final/remote/bin/znver2/REVISION: 1a3c3b0802086d900765196cc9286e8b34b5a3e8 http3: the framework docs say that workers are pinned by default (final review M11) RUSTFLAGS=-C target-cpu=znver2 profile=release toolchain=nightly-2026-10-12 
+/mnt/nvme1tb/claude-tmp/aws-final/remote/bin/regress/A/REVISION: 85c9fe8dc5909e815836c4fa94299730952a6543 docs: uring_stats walks every slot (O(n)); TLS pool zeroing covers key material and record buffers, not the h1 driver's plaintext pools RUSTFLAGS=-C target-cpu=znver2 profile=release toolchain=nightly-2026-10-12 
+/mnt/nvme1tb/claude-tmp/aws-final/remote/bin/regress/B/REVISION: 1a3c3b0802086d900765196cc9286e8b34b5a3e8 http3: the framework docs say that workers are pinned by default (final review M11) RUSTFLAGS=-C target-cpu=znver2 profile=release toolchain=nightly-2026-10-12 
+arena: 558df6dec51273951d35bd5b188bdb4574353b08
+== free -g
+               total        used        free      shared  buff/cache   available
+Mem:              62          30          26           3          14          32
+Swap:             16          16           0
+== lscpu
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           48 bits physical, 48 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  24
+On-line CPU(s) list:                     0-23
+Vendor ID:                               AuthenticAMD
+Model name:                              AMD Ryzen 9 5900X 12-Core Processor
+CPU family:                              25
+Model:                                   33
+Thread(s) per core:                      2
+Core(s) per socket:                      12
+Socket(s):                               1
+Stepping:                                0
+Frequency boost:                         enabled
+CPU(s) scaling MHz:                      70%
+CPU max MHz:                             4954.5649
+CPU min MHz:                             567.0890
+BogoMIPS:                                7399.34
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid extd_apicid aperfmperf rapl pni pclmulqdq monitor ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand lahf_lm cmp_legacy svm extapic cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw ibs skinit wdt tce topoext perfctr_core perfctr_nb bpext perfctr_llc mwaitx cpb cat_l3 cdp_l3 hw_pstate ssbd mba ibrs ibpb stibp vmmcall fsgsbase bmi1 avx2 smep bmi2 erms invpcid cqm rdt_a rdseed adx smap clflushopt clwb sha_ni xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local user_shstk clzero irperf xsaveerptr rdpru wbnoinvd arat npt lbrv svm_lock nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold avic v_vmsave_vmload vgif v_spec_ctrl umip pku ospke vaes vpclmulqdq rdpid overflow_recov succor smca fsrm debug_swap
+Virtualization:                          AMD-V
+L1d cache:                               384 KiB (12 instances)
+L1i cache:                               384 KiB (12 instances)
+L2 cache:                                6 MiB (12 instances)
+L3 cache:                                64 MiB (2 instances)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-23
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Ghostwrite:                Not affected
+Vulnerability Indirect target selection: Not affected
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Old microcode:             Not affected
+Vulnerability Reg file data sampling:    Not affected
+Vulnerability Retbleed:                  Not affected
+Vulnerability Spec rstack overflow:      Mitigation; Safe RET
+Vulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; Retpolines; IBPB conditional; IBRS_FW; STIBP always-on; RSB filling; PBRSB-eIBRS Not affected; BHI Not affected
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Mitigation; Clear CPU buffers
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Mitigation; IBPB before exit to userspace
+== lscpu -e
+CPU NODE SOCKET CORE L1d:L1i:L2:L3 ONLINE    MAXMHZ   MINMHZ       MHZ
+  0    0      0    0 0:0:0:0          yes 4954.5649 567.0890 3610.8760
+  1    0      0    1 1:1:1:0          yes 4954.5649 567.0890 3614.1919
+  2    0      0    2 2:2:2:0          yes 4954.5649 567.0890 3972.1670
+  3    0      0    3 3:3:3:0          yes 4954.5649 567.0890 3593.0020
+  4    0      0    4 4:4:4:0          yes 4954.5649 567.0890 3656.4990
+  5    0      0    5 5:5:5:0          yes 4954.5649 567.0890 3978.3491
+  6    0      0    6 8:8:8:1          yes 4954.5649 567.0890 3656.1460
+  7    0      0    7 9:9:9:1          yes 4954.5649 567.0890 3640.7351
+  8    0      0    8 10:10:10:1       yes 4954.5649 567.0890 3618.6111
+  9    0      0    9 11:11:11:1       yes 4954.5649 567.0890 3609.2451
+ 10    0      0   10 12:12:12:1       yes 4954.5649 567.0890 3597.9590
+ 11    0      0   11 13:13:13:1       yes 4954.5649 567.0890 3594.9690
+ 12    0      0    0 0:0:0:0          yes 4954.5649 567.0890 3759.8799
+ 13    0      0    1 1:1:1:0          yes 4954.5649 567.0890 4555.0112
+ 14    0      0    2 2:2:2:0          yes 4954.5649 567.0890 3638.9661
+ 15    0      0    3 3:3:3:0          yes 4954.5649 567.0890 1731.1130
+ 16    0      0    4 4:4:4:0          yes 4954.5649 567.0890 3607.4299
+ 17    0      0    5 5:5:5:0          yes 4954.5649 567.0890 3638.1541
+ 18    0      0    6 8:8:8:1          yes 4954.5649 567.0890 3664.9121
+ 19    0      0    7 9:9:9:1          yes 4954.5649 567.0890 3598.0381
+ 20    0      0    8 10:10:10:1       yes 4954.5649 567.0890 1731.1130
+ 21    0      0    9 11:11:11:1       yes 4954.5649 567.0890 1731.1130
+ 22    0      0   10 12:12:12:1       yes 4954.5649 567.0890 3641.5630
+ 23    0      0   11 13:13:13:1       yes 4954.5649 567.0890 3657.4099

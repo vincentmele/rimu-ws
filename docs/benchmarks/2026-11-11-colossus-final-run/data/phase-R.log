@@ -1,0 +1,93 @@
+== host colossus 7.0.0-38-generic mode=full phases=perf 2026-11-11T04:54:42Z
+CPU(s): 24
+Model name: AMD Ryzen 9 5900X 12-Core Processor
+Thread(s) per core: 2
+Core(s) per socket: 12
+Socket(s): 1
+CPU(s) scaling MHz: 81%
+NUMA node(s): 1
+NUMA node0 CPU(s): 0-23
+server cpus 0-5,12-17 | load cpus 6-10,18-22 (10 load threads) | passes 4 | run 8s window 3+4s (TLS 10s, 4+5s) | CLK_TCK 100
+variant A: 85c9fe8dc5909e815836c4fa94299730952a6543 docs: uring_stats walks every slot (O(n)); TLS pool zeroing covers key material and record buffers, not the h1 driver's plaintext pools
+RUSTFLAGS=-C target-cpu=znver2 profile=release toolchain=nightly-2026-10-12
+variant B: 1a3c3b0802086d900765196cc9286e8b34b5a3e8 http3: the framework docs say that workers are pinned by default (final review M11)
+RUSTFLAGS=-C target-cpu=znver2 profile=release toolchain=nightly-2026-10-12
+ulimit -n 524288 -l unlimited; lo mtu 65536
+== perf: 9 profiles x 2 variants x 4 passes, started 04:54:42
+p1 h1   h1-baseline          A rps     799891 | cpu   14.294 us/req (u 1.885 s 12.409) | cores   14.614 us/req | steal 0.00% | 6399127 
+p1 h1   h1-baseline          B rps     797112 | cpu   14.406 us/req (u 1.858 s 12.548) | cores   14.903 us/req | steal 0.00% | 6376892 
+p1 h1   h1-jsoncomp-4096     A rps     138586 | cpu   86.561 us/req (u 70.373 s 16.187) | cores   86.525 us/req | steal 0.00% | 1108687 Reconnects: 42499 Errors: connect 0, read 10, timeout 0
+p1 h1   h1-jsoncomp-4096     B rps     136612 | cpu   87.788 us/req (u 71.123 s 16.664) | cores   87.842 us/req | steal 0.00% | 1092898 Reconnects: 41844 Errors: connect 0, read 13, timeout 0
+p1 h1   h1-json-tls          A rps     354587 | cpu   26.832 us/req (u 9.997 s 16.834) | cores   27.556 us/req | steal 0.00% | 3559070 p50=3745us p99=17912us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+p1 h1   h1-json-tls          B rps     390845 | cpu   25.090 us/req (u 8.350 s 16.741) | cores   26.200 us/req | steal 0.00% | 3925225 p50=3503us p99=8796us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+p1 h1   h1-8gbit             A rps      47152 | cpu   35.431 us/req (u 14.375 s 21.055) | cores   39.532 us/req | steal 0.00% | 471700 p50=80us p99=177us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+p1 h1   h1-8gbit             B rps      47134 | cpu   35.828 us/req (u 14.297 s 21.531) | cores   38.493 us/req | steal 0.00% | 471577 p50=79us p99=183us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+p1 h2   baseline-h2-1024     A rps    4530612 | cpu    1.046 us/req (u 0.874 s 0.173) | cores    1.098 us/req | steal 0.00% | 36244900 failed=0 errored=0 timeout=0
+p1 h2   baseline-h2-1024     B rps    4528562 | cpu    1.065 us/req (u 0.889 s 0.175) | cores    1.174 us/req | steal 0.00% | 36228500 failed=0 errored=0 timeout=0
+p1 h2   static-h2-1024       A rps     450051 | cpu   25.771 us/req (u 11.064 s 14.708) | cores   26.599 us/req | steal 0.00% | 3600421 failed=0 errored=0 timeout=0
+p1 h2   static-h2-1024       B rps     454434 | cpu   25.534 us/req (u 10.731 s 14.803) | cores   26.322 us/req | steal 0.00% | 3635485 failed=0 errored=0 timeout=0
+p1 h2   baseline-h2c-1024    A rps    4890512 | cpu    0.999 us/req (u 0.836 s 0.163) | cores    1.073 us/req | steal 0.00% | 39124100 failed=0 errored=0 timeout=0
+p1 h2   baseline-h2c-1024    B rps    4944012 | cpu    1.008 us/req (u 0.845 s 0.163) | cores    1.055 us/req | steal 0.00% | 39552100 failed=0 errored=0 timeout=0
+p1 h2   json-h2c-1024        A rps    1928052 | cpu    4.999 us/req (u 3.047 s 1.952) | cores    5.136 us/req | steal 0.00% | 15424422 failed=0 errored=0 timeout=0
+p1 h2   json-h2c-1024        B rps    1903427 | cpu    5.031 us/req (u 3.092 s 1.939) | cores    5.234 us/req | steal 0.00% | 15227421 failed=0 errored=0 timeout=0
+p1 ws   ws-512:1:0           A rps     868607 | cpu   13.443 us/req (u 1.272 s 12.172) | cores   13.658 us/req | steal 0.00% | 6948855 
+p1 ws   ws-512:1:0           B rps     873851 | cpu   13.442 us/req (u 1.153 s 12.289) | cores   13.649 us/req | steal 0.00% | 6990811 
+== pass 1 done at 04:58:04 (202 s)
+p2 h1   h1-baseline          B rps     801385 | cpu   14.647 us/req (u 1.922 s 12.725) | cores   14.873 us/req | steal 0.00% | 6411079 
+p2 h1   h1-baseline          A rps     804936 | cpu   14.555 us/req (u 1.903 s 12.652) | cores   14.817 us/req | steal 0.00% | 6439492 
+p2 h1   h1-jsoncomp-4096     B rps     137822 | cpu   87.010 us/req (u 71.180 s 15.830) | cores   87.083 us/req | steal 0.00% | 1102577 Reconnects: 42203 Errors: connect 0, read 12, timeout 0
+p2 h1   h1-jsoncomp-4096     A rps     138938 | cpu   86.346 us/req (u 70.700 s 15.645) | cores   86.382 us/req | steal 0.00% | 1111506 Reconnects: 42552 Errors: connect 0, read 13, timeout 0
+p2 h1   h1-json-tls          B rps     350969 | cpu   27.366 us/req (u 11.026 s 16.340) | cores   28.211 us/req | steal 0.00% | 3526827 p50=3991us p99=18600us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+p2 h1   h1-json-tls          A rps     350552 | cpu   27.298 us/req (u 10.345 s 16.953) | cores   29.037 us/req | steal 0.00% | 3522740 p50=3799us p99=14596us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+p2 h1   h1-8gbit             B rps      47106 | cpu   50.311 us/req (u 21.749 s 28.562) | cores   54.627 us/req | steal 0.00% | 471244 p50=89us p99=1041us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+p2 h1   h1-8gbit             A rps      47137 | cpu   34.263 us/req (u 13.451 s 20.812) | cores   36.886 us/req | steal 0.00% | 471589 p50=78us p99=156us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+p2 h2   baseline-h2-1024     B rps    4473225 | cpu    1.052 us/req (u 0.883 s 0.170) | cores    1.100 us/req | steal 0.00% | 35785800 failed=0 errored=0 timeout=0
+p2 h2   baseline-h2-1024     A rps    4488362 | cpu    1.049 us/req (u 0.881 s 0.168) | cores    1.116 us/req | steal 0.00% | 35906900 failed=0 errored=0 timeout=0
+p2 h2   static-h2-1024       B rps     401118 | cpu   26.856 us/req (u 11.236 s 15.620) | cores   29.884 us/req | steal 0.00% | 3208986 failed=0 errored=0 timeout=0
+p2 h2   static-h2-1024       A rps     386008 | cpu   28.106 us/req (u 11.967 s 16.139) | cores   31.088 us/req | steal 0.00% | 3088066 failed=0 errored=0 timeout=0
+p2 h2   baseline-h2c-1024    B rps    4885975 | cpu    1.038 us/req (u 0.875 s 0.163) | cores    1.212 us/req | steal 0.00% | 39087800 failed=0 errored=0 timeout=0
+p2 h2   baseline-h2c-1024    A rps    4736875 | cpu    1.074 us/req (u 0.894 s 0.180) | cores    1.470 us/req | steal 0.00% | 37895000 failed=0 errored=0 timeout=0
+p2 h2   json-h2c-1024        B rps    1829164 | cpu    5.196 us/req (u 3.122 s 2.073) | cores    5.726 us/req | steal 0.00% | 14633312 failed=0 errored=0 timeout=0
+p2 h2   json-h2c-1024        A rps    1875349 | cpu    5.055 us/req (u 3.109 s 1.946) | cores    5.620 us/req | steal 0.00% | 15002795 failed=0 errored=0 timeout=0
+p2 ws   ws-512:1:0           B rps     854214 | cpu   13.266 us/req (u 1.127 s 12.139) | cores   13.848 us/req | steal 0.00% | 6833716 
+p2 ws   ws-512:1:0           A rps     859559 | cpu   13.302 us/req (u 1.154 s 12.149) | cores   13.803 us/req | steal 0.00% | 6876473 
+== pass 2 done at 05:01:26 (404 s)
+p3 h1   h1-baseline          A rps     772398 | cpu   14.696 us/req (u 1.927 s 12.769) | cores   15.350 us/req | steal 0.00% | 6179188 
+p3 h1   h1-baseline          B rps     799267 | cpu   14.631 us/req (u 1.900 s 12.732) | cores   14.824 us/req | steal 0.00% | 6394138 
+p3 h1   h1-jsoncomp-4096     A rps     138074 | cpu   86.866 us/req (u 70.275 s 16.591) | cores   86.884 us/req | steal 0.00% | 1104595 Reconnects: 42297 Errors: connect 0, read 9, timeout 0
+p3 h1   h1-jsoncomp-4096     B rps     132790 | cpu   89.192 us/req (u 71.451 s 17.741) | cores   90.355 us/req | steal 0.00% | 1062323 Reconnects: 40610 Errors: connect 0, read 8, timeout 0
+p3 h1   h1-json-tls          A rps     319739 | cpu   29.436 us/req (u 10.690 s 18.745) | cores   31.375 us/req | steal 0.00% | 3213915 p50=4390us p99=45712us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+p3 h1   h1-json-tls          B rps     356802 | cpu   26.541 us/req (u 9.643 s 16.898) | cores   27.395 us/req | steal 0.00% | 3586199 p50=3659us p99=13828us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+p3 h1   h1-8gbit             A rps      47171 | cpu   35.464 us/req (u 14.287 s 21.177) | cores   38.973 us/req | steal 0.00% | 471970 p50=80us p99=203us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+p3 h1   h1-8gbit             B rps      47136 | cpu   36.373 us/req (u 14.380 s 21.993) | cores   42.210 us/req | steal 0.00% | 471615 p50=82us p99=193us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+p3 h2   baseline-h2-1024     A rps    4532162 | cpu    1.025 us/req (u 0.856 s 0.168) | cores    1.079 us/req | steal 0.00% | 36257300 failed=0 errored=0 timeout=0
+p3 h2   baseline-h2-1024     B rps    4543937 | cpu    1.054 us/req (u 0.888 s 0.167) | cores    1.111 us/req | steal 0.00% | 36351500 failed=0 errored=0 timeout=0
+p3 h2   static-h2-1024       A rps     446751 | cpu   26.020 us/req (u 11.186 s 14.834) | cores   26.713 us/req | steal 0.00% | 3574016 failed=0 errored=0 timeout=0
+p3 h2   static-h2-1024       B rps     447490 | cpu   25.932 us/req (u 10.922 s 15.011) | cores   26.887 us/req | steal 0.00% | 3579937 failed=0 errored=0 timeout=0
+p3 h2   baseline-h2c-1024    A rps    4953425 | cpu    1.005 us/req (u 0.837 s 0.167) | cores    1.050 us/req | steal 0.00% | 39627400 failed=0 errored=0 timeout=0
+p3 h2   baseline-h2c-1024    B rps    4847387 | cpu    1.016 us/req (u 0.855 s 0.161) | cores    1.087 us/req | steal 0.00% | 38779100 failed=0 errored=0 timeout=0
+p3 h2   json-h2c-1024        A rps    1937596 | cpu    4.957 us/req (u 3.022 s 1.935) | cores    5.096 us/req | steal 0.00% | 15500768 failed=0 errored=0 timeout=0
+p3 h2   json-h2c-1024        B rps    1918196 | cpu    5.017 us/req (u 3.090 s 1.927) | cores    5.197 us/req | steal 0.00% | 15345568 failed=0 errored=0 timeout=0
+p3 ws   ws-512:1:0           A rps     872835 | cpu   13.126 us/req (u 1.189 s 11.937) | cores   13.360 us/req | steal 0.00% | 6982677 
+p3 ws   ws-512:1:0           B rps     877249 | cpu   13.285 us/req (u 1.168 s 12.117) | cores   13.501 us/req | steal 0.00% | 7017989 
+== pass 3 done at 05:04:48 (606 s)
+p4 h1   h1-baseline          B rps     800938 | cpu   14.658 us/req (u 1.884 s 12.774) | cores   14.863 us/req | steal 0.00% | 6407507 
+p4 h1   h1-baseline          A rps     783054 | cpu   14.913 us/req (u 1.925 s 12.988) | cores   15.142 us/req | steal 0.00% | 6264433 
+p4 h1   h1-jsoncomp-4096     B rps     137038 | cpu   87.500 us/req (u 71.621 s 15.879) | cores   87.609 us/req | steal 0.00% | 1096306 Reconnects: 41960 Errors: connect 0, read 10, timeout 0
+p4 h1   h1-jsoncomp-4096     A rps     138307 | cpu   86.716 us/req (u 70.733 s 15.983) | cores   86.716 us/req | steal 0.00% | 1106457 Reconnects: 42387 Errors: connect 0, read 13, timeout 0
+p4 h1   h1-json-tls          B rps     326675 | cpu   28.818 us/req (u 12.188 s 16.630) | cores   31.246 us/req | steal 0.00% | 3282412 p50=4614us p99=26088us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+p4 h1   h1-json-tls          A rps     354898 | cpu   25.846 us/req (u 9.800 s 16.046) | cores   26.715 us/req | steal 0.00% | 3566216 p50=4081us p99=13092us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+p4 h1   h1-8gbit             B rps      47216 | cpu   34.837 us/req (u 13.893 s 20.944) | cores   40.622 us/req | steal 0.00% | 472415 p50=77us p99=177us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+p4 h1   h1-8gbit             A rps      47189 | cpu   33.504 us/req (u 13.182 s 20.322) | cores   36.968 us/req | steal 0.00% | 472124 p50=78us p99=223us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+p4 h2   baseline-h2-1024     B rps    4562650 | cpu    1.050 us/req (u 0.890 s 0.160) | cores    1.104 us/req | steal 0.00% | 36501200 failed=0 errored=0 timeout=0
+p4 h2   baseline-h2-1024     A rps    4474062 | cpu    1.045 us/req (u 0.876 s 0.169) | cores    1.122 us/req | steal 0.00% | 35792500 failed=0 errored=0 timeout=0
+p4 h2   static-h2-1024       B rps     449663 | cpu   25.988 us/req (u 10.938 s 15.050) | cores   26.668 us/req | steal 0.00% | 3597318 failed=0 errored=0 timeout=0
+p4 h2   static-h2-1024       A rps     452125 | cpu   25.568 us/req (u 10.876 s 14.692) | cores   26.434 us/req | steal 0.00% | 3617015 failed=0 errored=0 timeout=0
+p4 h2   baseline-h2c-1024    B rps    4861600 | cpu    1.012 us/req (u 0.852 s 0.160) | cores    1.055 us/req | steal 0.00% | 38892800 failed=0 errored=0 timeout=0
+p4 h2   baseline-h2c-1024    A rps    4902825 | cpu    0.987 us/req (u 0.827 s 0.160) | cores    1.049 us/req | steal 0.00% | 39222600 failed=0 errored=0 timeout=0
+p4 h2   json-h2c-1024        B rps    1939919 | cpu    5.016 us/req (u 3.056 s 1.960) | cores    5.179 us/req | steal 0.00% | 15519356 failed=0 errored=0 timeout=0
+p4 h2   json-h2c-1024        A rps    1892444 | cpu    5.031 us/req (u 3.047 s 1.984) | cores    5.362 us/req | steal 0.00% | 15139558 failed=0 errored=0 timeout=0
+p4 ws   ws-512:1:0           B rps     873634 | cpu   13.359 us/req (u 1.182 s 12.177) | cores   13.567 us/req | steal 0.00% | 6989068 
+p4 ws   ws-512:1:0           A rps     873730 | cpu   13.257 us/req (u 1.091 s 12.166) | cores   13.439 us/req | steal 0.00% | 6989841 
+== pass 4 done at 05:08:10 (808 s)
+== full done 2026-11-11T05:08:10Z

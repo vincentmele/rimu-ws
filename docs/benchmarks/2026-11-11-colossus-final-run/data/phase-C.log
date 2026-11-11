@@ -1,0 +1,48 @@
+local: no sysctl or service changes
+== variants: base prev (reference: plod fib aegon cnetmod zix) x baseline-h3 static-h3 x 3 passes = 42 starts, 3 x 5s per start; then profiles of ; server 0-5,12-17, generator 6-10,18-22 (-t 10); 05:08:23
+vbench p1 baseline-h3 v-base    rps  1862017 | srv 1.764 us/req gen 5.484 | errors 0 | runs 1850633,1862017,1840803
+vbench p1 baseline-h3 v-prev    rps  1849434 | srv 1.744 us/req gen 5.515 | errors 0 | runs 1849434,1845036,1844998
+vbench p1 baseline-h3 plod      rps  1305243 | srv 6.951 us/req gen 7.818 | errors 0 | runs 1305243,1272325,1292724
+vbench p1 baseline-h3 fib       rps  1531125 | srv 4.544 us/req gen 6.664 | errors 0 | runs 1529681,1531125,1519890
+vbench p1 baseline-h3 aegon     rps  1469845 | srv 5.520 us/req gen 6.920 | errors 0 | runs 1461223,1465804,1469845
+vbench p1 baseline-h3 cnetmod   rps  1768267 | srv 2.194 us/req gen 5.766 | errors 0 | runs 1768267,1752541,1739334
+vbench p1 baseline-h3 zix       rps  1894126 | srv 1.348 us/req gen 5.398 | errors 0 | runs 1893624,1894126,1886875
+vbench p1 static-h3   v-base    rps   286032 | srv 24.528 us/req gen 35.897 | errors 0 | runs 286032,284531,285162
+vbench p1 static-h3   v-prev    rps   287770 | srv 23.896 us/req gen 35.739 | errors 0 | runs 283829,287770,282791
+vbench p1 static-h3   plod      rps   225181 | srv 51.060 us/req gen 43.195 | errors 0 | runs 225181,216144,221721
+vbench p1 static-h3   fib       rps   262723 | srv 34.021 us/req gen 39.109 | errors 0 | runs 260651,258861,262723
+vbench p1 static-h3   aegon     rps   189567 | srv 61.562 us/req gen 38.287 | errors 32 | runs 185525,189567,187897
+vbench p1 static-h3   cnetmod   rps   239047 | srv 37.006 us/req gen 43.284 | errors 0 | runs 238529,239047,235481
+vbench p1 static-h3   zix       rps   191196 | srv 47.680 us/req gen 53.905 | errors 0 | runs 190093,191196,189731
+== pass 1 done 05:14:50 (387 s)
+vbench p2 baseline-h3 plod      rps  1291079 | srv 7.113 us/req gen 7.902 | errors 0 | runs 1291079,1280688,1291024
+vbench p2 baseline-h3 fib       rps  1533635 | srv 4.500 us/req gen 6.646 | errors 0 | runs 1519610,1533635,1506434
+vbench p2 baseline-h3 aegon     rps  1481320 | srv 5.380 us/req gen 6.872 | errors 0 | runs 1473963,1481320,1470394
+vbench p2 baseline-h3 cnetmod   rps  1749490 | srv 2.171 us/req gen 5.830 | errors 0 | runs 1749490,1748100,1598271
+vbench p2 baseline-h3 zix       rps  1891814 | srv 1.317 us/req gen 5.404 | errors 0 | runs 1887342,1879349,1891814
+vbench p2 baseline-h3 v-base    rps  1845806 | srv 1.788 us/req gen 5.538 | errors 0 | runs 1629603,1836966,1845806
+vbench p2 baseline-h3 v-prev    rps  1846183 | srv 1.744 us/req gen 5.532 | errors 0 | runs 1846183,1842626,1844513
+vbench p2 static-h3   plod      rps   223410 | srv 51.538 us/req gen 43.243 | errors 0 | runs 223410,183589,216569
+vbench p2 static-h3   fib       rps   260819 | srv 34.496 us/req gen 39.424 | errors 0 | runs 254203,260819,258964
+vbench p2 static-h3   aegon     rps   187100 | srv 61.259 us/req gen 37.715 | errors 46 | runs 187100,184967,187089
+vbench p2 static-h3   cnetmod   rps   238274 | srv 36.867 us/req gen 43.394 | errors 0 | runs 238274,208566,234149
+vbench p2 static-h3   zix       rps   181220 | srv 49.657 us/req gen 56.117 | errors 0 | runs 179450,181220,127828
+vbench p2 static-h3   v-base    rps   263770 | srv 27.256 us/req gen 38.447 | errors 0 | runs 257860,263770,257580
+vbench p2 static-h3   v-prev    rps   249955 | srv 27.063 us/req gen 40.020 | errors 0 | runs 249941,239281,249955
+== pass 2 done 05:21:35 (792 s)
+vbench p3 baseline-h3 aegon     rps  1227219 | srv 5.929 us/req gen 7.395 | errors 0 | runs 1227219,1226225,1194786
+vbench p3 baseline-h3 cnetmod   rps  1654309 | srv 2.494 us/req gen 6.160 | errors 0 | runs 1467034,1654309,1647813
+vbench p3 baseline-h3 zix       rps  1828255 | srv 1.393 us/req gen 5.599 | errors 0 | runs 1786989,1782128,1828255
+vbench p3 baseline-h3 v-base    rps  1773335 | srv 1.868 us/req gen 5.734 | errors 0 | runs 1773335,1760077,1330074
+vbench p3 baseline-h3 v-prev    rps  1336338 | srv 2.801 us/req gen 6.567 | errors 0 | runs 1333435,1336338,1050363
+vbench p3 baseline-h3 plod      rps   755793 | srv 8.267 us/req gen 9.414 | errors 0 | runs 452102,716927,755793
+vbench p3 baseline-h3 fib       rps   733274 | srv 6.142 us/req gen 8.847 | errors 0 | runs 660666,733274,587451
+vbench p3 static-h3   aegon     rps    97197 | srv 70.188 us/req gen 50.293 | errors 65 | runs 87633,97197,94509
+vbench p3 static-h3   cnetmod   rps   109080 | srv 50.717 us/req gen 55.146 | errors 0 | runs 90024,109080,102922
+vbench p3 static-h3   zix       rps    98491 | srv 60.024 us/req gen 68.632 | errors 0 | runs 98491,88577,77596
+vbench p3 static-h3   v-base    rps   138209 | srv 34.681 us/req gen 47.773 | errors 0 | runs 130223,136290,138209
+vbench p3 static-h3   v-prev    rps   137879 | srv 33.784 us/req gen 48.856 | errors 0 | runs 131313,137879,129342
+vbench p3 static-h3   plod      rps   110473 | srv 64.399 us/req gen 52.820 | errors 0 | runs 88727,110473,92149
+vbench p3 static-h3   fib       rps   110659 | srv 45.257 us/req gen 51.179 | errors 0 | runs 110659,104752,110180
+== pass 3 done 05:28:45 (1222 s)
+== variants done 05:28:45 (1222 s)

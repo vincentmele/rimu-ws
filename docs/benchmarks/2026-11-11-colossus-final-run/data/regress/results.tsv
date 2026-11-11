@@ -1,0 +1,73 @@
+pass	family	profile	variant	rps	cpu_us	user_us	sys_us	core_us	steal_pct	ok	note
+1	h1	h1-baseline	A	799891	14.294	1.885	12.409	14.614	0.00	6399127	
+1	h1	h1-baseline	B	797112	14.406	1.858	12.548	14.903	0.00	6376892	
+1	h1	h1-jsoncomp-4096	A	138586	86.561	70.373	16.187	86.525	0.00	1108687	Reconnects: 42499 Errors: connect 0, read 10, timeout 0
+1	h1	h1-jsoncomp-4096	B	136612	87.788	71.123	16.664	87.842	0.00	1092898	Reconnects: 41844 Errors: connect 0, read 13, timeout 0
+1	h1	h1-json-tls	A	354587	26.832	9.997	16.834	27.556	0.00	3559070	p50=3745us p99=17912us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+1	h1	h1-json-tls	B	390845	25.090	8.350	16.741	26.200	0.00	3925225	p50=3503us p99=8796us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+1	h1	h1-8gbit	A	47152	35.431	14.375	21.055	39.532	0.00	471700	p50=80us p99=177us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+1	h1	h1-8gbit	B	47134	35.828	14.297	21.531	38.493	0.00	471577	p50=79us p99=183us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+1	h2	baseline-h2-1024	A	4530612	1.046	0.874	0.173	1.098	0.00	36244900	failed=0 errored=0 timeout=0
+1	h2	baseline-h2-1024	B	4528562	1.065	0.889	0.175	1.174	0.00	36228500	failed=0 errored=0 timeout=0
+1	h2	static-h2-1024	A	450051	25.771	11.064	14.708	26.599	0.00	3600421	failed=0 errored=0 timeout=0
+1	h2	static-h2-1024	B	454434	25.534	10.731	14.803	26.322	0.00	3635485	failed=0 errored=0 timeout=0
+1	h2	baseline-h2c-1024	A	4890512	0.999	0.836	0.163	1.073	0.00	39124100	failed=0 errored=0 timeout=0
+1	h2	baseline-h2c-1024	B	4944012	1.008	0.845	0.163	1.055	0.00	39552100	failed=0 errored=0 timeout=0
+1	h2	json-h2c-1024	A	1928052	4.999	3.047	1.952	5.136	0.00	15424422	failed=0 errored=0 timeout=0
+1	h2	json-h2c-1024	B	1903427	5.031	3.092	1.939	5.234	0.00	15227421	failed=0 errored=0 timeout=0
+1	ws	ws-512:1:0	A	868607	13.443	1.272	12.172	13.658	0.00	6948855	
+1	ws	ws-512:1:0	B	873851	13.442	1.153	12.289	13.649	0.00	6990811	
+2	h1	h1-baseline	B	801385	14.647	1.922	12.725	14.873	0.00	6411079	
+2	h1	h1-baseline	A	804936	14.555	1.903	12.652	14.817	0.00	6439492	
+2	h1	h1-jsoncomp-4096	B	137822	87.010	71.180	15.830	87.083	0.00	1102577	Reconnects: 42203 Errors: connect 0, read 12, timeout 0
+2	h1	h1-jsoncomp-4096	A	138938	86.346	70.700	15.645	86.382	0.00	1111506	Reconnects: 42552 Errors: connect 0, read 13, timeout 0
+2	h1	h1-json-tls	B	350969	27.366	11.026	16.340	28.211	0.00	3526827	p50=3991us p99=18600us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+2	h1	h1-json-tls	A	350552	27.298	10.345	16.953	29.037	0.00	3522740	p50=3799us p99=14596us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+2	h1	h1-8gbit	B	47106	50.311	21.749	28.562	54.627	0.00	471244	p50=89us p99=1041us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+2	h1	h1-8gbit	A	47137	34.263	13.451	20.812	36.886	0.00	471589	p50=78us p99=156us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+2	h2	baseline-h2-1024	B	4473225	1.052	0.883	0.170	1.100	0.00	35785800	failed=0 errored=0 timeout=0
+2	h2	baseline-h2-1024	A	4488362	1.049	0.881	0.168	1.116	0.00	35906900	failed=0 errored=0 timeout=0
+2	h2	static-h2-1024	B	401118	26.856	11.236	15.620	29.884	0.00	3208986	failed=0 errored=0 timeout=0
+2	h2	static-h2-1024	A	386008	28.106	11.967	16.139	31.088	0.00	3088066	failed=0 errored=0 timeout=0
+2	h2	baseline-h2c-1024	B	4885975	1.038	0.875	0.163	1.212	0.00	39087800	failed=0 errored=0 timeout=0
+2	h2	baseline-h2c-1024	A	4736875	1.074	0.894	0.180	1.470	0.00	37895000	failed=0 errored=0 timeout=0
+2	h2	json-h2c-1024	B	1829164	5.196	3.122	2.073	5.726	0.00	14633312	failed=0 errored=0 timeout=0
+2	h2	json-h2c-1024	A	1875349	5.055	3.109	1.946	5.620	0.00	15002795	failed=0 errored=0 timeout=0
+2	ws	ws-512:1:0	B	854214	13.266	1.127	12.139	13.848	0.00	6833716	
+2	ws	ws-512:1:0	A	859559	13.302	1.154	12.149	13.803	0.00	6876473	
+3	h1	h1-baseline	A	772398	14.696	1.927	12.769	15.350	0.00	6179188	
+3	h1	h1-baseline	B	799267	14.631	1.900	12.732	14.824	0.00	6394138	
+3	h1	h1-jsoncomp-4096	A	138074	86.866	70.275	16.591	86.884	0.00	1104595	Reconnects: 42297 Errors: connect 0, read 9, timeout 0
+3	h1	h1-jsoncomp-4096	B	132790	89.192	71.451	17.741	90.355	0.00	1062323	Reconnects: 40610 Errors: connect 0, read 8, timeout 0
+3	h1	h1-json-tls	A	319739	29.436	10.690	18.745	31.375	0.00	3213915	p50=4390us p99=45712us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+3	h1	h1-json-tls	B	356802	26.541	9.643	16.898	27.395	0.00	3586199	p50=3659us p99=13828us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+3	h1	h1-8gbit	A	47171	35.464	14.287	21.177	38.973	0.00	471970	p50=80us p99=203us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+3	h1	h1-8gbit	B	47136	36.373	14.380	21.993	42.210	0.00	471615	p50=82us p99=193us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+3	h2	baseline-h2-1024	A	4532162	1.025	0.856	0.168	1.079	0.00	36257300	failed=0 errored=0 timeout=0
+3	h2	baseline-h2-1024	B	4543937	1.054	0.888	0.167	1.111	0.00	36351500	failed=0 errored=0 timeout=0
+3	h2	static-h2-1024	A	446751	26.020	11.186	14.834	26.713	0.00	3574016	failed=0 errored=0 timeout=0
+3	h2	static-h2-1024	B	447490	25.932	10.922	15.011	26.887	0.00	3579937	failed=0 errored=0 timeout=0
+3	h2	baseline-h2c-1024	A	4953425	1.005	0.837	0.167	1.050	0.00	39627400	failed=0 errored=0 timeout=0
+3	h2	baseline-h2c-1024	B	4847387	1.016	0.855	0.161	1.087	0.00	38779100	failed=0 errored=0 timeout=0
+3	h2	json-h2c-1024	A	1937596	4.957	3.022	1.935	5.096	0.00	15500768	failed=0 errored=0 timeout=0
+3	h2	json-h2c-1024	B	1918196	5.017	3.090	1.927	5.197	0.00	15345568	failed=0 errored=0 timeout=0
+3	ws	ws-512:1:0	A	872835	13.126	1.189	11.937	13.360	0.00	6982677	
+3	ws	ws-512:1:0	B	877249	13.285	1.168	12.117	13.501	0.00	7017989	
+4	h1	h1-baseline	B	800938	14.658	1.884	12.774	14.863	0.00	6407507	
+4	h1	h1-baseline	A	783054	14.913	1.925	12.988	15.142	0.00	6264433	
+4	h1	h1-jsoncomp-4096	B	137038	87.500	71.621	15.879	87.609	0.00	1096306	Reconnects: 41960 Errors: connect 0, read 10, timeout 0
+4	h1	h1-jsoncomp-4096	A	138307	86.716	70.733	15.983	86.716	0.00	1106457	Reconnects: 42387 Errors: connect 0, read 13, timeout 0
+4	h1	h1-json-tls	B	326675	28.818	12.188	16.630	31.246	0.00	3282412	p50=4614us p99=26088us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+4	h1	h1-json-tls	A	354898	25.846	9.800	16.046	26.715	0.00	3566216	p50=4081us p99=13092us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+4	h1	h1-8gbit	B	47216	34.837	13.893	20.944	40.622	0.00	472415	p50=77us p99=177us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+4	h1	h1-8gbit	A	47189	33.504	13.182	20.322	36.968	0.00	472124	p50=78us p99=223us err={'connect': 0, 'read': 0, 'write': 0, 'timeout': 0, 'deadline': 0, 'non_2xx_3xx': 0}
+4	h2	baseline-h2-1024	B	4562650	1.050	0.890	0.160	1.104	0.00	36501200	failed=0 errored=0 timeout=0
+4	h2	baseline-h2-1024	A	4474062	1.045	0.876	0.169	1.122	0.00	35792500	failed=0 errored=0 timeout=0
+4	h2	static-h2-1024	B	449663	25.988	10.938	15.050	26.668	0.00	3597318	failed=0 errored=0 timeout=0
+4	h2	static-h2-1024	A	452125	25.568	10.876	14.692	26.434	0.00	3617015	failed=0 errored=0 timeout=0
+4	h2	baseline-h2c-1024	B	4861600	1.012	0.852	0.160	1.055	0.00	38892800	failed=0 errored=0 timeout=0
+4	h2	baseline-h2c-1024	A	4902825	0.987	0.827	0.160	1.049	0.00	39222600	failed=0 errored=0 timeout=0
+4	h2	json-h2c-1024	B	1939919	5.016	3.056	1.960	5.179	0.00	15519356	failed=0 errored=0 timeout=0
+4	h2	json-h2c-1024	A	1892444	5.031	3.047	1.984	5.362	0.00	15139558	failed=0 errored=0 timeout=0
+4	ws	ws-512:1:0	B	873634	13.359	1.182	12.177	13.567	0.00	6989068	
+4	ws	ws-512:1:0	A	873730	13.257	1.091	12.166	13.439	0.00	6989841	

@@ -1,0 +1,4 @@
+[2026-11-11 05:21:35.580] [INFO ] [Server.cpp:442] Aegon HTTP listening on 0.0.0.0:8080 [workers=12]
+[2026-11-11 05:21:35.580] [INFO ] [Server.cpp:442] Aegon HTTP listening on 0.0.0.0:8082 [workers=12]
+[2026-11-11 05:21:35.580] [INFO ] [Server.cpp:442] Aegon HTTPS listening on 0.0.0.0:8081 [workers=12]
+[2026-11-11 05:21:35.580] [INFO ] [Server.cpp:442] Aegon HTTPS listening on 0.0.0.0:8443 [workers=12]

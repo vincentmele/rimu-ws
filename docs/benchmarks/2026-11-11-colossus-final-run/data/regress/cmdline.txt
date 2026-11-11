@@ -1,0 +1,1 @@
+BOOT_IMAGE=/@/boot/vmlinuz-7.0.0-38-generic root=UUID=ff464666-a029-4ef9-901c-5a718b7980f4 ro rootflags=subvol=@ quiet splash

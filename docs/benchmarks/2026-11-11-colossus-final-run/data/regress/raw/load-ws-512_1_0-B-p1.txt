@@ -1,0 +1,19 @@
+gcannon v0.6.1 [WS]
+  Target:    localhost:8080/ws
+  Threads:   10
+  Conns:     512 (51/thread)
+  Pipeline:  1
+  Req/conn:  unlimited (keep-alive)
+  Expected:  200
+  Duration:  8s
+
+
+  Thread Stats   Avg      p50      p90      p99    p99.9
+    Latency    585us    665us    698us    726us   2.26ms
+
+  6990811 frames sent in 8.00s, 6990811 frames received
+  Throughput: 873.70K req/s
+  Bandwidth:  5.83MB/s
+  WS upgrades: 512
+  WS frames:   6990811
+  Latency samples: 6990811 / 6990811 responses (100.0%)

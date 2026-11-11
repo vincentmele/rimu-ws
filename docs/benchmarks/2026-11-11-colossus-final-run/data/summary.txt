@@ -1,0 +1,182 @@
+imds instance-type: 
+imds placement/availability-zone: 
+uname -r: 7.0.0-38-generic
+server cpus 0-5,12-17 | generator cpus 6-10,18-22 | h2load -t 10
+cpu model: AMD Ryzen 9 5900X 12-Core Processor
+cpu flags of note: aes avx2 sha_ni vaes vpclmulqdq 
+vaes=yes
+pmu=yes
+
+## phase R: regression A (main 85c9fe8d) vs B (feat/http3)
+
+72 runs, 4 passes; per pass the order A,B / B,A alternates. Rule: B must not be worse than A by more than 1 % (rps; for the rate-capped h1-8gbit: server CPU per request). A change smaller than the spread of the passes of A or B is marked within spread.
+
+| profile | A req/s | B req/s | B vs A | A spread | B spread | A cpu us/req | B cpu us/req | cpu vs A | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| h1-baseline | 791,472 | 800,102 | +1.09% | 4.1% | 0.5% | 14.625 | 14.639 | +0.09% | ok |
+| h1-jsoncomp-4096 | 138,446 | 136,825 | -1.17% | 0.6% | 3.7% | 86.638 | 87.644 | +1.16% | WORSE than 1 % (within spread) |
+| h1-json-tls | 352,570 | 353,886 | +0.37% | 10.0% | 18.1% | 27.065 | 26.953 | -0.41% | ok |
+| h1-8gbit | 47,162 | 47,135 | -0.06% | 0.1% | 0.2% | 34.847 | 36.100 | +3.60% | WORSE than 1 % |
+| baseline-h2-1024 | 4,509,487 | 4,536,250 | +0.59% | 1.3% | 2.0% | 1.046 | 1.053 | +0.72% | ok |
+| static-h2-1024 | 448,401 | 448,576 | +0.04% | 14.7% | 11.9% | 25.895 | 25.960 | +0.25% | ok |
+| baseline-h2c-1024 | 4,896,668 | 4,873,788 | -0.47% | 4.4% | 2.0% | 1.002 | 1.014 | +1.20% | ok |
+| json-h2c-1024 | 1,910,248 | 1,910,812 | +0.03% | 3.3% | 5.8% | 5.015 | 5.024 | +0.18% | ok |
+| ws-512:1:0 | 870,721 | 873,742 | +0.35% | 1.6% | 2.6% | 13.279 | 13.322 | +0.32% | ok |
+
+worse than 1 %: h1-jsoncomp-4096, h1-8gbit
+
+A/B rps of every run by pass:
+
+| profile | variant | pass 1 | pass 2 | pass 3 | pass 4 |
+|---|---|---|---|---|---|
+| h1-baseline | A | 800k | 805k | 772k | 783k |
+| h1-baseline | B | 797k | 801k | 799k | 801k |
+| h1-jsoncomp-4096 | A | 139k | 139k | 138k | 138k |
+| h1-jsoncomp-4096 | B | 137k | 138k | 133k | 137k |
+| h1-json-tls | A | 355k | 351k | 320k | 355k |
+| h1-json-tls | B | 391k | 351k | 357k | 327k |
+| h1-8gbit | A | 47k | 47k | 47k | 47k |
+| h1-8gbit | B | 47k | 47k | 47k | 47k |
+| baseline-h2-1024 | A | 4,531k | 4,488k | 4,532k | 4,474k |
+| baseline-h2-1024 | B | 4,529k | 4,473k | 4,544k | 4,563k |
+| static-h2-1024 | A | 450k | 386k | 447k | 452k |
+| static-h2-1024 | B | 454k | 401k | 447k | 450k |
+| baseline-h2c-1024 | A | 4,891k | 4,737k | 4,953k | 4,903k |
+| baseline-h2c-1024 | B | 4,944k | 4,886k | 4,847k | 4,862k |
+| json-h2c-1024 | A | 1,928k | 1,875k | 1,938k | 1,892k |
+| json-h2c-1024 | B | 1,903k | 1,829k | 1,918k | 1,940k |
+| ws-512:1:0 | A | 869k | 860k | 873k | 874k |
+| ws-512:1:0 | B | 874k | 854k | 877k | 874k |
+
+This result is the gate for the deferred checks T6-b, T10-q (BUF_POOL_MAX), T11-b, T14-b, T18-a / T18-f (keyed TLS record AEAD, revert route) and the StaticFiles path change of Task 20.
+
+## phase C: final h3 composite (rimu = the final build `base`, headers=min; rivals as measured)
+
+```
+server     composite               baseline-h3                 static-h3
+rimu-min        2000       1846k (1000) #2         264k (1000) #1 
+cnetmod         1851       1749k ( 948) #3         238k ( 903) #3 
+fib             1818       1531k ( 830) #4         261k ( 989) #2 
+zix             1712       1892k (1025) #1         181k ( 687) #6 
+plod            1546       1291k ( 699) #6         223k ( 847) #4 
+aegon           1506       1470k ( 796) #5         187k!( 709) #5 
+```
+
+| profile | server | rps median of starts (per start) | srv us/req | gen us/req | errors | load1 range | dgrams in/req | dgrams out/req | pkts out/req | ACK-only share |
+|---|---|---|---|---|---|---|---|---|---|---|
+| baseline-h3 | aegon | 1470k (1470k, 1481k, 1227k) | 5.52 | 6.92 | 0 | 10-14 | - | - | - | - |
+| baseline-h3 | cnetmod | 1749k (1768k, 1749k, 1654k) | 2.19 | 5.83 | 0 | 11-14 | - | - | - | - |
+| baseline-h3 | fib | 1531k (1531k, 1534k, 733k) | 4.54 | 6.66 | 0 | 10-28 | - | - | - | - |
+| baseline-h3 | plod | 1291k (1305k, 1291k, 756k) | 7.11 | 7.90 | 0 | 9-22 | - | - | - | - |
+| baseline-h3 | rimu-min | 1846k (1862k, 1846k, 1773k) | 1.79 | 5.54 | 0 | 9-11 | 0.05 | 0.02 | 0.02 | 0.1% |
+| baseline-h3 | zix | 1892k (1894k, 1892k, 1828k) | 1.35 | 5.40 | 0 | 9-13 | - | - | - | - |
+| static-h3 | aegon | 187k (190k, 187k, 97k) | 61.56 | 38.29 | 143 | 11-32 | - | - | - | - |
+| static-h3 | cnetmod | 238k (239k, 238k, 109k) | 37.01 | 43.39 | 0 | 11-33 | - | - | - | - |
+| static-h3 | fib | 261k (263k, 261k, 111k) | 34.50 | 39.42 | 0 | 11-35 | - | - | - | - |
+| static-h3 | plod | 223k (225k, 223k, 110k) | 51.54 | 43.24 | 0 | 8-33 | - | - | - | - |
+| static-h3 | rimu-min | 264k (286k, 264k, 138k) | 27.26 | 38.45 | 0 | 9-34 | 0.12 | 11.36 | 11.36 | 0.0% |
+| static-h3 | zix | 181k (191k, 181k, 98k) | 49.66 | 56.12 | 0 | 11-33 | - | - | - | - |
+
+generator busy share (gen us/req x req/s / 10 generator CPUs) and rimu's gap to the best rival, per profile (spec section 3 tie rule: both within 1 % and the generator saturated = a tie, the other profile decides):
+
+| profile | server | req/s (median) | gen busy | gap to best other |
+|---|---|---|---|---|
+| baseline-h3 | zix | 1,891,814 | 102% |  |
+| baseline-h3 | rimu-min | 1,845,806 | 102% | -2.43% |
+| baseline-h3 | cnetmod | 1,749,490 | 102% |  |
+| baseline-h3 | fib | 1,531,125 | 102% |  |
+| baseline-h3 | aegon | 1,469,845 | 102% |  |
+| baseline-h3 | plod | 1,291,079 | 102% |  |
+| static-h3 | rimu-min | 263,770 | 101% | +1.13% |
+| static-h3 | fib | 260,819 | 103% |  |
+| static-h3 | cnetmod | 238,274 | 103% |  |
+| static-h3 | plod | 223,410 | 97% |  |
+| static-h3 | aegon | 187,100 | 72% |  |
+| static-h3 | zix | 181,220 | 102% |  |
+
+## phase X: connection closes and errors of the rimu starts (carried checks of Tasks 21 to 23d)
+
+The server counts no closes by code (the h3 stats line has no such counter), and `error_cb` (ARENA_LOG_ERRORS=1) reports worker-level errors only. So a close with 0x0107 (excessive load) or InternalError / PoolExhausted is read from what it does to the client: h2load counts the requests of a closed connection as failed or errored, summed per start in `errors` (which also counts non-2xx statuses), and every rimu start must have 0. Beside it the server's own totals per start (the last `h3-stats` line of its log): handler panics, UDP send errors, stateless resets (a reset answers a datagram for a connection the worker no longer has), datagrams dropped when forwarding, `frames_resent_acked` (must be 0; `prev` has no such counter) and the worker-level `arena-h2:` error lines.
+
+| variant | profile | starts | request errors (sum) | worker error lines | handler panics | UDP send errors | stateless resets | forward dropped | frames_resent_acked |
+|---|---|---|---|---|---|---|---|---|---|
+| base | baseline-h3 | 3 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| base | static-h3 | 3 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| prev | baseline-h3 | 3 | 0 | 0 | 0 | 0 | 0 | 0 | n/a |
+| prev | static-h3 | 3 | 0 | 0 | 0 | 0 | 0 | 0 | n/a |
+
+request errors over all rimu starts: 0 (required 0). The peak live frame-reference chunks per worker are not in the stats line (a test-only measure of Task 23d, 22 % in-process): not reported here.
+
+## variants (phase V)
+
+### baseline-h3 (median of 3 passes; base 1,845,806 req/s, 1.79 us/req)
+
+| variant | req/s | vs base | srv us/req | vs base | spread | verdict | gen us/req | resp/pkt | ACK-only | flushes w/ ACK | blocked in (streams/data/stream) | lost | PTO | resent | resent-acked (must be 0) | memo hits | starts |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| base | 1,845,806 | +0.0% | 1.79 | +0.0% | 4.8% | - | 5.54 | 63.8 | 0.1% | 100.0% | 0/0/0 | 0 | 0 | 0 | 0 | 100.0% | 3 |
+| prev | 1,846,183 | +0.0% | 1.74 | -2.5% | 27.8% | WIN (within spread) [prev: read inverted] | 5.53 | 63.8 | 0.1% | 100.0% | 0/0/0 | 0 | 0 | 0 | - | 100.0% | 3 |
+| plod | 1,291,079 | -30.1% | 7.11 | +297.8% | 42.6% | - | 7.90 | - | - | - | -/-/- | - | - | - | - | - | 3 |
+| fib | 1,531,125 | -17.0% | 4.54 | +154.1% | 52.3% | - | 6.66 | - | - | - | -/-/- | - | - | - | - | - | 3 |
+| aegon | 1,469,845 | -20.4% | 5.52 | +208.7% | 17.3% | - | 6.92 | - | - | - | -/-/- | - | - | - | - | - | 3 |
+| cnetmod | 1,749,490 | -5.2% | 2.19 | +22.7% | 6.5% | - | 5.83 | - | - | - | -/-/- | - | - | - | - | - | 3 |
+| zix | 1,891,814 | +2.5% | 1.35 | -24.6% | 3.5% | - | 5.40 | - | - | - | -/-/- | - | - | - | - | - | 3 |
+
+The verdict of `prev` (the build before the one measured) reads inverted: its loss is the newer build's win. "within spread": the change is smaller than the spread of the passes of base or of the variant.
+
+transfer (baseline-h3, task 19; median of the passes): bytes and stream payload of a datagram (target >= 1,420 of 1,472), datagrams per GSO train, packets per response, copies per stream byte (target 1), flushes finishing a response that carried the ACK they owed, pacer holds per request, zero-copy (trains sent zero-copy / of them copied by the kernel anyway / workers that fell back):
+
+| variant | dgram B | payload B | segs/train | pkts/resp | copies/B | owed ACK carried | pacer holds/req | zc sent / copied / fallbacks |
+|---|---|---|---|---|---|---|---|---|
+| base | 992 | 575 | 1.00 | 0.02 | 3.00 | 100.0% | 0.000 | 0.0% / - / 0 |
+| prev | 992 | 575 | 1.00 | 0.02 | 3.00 | 100.0% | 0.000 | 0.0% / - / 0 |
+
+rps by pass (k = 1000; ! = errors):
+
+| variant | pass 1 | pass 2 | pass 3 |
+|---|---|---|---|
+| base | 1862k | 1846k | 1773k |
+| prev | 1849k | 1846k | 1336k |
+| plod | 1305k | 1291k | 756k |
+| fib | 1531k | 1534k | 733k |
+| aegon | 1470k | 1481k | 1227k |
+| cnetmod | 1768k | 1749k | 1654k |
+| zix | 1894k | 1892k | 1828k |
+
+### static-h3 (median of 3 passes; base 263,770 req/s, 27.26 us/req)
+
+| variant | req/s | vs base | srv us/req | vs base | spread | verdict | gen us/req | resp/pkt | ACK-only | flushes w/ ACK | blocked in (streams/data/stream) | lost | PTO | resent | resent-acked (must be 0) | memo hits | starts |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| base | 263,770 | +0.0% | 27.26 | +0.0% | 56.0% | - | 38.45 | 0.1 | 0.0% | 100.0% | 0/0/0 | 47294 | 0 | 62577 | 0 | 0.0% | 3 |
+| prev | 249,955 | -5.2% | 27.06 | -0.7% | 60.0% | loss (within spread) [prev: read inverted] | 40.02 | 0.1 | 0.0% | 100.0% | 0/0/0 | 43469 | 0 | 57250 | - | 0.0% | 3 |
+| plod | 223,410 | -15.3% | 51.54 | +89.1% | 51.3% | - | 43.24 | - | - | - | -/-/- | - | - | - | - | - | 3 |
+| fib | 260,819 | -1.1% | 34.50 | +26.6% | 58.3% | - | 39.42 | - | - | - | -/-/- | - | - | - | - | - | 3 |
+| aegon | 187,100 | -29.1% | 61.56 | +125.9% | 49.4% | - | 38.29 | - | - | - | -/-/- | - | - | - | - | - | 3 |
+| cnetmod | 238,274 | -9.7% | 37.01 | +35.8% | 54.5% | - | 43.39 | - | - | - | -/-/- | - | - | - | - | - | 3 |
+| zix | 181,220 | -31.3% | 49.66 | +82.2% | 51.2% | - | 56.12 | - | - | - | -/-/- | - | - | - | - | - | 3 |
+
+The verdict of `prev` (the build before the one measured) reads inverted: its loss is the newer build's win. "within spread": the change is smaller than the spread of the passes of base or of the variant.
+
+transfer (static-h3, task 19; median of the passes): bytes and stream payload of a datagram (target >= 1,420 of 1,472), datagrams per GSO train, packets per response, copies per stream byte (target 1), flushes finishing a response that carried the ACK they owed, pacer holds per request, zero-copy (trains sent zero-copy / of them copied by the kernel anyway / workers that fell back):
+
+| variant | dgram B | payload B | segs/train | pkts/resp | copies/B | owed ACK carried | pacer holds/req | zc sent / copied / fallbacks |
+|---|---|---|---|---|---|---|---|---|
+| base | 1472 | 1436 | 27.09 | 11.38 | 2.00 | 100.0% | 0.160 | 0.0% / - / 0 |
+| prev | 1472 | 1436 | 26.95 | 11.38 | 2.00 | 100.0% | 0.163 | 0.0% / - / 0 |
+
+rps by pass (k = 1000; ! = errors):
+
+| variant | pass 1 | pass 2 | pass 3 |
+|---|---|---|---|
+| base | 286k | 264k | 138k |
+| prev | 288k | 250k | 138k |
+| plod | 225k | 223k | 110k |
+| fib | 263k | 261k | 111k |
+| aegon | 190k! | 187k! | 97k! |
+| cnetmod | 239k | 238k | 109k |
+| zix | 191k | 181k | 98k |
+
+knobs each variant ran with (first start; the server's own line):
+
+- base: headers=min data=reuse gro=1 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete hp=ring qpack=0 zc=0 pacing_burst=64 repeat_ack=1 ping_budget=64
+- prev: headers=min data=reuse gro=1 recv_buffers=256 tx_arena=768000 rcvbuf=4194304 sndbuf=4194304 train=64 flush_order=arrival steering=cid balance=1 pin=1 max_in_flight=262144 pacing=1 pmtu_probe=now bodies=complete hp=ring qpack=0 zc=0 pacing_burst=64 repeat_ack=1
+

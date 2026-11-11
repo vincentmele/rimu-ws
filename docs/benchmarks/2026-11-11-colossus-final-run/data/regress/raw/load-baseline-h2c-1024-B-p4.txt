@@ -1,0 +1,82 @@
+starting benchmark...
+spawning thread #0: 103 total client(s). Timing-based test with 0s of warm-up time and 8s of main duration for measurements.
+spawning thread #1: 103 total client(s). Timing-based test with 0s of warm-up time and 8s of main duration for measurements.
+spawning thread #2: 103 total client(s). Timing-based test with 0s of warm-up time and 8s of main duration for measurements.
+spawning thread #3: 103 total client(s). Timing-based test with 0s of warm-up time and 8s of main duration for measurements.
+spawning thread #4: 102 total client(s). Timing-based test with 0s of warm-up time and 8s of main duration for measurements.
+spawning thread #5: 102 total client(s). Timing-based test with 0s of warm-up time and 8s of main duration for measurements.
+spawning thread #6: 102 total client(s). Timing-based test with 0s of warm-up time and 8s of main duration for measurements.
+spawning thread #7: 102 total client(s). Timing-based test with 0s of warm-up time and 8s of main duration for measurements.
+spawning thread #8: 102 total client(s). Timing-based test with 0s of warm-up time and 8s of main duration for measurements.
+spawning thread #9: 102 total client(s). Timing-based test with 0s of warm-up time and 8s of main duration for measurements.
+Warm-up started for thread #3.
+Warm-up started for thread #6.
+Warm-up started for thread #2.
+Warm-up started for thread #0.
+Warm-up started for thread #1.
+Warm-up started for thread #4.
+Warm-up started for thread #7.
+Warm-up started for thread #9.
+Warm-up started for thread #5.
+Warm-up started for thread #8.
+progress: 9% of clients started
+progress: 19% of clients started
+progress: 29% of clients started
+progress: 38% of clients started
+progress: 48% of clients started
+progress: 58% of clients started
+progress: 67% of clients started
+progress: 77% of clients started
+progress: 87% of clients started
+Warm-up phase is over for thread #3.
+Main benchmark duration is started for thread #3.
+progress: 97% of clients started
+Warm-up phase is over for thread #6.
+Main benchmark duration is started for thread #6.
+Warm-up phase is over for thread #2.
+Main benchmark duration is started for thread #2.
+Warm-up phase is over for thread #8.
+Main benchmark duration is started for thread #8.
+Warm-up phase is over for thread #1.
+Main benchmark duration is started for thread #1.
+Warm-up phase is over for thread #0.
+Main benchmark duration is started for thread #0.
+Warm-up phase is over for thread #5.
+Main benchmark duration is started for thread #5.
+Warm-up phase is over for thread #9.
+Main benchmark duration is started for thread #9.
+Warm-up phase is over for thread #7.
+Main benchmark duration is started for thread #7.
+Application protocol: h2c
+Warm-up phase is over for thread #4.
+Main benchmark duration is started for thread #4.
+Main benchmark duration is over for thread #6. Stopping all clients.
+Stopped all clients for thread #6
+Main benchmark duration is over for thread #0. Stopping all clients.
+Stopped all clients for thread #0
+Main benchmark duration is over for thread #7. Stopping all clients.
+Main benchmark duration is over for thread #8. Stopping all clients.
+Stopped all clients for thread #7
+Stopped all clients for thread #8
+Main benchmark duration is over for thread #5. Stopping all clients.
+Stopped all clients for thread #5
+Main benchmark duration is over for thread #3. Stopping all clients.
+Stopped all clients for thread #3
+Main benchmark duration is over for thread #2. Stopping all clients.
+Stopped all clients for thread #2
+Main benchmark duration is over for thread #9. Stopping all clients.
+Stopped all clients for thread #9
+Main benchmark duration is over for thread #1. Stopping all clients.
+Stopped all clients for thread #1
+Main benchmark duration is over for thread #4. Stopping all clients.
+Stopped all clients for thread #4
+
+finished in 8.08s, 4861600.00 req/s, 111.31MB/s
+requests: 38892800 total, 38995200 started, 38892800 done, 38892800 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 38892800 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 890.46MB (933714944) total, 185.68MB (194696448) headers (space savings 94.62%), 37.09MB (38892800) data
+                     min         max         mean         sd        +/- sd
+time for request:     1.00ms     89.75ms     11.00ms      4.52ms    95.83%
+time for connect:      115us      7.92ms      3.11ms      1.94ms    64.16%
+time to 1st byte:    21.51ms     95.80ms     53.25ms     11.90ms    60.74%
+req/s           :    4642.77     4823.62     4743.13       46.27    63.09%
