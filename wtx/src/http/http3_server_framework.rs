@@ -348,6 +348,10 @@ impl StatsCell {
 /// `vary` where static files need them), like the HttpArena HTTP/3 leaders (cnetmod, zix). That
 /// is not RFC 9110-compliant: `date` (section 6.6.1) and `content-length` (section 8.6) are left
 /// out, and [`Http3ServerFramework::set_rfc9110_headers`] turns both on.
+///
+/// Each worker thread is pinned to a CPU of the process by default, which suits a server that has
+/// the machine to itself; [`Http3ServerFramework::set_pin_workers`] turns it off for one that
+/// shares its CPUs with another server or other work.
 #[derive(Debug)]
 pub struct Http3ServerFramework<DA, EC, EX, RC, RNG, TCX> {
   content_length: bool,
