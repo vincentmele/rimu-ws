@@ -3,7 +3,8 @@
 This guide covers the HTTP/2 server framework (`Http2ServerFramework`) on the io_uring runtime
 (`UringRuntime`, Linux). For every setting a deployment may change it gives the default, when to
 change it, and what the change costs. The defaults are meant to be fast and safe on a shared host;
-change one only when your deployment matches the situation described.
+change one only when your deployment matches the situation described. The HTTP/1.1 and WebSocket
+servers have [their own guide](production-h1-ws.md).
 
 ## Deployment shapes
 

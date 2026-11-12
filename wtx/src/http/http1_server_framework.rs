@@ -2386,6 +2386,57 @@ mod tests {
     assert_eq!(stream.read(&mut byte).unwrap_or(0), 0);
   }
 
+  // A request head that stalls is closed without an answer, where nginx answers 408 (its
+  // `client_header_timeout`): the first head by the runtime's handshake timeout, a later one by
+  // its idle timeout. Both close with no bytes sent, and no 408 is ever written
+  // (docs/production-h1-ws.md, "Timeouts").
+  #[test]
+  fn a_stalled_request_head_is_closed_without_a_408() {
+    let uri = _uri();
+    let (host, port) = uri.hostname_with_implied_port();
+    let addr = std::format!("{host}:{port}");
+    let server_addr = addr.clone();
+    let _server = std::thread::spawn(move || {
+      Http1ServerFramework::<(), fn(crate::Error), UringExecutor, _>::new(UringExecutor::default())
+        .unwrap()
+        .set_error_cb(|_| {})
+        .set_local_runtime_cb(|| {
+          UringRuntime::with_params(
+            UringParams::new()
+              .set_ring_entries(64, 64)
+              .set_recv_buffers(32, 1024)
+              .set_handshake_timeout(Some(Duration::from_millis(300)))
+              .set_idle_timeout(Some(Duration::from_millis(300))),
+          )
+        })
+        .set_local_runtimes(core::num::NonZeroUsize::new(1))
+        .run_in_threads(&server_addr, router())
+    });
+    let closed_silently = |stream: &mut TcpStream| {
+      let begin = std::time::Instant::now();
+      stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+      let mut rest = Vec::new();
+      let _rslt = stream.read_to_end(&mut rest);
+      (rest, begin.elapsed())
+    };
+    // The first head stalls
+    let mut stream = connect(&addr);
+    stream.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n").unwrap();
+    let (rest, elapsed) = closed_silently(&mut stream);
+    assert_eq!(rest, b"", "first head");
+    assert!(elapsed < Duration::from_secs(2), "first head: {elapsed:?}");
+    // A request is answered, then the next head stalls
+    let mut stream = connect(&addr);
+    stream.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let (head, body) = read_response(&mut stream);
+    assert!(head.starts_with("http/1.1 200 "), "{head}");
+    assert_eq!(body, b"pong");
+    stream.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n").unwrap();
+    let (rest, elapsed) = closed_silently(&mut stream);
+    assert_eq!(rest, b"", "later head");
+    assert!(elapsed < Duration::from_secs(2), "later head: {elapsed:?}");
+  }
+
   // h2o t/40bad-request.t: a client that sends nothing at all — or a lone CR — and closes is
   // answered with a close, not a stray 400.
   #[test]
