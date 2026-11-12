@@ -1,0 +1,123 @@
+waiting: xarchive 330  load 4.32 4.01 2.22
+waiting: xarchive 325  load 4.04 3.96 2.22
+waiting: xarchive 320  load 3.80 3.91 2.22
+waiting: xarchive 315  load 3.59 3.87 2.23
+waiting: xarchive 311  load 3.42 3.82 2.23
+waiting: xarchive 307  load 3.20 3.76 2.23
+waiting: xarchive 303  load 3.17 3.74 2.24
+waiting: xarchive 299  load 2.99 3.68 2.23
+waiting: xarchive 295  load 2.76 3.61 2.22
+waiting: xarchive 292  load 2.72 3.57 2.23
+waiting: xarchive 288  load 2.68 3.53 2.23
+waiting: xarchive 285  load 2.58 3.48 2.23
+waiting: xarchive 282  load 2.57 3.45 2.23
+waiting: xarchive 279  load 2.48 3.40 2.23
+waiting: xarchive 276  load 2.41 3.35 2.22
+waiting: xarchive 273  load 2.34 3.31 2.22
+waiting: xarchive 271  load 2.28 3.26 2.22
+waiting: xarchive 268  load 2.24 3.22 2.22
+waiting: xarchive 266  load 2.36 3.21 2.22
+waiting: xarchive 264  load 3.51 3.44 2.31
+waiting: xarchive 262  load 4.05 3.56 2.36
+waiting: xarchive 260  load 4.12 3.59 2.38
+waiting: xarchive 258  load 4.25 3.63 2.41
+waiting: xarchive 255  load 3.90 3.58 2.41
+waiting: xarchive 253  load 3.68 3.54 2.41
+waiting: xarchive 251  load 3.50 3.51 2.41
+waiting: xarchive 249  load 3.42 3.49 2.41
+waiting: xarchive 247  load 3.20 3.44 2.41
+waiting: xarchive 245  load 3.10 3.41 2.41
+waiting: xarchive 244  load 2.85 3.35 2.40
+waiting: xarchive 242  load 2.80 3.32 2.40
+waiting: xarchive 240  load 2.67 3.27 2.40
+waiting: xarchive 238  load 2.57 3.23 2.39
+waiting: xarchive 237  load 2.64 3.22 2.40
+waiting: xarchive 235  load 2.62 3.20 2.40
+waiting: xarchive 234  load 2.60 3.18 2.40
+waiting: xarchive 232 z_wr_iss 100  load 2.65 3.17 2.41
+waiting: xarchive 231  load 2.55 3.13 2.40
+waiting: xarchive 229  load 2.47 3.09 2.40
+waiting: xarchive 228  load 2.47 3.07 2.40
+waiting: xarchive 227  load 2.48 3.05 2.40
+waiting: xarchive 225  load 2.40 3.02 2.39
+waiting: xarchive 224  load 2.50 3.02 2.40
+waiting: xarchive 223  load 2.57 3.02 2.41
+waiting: xarchive 222  load 2.55 3.00 2.41
+waiting: xarchive 221  load 2.55 2.98 2.41
+== pass 1 12:19:25 order A B load 2.46 2.95 2.40
+p1 A baseline r1  Throughput: 811.50K req/s  cpu_s 58.69 2xx=4058507, 3xx=0, 4xx=0, 5xx=0
+p1 A baseline r2  Throughput: 811.96K req/s  cpu_s 59.05 2xx=4060652, 3xx=0, 4xx=0, 5xx=0
+p1 A baseline r3  Throughput: 799.56K req/s  cpu_s 58.58 2xx=3998679, 3xx=0, 4xx=0, 5xx=0
+p1 A limited-conn r1  Throughput: 486.52K req/s  cpu_s 47.20 2xx=2433081, 3xx=0, 4xx=0, 5xx=0
+p1 A limited-conn r2  Throughput: 486.76K req/s  cpu_s 47.01 2xx=2434284, 3xx=0, 4xx=0, 5xx=0
+p1 A limited-conn r3  Throughput: 479.58K req/s  cpu_s 46.75 2xx=2398564, 3xx=0, 4xx=0, 5xx=0
+p1 A json-comp r1  Throughput: 255.52K req/s  cpu_s 60.44 2xx=1277771, 3xx=0, 4xx=0, 5xx=0
+p1 A json-comp r2  Throughput: 257.08K req/s  cpu_s 60.56 2xx=1285569, 3xx=0, 4xx=0, 5xx=0
+p1 A json-comp r3  Throughput: 256.59K req/s  cpu_s 60.54 2xx=1283074, 3xx=0, 4xx=0, 5xx=0
+p1 B baseline r1  Throughput: 799.29K req/s  cpu_s 58.70 2xx=3998864, 3xx=0, 4xx=0, 5xx=0
+p1 B baseline r2  Throughput: 783.31K req/s  cpu_s 57.95 2xx=3917972, 3xx=0, 4xx=0, 5xx=0
+p1 B baseline r3  Throughput: 805.39K req/s  cpu_s 58.92 2xx=4027750, 3xx=0, 4xx=0, 5xx=0
+p1 B limited-conn r1  Throughput: 489.46K req/s  cpu_s 47.08 2xx=2447894, 3xx=0, 4xx=0, 5xx=0
+p1 B limited-conn r2  Throughput: 487.94K req/s  cpu_s 47.10 2xx=2440309, 3xx=0, 4xx=0, 5xx=0
+p1 B limited-conn r3  Throughput: 491.08K req/s  cpu_s 47.32 2xx=2456182, 3xx=0, 4xx=0, 5xx=0
+p1 B json-comp r1  Throughput: 256.35K req/s  cpu_s 60.49 2xx=1281881, 3xx=0, 4xx=0, 5xx=0
+p1 B json-comp r2  Throughput: 258.71K req/s  cpu_s 60.46 2xx=1293675, 3xx=0, 4xx=0, 5xx=0
+p1 B json-comp r3  Throughput: 255.78K req/s  cpu_s 60.47 2xx=1279056, 3xx=0, 4xx=0, 5xx=0
+== pass 2 12:21:34 order B A load 12.73 6.99 3.98
+p2 B baseline r1  Throughput: 799.87K req/s  cpu_s 58.36 2xx=4000137, 3xx=0, 4xx=0, 5xx=0
+p2 B baseline r2  Throughput: 801.69K req/s  cpu_s 58.47 2xx=4009166, 3xx=0, 4xx=0, 5xx=0
+p2 B baseline r3  Throughput: 803.46K req/s  cpu_s 58.66 2xx=4018066, 3xx=0, 4xx=0, 5xx=0
+p2 B limited-conn r1  Throughput: 489.27K req/s  cpu_s 46.41 2xx=2447000, 3xx=0, 4xx=0, 5xx=0
+p2 B limited-conn r2  Throughput: 490.70K req/s  cpu_s 47.14 2xx=2454034, 3xx=0, 4xx=0, 5xx=0
+p2 B limited-conn r3  Throughput: 492.43K req/s  cpu_s 47.19 2xx=2462695, 3xx=0, 4xx=0, 5xx=0
+p2 B json-comp r1  Throughput: 256.42K req/s  cpu_s 60.46 2xx=1282243, 3xx=0, 4xx=0, 5xx=0
+p2 B json-comp r2  Throughput: 257.62K req/s  cpu_s 60.44 2xx=1288258, 3xx=0, 4xx=0, 5xx=0
+p2 B json-comp r3  Throughput: 257.03K req/s  cpu_s 60.50 2xx=1285270, 3xx=0, 4xx=0, 5xx=0
+p2 A baseline r1  Throughput: 798.91K req/s  cpu_s 58.11 2xx=3995698, 3xx=0, 4xx=0, 5xx=0
+p2 A baseline r2  Throughput: 798.15K req/s  cpu_s 58.01 2xx=3991597, 3xx=0, 4xx=0, 5xx=0
+p2 A baseline r3  Throughput: 805.08K req/s  cpu_s 58.48 2xx=4026195, 3xx=0, 4xx=0, 5xx=0
+p2 A limited-conn r1  Throughput: 490.38K req/s  cpu_s 47.40 2xx=2452624, 3xx=0, 4xx=0, 5xx=0
+p2 A limited-conn r2  Throughput: 489.51K req/s  cpu_s 47.33 2xx=2448070, 3xx=0, 4xx=0, 5xx=0
+p2 A limited-conn r3  Throughput: 492.81K req/s  cpu_s 47.46 2xx=2464757, 3xx=0, 4xx=0, 5xx=0
+p2 A json-comp r1  Throughput: 257.41K req/s  cpu_s 60.56 2xx=1287149, 3xx=0, 4xx=0, 5xx=0
+p2 A json-comp r2  Throughput: 257.30K req/s  cpu_s 60.36 2xx=1286649, 3xx=0, 4xx=0, 5xx=0
+p2 A json-comp r3  Throughput: 257.10K req/s  cpu_s 60.50 2xx=1285654, 3xx=0, 4xx=0, 5xx=0
+== pass 3 12:23:43 order A B load 14.69 10.05 5.53
+p3 A baseline r1  Throughput: 798.97K req/s  cpu_s 58.24 2xx=3995677, 3xx=0, 4xx=0, 5xx=0
+p3 A baseline r2  Throughput: 802.37K req/s  cpu_s 58.66 2xx=4012596, 3xx=0, 4xx=0, 5xx=0
+p3 A baseline r3  Throughput: 803.19K req/s  cpu_s 58.73 2xx=4016827, 3xx=0, 4xx=0, 5xx=0
+p3 A limited-conn r1  Throughput: 493.82K req/s  cpu_s 47.44 2xx=2469734, 3xx=0, 4xx=0, 5xx=0
+p3 A limited-conn r2  Throughput: 489.73K req/s  cpu_s 47.15 2xx=2449240, 3xx=0, 4xx=0, 5xx=0
+p3 A limited-conn r3  Throughput: 492.02K req/s  cpu_s 47.24 2xx=2460737, 3xx=0, 4xx=0, 5xx=0
+p3 A json-comp r1  Throughput: 256.05K req/s  cpu_s 60.25 2xx=1280392, 3xx=0, 4xx=0, 5xx=0
+p3 A json-comp r2  Throughput: 257.25K req/s  cpu_s 60.27 2xx=1286406, 3xx=0, 4xx=0, 5xx=0
+p3 A json-comp r3  Throughput: 257.02K req/s  cpu_s 60.46 2xx=1285354, 3xx=0, 4xx=0, 5xx=0
+p3 B baseline r1  Throughput: 799.69K req/s  cpu_s 58.24 2xx=3999455, 3xx=0, 4xx=0, 5xx=0
+p3 B baseline r2  Throughput: 802.86K req/s  cpu_s 58.62 2xx=4015103, 3xx=0, 4xx=0, 5xx=0
+p3 B baseline r3  Throughput: 802.33K req/s  cpu_s 58.60 2xx=4012475, 3xx=0, 4xx=0, 5xx=0
+p3 B limited-conn r1  Throughput: 491.52K req/s  cpu_s 47.10 2xx=2458263, 3xx=0, 4xx=0, 5xx=0
+p3 B limited-conn r2  Throughput: 490.13K req/s  cpu_s 47.29 2xx=2451298, 3xx=0, 4xx=0, 5xx=0
+p3 B limited-conn r3  Throughput: 490.55K req/s  cpu_s 47.32 2xx=2453329, 3xx=0, 4xx=0, 5xx=0
+p3 B json-comp r1  Throughput: 257.35K req/s  cpu_s 60.35 2xx=1286880, 3xx=0, 4xx=0, 5xx=0
+p3 B json-comp r2  Throughput: 258.95K req/s  cpu_s 60.38 2xx=1294931, 3xx=0, 4xx=0, 5xx=0
+p3 B json-comp r3  Throughput: 256.58K req/s  cpu_s 60.40 2xx=1283050, 3xx=0, 4xx=0, 5xx=0
+== pass 4 12:25:52 order B A load 13.90 11.55 6.69
+p4 B baseline r1  Throughput: 803.33K req/s  cpu_s 58.83 2xx=4017450, 3xx=0, 4xx=0, 5xx=0
+p4 B baseline r2  Throughput: 801.52K req/s  cpu_s 58.68 2xx=4008234, 3xx=0, 4xx=0, 5xx=0
+p4 B baseline r3  Throughput: 803.82K req/s  cpu_s 58.51 2xx=4019925, 3xx=0, 4xx=0, 5xx=0
+p4 B limited-conn r1  Throughput: 488.96K req/s  cpu_s 46.83 2xx=2445349, 3xx=0, 4xx=0, 5xx=0
+p4 B limited-conn r2  Throughput: 494.46K req/s  cpu_s 47.10 2xx=2472778, 3xx=0, 4xx=0, 5xx=0
+p4 B limited-conn r3  Throughput: 490.94K req/s  cpu_s 46.91 2xx=2455231, 3xx=0, 4xx=0, 5xx=0
+p4 B json-comp r1  Throughput: 257.37K req/s  cpu_s 60.47 2xx=1287101, 3xx=0, 4xx=0, 5xx=0
+p4 B json-comp r2  Throughput: 257.61K req/s  cpu_s 60.44 2xx=1288205, 3xx=0, 4xx=0, 5xx=0
+p4 B json-comp r3  Throughput: 257.71K req/s  cpu_s 60.54 2xx=1288675, 3xx=0, 4xx=0, 5xx=0
+p4 A baseline r1  Throughput: 798.95K req/s  cpu_s 58.43 2xx=3995965, 3xx=0, 4xx=0, 5xx=0
+p4 A baseline r2  Throughput: 801.46K req/s  cpu_s 58.55 2xx=4008188, 3xx=0, 4xx=0, 5xx=0
+p4 A baseline r3  Throughput: 804.82K req/s  cpu_s 57.92 2xx=4024952, 3xx=0, 4xx=0, 5xx=0
+p4 A limited-conn r1  Throughput: 489.93K req/s  cpu_s 46.98 2xx=2450383, 3xx=0, 4xx=0, 5xx=0
+p4 A limited-conn r2  Throughput: 494.55K req/s  cpu_s 47.14 2xx=2473276, 3xx=0, 4xx=0, 5xx=0
+p4 A limited-conn r3  Throughput: 489.08K req/s  cpu_s 47.07 2xx=2445888, 3xx=0, 4xx=0, 5xx=0
+p4 A json-comp r1  Throughput: 257.59K req/s  cpu_s 60.37 2xx=1288154, 3xx=0, 4xx=0, 5xx=0
+p4 A json-comp r2  Throughput: 256.29K req/s  cpu_s 60.35 2xx=1281567, 3xx=0, 4xx=0, 5xx=0
+p4 A json-comp r3  Throughput: 257.41K req/s  cpu_s 60.37 2xx=1287207, 3xx=0, 4xx=0, 5xx=0
+== done 12:28:00 load 14.21 12.68 7.73

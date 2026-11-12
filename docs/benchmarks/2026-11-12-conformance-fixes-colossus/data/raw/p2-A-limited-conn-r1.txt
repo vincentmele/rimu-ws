@@ -1,0 +1,23 @@
+gcannon v0.6.1
+  Target:    localhost:8080/
+  Threads:   10
+  Conns:     4096 (410/thread)
+  Pipeline:  1
+  Req/conn:  10
+  Templates: 3
+  Expected:  200
+  Duration:  5s
+
+
+  Thread Stats   Avg      p50      p90      p99    p99.9
+    Latency   7.43ms   7.09ms   10.20ms   11.50ms   12.40ms
+
+  2452515 requests in 5.00s, 2452624 responses
+  Throughput: 490.38K req/s
+  Bandwidth:  30.87MB/s
+  Status codes: 2xx=2452624, 3xx=0, 4xx=0, 5xx=0
+  Latency samples: 2452624 / 2452624 responses (100.0%)
+  Reconnects: 244791
+  Per-template: 817614,817486,817524
+  Per-template-ok: 817614,817486,817524
+cpu_ticks 4740 tick 100
