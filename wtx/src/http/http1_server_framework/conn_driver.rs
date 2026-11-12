@@ -157,6 +157,7 @@ where
     max_delay: params.max_delay,
     midreq: false,
     offset: 0,
+    peer_closed: false,
     peer_eof: false,
     queued: 0,
     reads_async: false,
@@ -180,6 +181,9 @@ struct Driver {
   midreq: bool,
   /// How much of `rx` was fed.
   offset: usize,
+  /// The peer ended its input (not the server going away): a request body it left incomplete
+  /// is answered with a 400 before the connection closes.
+  peer_closed: bool,
   /// The peer is done sending (or its server is going away): what was received is answered and
   /// then the connection closes.
   peer_eof: bool,
@@ -252,6 +256,11 @@ impl Driver {
       }
       // Also when the end of the input was seen while a response was delayed.
       if self.peer_eof {
+        // A body cut short by the end of the input is answered, as Envoy does, instead of being
+        // dropped without a word.
+        if self.peer_closed && self.conn.end_of_input() {
+          self.flush(stream).await?;
+        }
         return Ok(());
       }
       if self.rx.is_empty() && !self.reads_async {
@@ -290,7 +299,10 @@ impl Driver {
             self.rx.set_len(init_len.wrapping_add(len.get()));
           }
         }
-        TryRead::Closed => return Ok(true),
+        TryRead::Closed => {
+          self.peer_closed = true;
+          return Ok(true);
+        }
         TryRead::Pending => return Ok(false),
         TryRead::Unsupported => {
           self.reads_async = true;
@@ -311,6 +323,7 @@ impl Driver {
             Some(deadline) => before(read, deadline).await,
           };
           let Some(len) = rslt? else {
+            self.peer_closed = true;
             return Ok(true);
           };
           // SAFETY: `read` initialized `len` bytes of the spare capacity

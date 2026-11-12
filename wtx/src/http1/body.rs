@@ -1,6 +1,6 @@
 //! HTTP/1.1 request body decoder.
 
-use crate::http1::BodyKind;
+use crate::http1::{BodyKind, MAX_HEADERS, parser::is_tchar};
 use alloc::vec::Vec;
 
 /// Progress of a [`BodyDecoder`].
@@ -39,12 +39,14 @@ enum State {
   DataCr,
   /// Expecting `\n` after the chunk payload.
   DataLf,
-  /// Start of a trailer line or of the final empty line.
-  TrailerStart,
-  /// Skipping a trailer line until `\r`.
-  TrailerLine,
-  /// Expecting `\n` after a trailer line.
-  TrailerLf,
+  /// Start of a trailer field or of the final empty line, after `count` trailer fields.
+  TrailerStart { count: usize },
+  /// Reading the name of a trailer field.
+  TrailerName { count: usize },
+  /// Reading the value of a trailer field until `\r`.
+  TrailerValue { count: usize },
+  /// Expecting `\n` after a trailer field.
+  TrailerLf { count: usize },
   /// Expecting `\n` of the final empty line.
   FinalLf,
 }
@@ -144,7 +146,7 @@ fn step(state: State, byte: u8) -> crate::Result<State> {
       if byte != b'\n' {
         return Err(bad_request());
       }
-      if value == 0 { State::TrailerStart } else { State::Data(value) }
+      if value == 0 { State::TrailerStart { count: 0 } } else { State::Data(value) }
     }
     State::DataCr => {
       if byte != b'\r' {
@@ -158,29 +160,42 @@ fn step(state: State, byte: u8) -> crate::Result<State> {
       }
       State::Size { any: false, value: 0 }
     }
-    State::TrailerStart => {
+    // Trailer fields are fields (RFC 9112 §7.1.2): their names are tokens and their values hold no
+    // control character, and there are no more of them than of a head's headers (as in Envoy).
+    State::TrailerStart { count } => {
       if byte == b'\r' {
         State::FinalLf
-      } else if byte == b'\n' {
+      } else if !is_tchar(byte) {
         return Err(bad_request());
+      } else if count >= MAX_HEADERS {
+        return Err(crate::http::HttpError::RequestHeaderFieldsTooLarge.into());
       } else {
-        State::TrailerLine
+        State::TrailerName { count: count.wrapping_add(1) }
       }
     }
-    State::TrailerLine => {
+    State::TrailerName { count } => {
+      if byte == b':' {
+        State::TrailerValue { count }
+      } else if is_tchar(byte) {
+        State::TrailerName { count }
+      } else {
+        return Err(bad_request());
+      }
+    }
+    State::TrailerValue { count } => {
       if byte == b'\r' {
-        State::TrailerLf
-      } else if byte == b'\n' {
+        State::TrailerLf { count }
+      } else if (byte < 0x20 && byte != b'\t') || byte == 0x7f {
         return Err(bad_request());
       } else {
-        State::TrailerLine
+        State::TrailerValue { count }
       }
     }
-    State::TrailerLf => {
+    State::TrailerLf { count } => {
       if byte != b'\n' {
         return Err(bad_request());
       }
-      State::TrailerStart
+      State::TrailerStart { count }
     }
     State::FinalLf => {
       if byte != b'\n' {
@@ -357,5 +372,77 @@ mod tests {
   fn rejects_missing_chunk_terminator() {
     let mut decoder = BodyDecoder::new(BodyKind::Chunked);
     assert!(decoder.feed(b"2\r\n20XX", &mut Vec::new()).is_err());
+  }
+
+  // ---- Chunked shapes from lighttpd and llhttp ----
+
+  // lighttpd answers uppercase hex chunk sizes; the decoder takes `A` for 10.
+  #[test]
+  fn chunked_uppercase_hex_size() {
+    let mut decoder = BodyDecoder::new(BodyKind::Chunked);
+    let mut out = Vec::new();
+    let input = b"A\r\n0123456789\r\n0\r\n\r\n";
+    assert_eq!(
+      decoder.feed(input, &mut out).unwrap(),
+      BodyStatus::Complete { consumed: input.len() }
+    );
+    assert_eq!(out, b"0123456789");
+  }
+
+  // llhttp refuses a space after the chunk size (httpd tolerates up to ten) and the `0x`
+  // prefix some clients send.
+  #[test]
+  fn chunked_size_junk_is_rejected() {
+    let mut decoder = BodyDecoder::new(BodyKind::Chunked);
+    assert!(decoder.feed(b"a \r\n0123456789\r\n0\r\n\r\n", &mut Vec::new()).is_err());
+    let mut decoder = BodyDecoder::new(BodyKind::Chunked);
+    assert!(decoder.feed(b"0x10\r\n\r\n", &mut Vec::new()).is_err());
+  }
+
+  // A bare CR inside chunk extensions derails the terminator: lighttpd answers 400 to `2;a\rb`.
+  #[test]
+  fn chunked_extension_bare_cr_is_rejected() {
+    let mut decoder = BodyDecoder::new(BodyKind::Chunked);
+    assert!(decoder.feed(b"2;a\rb\r\n20\r\n0\r\n\r\n", &mut Vec::new()).is_err());
+  }
+
+  // The final chunk may carry extensions: lighttpd answers 200 to `0; comment`.
+  #[test]
+  fn chunked_final_chunk_extensions() {
+    let mut decoder = BodyDecoder::new(BodyKind::Chunked);
+    let mut out = Vec::new();
+    let input = b"2\r\n20\r\n0; comment\r\n\r\n";
+    assert_eq!(
+      decoder.feed(input, &mut out).unwrap(),
+      BodyStatus::Complete { consumed: input.len() }
+    );
+    assert_eq!(out, b"20");
+  }
+
+  // ---- Trailer limits ----
+
+  // Envoy bounds the trailer-field count like the header count; 150 of them must not complete
+  // a body.
+  #[test]
+  fn trailer_count_is_bounded() {
+    let mut input = b"0\r\n".to_vec();
+    for _ in 0..150 {
+      input.extend_from_slice(b"X-Many: v\r\n");
+    }
+    input.extend_from_slice(b"\r\n");
+    let mut decoder = BodyDecoder::new(BodyKind::Chunked);
+    assert!(decoder.feed(&input, &mut Vec::new()).is_err(), "150 trailer fields were accepted");
+  }
+
+  // Trailer fields are HTTP fields (RFC 9112 §7.1): llhttp and Envoy validate their names and
+  // values.
+  #[test]
+  fn trailer_fields_are_validated() {
+    for case in
+      [b"0\r\nX-T\x01: v\r\n\r\n".as_slice(), b"0\r\n: v\r\n\r\n", b"0\r\nX-T: \x7f\r\n\r\n"]
+    {
+      let mut decoder = BodyDecoder::new(BodyKind::Chunked);
+      assert!(decoder.feed(case, &mut Vec::new()).is_err(), "{case:?}");
+    }
   }
 }

@@ -615,3 +615,104 @@ fn client_checks_the_servers_answer() {
   };
   assert!(!connect_to(no_upgrade, false));
 }
+
+// RFC 6455 4.2.1: exactly one `Sec-WebSocket-Key`; gorilla's TestServerFromRequest refuses the
+// duplicate.
+#[test]
+fn duplicate_sec_websocket_key_is_refused() {
+  let mut headers = without("Sec-WebSocket-Key");
+  headers.push("Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==".into());
+  headers.push("Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==".into());
+  let (upgraded, answer, _) = serve(&request("GET / HTTP/1.1", &refs(&headers)), 1024);
+  assert!(!upgraded, "{answer}");
+  assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+}
+
+// httpd refuses a duplicated Host as request smuggling.
+#[test]
+fn duplicate_host_is_refused() {
+  let mut headers = valid_headers();
+  headers.push("Host: other.example.com".into());
+  let (upgraded, answer, _) = serve(&request("GET / HTTP/1.1", &refs(&headers)), 1024);
+  assert!(!upgraded, "{answer}");
+  assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+}
+
+// `Upgrade` is a token list, so `websocket, foobar` still upgrades — what gorilla's client
+// accepts from servers in TestDialExtraTokensInRespHeaders, mirrored server-side.
+#[test]
+fn upgrade_token_list_is_upgraded() {
+  let mut headers = without("Upgrade");
+  headers.push("Upgrade: websocket, foobar".into());
+  let (upgraded, answer, _) = serve(&request("GET / HTTP/1.1", &refs(&headers)), 1024);
+  assert!(upgraded, "{answer}");
+  assert!(answer.contains(ACCEPT), "{answer}");
+}
+
+// gorilla's IsWebSocketUpgrade: a `Connection` without the `upgrade` token never upgrades.
+#[test]
+fn connection_without_the_upgrade_token_is_refused() {
+  let mut headers = without("Connection");
+  headers.push("Connection: keep-alive".into());
+  let (upgraded, answer, _) = serve(&request("GET / HTTP/1.1", &refs(&headers)), 1024);
+  assert!(!upgraded, "{answer}");
+  assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+}
+
+// The target of an upgrade is any origin-form, query string included.
+#[test]
+fn query_string_target_is_upgraded() {
+  let headers = valid_headers();
+  let (upgraded, answer, _) = serve(&request("GET /chat?room=1 HTTP/1.1", &refs(&headers)), 1024);
+  assert!(upgraded, "{answer}");
+  assert!(answer.contains(ACCEPT), "{answer}");
+}
+
+// RFC 6455 5.1: a server MUST NOT mask the frames it sends; gorilla's client rejects one, and
+// so does this one.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn client_fails_on_a_masked_server_frame() {
+  use std::io::{Read, Write};
+  let uri = _uri();
+  let listener = TcpListener::bind(uri.hostname_with_implied_port()).unwrap();
+  let server = std::thread::spawn(move || {
+    let (mut stream, _) = listener.accept().unwrap();
+    stream.set_nodelay(true).unwrap();
+    let mut head = std::vec::Vec::new();
+    let mut byte = [0; 1];
+    while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap() == 1 {
+      head.push(byte[0]);
+    }
+    let head = std::string::String::from_utf8(head).unwrap();
+    let key = std::string::String::from(
+      head.lines().find_map(|el| el.strip_prefix("Sec-WebSocket-Key: ")).unwrap().trim(),
+    );
+    let mut buffer = [0; 30];
+    let accept =
+      crate::misc::from_utf8_basic(super::derived_key(&mut buffer, key.as_bytes())).unwrap();
+    let res = std::format!(
+      "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+    );
+    stream.write_all(res.as_bytes()).unwrap();
+    // A masked text frame from the server: the violation under test.
+    stream.write_all(&[0x81, 0x82, 1, 2, 3, 4, b'X' ^ 1, b'Y' ^ 2, b'Z' ^ 3]).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+  });
+  let read = StdRuntime::new().block_on(async {
+    let mut ws = WebSocketConnector::default()
+      .connect(
+        TlsConnectorBuilder::std(uri)
+          .build(&TlsConfig::plaintext(), &mut ChaCha20::from_std_random().unwrap())
+          .await
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    ws.read_frame(&mut VectorUsize::new(), WebSocketPayloadOrigin::Adaptive)
+      .await
+      .map(|el| (el.op_code(), el.payload().len()))
+  });
+  server.join().unwrap();
+  assert!(read.is_err(), "a masked server frame was read as {read:?}");
+}

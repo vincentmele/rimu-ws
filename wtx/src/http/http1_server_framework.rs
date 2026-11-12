@@ -979,6 +979,32 @@ mod tests {
     server_with(error_cb, None, Duration::from_secs(10))
   }
 
+  // A server like [`server`] whose runtime rings are small. The suite's servers never exit, so
+  // every test pins its rings for the rest of the process: with the default 1024/4096 rings
+  // that is ~200 KiB of locked memory per test, and the process runs out around the fortieth
+  // one. The small rings keep this suite's additions far away from that ceiling.
+  fn server_small(error_cb: fn(crate::Error)) -> String {
+    let uri = _uri();
+    let (host, port) = uri.hostname_with_implied_port();
+    let addr = std::format!("{host}:{port}");
+    let server_addr = addr.clone();
+    let _server = std::thread::spawn(move || {
+      Http1ServerFramework::<(), fn(crate::Error), UringExecutor, _>::new(UringExecutor::default())
+        .unwrap()
+        .set_error_cb(error_cb)
+        .set_local_runtime_cb(|| {
+          UringRuntime::with_params(
+            UringParams::new().set_ring_entries(64, 64).set_recv_buffers(32, 1024),
+          )
+        })
+        .set_local_runtimes(core::num::NonZeroUsize::new(1))
+        .set_max_connections(None)
+        .set_max_delay(Duration::from_secs(10))
+        .run_in_threads(&server_addr, router().set_middleware(Http1ServerHeader("rimu-ws")))
+    });
+    addr
+  }
+
   // A one-runtime server serving at most `max_connections` at once; returns its address.
   fn server_with(
     error_cb: fn(crate::Error),
@@ -2229,5 +2255,152 @@ mod tests {
     }
     let after = ALLOCATIONS.load(Ordering::SeqCst);
     assert_eq!(after - before, 0, "allocations on the server thread for 900 requests");
+  }
+
+  // ---- Answers the mature servers give ----
+
+  // nginx and httpd answer 501 to a well-formed but unknown method (Envoy answers 400).
+  #[test]
+  fn unknown_method_gets_501() {
+    let addr = server_small(|_| {});
+    let mut stream = connect(&addr);
+    stream.write_all(b"BAD /ping HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let (head, _body) = read_response(&mut stream);
+    assert!(head.starts_with("http/1.1 501 "), "{head}");
+    let mut byte = [0; 1];
+    assert_eq!(stream.read(&mut byte).unwrap_or(0), 0, "the connection must close after a 501");
+  }
+
+  // nginx and httpd answer 414 when the request line alone is oversized, reserving 431 for
+  // oversized headers.
+  #[test]
+  fn long_request_target_gets_414() {
+    let addr = server_small(|_| {});
+    let mut stream = connect(&addr);
+    let mut raw = b"GET /".to_vec();
+    raw.extend(core::iter::repeat_n(b'a', 20 * 1024));
+    raw.extend_from_slice(b" HTTP/1.1\r\nHost: x\r\n\r\n");
+    stream.write_all(&raw).unwrap();
+    let (head, _body) = read_response(&mut stream);
+    assert!(head.starts_with("http/1.1 414 "), "{head}");
+  }
+
+  // RFC 9110 §10.1.1 and lighttpd's 100-continue tests: a client that holds its body back
+  // until told to go on gets an interim 100 response, then the final one.
+  #[test]
+  fn expect_100_continue_interim_then_final() {
+    let addr = server_small(|_| {});
+    let mut stream = connect(&addr);
+    stream
+      .write_all(
+        b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nExpect: 100-continue\r\n\r\n",
+      )
+      .unwrap();
+    let interim = read_head(&mut stream);
+    assert!(interim.starts_with("http/1.1 100 "), "{interim}");
+    stream.write_all(b"abc").unwrap();
+    let (final_head, body) = read_response(&mut stream);
+    assert!(final_head.starts_with("http/1.1 200 "), "{final_head}");
+    assert_eq!(body, b"abc");
+  }
+
+  // A body that came with the head needs no 100 (RFC 9110 §10.1.1 lets it be left out): the
+  // final response is the first thing back.
+  #[test]
+  fn expect_100_continue_with_the_body_in_gets_only_the_final_response() {
+    let addr = server_small(|_| {});
+    let mut stream = connect(&addr);
+    stream
+      .write_all(
+        b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nExpect: 100-continue\r\n\r\nabc",
+      )
+      .unwrap();
+    let (head, body) = read_response(&mut stream);
+    assert!(head.starts_with("http/1.1 200 "), "{head}");
+    assert_eq!(body, b"abc");
+  }
+
+  // Envoy answers 400 to a body cut short by a half-close instead of holding the connection.
+  #[test]
+  fn truncated_body_after_half_close_gets_400() {
+    use std::net::Shutdown;
+    let addr = server_small(|_| {});
+    let mut stream = connect(&addr);
+    stream.write_all(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabcd").unwrap();
+    stream.shutdown(Shutdown::Write).unwrap();
+    let mut got = Vec::new();
+    let mut byte = [0; 1];
+    while stream.read(&mut byte).unwrap_or(0) == 1 {
+      got.push(byte[0]);
+    }
+    let answer = String::from_utf8_lossy(&got).into_owned().to_lowercase();
+    assert!(answer.starts_with("http/1.1 400 "), "{answer}");
+  }
+
+  // ---- Robustness the mature suites carry ----
+
+  // httpd's half-close tests: a client that finishes writing but keeps reading is still
+  // answered.
+  #[test]
+  fn half_closed_write_is_still_answered() {
+    use std::net::Shutdown;
+    let addr = server_small(|_| {});
+    let mut stream = connect(&addr);
+    stream.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    stream.shutdown(Shutdown::Write).unwrap();
+    let (head, body) = read_response(&mut stream);
+    assert!(head.starts_with("http/1.1 200 "), "{head}");
+    assert_eq!(body, b"pong");
+  }
+
+  // lighttpd 787-840: an HTTP/1.0 request that opts in with `Connection: keep-alive` and
+  // carries a Content-Length keeps the connection for the next one.
+  #[test]
+  fn http10_keep_alive_with_content_length() {
+    let addr = server_small(|_| {});
+    let mut stream = connect(&addr);
+    stream
+      .write_all(
+        b"POST /echo HTTP/1.0\r\nHost: x\r\nConnection: keep-alive\r\nContent-Length: 3\r\n\r\nabc",
+      )
+      .unwrap();
+    let (head, body) = read_response(&mut stream);
+    assert!(head.starts_with("http/1.1 200 "), "{head}");
+    assert_eq!(body, b"abc");
+    stream.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let (head, body) = read_response(&mut stream);
+    assert!(head.starts_with("http/1.1 200 "), "{head}");
+    assert_eq!(body, b"pong");
+  }
+
+  // lighttpd 865: a single empty line in front of a request is tolerated, a second one is a
+  // 400.
+  #[test]
+  fn leading_crlf_crlf_gets_400() {
+    let addr = server_small(|_| {});
+    let mut stream = connect(&addr);
+    stream.write_all(b"\r\n\r\nGET /ping HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let (head, _body) = read_response(&mut stream);
+    assert!(head.starts_with("http/1.1 400 "), "{head}");
+    let mut byte = [0; 1];
+    assert_eq!(stream.read(&mut byte).unwrap_or(0), 0);
+  }
+
+  // h2o t/40bad-request.t: a client that sends nothing at all — or a lone CR — and closes is
+  // answered with a close, not a stray 400.
+  #[test]
+  fn empty_request_is_closed_silently() {
+    use std::net::Shutdown;
+    let addr = server_small(|_| {});
+    for prefix in [b"".as_slice(), b"\r"] {
+      let mut stream = connect(&addr);
+      stream.write_all(prefix).unwrap();
+      stream.shutdown(Shutdown::Write).unwrap();
+      let mut byte = [0; 1];
+      match stream.read(&mut byte) {
+        Ok(0) => {}
+        other => panic!("{prefix:?}: expected a silent close, got {other:?}"),
+      }
+    }
   }
 }
