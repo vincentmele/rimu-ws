@@ -17,7 +17,7 @@ pub enum WebSocketError {
   InvalidHandshakeRequest,
   /// Received an invalid header compression parameter.
   InvalidCompressionHeaderParameter,
-  /// The client sent an invalid mask bit.
+  /// A frame's mask bit is wrong for its sender: unmasked from a client or masked from a server.
   InvalidMaskBit,
   /// Server received a frame without a mask.
   MissingFrameMask,

@@ -219,6 +219,10 @@ impl ReadFrameInfo {
 
   fn manage_mask<const IS_CLIENT: bool>(masked: bool, no_masking: bool) -> crate::Result<bool> {
     Ok(if IS_CLIENT {
+      // RFC 6455 5.1: a server MUST NOT mask its frames, and a client that gets one closes.
+      if masked {
+        return Err(WebSocketError::InvalidMaskBit.into());
+      }
       false
     } else if no_masking {
       if masked {
@@ -231,5 +235,68 @@ impl ReadFrameInfo {
       }
       true
     })
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::ReadFrameInfo;
+
+  const MAX: usize = 1024 * 1024;
+
+  fn server(bytes: &[u8]) -> Option<crate::Result<(ReadFrameInfo, usize)>> {
+    ReadFrameInfo::parse_header::<(), false>(bytes, MAX, 0, false)
+  }
+
+  fn client(bytes: &[u8]) -> Option<crate::Result<(ReadFrameInfo, usize)>> {
+    ReadFrameInfo::parse_header::<(), true>(bytes, MAX, 0, false)
+  }
+
+  // The header checks every frame reader leans on, in the shape Autobahn's fuzzing client
+  // sends them: reserved bits, reserved opcodes, fragmented or oversized control frames, the
+  // client mask, and the payload cap.
+  #[test]
+  fn server_side_header_checks() {
+    for (name, bytes) in [
+      ("rsv1", [0xC1, 0x81, 1, 2, 3, 4].as_slice()),
+      ("rsv2", [0xA1, 0x81, 1, 2, 3, 4].as_slice()),
+      ("rsv3", [0x91, 0x81, 1, 2, 3, 4].as_slice()),
+      ("opcode 3", [0x83, 0x81, 1, 2, 3, 4].as_slice()),
+      ("opcode 7", [0x87, 0x81, 1, 2, 3, 4].as_slice()),
+      ("opcode 0xB", [0x8B, 0x81, 1, 2, 3, 4].as_slice()),
+      ("opcode 0xF", [0x8F, 0x81, 1, 2, 3, 4].as_slice()),
+      ("fragmented ping", [0x09, 0x81, 1, 2, 3, 4].as_slice()),
+      ("control of 126", [0x89, 0xFE, 0x00, 0x7E, 1, 2, 3, 4].as_slice()),
+      ("unmasked", [0x81, 0x01, b'x'].as_slice()),
+    ] {
+      assert!(server(bytes).unwrap().is_err(), "{name}");
+    }
+    // A payload of exactly the cap is already too large: the check is `>=`.
+    let mut at_cap = [0x81, 0x7F].to_vec();
+    at_cap.extend((MAX as u64).to_be_bytes());
+    at_cap.extend_from_slice(&[1, 2, 3, 4]);
+    assert!(server(&at_cap).unwrap().is_err());
+    // A well-formed masked text frame parses.
+    let (rfi, len) = server(&[0x81, 0x81, 1, 2, 3, 4, b'x' ^ 1]).unwrap().unwrap();
+    assert_eq!((rfi.op_code, rfi.payload_len, len), (crate::web_socket::OpCode::Text, 1, 6));
+  }
+
+  // RFC 6455 5.1: a server MUST NOT mask; the client must refuse the frame, as gorilla's does.
+  #[test]
+  fn client_rejects_a_masked_server_frame() {
+    assert!(client(&[0x81, 0x82, 1, 2, 3, 4, b'x' ^ 1, b'y' ^ 2]).unwrap().is_err());
+  }
+
+  // RFC 6455 5.2 has the sender use the minimal length field but doesn't make the receiver
+  // refuse a longer one, and Autobahn doesn't test it: a five-byte payload behind a 16-bit or
+  // 64-bit length is read, by choice.
+  #[test]
+  fn non_minimal_length_encoding_is_accepted() {
+    let (rfi, len) = server(&[0x81, 0xFE, 0x00, 0x05, 1, 2, 3, 4, 1, 2, 3, 4, 5]).unwrap().unwrap();
+    assert_eq!((rfi.payload_len, len), (5, 8));
+    let mut sixty_four = [0x81, 0xFF, 0, 0, 0, 0, 0, 0, 0, 5, 1, 2, 3, 4].to_vec();
+    sixty_four.extend_from_slice(&[1, 2, 3, 4, 5]);
+    let (rfi, len) = server(&sixty_four).unwrap().unwrap();
+    assert_eq!((rfi.payload_len, len), (5, 14));
   }
 }

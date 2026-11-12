@@ -6,6 +6,8 @@ mod close_code;
 #[doc(hidden)]
 pub mod differential;
 mod frame;
+#[cfg(test)]
+mod frame_tests;
 mod handshake;
 #[cfg(any(test, feature = "_fuzz"))]
 #[doc(hidden)]

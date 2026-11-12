@@ -18,6 +18,8 @@ pub enum HttpError {
   ),
   /// Received request does not contain a method field
   MissingRequestMethod,
+  /// HTTP/1.1 request with a version whose major number is not 1 (answered with 505)
+  HttpVersionNotSupported,
   /// HTTP/1.1 request head over the size limit or with too many headers (answered with 431)
   RequestHeaderFieldsTooLarge,
   /// Received response does not contain a status code field
@@ -45,8 +47,12 @@ pub enum HttpError {
   },
   /// HTTP/1.1 `Transfer-Encoding` with a coding other than `chunked` (answered with 501)
   UnsupportedTransferCoding,
+  /// HTTP/1.1 request with a well-formed method that isn't known (answered with 501)
+  UnknownMethod,
   /// Unknown `WebAuthn` Algorithm
   UnknownWebAuthnAlg,
   /// URI mismatch
   UriMismatch,
+  /// HTTP/1.1 request line over the size limit (answered with 414)
+  UriTooLong,
 }

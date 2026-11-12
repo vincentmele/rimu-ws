@@ -57,8 +57,10 @@ impl Default for ParseScratch {
 /// Parses the head of a request found in `buf`.
 ///
 /// Errors are [`HttpError::BadRequest`], [`HttpError::RequestHeaderFieldsTooLarge`] (head over
-/// 16 KiB or more than [`MAX_HEADERS`] headers) or [`HttpError::UnsupportedTransferCoding`];
-/// [`error_status`] gives the status code each one is answered with.
+/// 16 KiB or more than [`MAX_HEADERS`] headers), [`HttpError::UriTooLong`] (request line over
+/// 16 KiB), [`HttpError::UnknownMethod`], [`HttpError::HttpVersionNotSupported`] or
+/// [`HttpError::UnsupportedTransferCoding`]; [`error_status`] gives the status code each one is
+/// answered with.
 ///
 /// Returns [`ParseOutcome::Partial`], never an error, while the blank line that ends the head
 /// has not arrived (unless the head is already larger than the 16 KiB limit). The function is
@@ -76,7 +78,15 @@ pub fn parse_request<'b>(
   let window = buf.get(..MAX_HEAD_LEN).unwrap_or(buf);
   let Some(head_len) = find_head_end(window) else {
     if buf.len() > MAX_HEAD_LEN {
+      // No line ended within the limit: the request line alone is over it (RFC 9112 §3: 414).
+      if find_byte(window, b'\n').is_none() {
+        return Err(HttpError::UriTooLong.into());
+      }
       return Err(HttpError::RequestHeaderFieldsTooLarge.into());
+    }
+    // A line that ends in a bare LF can never be part of a head that completes here.
+    if has_bare_lf(window) {
+      return Err(bad());
     }
     return Ok(ParseOutcome::Partial);
   };
@@ -93,23 +103,52 @@ pub fn parse_request<'b>(
   }
   let line = head.get(..line_end - 1).ok_or_else(bad)?;
   let line_bytes = line.as_bytes();
-  if has_ctl(line_bytes) || find_byte(line_bytes, b'\t').is_some() {
+  // Controls, tabs, DEL, a fragment and raw non-ASCII bytes (RFC 9112 §3, RFC 9110 §7.1)
+  if has_line_junk(line_bytes) {
     return Err(bad());
   }
   let sp0 = find_byte(line_bytes, b' ').ok_or_else(bad)?;
-  let method = Method::from_canonical_bytes(line_bytes.get(..sp0).ok_or_else(bad)?)?;
+  let method_bytes = line_bytes.get(..sp0).ok_or_else(bad)?;
+  // An unknown method is judged once the rest of the line is known to be well formed.
+  let method = Method::from_canonical_bytes(method_bytes).ok();
   let rest = line.get(sp0 + 1..).ok_or_else(bad)?;
   let sp1 = find_byte(rest.as_bytes(), b' ').ok_or_else(bad)?;
   let target = rest.get(..sp1).ok_or_else(bad)?;
+  // RFC 9112 §2.5: an unsupported minor version is treated as the highest one supported, a major
+  // version other than 1 is a 505.
   let http10 = match rest.get(sp1 + 1..).ok_or_else(bad)?.as_bytes() {
-    b"HTTP/1.1" => false,
-    b"HTTP/1.0" => true,
+    [b'H', b'T', b'T', b'P', b'/', major, b'.', minor]
+      if major.is_ascii_digit() && minor.is_ascii_digit() =>
+    {
+      if *major != b'1' {
+        return Err(HttpError::HttpVersionNotSupported.into());
+      }
+      *minor == b'0'
+    }
     _ => return Err(bad()),
   };
   if target.is_empty() {
     return Err(bad());
   }
   let (origin, authority) = origin_part(target)?;
+  // Origin-form, absolute-form (an authority above), asterisk-form, or CONNECT's authority-form
+  // (RFC 9112 §3.2). Anything else, such as `GET www.example.com`, is a bad request.
+  if authority.is_none()
+    && !target.starts_with('/')
+    && target != "*"
+    && method != Some(Method::Connect)
+  {
+    return Err(bad());
+  }
+  // nginx and httpd: a well-formed method that isn't known is not implemented, other tokens
+  // (`get`, `G@T`) are bad requests.
+  let Some(method) = method else {
+    return Err(if method_bytes.iter().all(u8::is_ascii_uppercase) {
+      HttpError::UnknownMethod.into()
+    } else {
+      bad()
+    });
+  };
   let (mut path, query) = match find_byte(origin.as_bytes(), b'?') {
     Some(idx) => (origin.get(..idx).ok_or_else(bad)?, origin.get(idx + 1..).ok_or_else(bad)?),
     None => (origin, ""),
@@ -162,6 +201,7 @@ pub fn parse_request<'b>(
         if let Some(authority) = authority {
           value = authority;
         }
+        check_host(value)?;
       }
       10 if name.eq_ignore_ascii_case("connection") => {
         for token in value.split(',') {
@@ -232,14 +272,18 @@ pub fn parse_request<'b>(
   })
 }
 
-/// Status code a [`parse_request`] error is answered with: 431, 501 or else 400.
+/// Status code a [`parse_request`] error is answered with: 414, 431, 501, 505 or else 400.
 #[inline]
 pub fn error_status(error: &crate::Error) -> StatusCode {
   match error {
     crate::Error::Http(HttpError::RequestHeaderFieldsTooLarge) => {
       StatusCode::RequestHeaderFieldsTooLarge
     }
-    crate::Error::Http(HttpError::UnsupportedTransferCoding) => StatusCode::NotImplemented,
+    crate::Error::Http(HttpError::UnsupportedTransferCoding | HttpError::UnknownMethod) => {
+      StatusCode::NotImplemented
+    }
+    crate::Error::Http(HttpError::UriTooLong) => StatusCode::UriTooLong,
+    crate::Error::Http(HttpError::HttpVersionNotSupported) => StatusCode::HttpVersionNotSupported,
     _ => StatusCode::BadRequest,
   }
 }
@@ -273,6 +317,132 @@ fn origin_part(target: &str) -> crate::Result<(&str, Option<&str>)> {
     return Err(bad());
   }
   Ok((rest.get(authority_len..).ok_or_else(bad)?, Some(authority)))
+}
+
+/// Accepts a `Host` value that is an RFC 3986 `host [ ":" port ]`: a registered name or IPv4
+/// address, or a bracketed IPv6 literal, and a port of at most 65535. Userinfo, a path or extra
+/// colons are a bad request, as h2o has them. An empty value is allowed (RFC 9110 §7.2).
+#[inline]
+fn check_host(value: &str) -> crate::Result<()> {
+  let bytes = value.as_bytes();
+  let port = if let Some(rest) = bytes.strip_prefix(b"[") {
+    let end = find_byte(rest, b']').ok_or_else(bad)?;
+    let literal = rest.get(..end).ok_or_else(bad)?;
+    if literal.is_empty()
+      || !literal.iter().all(|byte| byte.is_ascii_hexdigit() || matches!(byte, b':' | b'.'))
+    {
+      return Err(bad());
+    }
+    match rest.get(end + 1..).ok_or_else(bad)? {
+      [] => None,
+      [b':', port @ ..] => Some(port),
+      _ => return Err(bad()),
+    }
+  } else {
+    let (name, port) = match find_byte(bytes, b':') {
+      Some(idx) => (bytes.get(..idx).ok_or_else(bad)?, Some(bytes.get(idx + 1..).ok_or_else(bad)?)),
+      None => (bytes, None),
+    };
+    if !name.iter().all(|byte| is_reg_name_byte(*byte)) {
+      return Err(bad());
+    }
+    port
+  };
+  if let Some(port) = port {
+    let mut number: u32 = 0;
+    for byte in port {
+      let digit = byte.wrapping_sub(b'0');
+      if digit > 9 {
+        return Err(bad());
+      }
+      number = number.saturating_mul(10).saturating_add(u32::from(digit));
+    }
+    if number > 65535 {
+      return Err(bad());
+    }
+  }
+  Ok(())
+}
+
+/// RFC 3986 `reg-name` bytes: unreserved, `%` of a percent-encoding, and sub-delims.
+#[inline]
+const fn is_reg_name_byte(byte: u8) -> bool {
+  byte.is_ascii_alphanumeric()
+    || matches!(
+      byte,
+      b'-'
+        | b'.'
+        | b'_'
+        | b'~'
+        | b'%'
+        | b'!'
+        | b'$'
+        | b'&'
+        | b'\''
+        | b'('
+        | b')'
+        | b'*'
+        | b'+'
+        | b','
+        | b';'
+        | b'='
+    )
+}
+
+/// If a `\n` in `bytes` is not preceded by `\r`.
+#[inline]
+fn has_bare_lf(bytes: &[u8]) -> bool {
+  let mut start = 0usize;
+  while let Some(rel) = bytes.get(start..).and_then(|el| find_byte(el, b'\n')) {
+    let idx = start.wrapping_add(rel);
+    if idx == 0 || bytes.get(idx.wrapping_sub(1)) != Some(&b'\r') {
+      return true;
+    }
+    start = idx.wrapping_add(1);
+  }
+  false
+}
+
+/// If the request line `bytes` holds a control character (a tab included), a DEL, a `#` or a
+/// byte that isn't ASCII.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn has_line_junk(bytes: &[u8]) -> bool {
+  use core::arch::x86_64::{
+    _mm_cmpeq_epi8, _mm_loadu_si128, _mm_max_epu8, _mm_min_epu8, _mm_movemask_epi8, _mm_or_si128,
+    _mm_set1_epi8,
+  };
+  let mut idx = 0usize;
+  // SAFETY: SSE2 is part of the `x86_64` baseline and every load stays inside `bytes`.
+  unsafe {
+    let c1f = _mm_set1_epi8(0x1f);
+    let del = _mm_set1_epi8(0x7f);
+    let hash = _mm_set1_epi8(b'#' as i8);
+    while idx + 16 <= bytes.len() {
+      let v = _mm_loadu_si128(bytes.as_ptr().add(idx).cast());
+      let low = _mm_cmpeq_epi8(_mm_min_epu8(v, c1f), v);
+      let high = _mm_cmpeq_epi8(_mm_max_epu8(v, del), v);
+      let bad = _mm_or_si128(_mm_or_si128(low, high), _mm_cmpeq_epi8(v, hash));
+      if _mm_movemask_epi8(bad) != 0 {
+        return true;
+      }
+      idx += 16;
+    }
+  }
+  bytes.get(idx..).is_some_and(has_line_junk_scalar)
+}
+
+/// If the request line `bytes` holds a control character (a tab included), a DEL, a `#` or a
+/// byte that isn't ASCII.
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn has_line_junk(bytes: &[u8]) -> bool {
+  has_line_junk_scalar(bytes)
+}
+
+#[inline]
+fn has_line_junk_scalar(bytes: &[u8]) -> bool {
+  bytes.iter().any(|b| *b < 0x20 || *b >= 0x7f || *b == b'#')
 }
 
 /// Accepts a `Transfer-Encoding` value that is exactly `chunked`, the only coding supported.
@@ -325,7 +495,7 @@ fn parse_decimal(bytes: &[u8]) -> crate::Result<usize> {
 
 /// RFC 9110 `tchar`.
 #[inline]
-const fn is_tchar(byte: u8) -> bool {
+pub(crate) const fn is_tchar(byte: u8) -> bool {
   const TABLE: [bool; 256] = {
     let mut table = [false; 256];
     let mut i = 0usize;
@@ -839,5 +1009,149 @@ mod tests {
         assert!(has_ctl(&v), "{bad} at {pos}");
       }
     }
+  }
+
+  // ---- Shapes and answers the mature suites agree on ----
+
+  // llhttp's request-line checks and h2o t/40bad-request.t: a target with a space, a missing
+  // method or target, junk in or after the version, a raw NUL, and a second empty line in
+  // front (RFC 9112 §2.2 tolerates exactly one) are all bad requests.
+  #[test]
+  fn request_line_shapes_from_other_suites() {
+    assert!(is_err(b"GET /foo bar/ HTTP/1.1\r\nHost: a\r\n\r\n"));
+    assert!(is_err(b" / HTTP/1.1\r\nHost: a\r\n\r\n"));
+    assert!(is_err(b"GET  HTTP/1.1\r\nHost: a\r\n\r\n"));
+    assert!(is_err(b"GET / HTTP/1.1 \r\nHost: a\r\n\r\n"));
+    assert!(is_err(b"GET / HTTP/1.01\r\nHost: a\r\n\r\n"));
+    assert!(is_err(b"GET / HTTP/A.0\r\nHost: a\r\n\r\n"));
+    assert!(is_err(b"GET / aHTTP/1.1\r\nHost: a\r\n\r\n"));
+    assert!(is_err(b"GET /\x00 HTTP/1.1\r\nHost: a\r\n\r\n"));
+    assert!(is_err(b"\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n"));
+  }
+
+  // `OPTIONS *` is the asterisk-form (RFC 9110 §9.3.7): lighttpd answers it, curl sends it.
+  #[test]
+  fn asterisk_form_parses() {
+    let (method, path, _, _, body_kind, _, _) = complete(b"OPTIONS * HTTP/1.1\r\nHost: a\r\n\r\n");
+    assert_eq!(method, Method::Options);
+    assert_eq!(path, "*");
+    assert_eq!(body_kind, BodyKind::None);
+  }
+
+  // CONNECT's target is an authority, not a path (RFC 9110 §9.3.6); Envoy's CONNECT tests use
+  // the shape.
+  #[test]
+  fn connect_authority_form_parses() {
+    let (method, path, _, _, _, keep_alive, _) =
+      complete(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n");
+    assert_eq!(method, Method::Connect);
+    assert_eq!(path, "example.com:443");
+    assert!(keep_alive);
+  }
+
+  // llhttp rejects embedded whitespace, commas and signs in `Content-Length`; nginx accepts a
+  // comma list of equal values, which RFC 9110 §8.6 leaves to recipients.
+  #[test]
+  fn content_length_junk_is_rejected() {
+    for value in ["4 2", "5, 5", "+5", "4\t2"] {
+      let raw = format!("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: {value}\r\n\r\n");
+      assert!(is_err(raw.as_bytes()), "{value}");
+    }
+  }
+
+  // llhttp and Envoy: no empty header names, no space before the colon (a `Content-Length :`
+  // must not be re-read as an unknown header), no CR inside a name, and a space before the
+  // first header name is not a folded value.
+  #[test]
+  fn header_name_shapes() {
+    assert!(is_err(b"GET / HTTP/1.1\r\nHost: a\r\n: v\r\n\r\n"));
+    assert!(is_err(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length : 4\r\n\r\n"));
+    assert!(is_err(b"POST / HTTP/1.1\r\nHost: a\r\nContent\r-Length: 4\r\n\r\n"));
+    assert!(is_err(b"GET / HTTP/1.1\r\n Host: a\r\n\r\n"));
+  }
+
+  // A `chunked` with parameters is a coding this server does not speak: llhttp and Envoy also
+  // refuse `chunked;foo`.
+  #[test]
+  fn transfer_encoding_with_parameters_is_refused() {
+    assert!(is_err(b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked;foo\r\n\r\n"));
+  }
+
+  // ---- What mature servers refuse ----
+
+  // httpd's CVE-2011-3368 and Envoy: an authority-shaped target belongs to CONNECT only; a GET
+  // of `www.somewhere.com` is a bad request.
+  #[test]
+  fn authority_form_target_is_rejected() {
+    assert!(is_err(b"GET www.somewhere.com HTTP/1.1\r\nHost: a\r\n\r\n"));
+  }
+
+  // A request target carries no fragment (RFC 9110 §7.1); httpd and Envoy answer 400.
+  #[test]
+  fn fragment_in_target_is_rejected() {
+    assert!(is_err(b"GET /x#f HTTP/1.1\r\nHost: a\r\n\r\n"));
+  }
+
+  // llhttp in strict mode and uWS reject raw non-ASCII bytes in the target; Envoy and lighttpd
+  // accept them instead. The suites disagree; this server follows RFC 3986, which has no raw
+  // non-ASCII in a URI.
+  #[test]
+  fn raw_non_ascii_in_target_is_rejected() {
+    assert!(is_err("GET /café HTTP/1.1\r\nHost: a\r\n\r\n".as_bytes()));
+  }
+
+  // h2o t/40bad-request.t: userinfo, extra colons, an embedded path and an out-of-range port
+  // in `Host` are bad requests.
+  #[test]
+  fn host_authority_junk_is_rejected() {
+    for host in ["a@b:80", "a:b:99", "localhost:80/x", "example.com:99999"] {
+      let raw = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+      assert!(is_err(raw.as_bytes()), "{host}");
+    }
+  }
+
+  // RFC 9112 §2.5: a major version this server does not speak is a 505, and an unsupported
+  // minor version is treated as the highest one supported — exactly what httpd does (h2o
+  // answers 400 to 1.2 instead).
+  #[test]
+  fn version_major_and_minor_rules() {
+    let mut scratch = ParseScratch::new();
+    let request = match parse_request(b"GET / HTTP/1.2\r\nHost: a\r\n\r\n", &mut scratch).unwrap() {
+      ParseOutcome::Complete { request, .. } => request,
+      ParseOutcome::Partial => panic!("partial"),
+    };
+    assert_eq!(request.version, Version::Http1_1);
+    assert!(request.keep_alive);
+    assert_eq!(
+      err_status(b"GET / HTTP/9.1\r\nHost: a\r\n\r\n"),
+      StatusCode::HttpVersionNotSupported
+    );
+    // HTTP/0.9, a request line without a version, is refused as well.
+    assert!(is_err(b"GET /\r\n\r\n"));
+  }
+
+  // nginx and httpd answer 501 to a well-formed but unknown method; Envoy answers 400. Other
+  // tokens, such as a lowercase method, stay bad requests.
+  #[test]
+  fn unknown_method_is_not_implemented() {
+    assert_eq!(err_status(b"BAD /ping HTTP/1.1\r\nHost: a\r\n\r\n"), StatusCode::NotImplemented);
+    assert_eq!(err_status(b"bad /ping HTTP/1.1\r\nHost: a\r\n\r\n"), StatusCode::BadRequest);
+  }
+
+  // A request line alone over the cap is a long URI: nginx and httpd answer 414, distinct from
+  // the 431 of oversized headers.
+  #[test]
+  fn oversized_request_line_is_uri_too_long() {
+    let mut raw = b"GET /".to_vec();
+    raw.extend(core::iter::repeat_n(b'a', 20 * 1024));
+    raw.extend_from_slice(b" HTTP/1.1\r\nHost: a\r\n\r\n");
+    assert_eq!(err_status(&raw), StatusCode::UriTooLong);
+  }
+
+  // llhttp rejects bare-LF endings; a request that only ever has them never completes a head
+  // here, so it hangs until the size cap instead of being answered.
+  #[test]
+  fn bare_lf_request_is_rejected() {
+    assert!(is_err(b"GET / HTTP/1.1\nHost: a\n\n"));
   }
 }

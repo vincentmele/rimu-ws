@@ -150,6 +150,10 @@ where
         bytes_split1(value, b',').any(|el| el.trim_ascii().eq_ignore_ascii_case(token))
       };
       if name.eq_ignore_ascii_case(b"host") {
+        // RFC 9112 §3.2: more than one is a bad request (httpd refuses it as smuggling).
+        if host {
+          return Err(false);
+        }
         host = true;
       } else if name.eq_ignore_ascii_case(b"upgrade") {
         upgrade |= has_token(b"websocket");

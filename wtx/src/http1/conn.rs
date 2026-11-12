@@ -8,6 +8,7 @@ use crate::{
   },
 };
 use alloc::vec::Vec;
+use core::mem;
 
 /// Maximum number of bytes buffered between two `poll_event` calls.
 const BUF_CAP: usize = 256 * 1024;
@@ -63,8 +64,10 @@ pub struct Http1Conn {
 enum Phase {
   /// Waiting for a complete head.
   Head,
-  /// Head parsed (it stays at `buf[start..start + head_len]`), decoding the body.
-  Body { decoder: BodyDecoder, head_len: usize, raw: usize },
+  /// Head parsed (it stays at `buf[start..start + head_len]`), decoding the body. `expect` while
+  /// a 100 (Continue) is owed if the body isn't complete after the first bytes that follow the
+  /// head.
+  Body { decoder: BodyDecoder, head_len: usize, raw: usize, expect: bool },
   /// A complete request awaits `respond`. Its head and what is left of its body in the buffer
   /// (all of it unless it arrived over several feeds) occupy `buf[start..start + len]`.
   Ready { len: usize, keep_alive: bool, method: Method, version: Version },
@@ -75,7 +78,8 @@ enum Head {
   Bad(StatusCode),
   Partial,
   Bodyless(Http1Request<'static>, usize),
-  WithBody(BodyKind, usize),
+  /// The framing, the length of the head, and if the client waits for a 100 (Continue) first.
+  WithBody(BodyKind, usize, bool),
 }
 
 /// The buffers of an [`Http1Conn`], to serve another connection with: what
@@ -209,7 +213,7 @@ impl Http1Conn {
       return Http1Event::RequestReady;
     }
     if let Phase::Head = self.phase {
-      let (kind, head_len) = match self.parse_head() {
+      let (kind, head_len, expect) = match self.parse_head() {
         Head::Bad(status) => return self.fail(status),
         Head::Partial => return Http1Event::NeedMore,
         Head::Bodyless(request, head_len) => {
@@ -223,7 +227,7 @@ impl Http1Conn {
           };
           return Http1Event::RequestReady;
         }
-        Head::WithBody(kind, head_len) => (kind, head_len),
+        Head::WithBody(kind, head_len, expect) => (kind, head_len, expect),
       };
       if let BodyKind::ContentLength(len) = kind
         && len > self.max_body_len
@@ -231,18 +235,20 @@ impl Http1Conn {
         return self.fail(StatusCode::PayloadTooLarge);
       }
       self.body.clear();
-      self.phase = Phase::Body { decoder: BodyDecoder::new(kind), head_len, raw: 0 };
+      self.phase = Phase::Body { decoder: BodyDecoder::new(kind), head_len, raw: 0, expect };
     }
-    let Phase::Body { decoder, head_len, raw } = &mut self.phase else {
+    let Phase::Body { decoder, head_len, raw, expect } = &mut self.phase else {
       return Http1Event::NeedMore;
     };
     let head_len = *head_len;
+    let continue_due = mem::take(expect);
     let head_end = self.start.wrapping_add(head_len);
     let input = self.buf.get(head_end..).unwrap_or_default();
     let input_len = input.len();
     let status = match decoder.feed(input, &mut self.body) {
       Ok(status) => status,
-      Err(_) => return self.fail(StatusCode::BadRequest),
+      // 400, or 431 for too many trailer fields
+      Err(err) => return self.fail(error_status(&err)),
     };
     // Only what belongs to this body counts, not the pipelined requests after it.
     let taken = match status {
@@ -260,6 +266,11 @@ impl Http1Conn {
       BodyStatus::NeedMore => {
         // Everything after the head went through the decoder, so it is not kept.
         self.buf.truncate(head_end);
+        // RFC 9110 §10.1.1: a client that waits for it before sending the body is told to go on.
+        // Not when the body is already in: the 100 may then be left out.
+        if continue_due {
+          self.out.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+        }
         Http1Event::NeedMore
       }
       BodyStatus::Complete { consumed } => {
@@ -356,6 +367,18 @@ impl Http1Conn {
     matches!(self.phase, Phase::Head)
   }
 
+  /// The peer is done sending. A request whose head came in and whose body was cut short is
+  /// answered with a 400 (as Envoy does) and the connection starts closing, which is returned. A
+  /// head cut short, or nothing at all, is closed without an answer (as h2o does).
+  #[inline]
+  pub fn end_of_input(&mut self) -> bool {
+    if self.closing || !matches!(self.phase, Phase::Body { .. }) {
+      return false;
+    }
+    let _event = self.fail(StatusCode::BadRequest);
+    true
+  }
+
   /// If the connection should be closed once the output is flushed.
   #[inline]
   pub fn wants_close(&self) -> bool {
@@ -389,7 +412,13 @@ impl Http1Conn {
             unsafe { core::mem::transmute::<Http1Request<'_>, Http1Request<'static>>(request) };
           Head::Bodyless(request, head_len)
         }
-        kind => Head::WithBody(kind, head_len),
+        kind => {
+          let expect = request.version == Version::Http1_1
+            && request.headers.iter().any(|(name, value)| {
+              name.eq_ignore_ascii_case("expect") && value.eq_ignore_ascii_case("100-continue")
+            });
+          Head::WithBody(kind, head_len, expect)
+        }
       },
     }
   }
@@ -967,5 +996,37 @@ mod tests {
     parts.free_larger_than(1024);
     assert_eq!((parts.buf.capacity(), parts.body.capacity(), parts.out.capacity()), (0, 0, out));
     assert_eq!(parts.scratch.len(), 1);
+  }
+
+  // Envoy's pipelined-error tests: the first request of a pipeline is answered before the
+  // malformed one behind it fails the connection with a 400.
+  #[test]
+  fn pipelined_malformed_second_request_fails_after_the_first_is_answered() {
+    let mut c = conn();
+    c.feed(&[GET, b"NOPE\r\n\r\n"].concat()).unwrap();
+    assert_eq!(c.poll_event(), Http1Event::RequestReady);
+    answer(&mut c);
+    assert!(output(&mut c).starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert_eq!(c.poll_event(), Http1Event::NeedMore);
+    assert!(output(&mut c).starts_with(b"HTTP/1.1 400 "));
+    assert_eq!(c.poll_event(), Http1Event::Closed);
+  }
+
+  // Envoy bounds the trailer-field count like the header count: 150 of them after the last
+  // chunk is a 431, not a completed body.
+  #[test]
+  fn endless_trailer_count_is_bounded() {
+    let mut raw =
+      b"POST /upload HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".to_vec();
+    for _ in 0..150 {
+      raw.extend_from_slice(b"X-Many: v\r\n");
+    }
+    raw.extend_from_slice(b"\r\n");
+    let mut c = conn();
+    c.feed(&raw).unwrap();
+    let _event = c.poll_event();
+    assert!(c.wants_close(), "the connection lived on after 150 trailer fields");
+    assert!(output(&mut c).starts_with(b"HTTP/1.1 431 "));
+    assert_eq!(c.poll_event(), Http1Event::Closed);
   }
 }

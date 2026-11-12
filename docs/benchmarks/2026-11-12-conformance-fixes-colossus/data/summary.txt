@@ -1,0 +1,5 @@
+non-2xx total: 0
+profile           A rps     B rps     B/A A spread B spread A us/req B us/req cpu B/A  per-pass B/A rps
+baseline         804950    803640  -0.16%     1.1%     0.3%   14.533   14.599  +0.45%  -0.8 -0.2 -0.0 -0.1
+limited-conn     493315    491975  -0.27%     1.6%     0.7%   19.232   19.161  -0.37%  +0.9 -0.1 -0.5 -0.0
+json-comp        257330    258210  +0.34%     0.2%     0.5%   46.958   46.826  -0.28%  +0.6 +0.1 +0.7 +0.0
