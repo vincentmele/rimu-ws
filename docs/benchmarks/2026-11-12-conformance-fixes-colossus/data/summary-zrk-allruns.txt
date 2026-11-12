@@ -1,0 +1,18 @@
+all passes
+  8gbit        cpu µs/req  A     36.70  B     36.84    +0.4%  (12 runs each)
+  8gbit        mean µs     A    121.10  B    126.45    +4.4%  (12 runs each)
+  8gbit        p99 µs      A    155.50  B    168.50    +8.4%  (12 runs each)
+  8gbit        p99.9 µs    A  16018.00  B  16466.00    +2.8%  (12 runs each)
+  latency-10k  cpu µs/req  A     21.66  B     21.75    +0.4%  (4 runs each)
+  latency-10k  mean µs     A     74.35  B     69.70    -6.3%  (4 runs each)
+  latency-10k  p99 µs      A     77.50  B     77.50    +0.0%  (4 runs each)
+  latency-10k  p99.9 µs    A   5162.00  B   3725.50   -27.8%  (4 runs each)
+without pass 4
+  8gbit        cpu µs/req  A     36.59  B     36.58    -0.0%  (9 runs each)
+  8gbit        mean µs     A    120.80  B    119.30    -1.2%  (9 runs each)
+  8gbit        p99 µs      A    149.00  B    159.00    +6.7%  (9 runs each)
+  8gbit        p99.9 µs    A  16488.00  B  16140.00    -2.1%  (9 runs each)
+  latency-10k  cpu µs/req  A     21.63  B     21.64    +0.0%  (3 runs each)
+  latency-10k  mean µs     A     70.10  B     66.40    -5.3%  (3 runs each)
+  latency-10k  p99 µs      A     77.00  B     77.00    +0.0%  (3 runs each)
+  latency-10k  p99.9 µs    A   5262.00  B   2593.00   -50.7%  (3 runs each)

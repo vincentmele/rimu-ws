@@ -1,0 +1,79 @@
+== pass 1 14:19:47 order A B load 8.42 8.88 4.91
+p1 A 8gbit r1 rate 49437 ratio 0.9887 mean 124.9 p99 170.0 p999 17112.0 cpu_s 9.05 cpu_us_req 36.590 2xx 247336 non2xx 0 lag_us 33125
+p1 A 8gbit r2 rate 49503 ratio 0.9901 mean 109.0 p99 149.0 p999 13156.0 cpu_s 8.95 cpu_us_req 36.136 2xx 247673 non2xx 0 lag_us 28418
+p1 A 8gbit r3 rate 49453 ratio 0.9891 mean 124.2 p99 186.0 p999 16568.0 cpu_s 9.47 cpu_us_req 38.275 2xx 247418 non2xx 0 lag_us 33474
+p1 A latency-10k r1 rate 9979 ratio 0.9979 mean 78.6 p99 78.0 p999 6862.0 cpu_s 4.33 cpu_us_req 21.691 2xx 199618 non2xx 0 lag_us 0
+p1 B 8gbit r1 rate 49450 ratio 0.9890 mean 145.6 p99 159.0 p999 21400.0 cpu_s 9.05 cpu_us_req 36.577 2xx 247423 non2xx 0 lag_us 29348
+p1 B 8gbit r2 rate 49530 ratio 0.9906 mean 130.0 p99 189.0 p999 18072.0 cpu_s 9.18 cpu_us_req 37.045 2xx 247810 non2xx 0 lag_us 36172
+p1 B 8gbit r3 rate 49436 ratio 0.9887 mean 114.7 p99 135.0 p999 15844.0 cpu_s 8.87 cpu_us_req 35.862 2xx 247339 non2xx 0 lag_us 31514
+p1 B latency-10k r1 rate 9982 ratio 0.9982 mean 73.2 p99 77.0 p999 1403.0 cpu_s 4.32 cpu_us_req 21.635 2xx 199673 non2xx 0 lag_us 0
+== pass 2 14:21:10 order B A load 3.20 7.10 4.63
+p2 B 8gbit r1 rate 49476 ratio 0.9895 mean 122.9 p99 201.0 p999 13996.0 cpu_s 9.31 cpu_us_req 37.608 2xx 247552 non2xx 0 lag_us 29451
+p2 B 8gbit r2 rate 49472 ratio 0.9894 mean 117.6 p99 141.0 p999 16792.0 cpu_s 8.88 cpu_us_req 35.876 2xx 247518 non2xx 0 lag_us 25535
+p2 B 8gbit r3 rate 49426 ratio 0.9885 mean 119.3 p99 163.0 p999 16092.0 cpu_s 9.03 cpu_us_req 36.514 2xx 247300 non2xx 0 lag_us 35188
+p2 B latency-10k r1 rate 9979 ratio 0.9979 mean 65.6 p99 78.0 p999 2593.0 cpu_s 4.28 cpu_us_req 21.441 2xx 199619 non2xx 0 lag_us 0
+p2 A 8gbit r1 rate 49477 ratio 0.9895 mean 132.5 p99 148.0 p999 17880.0 cpu_s 9.02 cpu_us_req 36.437 2xx 247549 non2xx 0 lag_us 23136
+p2 A 8gbit r2 rate 49476 ratio 0.9895 mean 113.6 p99 145.0 p999 15548.0 cpu_s 8.99 cpu_us_req 36.316 2xx 247552 non2xx 0 lag_us 34163
+p2 A 8gbit r3 rate 49573 ratio 0.9915 mean 120.8 p99 149.0 p999 16488.0 cpu_s 9.13 cpu_us_req 36.815 2xx 247998 non2xx 0 lag_us 23458
+p2 A latency-10k r1 rate 9983 ratio 0.9983 mean 70.1 p99 77.0 p999 5262.0 cpu_s 4.32 cpu_us_req 21.632 2xx 199701 non2xx 0 lag_us 0
+== pass 3 14:22:34 order A B load 2.13 5.85 4.41
+p3 A 8gbit r1 rate 49459 ratio 0.9892 mean 136.3 p99 161.0 p999 19208.0 cpu_s 9.20 cpu_us_req 37.175 2xx 247479 non2xx 0 lag_us 28527
+p3 A 8gbit r2 rate 49510 ratio 0.9902 mean 117.6 p99 188.0 p999 14580.0 cpu_s 9.16 cpu_us_req 36.980 2xx 247703 non2xx 0 lag_us 26873
+p3 A 8gbit r3 rate 49476 ratio 0.9895 mean 101.0 p99 140.0 p999 10884.0 cpu_s 8.91 cpu_us_req 35.996 2xx 247530 non2xx 0 lag_us 24559
+p3 A latency-10k r1 rate 9984 ratio 0.9984 mean 63.6 p99 75.0 p999 1525.0 cpu_s 4.22 cpu_us_req 21.131 2xx 199710 non2xx 0 lag_us 0
+p3 B 8gbit r1 rate 49537 ratio 0.9907 mean 145.4 p99 157.0 p999 22632.0 cpu_s 9.08 cpu_us_req 36.631 2xx 247877 non2xx 0 lag_us 31778
+p3 B 8gbit r2 rate 49526 ratio 0.9905 mean 118.8 p99 146.0 p999 16140.0 cpu_s 8.86 cpu_us_req 35.761 2xx 247759 non2xx 0 lag_us 32223
+p3 B 8gbit r3 rate 49415 ratio 0.9883 mean 110.8 p99 174.0 p999 11956.0 cpu_s 9.20 cpu_us_req 37.213 2xx 247223 non2xx 0 lag_us 22976
+p3 B latency-10k r1 rate 9987 ratio 0.9987 mean 66.4 p99 77.0 p999 6790.0 cpu_s 4.37 cpu_us_req 21.874 2xx 199777 non2xx 0 lag_us 0
+waiting: rustfmt 111  load 2.29 5.09 4.26
+waiting: rustc 400 cc1 400 rustc 166  load 2.73 5.09 4.27
+waiting: rustc 200 rustc 137 rustc 110  load 3.78 5.23 4.33
+waiting: rustc 109 cc1plus 101 cc1plus 101  load 4.43 5.33 4.37
+waiting: x86_64-linux-gn 142 cc1plus 133 clippy-driver 116  load 5.43 5.51 4.44
+waiting: cc1plus 137 cc1plus 120 cc1plus 108  load 6.44 5.73 4.52
+waiting: cc1plus 125 cc1plus 111 cc1plus 110  load 7.43 5.96 4.61
+waiting: cc1plus 300 clippy-driver 250 cc1plus 104  load 7.75 6.08 4.66
+waiting: cc1plus 400 cc1plus 220 x86_64-linux-gn 185  load 8.02 6.19 4.72
+waiting: cc1 126 rustc 116 rustc 114  load 9.47 6.57 4.85
+waiting: rustc 166 rustc 138 rustc 135  load 11.48 7.15 5.07
+waiting: x86_64-linux-gn 115 cc1plus 111 rustc 106  load 12.62 7.54 5.22
+waiting: cc1 162 cc1 133 cc1 108  load 13.30 7.85 5.35
+waiting: x86_64-linux-gn 114 cc1plus 105 cc1plus 103  load 14.03 8.18 5.48
+waiting: rustc 112 cc1plus 106 rustc 102  load 14.24 8.42 5.59
+waiting: x86_64-linux-gn 107 cc1plus 104 x86_64-linux-gn 104  load 13.82 8.53 5.66
+waiting: cc1plus 104 cc1plus 101 cc1plus 100  load 13.38 8.61 5.71
+waiting: x86_64-linux-gn 120 cc1plus 110 rustc 103  load 12.94 8.67 5.76
+waiting: cc1plus 103 cc1plus 102 cc1plus 101  load 12.57 8.73 5.82
+waiting: cc1plus 137 x86_64-linux-gn 102 cc1plus 100  load 12.10 8.76 5.86
+waiting: cc1plus 400 cc1plus 110 cc1plus 100  load 11.86 8.82 5.91
+waiting: cc1plus 100 cc1plus 100 rustc 99.9  load 11.10 8.76 5.92
+waiting: rustc 99.9  load 9.77 8.55 5.88
+waiting: rustc 99.9 ar 95.1  load 8.66 8.35 5.84
+waiting: ar 127 rustc 99.9  load 7.63 8.14 5.80
+waiting: rustc 400 rustc 140 rustc 133  load 7.62 8.12 5.82
+waiting: rustc 400 rustc 137 rustc 121  load 7.91 8.17 5.86
+waiting: rustc 130 rustc 128 rustc 111  load 8.07 8.19 5.89
+waiting: rust-lld 221 rust-lld 216 rust-lld 171  load 9.81 8.55 6.04
+waiting: rust-lld 250 rustc 233 rustc 117  load 13.04 9.28 6.30
+waiting: kl_stream-edbe6 945  load 11.78 9.14 6.28
+waiting: markets_memory- 100  load 10.12 8.87 6.23
+waiting: markets_memory- 100  load 8.72 8.61 6.17
+waiting: markets_memory- 100  load 7.53 8.36 6.12
+waiting: markets_memory- 100  load 6.75 8.16 6.08
+waiting: stream_memory-c 103  load 6.18 7.99 6.04
+waiting: stream_memory-c 152 hpb-run 109 hpb-run 109  load 5.54 7.79 6.00
+waiting: stream_memory-c 141  load 5.15 7.64 5.97
+waiting: writer-fe4e9727 156 python 92.8  load 4.75 7.47 5.93
+waiting: writer-fe4e9727 133  load 4.32 7.29 5.89
+waiting: writer-fe4e9727 140  load 4.04 7.13 5.85
+waiting: writer-fe4e9727 129  load 3.73 6.96 5.81
+== pass 4 14:31:00 order B A load 3.54 6.81 5.77
+p4 B 8gbit r1 rate 49388 ratio 0.9878 mean 149.2 p99 201.0 p999 20408.0 cpu_s 9.68 cpu_us_req 39.173 2xx 247108 non2xx 0 lag_us 31818
+p4 B 8gbit r2 rate 49490 ratio 0.9898 mean 132.9 p99 288.0 p999 17912.0 cpu_s 9.61 cpu_us_req 38.814 2xx 247589 non2xx 0 lag_us 39747
+p4 B 8gbit r3 rate 49456 ratio 0.9891 mean 334.7 p99 5038.0 p999 15404.0 cpu_s 10.28 cpu_us_req 41.542 2xx 247463 non2xx 0 lag_us 54027
+p4 B latency-10k r1 rate 9983 ratio 0.9983 mean 73.0 p99 94.0 p999 4858.0 cpu_s 4.74 cpu_us_req 23.736 2xx 199698 non2xx 0 lag_us 0
+p4 A 8gbit r1 rate 49380 ratio 0.9876 mean 253.3 p99 2939.0 p999 33872.0 cpu_s 9.60 cpu_us_req 38.853 2xx 247084 non2xx 0 lag_us 51714
+p4 A 8gbit r2 rate 49508 ratio 0.9902 mean 121.4 p99 207.0 p999 14932.0 cpu_s 9.93 cpu_us_req 40.092 2xx 247680 non2xx 0 lag_us 21497
+p4 A 8gbit r3 rate 49502 ratio 0.9900 mean 116.4 p99 150.0 p999 15380.0 cpu_s 9.05 cpu_us_req 36.542 2xx 247657 non2xx 0 lag_us 34203
+p4 A latency-10k r1 rate 9980 ratio 0.9980 mean 82.7 p99 100.0 p999 5062.0 cpu_s 5.37 cpu_us_req 26.899 2xx 199632 non2xx 0 lag_us 0
+== done 14:32:24 load 3.82 6.20 5.65
