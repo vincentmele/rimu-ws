@@ -143,7 +143,7 @@ pub fn parse_request<'b>(
   // nginx and httpd: a well-formed method that isn't known is not implemented, other tokens
   // (`get`, `G@T`) are bad requests.
   let Some(method) = method else {
-    return Err(if method_bytes.iter().all(u8::is_ascii_uppercase) {
+    return Err(if !method_bytes.is_empty() && method_bytes.iter().all(u8::is_ascii_uppercase) {
       HttpError::UnknownMethod.into()
     } else {
       bad()
@@ -1136,6 +1136,8 @@ mod tests {
   fn unknown_method_is_not_implemented() {
     assert_eq!(err_status(b"BAD /ping HTTP/1.1\r\nHost: a\r\n\r\n"), StatusCode::NotImplemented);
     assert_eq!(err_status(b"bad /ping HTTP/1.1\r\nHost: a\r\n\r\n"), StatusCode::BadRequest);
+    // No method at all is a bad request, not an unknown one (nginx and h2o answer 400).
+    assert_eq!(err_status(b" /ping HTTP/1.1\r\nHost: a\r\n\r\n"), StatusCode::BadRequest);
   }
 
   // A request line alone over the cap is a long URI: nginx and httpd answer 414, distinct from

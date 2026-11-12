@@ -217,7 +217,9 @@ recommendations, corrected where the code says otherwise, amend the plan above:
    panic or a hang; bounded bytes"), and the fuzzer keeps the cap from regressing.
 2. **F-A is a vulnerability in the default configuration.**
    - `UringParams::new()` has `handshake_timeout: None` (`uring_executor.rs:138`); the smoke
-     server sets one only through `WTX_HANDSHAKE_MS`.
+     server sets one only through `WTX_HANDSHAKE_MS`. *(Since 66648199, 5 Nov, the default is
+     `Some(10 s)`, with an idle timeout of 300 s and a close timeout of 10 s; see
+     `docs/production.md`.)*
    - The only other backstop is the reader's general 32 MiB `capacity_ub`
      (`BufStreamReader::manage_capacity`), which errors past it. So it is bounded per connection,
      but at 32 MiB, with quadratic re-parsing, and unbounded across connections.
