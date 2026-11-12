@@ -4918,6 +4918,69 @@ mod tests {
 
   // With the default limits, a peer that never reads pins a bounded amount of send buffer:
   // writes wait once it is reached. Thousands of such peers must not take gigabytes.
+  // A client that floods full 125-byte pings and never reads the pongs: the server's pong writes
+  // wait for room, and its network buffer must still drop the pings it has read instead of
+  // growing with every one. It held 8 MiB a connection after 10 s of this.
+  #[test]
+  fn ping_flood_from_a_peer_that_never_reads_keeps_the_network_buffer_small() {
+    let addr = test_addr();
+    let client_addr = addr.clone();
+    let client = std::thread::spawn(move || {
+      let mut stream = connect(&client_addr);
+      set_sock_int(&stream, libc::SOL_SOCKET, libc::SO_RCVBUF, 4096);
+      stream
+        .write_all(
+          b"GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .unwrap();
+      let mut res = Vec::new();
+      while !res.windows(4).any(|el| el == b"\r\n\r\n") {
+        let mut byte = [0; 1];
+        stream.read_exact(&mut byte).unwrap();
+        res.push(byte[0]);
+      }
+      let mask = [1, 2, 3, 4];
+      let mut ping = alloc::vec![0x89, 0x80 | 125];
+      ping.extend_from_slice(&mask);
+      ping.extend((0..125).map(|idx| 7 ^ mask[idx % 4]));
+      let batch: Vec<u8> = ping.iter().copied().cycle().take(ping.len() * 64).collect();
+      stream.set_write_timeout(Some(core::time::Duration::from_millis(100))).unwrap();
+      let begin = std::time::Instant::now();
+      while begin.elapsed() < core::time::Duration::from_secs(2) {
+        if stream.write_all(&batch).is_err() {
+          break;
+        }
+      }
+      drop(stream);
+    });
+    let runtime = UringRuntime::new().unwrap();
+    let peak = runtime.block_on(async {
+      let listener = bind(&addr).await;
+      let (stream, _) = listener.accept(TcpParams::default()).await.unwrap();
+      let mut ws = WebSocketAcceptor::default()
+        .accept(TlsAcceptor::new(
+          &TlsConfig::plaintext(),
+          &mut ChaCha20::from_std_random().unwrap(),
+          stream,
+        ))
+        .await
+        .unwrap();
+      let mut buffer = VectorUsize::new();
+      let (mut common, mut reader, mut writer) = ws.split_mut();
+      let origin = WebSocketPayloadOrigin::Adaptive;
+      let mut peak = 0;
+      while let Ok(mut frame) = reader.read_frame(&mut buffer, &mut common, origin).await {
+        if matches!(frame.op_code(), OpCode::Text | OpCode::Binary) {
+          let _rslt = writer.write_frame(&mut common, &mut frame).await;
+        }
+        peak = peak.max(reader.network_buffer.buffer_mut().capacity());
+      }
+      peak
+    });
+    client.join().unwrap();
+    assert!(peak <= 256 * 1024, "{peak} bytes of network buffer at the peak");
+  }
+
   #[test]
   fn peer_that_never_reads_pins_little_send_buffer_by_default() {
     use crate::net::StreamWriter;

@@ -382,7 +382,7 @@ impl BufStreamReader {
   /// connection. Only for callers that keep no indices into the buffer across reads.
   #[cfg(feature = "web-socket")]
   #[inline]
-  fn compact_for(&mut self, reserve_len: usize) {
+  pub(crate) fn compact_for(&mut self, reserve_len: usize) {
     let current_end_idx = self.current_end_idx;
     if current_end_idx == 0
       || self.forbid_clear

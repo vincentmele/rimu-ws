@@ -577,6 +577,10 @@ where
   D: WebSocketDecompression,
   SR: StreamReader,
 {
+  // A stream of frames that never ends on a read's boundary always leaves part of the next one
+  // unread, so the buffer never empties: drop the frames already read rather than let the header
+  // and payload reads grow it. A client flooding pings it never reads the pongs to held 8 MiB.
+  network_buffer.compact_for(MAX_HEADER_LEN);
   let rfi = ReadFrameInfo::from_stream::<D, _, IS_CLIENT>(
     max_payload_len,
     nc_rsv1,
@@ -585,6 +589,7 @@ where
     stream_reader,
   )
   .await?;
+  network_buffer.compact_for(rfi.payload_len);
   network_buffer.read_payload(rfi.payload_len, stream_reader).await?;
   Ok(rfi)
 }
