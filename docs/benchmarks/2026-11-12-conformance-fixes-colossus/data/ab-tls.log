@@ -1,0 +1,53 @@
+== pass 1 14:13:33 order A B load 1.35 0.86 1.08
+p1 A json-tls r1 rps 266763.02 reqs 1356192 cpu_s 38.70 non2xx 0 sockerr 
+p1 A json-tls r2 rps 266492.23 reqs 1348165 cpu_s 39.01 non2xx 0 sockerr 
+p1 A json-tls r3 rps 268548.57 reqs 1368364 cpu_s 38.38 non2xx 0 sockerr 
+p1 A 8gbit r1 rps 133902.25 reqs 682825 cpu_s 59.38 non2xx 0 sockerr 
+p1 A 8gbit r2 rps 133326.62 reqs 671765 cpu_s 58.66 non2xx 0 sockerr 
+p1 A 8gbit r3 rps 128247.58 reqs 654095 cpu_s 60.04 non2xx 0 sockerr 
+p1 B json-tls r1 rps 264906.71 reqs 1341446 cpu_s 40.04 non2xx 0 sockerr 
+p1 B json-tls r2 rps 271777.12 reqs 1375745 cpu_s 39.17 non2xx 0 sockerr 
+p1 B json-tls r3 rps 267344.09 reqs 1362501 cpu_s 39.07 non2xx 0 sockerr 
+p1 B 8gbit r1 rps 131483.94 reqs 661925 cpu_s 59.62 non2xx 0 sockerr 
+p1 B 8gbit r2 rps 125418.31 reqs 631393 cpu_s 59.87 non2xx 0 sockerr 
+p1 B 8gbit r3 rps 130126.22 reqs 655248 cpu_s 59.86 non2xx 0 sockerr 
+== pass 2 14:14:58 order B A load 10.49 4.12 2.22
+p2 B json-tls r1 rps 260058.60 reqs 1318249 cpu_s 39.62 non2xx 0 sockerr 
+p2 B json-tls r2 rps 267320.19 reqs 1360582 cpu_s 38.68 non2xx 0 sockerr 
+p2 B json-tls r3 rps 266592.88 reqs 1340473 cpu_s 38.50 non2xx 0 sockerr 
+p2 B 8gbit r1 rps 133531.01 reqs 673193 cpu_s 59.33 non2xx 0 sockerr 
+p2 B 8gbit r2 rps 128243.45 reqs 654042 cpu_s 59.95 non2xx 0 sockerr 
+p2 B 8gbit r3 rps 118717.31 reqs 598149 cpu_s 58.84 non2xx 0 sockerr 
+p2 A json-tls r1 rps 266232.81 reqs 1347310 cpu_s 38.95 non2xx 0 sockerr 
+p2 A json-tls r2 rps 269418.37 reqs 1365984 cpu_s 40.37 non2xx 0 sockerr 
+p2 A json-tls r3 rps 268508.18 reqs 1367517 cpu_s 38.80 non2xx 0 sockerr 
+p2 A 8gbit r1 rps 128753.54 reqs 648726 cpu_s 59.87 non2xx 0 sockerr 
+p2 A 8gbit r2 rps 122515.51 reqs 616248 cpu_s 59.41 non2xx 0 sockerr 
+p2 A 8gbit r3 rps 129323.55 reqs 650454 cpu_s 59.96 non2xx 0 sockerr 
+== pass 3 14:16:24 order A B load 12.96 6.61 3.27
+p3 A json-tls r1 rps 266180.57 reqs 1353932 cpu_s 39.54 non2xx 0 sockerr 
+p3 A json-tls r2 rps 266988.26 reqs 1360412 cpu_s 38.76 non2xx 0 sockerr 
+p3 A json-tls r3 rps 269293.24 reqs 1366207 cpu_s 39.49 non2xx 0 sockerr 
+p3 A 8gbit r1 rps 128316.51 reqs 645682 cpu_s 59.77 non2xx 0 sockerr 
+p3 A 8gbit r2 rps 135631.49 reqs 681786 cpu_s 59.82 non2xx 0 sockerr 
+p3 A 8gbit r3 rps 135543.34 reqs 681444 cpu_s 59.77 non2xx 0 sockerr 
+p3 B json-tls r1 rps 267062.82 reqs 1361490 cpu_s 40.07 non2xx 0 sockerr 
+p3 B json-tls r2 rps 263749.74 reqs 1341687 cpu_s 39.36 non2xx 0 sockerr 
+p3 B json-tls r3 rps 269317.61 reqs 1372651 cpu_s 39.44 non2xx 0 sockerr 
+p3 B 8gbit r1 rps 129221.41 reqs 659038 cpu_s 59.42 non2xx 0 sockerr 
+p3 B 8gbit r2 rps 129348.38 reqs 650779 cpu_s 59.89 non2xx 0 sockerr 
+p3 B 8gbit r3 rps 125721.55 reqs 641152 cpu_s 60.07 non2xx 0 sockerr 
+== pass 4 14:17:50 order B A load 13.77 8.47 4.22
+p4 B json-tls r1 rps 263144.44 reqs 1342294 cpu_s 39.44 non2xx 0 sockerr 
+p4 B json-tls r2 rps 268628.69 reqs 1367507 cpu_s 38.95 non2xx 0 sockerr 
+p4 B json-tls r3 rps 269927.53 reqs 1372402 cpu_s 38.86 non2xx 0 sockerr 
+p4 B 8gbit r1 rps 127572.41 reqs 642285 cpu_s 59.65 non2xx 0 sockerr 
+p4 B 8gbit r2 rps 126399.43 reqs 636092 cpu_s 59.74 non2xx 0 sockerr 
+p4 B 8gbit r3 rps 125643.71 reqs 633794 cpu_s 59.93 non2xx 0 sockerr 
+p4 A json-tls r1 rps 267863.58 reqs 1356725 cpu_s 40.43 non2xx 0 sockerr 
+p4 A json-tls r2 rps 270512.67 reqs 1376016 cpu_s 38.79 non2xx 0 sockerr 
+p4 A json-tls r3 rps 268167.92 reqs 1366828 cpu_s 39.82 non2xx 0 sockerr 
+p4 A 8gbit r1 rps 126682.31 reqs 636757 cpu_s 59.76 non2xx 0 sockerr 
+p4 A 8gbit r2 rps 130509.44 reqs 657689 cpu_s 59.93 non2xx 0 sockerr 
+p4 A 8gbit r3 rps 129350.12 reqs 650743 cpu_s 59.90 non2xx 0 sockerr 
+== done 14:19:16 load 13.89 9.82 5.07

@@ -1,4 +1,4 @@
-# HTTP/1.1 and WebSocket conformance fixes: validator and h1 A/B on colossus — 12 Nov 2026 (12:19–12:28 UTC)
+# HTTP/1.1 and WebSocket conformance fixes: validator and h1 A/B on colossus — 12 Nov 2026 (12:19–14:32 UTC)
 
 A regression check of the conformance fixes on the `fix/conformance-gaps` branch: new tests, ported from llhttp,
 h2o, Envoy, lighttpd, httpd, gorilla and Autobahn, and the parser, chunked-body, connection-core and WebSocket changes
@@ -21,7 +21,8 @@ colossus (AMD Ryzen 9 5900X, 12 cores / 24 threads, kernel 7.0.0-38). Servers on
 - Quiet machine: each pass waited until no process outside the run used more than half a CPU. Another session's
   archiver held about 3 CPUs until 12:19; all four passes then started clean (the logged load of 13–14 is the run's
   own server and generator).
-- json-tls and 8gbit were not run: HttpArena drives them with wrk, which is not installed here.
+- json-tls, 8gbit and latency-10k followed later that day, once wrk and zrk were installed:
+  [TLS and paced profiles](#tls-and-paced-profiles-14131432-utc).
 
 ## Validator
 HttpArena's `scripts/validate.sh rimu-ws-h1` on an image built from the fixed tree (scratch HttpArena clone, entry
@@ -40,6 +41,49 @@ Paired per pass, B vs A in req/s: baseline −0.8 / −0.2 / −0.0 / −0.1 %, 
 json-comp +0.6 / +0.1 / +0.7 / +0.0 %. Every change is inside A's own pass-to-pass spread, and 0 non-2xx responses in
 every run. **No measurable cost.**
 
+## TLS and paced profiles (14:13–14:32 UTC)
+
+The profiles the first run could not drive, measured the same way (same machine, CPU split, alternating
+order, 4 passes) with HttpArena's other generators: wrk 4.1.0 and zrk 3.0.0. The builds this time:
+A = ef0f7abb (before the conformance work, as above), B = `main` 37e36643, which adds to the fixes
+above the WebSocket network-buffer fix (c74c2cd1), the empty-method 400 and a production guide. Both
+run natively with HttpArena's certificate pair (`CERT_DIR`), TLS on 8081.
+
+**Open loop, wrk** (`data/ab-tls.sh`; 5 s runs, best of 3 per start, medians over the passes,
+`data/summary_tls.py`):
+
+| profile | A req/s | B req/s | B vs A | pass spread A / B | cpu µs/req A → B |
+|---|---|---|---|---|---|
+| json-tls (`json-tls-rotate.lua`, 4,096 connections) | 269,356 | 269,623 | +0.10 % | 0.7 / 1.7 % | 28.55 → 28.45 (−0.34 %) |
+| 8gbit, open loop (`8gbit-rotate.lua`: 10 KB bodies, 512 connections) | 132,206 | 130,416 | −1.35 % | 4.8 / 4.6 % | 89.43 → 91.05 (+1.81 %) |
+
+json-tls is level. The open-loop 8gbit is inconclusive: paired per pass B was +3.3 % to −4.6 % against
+A, inside each build's own ~4.7 % spread (the 11 Nov colossus runs found the same noise on this
+profile). HttpArena itself no longer drives 8gbit this way; the paced run below is its shape.
+
+**Paced, zrk** (`data/ab-zrk.sh`): 8gbit as HttpArena runs it (`POST /echo` over TLS, one 10 KiB
+body, 512 connections, 50,000 req/s, 5 s, 3 runs per start) and latency-10k (`GET /baseline11`, 1,024
+connections, 10,000 req/s, 20 s, 1 run per start). Both reached their rate (rate ratio 0.990 and 0.998
+for both builds), so they are judged by server cpu per request and latency. Medians over every run of
+passes 1–3 (`data/summary_zrk_allruns.py`):
+
+| profile | metric | A | B | B vs A |
+|---|---|---|---|---|
+| 8gbit | cpu µs/req | 36.59 | 36.58 | −0.0 % |
+| | mean latency | 120.8 µs | 119.3 µs | −1.2 % |
+| | p99 | 149 µs | 159 µs | +6.7 % |
+| latency-10k | cpu µs/req | 21.63 | 21.64 | +0.0 % |
+| | mean latency | 70.1 µs | 66.4 µs | −5.3 % |
+| | p99 | 77 µs | 77 µs | 0 % |
+
+8gbit's p99 differs by 10 µs where each build's runs range from 135 to 201 µs; p99.9 is in the
+milliseconds for both builds and too noisy to tell them apart. **Pass 4 is left out:** it started
+after an 8½-minute wait for other sessions' builds, and both builds had outlier runs in it (a 5 ms
+and a 2.9 ms p99); with it, 8gbit's mean reads +4.4 %, carried by those runs (all four passes:
+`data/summary-zrk-allruns.txt`; one run per start, the least cpu of three: `data/summary-zrk.txt`).
+0 non-2xx responses in every run of both generators. **No measurable cost** on the TLS or paced
+profiles either.
+
 ## What the fixes change
 - Request line: an unknown uppercase method is a 501 (other tokens stay 400); HTTP/1.x with a minor version above 1 is
   served as 1.1 and another major version is a 505; a request line over 16 KiB is a 414 (an oversized head with lines is
@@ -52,6 +96,10 @@ every run. **No measurable cost.**
   Non-minimal length encodings stay accepted, by choice (RFC 6455 binds the sender only).
 
 ## Data
-`data/summary.txt` (the table above), `data/ab.log` (every run), `data/raw/` (gcannon outputs with server cpu ticks,
-server logs), `data/ab.sh` (the run; its paths are the session's scratch directories), `data/summary.py`,
-`data/validate.log`.
+- First run (gcannon): `data/summary.txt` (the table above), `data/ab.log` (every run), `data/raw/` (gcannon outputs
+  with server cpu ticks, server logs), `data/ab.sh` (the run; its paths are the session's scratch directories),
+  `data/summary.py`, `data/validate.log`.
+- TLS and paced runs: `data/ab-tls.sh`, `data/ab-tls.log`, `data/summary_tls.py`, `data/summary-tls.txt`,
+  `data/raw-tls/` (wrk outputs, server logs); `data/ab-zrk.sh`, `data/ab-zrk.log`, `data/summary_zrk.py`,
+  `data/summary_zrk_allruns.py`, `data/summary-zrk.txt`, `data/summary-zrk-allruns.txt`, `data/raw-zrk/` (zrk JSON
+  summaries, server logs).

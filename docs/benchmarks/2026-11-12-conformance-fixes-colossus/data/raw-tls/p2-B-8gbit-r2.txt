@@ -1,0 +1,9 @@
+Running 5s test @ https://localhost:8081
+  10 threads and 512 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     3.85ms    1.45ms  27.62ms   73.56%
+    Req/Sec    13.12k     1.40k   36.47k    93.61%
+  654042 requests in 5.10s, 6.29GB read
+Requests/sec: 128243.45
+Transfer/sec:      1.23GB
+cpu_ticks 5995 tick 100
